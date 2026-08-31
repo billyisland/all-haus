@@ -1,0 +1,29 @@
+<svg viewBox="0 0 56 56" xmlns="http://www.w3.org/2000/svg">
+  <!-- Scaled-down ForallMenu mark: an ink disc carrying the constructed ∀ —
+       the legs are one mitred stroked path plus a straight crossbar in the
+       upper third, slightly lighter than the legs.
+
+       Geometry is the DISC form's rim-kiss construction
+       (docs/adr/FORALL-CUT-AND-LOCKUP-ADR §III.1), transposed from its
+       200-unit frame (disc r=94) to this 56-unit one (disc r=28) by 28/94:
+       feet overshoot the top rim along the leg axis so the clip trims them
+       flush, and the apex vertex (28, 47.15) puts the mitred outer tip on the
+       bottom rim. Same numbers as the live ForallMenu trigger and the brand
+       exports in /brand — the three disc instances are one geometry.
+
+       PAINTED, not punched: a favicon lands on a tab ground we don't control,
+       so the ∀ is drawn in bone over the opaque disc (§II). Bars are clipped
+       to the disc so the tab corners stay transparent.
+
+       The rasters icon-32.png / apple-touch-icon.png are regenerated FROM this
+       file — never edited directly. -->
+  <defs>
+    <clipPath id="disc"><circle cx="28" cy="28" r="28"/></clipPath>
+  </defs>
+  <circle cx="28" cy="28" r="28" fill="#1A1A18"/>
+  <g clip-path="url(#disc)" fill="none" stroke="#F0EFEB">
+    <path d="M14.36 1.61 L28 47.15 L41.64 1.61" stroke-width="5.06"
+          stroke-linejoin="miter" stroke-miterlimit="12" stroke-linecap="butt"/>
+    <line x1="19.96" y1="20.26" x2="36.04" y2="20.26" stroke-width="4.17"/>
+  </g>
+</svg>

@@ -1,0 +1,16 @@
+**/node_modules
+**/dist
+**/.next
+
+.git
+docs
+planning-archive
+migrations
+scripts
+relay
+media
+.claude
+
+*.log
+.env
+**/.env

@@ -1,0 +1,1684 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Canonical colour variables ─────────────────────────────────────────────
+   One pair per entry in web/src/lib/palette/registry.ts (same order). The
+   -rgb triple is what Tailwind + alpha washes consume; the plain var is what
+   inline styles reference. The Palette devtool overrides the -rgb triples
+   inline on <html> for live tuning. Keep registry + this block in sync. */
+
+:root {
+  --ah-ink-rgb: 17 17 17;
+  --ah-ink: rgb(var(--ah-ink-rgb));
+  --ah-true-black-rgb: 0 0 0;
+  --ah-true-black: rgb(var(--ah-true-black-rgb));
+  --ah-white-rgb: 255 255 255;
+  --ah-white: rgb(var(--ah-white-rgb));
+  --ah-grey-100-rgb: 242 241 237;
+  --ah-grey-100: rgb(var(--ah-grey-100-rgb));
+  --ah-grey-200-rgb: 231 229 223;
+  --ah-grey-200: rgb(var(--ah-grey-200-rgb));
+  --ah-grey-300-rgb: 185 183 175;
+  --ah-grey-300: rgb(var(--ah-grey-300-rgb));
+  --ah-grey-400-rgb: 153 153 153;
+  --ah-grey-400: rgb(var(--ah-grey-400-rgb));
+  --ah-grey-600-rgb: 102 102 102;
+  --ah-grey-600: rgb(var(--ah-grey-600-rgb));
+  --ah-nav-grey-rgb: 51 51 51;
+  --ah-nav-grey: rgb(var(--ah-nav-grey-rgb));
+  --ah-crimson-rgb: 181 36 42;
+  --ah-crimson: rgb(var(--ah-crimson-rgb));
+  --ah-crimson-dark-rgb: 146 29 34;
+  --ah-crimson-dark: rgb(var(--ah-crimson-dark-rgb));
+  --ah-crimson-deep-rgb: 139 27 31;
+  --ah-crimson-deep: rgb(var(--ah-crimson-deep-rgb));
+  --ah-crimson-soft-rgb: 217 85 90;
+  --ah-crimson-soft: rgb(var(--ah-crimson-soft-rgb));
+  --ah-vouch-red-rgb: 196 18 48;
+  --ah-vouch-red: rgb(var(--ah-vouch-red-rgb));
+  --ah-danger-red-rgb: 220 38 38;
+  --ah-danger-red: rgb(var(--ah-danger-red-rgb));
+  --ah-glasshouse-rgb: 255 255 255;
+  --ah-glasshouse: rgb(var(--ah-glasshouse-rgb));
+  --ah-glasshouse-well-rgb: 245 244 240;
+  --ah-glasshouse-well: rgb(var(--ah-glasshouse-well-rgb));
+  --ah-bone-rgb: 240 239 235;
+  --ah-bone: rgb(var(--ah-bone-rgb));
+  --ah-bone-bright-rgb: 230 229 224;
+  --ah-bone-bright: rgb(var(--ah-bone-bright-rgb));
+  --ah-stone-300-rgb: 180 178 169;
+  --ah-stone-300: rgb(var(--ah-stone-300-rgb));
+  --ah-stone-350-rgb: 156 154 148;
+  --ah-stone-350: rgb(var(--ah-stone-350-rgb));
+  --ah-stone-400-rgb: 138 136 128;
+  --ah-stone-400: rgb(var(--ah-stone-400-rgb));
+  --ah-stone-600-rgb: 95 94 90;
+  --ah-stone-600: rgb(var(--ah-stone-600-rgb));
+  --ah-trust-grey-rgb: 176 176 171;
+  --ah-trust-grey: rgb(var(--ah-trust-grey-rgb));
+  --ah-ink-925-rgb: 26 26 24;
+  --ah-ink-925: rgb(var(--ah-ink-925-rgb));
+  --ah-ink-900-rgb: 35 35 32;
+  --ah-ink-900: rgb(var(--ah-ink-900-rgb));
+  --ah-ink-850-rgb: 42 42 39;
+  --ah-ink-850: rgb(var(--ah-ink-850-rgb));
+  --ah-ink-grey-rgb: 106 106 102;
+  --ah-ink-grey: rgb(var(--ah-ink-grey-rgb));
+  --ah-wall-grey-rgb: 74 74 71;
+  --ah-wall-grey: rgb(var(--ah-wall-grey-rgb));
+  --ah-trust-green-rgb: 29 158 117;
+  --ah-trust-green: rgb(var(--ah-trust-green-rgb));
+  --ah-trust-amber-rgb: 239 159 39;
+  --ah-trust-amber: rgb(var(--ah-trust-amber-rgb));
+  --ah-klein-blue-rgb: 0 47 167;
+  --ah-klein-blue: rgb(var(--ah-klein-blue-rgb));
+  --ah-cream-rgb: 245 244 240;
+  --ah-cream: rgb(var(--ah-cream-rgb));
+  --ah-cream-hover-rgb: 250 250 247;
+  --ah-cream-hover: rgb(var(--ah-cream-hover-rgb));
+  --ah-off-white-rgb: 250 250 250;
+  --ah-off-white: rgb(var(--ah-off-white-rgb));
+  --ah-blush-rgb: 245 213 214;
+  --ah-blush: rgb(var(--ah-blush-rgb));
+  --ah-blush-deep-rgb: 232 165 167;
+  --ah-blush-deep: rgb(var(--ah-blush-deep-rgb));
+  /* Per-feed colour-scheme surfaces (feature-debt §3; four-seasons family —
+     DESIGN-TUNING-FINDINGS §3). One shared grammar: saturated frame (walls) →
+     tinted ground (interior) → clean reading surface (card). Each colourway now
+     carries BOTH a light and a dark surface set (`-dk`/`-lt` suffix on the
+     opposite-of-original variant); the colourway is the seasonal character, the
+     global light/dark toggle picks the variant. These season slugs are NOT in
+     DARK_SLUGS — they never invert under html.dark; the variant is chosen in
+     tokens.ts (paletteFor) instead. */
+  --ah-spring-walls-rgb: 47 125 74;
+  --ah-spring-walls: rgb(var(--ah-spring-walls-rgb));
+  --ah-spring-interior-rgb: 220 235 207;
+  --ah-spring-interior: rgb(var(--ah-spring-interior-rgb));
+  --ah-spring-card-rgb: 244 248 236;
+  --ah-spring-card: rgb(var(--ah-spring-card-rgb));
+  --ah-spring-walls-dk-rgb: 44 131 80;
+  --ah-spring-walls-dk: rgb(var(--ah-spring-walls-dk-rgb));
+  --ah-spring-interior-dk-rgb: 24 33 27;
+  --ah-spring-interior-dk: rgb(var(--ah-spring-interior-dk-rgb));
+  --ah-spring-card-dk-rgb: 34 46 38;
+  --ah-spring-card-dk: rgb(var(--ah-spring-card-dk-rgb));
+  --ah-summer-walls-rgb: 14 93 176;
+  --ah-summer-walls: rgb(var(--ah-summer-walls-rgb));
+  --ah-summer-interior-rgb: 242 216 158;
+  --ah-summer-interior: rgb(var(--ah-summer-interior-rgb));
+  --ah-summer-card-rgb: 252 243 221;
+  --ah-summer-card: rgb(var(--ah-summer-card-rgb));
+  --ah-summer-walls-dk-rgb: 43 111 168;
+  --ah-summer-walls-dk: rgb(var(--ah-summer-walls-dk-rgb));
+  --ah-summer-interior-dk-rgb: 22 30 38;
+  --ah-summer-interior-dk: rgb(var(--ah-summer-interior-dk-rgb));
+  --ah-summer-card-dk-rgb: 30 42 56;
+  --ah-summer-card-dk: rgb(var(--ah-summer-card-dk-rgb));
+  --ah-autumn-walls-rgb: 181 70 30;
+  --ah-autumn-walls: rgb(var(--ah-autumn-walls-rgb));
+  --ah-autumn-interior-rgb: 233 201 180;
+  --ah-autumn-interior: rgb(var(--ah-autumn-interior-rgb));
+  --ah-autumn-card-rgb: 251 239 227;
+  --ah-autumn-card: rgb(var(--ah-autumn-card-rgb));
+  --ah-autumn-walls-dk-rgb: 176 73 42;
+  --ah-autumn-walls-dk: rgb(var(--ah-autumn-walls-dk-rgb));
+  --ah-autumn-interior-dk-rgb: 33 26 22;
+  --ah-autumn-interior-dk: rgb(var(--ah-autumn-interior-dk-rgb));
+  --ah-autumn-card-dk-rgb: 50 38 32;
+  --ah-autumn-card-dk: rgb(var(--ah-autumn-card-dk-rgb));
+  --ah-winter-walls-rgb: 106 79 188;
+  --ah-winter-walls: rgb(var(--ah-winter-walls-rgb));
+  --ah-winter-interior-rgb: 28 26 36;
+  --ah-winter-interior: rgb(var(--ah-winter-interior-rgb));
+  --ah-winter-card-rgb: 40 37 58;
+  --ah-winter-card: rgb(var(--ah-winter-card-rgb));
+  --ah-winter-walls-lt-rgb: 43 55 86;
+  --ah-winter-walls-lt: rgb(var(--ah-winter-walls-lt-rgb));
+  --ah-winter-interior-lt-rgb: 216 221 234;
+  --ah-winter-interior-lt: rgb(var(--ah-winter-interior-lt-rgb));
+  --ah-winter-card-lt-rgb: 239 242 248;
+  --ah-winter-card-lt: rgb(var(--ah-winter-card-lt-rgb));
+
+  /* Foreground on a crimson ground. Deliberately NOT `white`: `white` is a
+     DARK_SLUG, so html.dark takes it to 30 29 26 — while `crimson` is an accent
+     and holds at 181 36 42. Anything painting white-on-crimson through
+     `--ah-white` therefore rendered crimson-with-near-black-text under dark
+     mode (`.btn-accent` sitewide, and ::selection). This slug never inverts,
+     which is the whole point of it. */
+  --ah-on-crimson-rgb: 255 255 255;
+  --ah-on-crimson: rgb(var(--ah-on-crimson-rgb));
+
+  /* The dark-mode well on an UN-ISLANDED vessel bar — the profile pane's tier 1
+     (PROFILE-PANE-REDESIGN-ADR §4.1). `barBg` is `ink`, a DARK_SLUG, so under
+     html.dark the bar inverts to a light slab with dark text; but `ink-850`
+     (the light-mode well) is in the never-inverted set, so the `+` well and the
+     secondary button fills would stay near-black beneath a near-black glyph.
+     This is the light counterpart, and like `on-crimson` it NEVER inverts — it
+     exists only to be painted on the already-inverted bar. */
+  --ah-bar-well-dk-rgb: 217 215 209;
+  --ah-bar-well-dk: rgb(var(--ah-bar-well-dk-rgb));
+}
+
+/* ── Global dark mode ────────────────────────────────────────────────────────
+   Toggled on <html> by useColorScheme (web/src/stores/colorScheme.ts). Dark
+   mode = invert the canonical NEUTRAL ramp at the root: surfaces darken, text
+   lightens. Only these global-chrome neutral slugs flip — accent (crimson*),
+   semantic (trust-*, danger/vouch, klein-blue), already-dark (true-black,
+   ink-925/900/850, stone-*, wall-grey), and per-feed season slugs are left
+   untouched. The plain `--ah-<slug>` vars read the `-rgb` triple, so flipping
+   the triple cascades. Desktop feed vessels (+ the ∀ disc and the scheme
+   swatch) re-pin these to canonical light via LIGHT_ISLAND_STYLE
+   (web/src/lib/palette/island.ts) so feeds keep their per-scheme colours; keep
+   DARK_SLUGS there in sync with this list.
+   Elevation (darkest→lightest): bone (ground) < well < white (cards/fields) <
+   glasshouse (floating pane). */
+html.dark {
+  /* text / lines (dark → light) */
+  --ah-ink-rgb: 236 234 230;
+  --ah-nav-grey-rgb: 198 196 190;
+  --ah-grey-600-rgb: 166 164 158;
+  --ah-grey-400-rgb: 138 136 130;
+  --ah-grey-300-rgb: 108 106 101;
+  /* fills / edges */
+  --ah-grey-200-rgb: 60 58 54;
+  --ah-grey-100-rgb: 42 41 37;
+  /* surfaces (light → dark) */
+  --ah-white-rgb: 30 29 26;
+  --ah-glasshouse-rgb: 35 34 31;
+  --ah-glasshouse-well-rgb: 26 25 22;
+  --ah-bone-rgb: 20 19 17;
+  --ah-bone-bright-rgb: 28 27 24;
+  --ah-off-white-rgb: 33 32 29;
+  --ah-cream-rgb: 28 27 24;
+  --ah-cream-hover-rgb: 40 39 36;
+}
+
+/* ── Self-hosted fonts ───────────────────────────────────────────────────────── */
+
+/* Literata — serif, literary voice */
+@font-face {
+  font-family: 'Literata';
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url('/fonts/literata-latin-400.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Literata';
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url('/fonts/literata-latin-ext-400.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'Literata';
+  font-style: italic;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url('/fonts/literata-latin-400-italic.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Literata';
+  font-style: italic;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url('/fonts/literata-latin-ext-400-italic.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+/* Jost — geometric sans, platform voice */
+@font-face {
+  font-family: 'Jost';
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url('/fonts/jost-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Jost';
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url('/fonts/jost-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+/* IBM Plex Mono — infrastructure voice */
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/ibm-plex-mono-latin-400.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/* ── Base ────────────────────────────────────────────────────────────────────── */
+
+@layer base {
+  body {
+    @apply bg-white text-black antialiased font-sans;
+    font-size: 1.0625rem;
+    line-height: 1.6;
+    padding-top: 0;
+  }
+
+  ::selection {
+    background-color: var(--ah-crimson);
+    /* `on-crimson`, not `white` — see the slug's note in :root. */
+    color: var(--ah-on-crimson);
+  }
+
+  /* No hairline hrs — use slab-rule classes instead  hairline-ok (prose: names the UA default this rule ABOLISHES; the hr below is a 4px slab) */
+  hr {
+    border: none;
+    height: 4px;
+    background: var(--ah-ink);
+  }
+
+
+  ::placeholder {
+    color: var(--ah-grey-400);
+    font-style: normal;
+  }
+
+  input[type="checkbox"],
+  input[type="radio"] {
+    accent-color: var(--ah-crimson);
+  }
+  input[type="checkbox"] {
+    border-color: var(--ah-grey-200);
+    border-radius: 0;
+    width: 1rem;
+    height: 1rem;
+  }
+  input[type="checkbox"]:checked {
+    background-color: var(--ah-crimson);
+    border-color: var(--ah-crimson);
+  }
+  input[type="checkbox"]:focus {
+    box-shadow: 0 0 0 2px var(--ah-crimson);
+  }
+
+  input[type="range"] {
+    accent-color: var(--ah-crimson);
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    background: var(--ah-crimson);
+  }
+  input[type="range"]::-moz-range-thumb {
+    background: var(--ah-crimson);
+  }
+}
+
+/* ��─ Components ──────────────────────────────────────────────────────────────── */
+
+@layer components {
+
+  /* ----- Landing page headlines ----- */
+  .hero-headline {
+    font-size: clamp(52px, 9vw, 92px);
+    letter-spacing: -0.035em;
+    line-height: 0.92;
+  }
+  .manifesto-line {
+    font-size: clamp(20px, 3vw, 28px);
+    font-weight: 400;
+  }
+
+  /* ----- Slab rules ----- */
+  .slab-rule {
+    border: none;
+    height: 6px;
+    background: var(--ah-ink);
+    width: 100%;
+  }
+  .slab-rule-4 {
+    border: none;
+    height: 4px;
+    background: var(--ah-ink);
+    width: 100%;
+  }
+  .slab-rule-crimson {
+    border: none;
+    height: 6px;
+    background: var(--ah-crimson);
+    width: 100%;
+  }
+
+  /* ----- Trust pip — 5px circle, three-state legibility indicator ----- */
+  .trust-pip {
+    display: inline-block;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  /* ----- Legacy rule aliases (map to slab rules) ----- */
+  .rule {
+    border: none;
+    height: 4px;
+    background: var(--ah-ink);
+  }
+  .rule-inset {
+    border: none;
+    height: 4px;
+    background: var(--ah-ink);
+    margin-left: 1.5rem;
+    margin-right: 1.5rem;
+  }
+
+  /* ----- Section label bar (black bg, mono-caps text) ----- */
+  .section-label-bar {
+    background: var(--ah-ink);
+    padding: 0.75rem 1.5rem;
+  }
+  .section-label-bar span {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.6875rem;
+    font-weight: 400;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ah-grey-400);
+  }
+
+  /* ----- Label styles ----- */
+  .label-ui {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.6875rem;
+    font-weight: 400;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  /* ----- Feed tabs (on black bar) ----- */
+  .tab-feed {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.6875rem;
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.75rem 1.25rem;
+    margin-right: 0.5rem;
+    border: none;
+    border-bottom: 4px solid transparent;
+    background: transparent;
+    cursor: pointer;
+    transition: color 0.15s ease;
+    color: var(--ah-grey-600);
+    margin-bottom: -4px;
+  }
+  .tab-feed-active {
+    color: var(--ah-white);
+    border-bottom-color: var(--ah-crimson);
+  }
+  .tab-feed:hover:not(.tab-feed-active) {
+    color: var(--ah-white);
+  }
+
+  /* ----- Dashboard tab pills ----- */
+  .tab-pill {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.6875rem;
+    font-weight: 400;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 0.5rem 1rem;
+    margin-right: 6px;
+    border: none;
+    border-radius: 0;
+    cursor: pointer;
+    transition: background-color 0.15s ease, color 0.15s ease;
+  }
+  .tab-pill-active {
+    background: var(--ah-ink);
+    color: var(--ah-white);
+  }
+  .tab-pill-inactive {
+    background: var(--ah-grey-100);
+    color: var(--ah-grey-600);
+  }
+  .tab-pill-inactive:hover {
+    color: var(--ah-ink);
+    background: var(--ah-grey-200);
+  }
+
+  /* ----- Buttons ----- */
+  .btn {
+    background: var(--ah-ink);
+    color: var(--ah-white);
+    font-family: 'Jost', system-ui, sans-serif;
+    font-size: 0.9375rem;
+    font-weight: 600;
+    letter-spacing: 0;
+    text-transform: none;
+    border: none;
+    border-radius: 0;
+    padding: 0.75rem 2rem;
+    transition: opacity 0.15s ease;
+    cursor: pointer;
+  }
+  .btn:hover { opacity: 0.85; }
+  .btn:focus-visible {
+    outline: 2px solid var(--ah-crimson);
+    outline-offset: 2px;
+  }
+  .btn:disabled { opacity: 0.5; }
+
+  .btn-accent {
+    background: var(--ah-crimson);
+    /* `on-crimson`, not `white`: `white` is a DARK_SLUG and inverts to 30 29 26
+       under html.dark, while crimson (an accent) holds — so this rendered
+       crimson-on-near-black on every .btn-accent in the app. See :root. */
+    color: var(--ah-on-crimson);
+    font-family: 'Jost', system-ui, sans-serif;
+    font-size: 0.9375rem;
+    font-weight: 600;
+    letter-spacing: 0;
+    text-transform: none;
+    border: none;
+    border-radius: 0;
+    padding: 0.75rem 2rem;
+    transition: opacity 0.15s ease;
+    cursor: pointer;
+  }
+  .btn-accent:hover { opacity: 0.85; }
+  .btn-accent:focus-visible {
+    outline: 2px solid var(--ah-ink);
+    outline-offset: 2px;
+  }
+  .btn-accent:disabled { opacity: 0.5; }
+
+  .btn-ghost {
+    background: var(--ah-grey-100);
+    color: var(--ah-grey-600);
+    font-family: 'Jost', system-ui, sans-serif;
+    font-size: 0.9375rem;
+    font-weight: 500;
+    letter-spacing: 0;
+    text-transform: none;
+    border: none;
+    border-radius: 0;
+    padding: 0.75rem 2rem;
+    transition: background-color 0.15s ease;
+    cursor: pointer;
+  }
+  .btn-ghost:hover { background: var(--ah-grey-200); }
+  .btn-ghost:focus-visible {
+    outline: 2px solid var(--ah-crimson);
+    outline-offset: 2px;
+  }
+
+  .btn-soft {
+    background: var(--ah-grey-100);
+    color: var(--ah-grey-600);
+    font-family: 'Jost', system-ui, sans-serif;
+    font-size: 0.875rem;
+    font-weight: 500;
+    letter-spacing: 0;
+    text-transform: none;
+    border: none;
+    border-radius: 0;
+    padding: 0.5rem 1.25rem;
+    transition: background-color 0.15s ease, color 0.15s ease;
+    cursor: pointer;
+  }
+  .btn-soft:hover {
+    background: var(--ah-grey-200);
+    color: var(--ah-ink);
+  }
+  .btn-soft:focus-visible {
+    outline: 2px solid var(--ah-crimson);
+    outline-offset: 2px;
+  }
+  .btn-soft:disabled { opacity: 0.5; }
+
+  .btn-sm {
+    font-size: 0.875rem;
+    padding: 0.625rem 1.5rem;
+  }
+
+  /* ----- Text-link action buttons ----- */
+  .btn-text {
+    font-family: 'Jost', system-ui, sans-serif;
+    font-size: 0.8125rem; /* 13px — matches text-ui-xs */
+    font-weight: 500;
+    color: var(--ah-ink);
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    transition: opacity 0.15s ease;
+  }
+  .btn-text:hover { opacity: 0.65; }
+  .btn-text:disabled { opacity: 0.5; }
+
+  .btn-text-muted {
+    font-family: 'Jost', system-ui, sans-serif;
+    font-size: 0.8125rem;
+    font-weight: 400;
+    color: var(--ah-grey-400);
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    transition: color 0.15s ease;
+  }
+  .btn-text-muted:hover { color: var(--ah-ink); }
+
+  .btn-text-danger {
+    font-family: 'Jost', system-ui, sans-serif;
+    font-size: 0.8125rem;
+    font-weight: 400;
+    color: var(--ah-crimson);
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    transition: color 0.15s ease;
+  }
+  .btn-text-danger:hover { color: var(--ah-crimson-deep); }
+  .btn-text-danger:disabled { opacity: 0.5; }
+
+  /* ----- Toggle chips (On/Off selectors) ----- */
+  .toggle-chip {
+    padding: 0.25rem 0.625rem;
+    transition: background-color 0.15s ease, color 0.15s ease;
+  }
+  .toggle-chip-active {
+    background: var(--ah-ink);
+    color: var(--ah-white);
+  }
+  .toggle-chip-inactive {
+    background: var(--ah-grey-100);
+    color: var(--ah-grey-600);
+  }
+  .toggle-chip-inactive:hover {
+    color: var(--ah-ink);
+  }
+
+  /* ----- Focus ring utility ----- */
+  .focus-ring:focus-visible {
+    outline: 2px solid var(--ah-crimson);
+    outline-offset: 2px;
+  }
+
+  /* ----- Glasshouse scrim (GLASSHOUSE-AND-PALETTE-ADR §III.1) -----
+     The scrim, not the pane, does the separating: a feed scheme behind the
+     overlay (Paper / Dark / Blush / Sage / Sand / Slate) is converged toward
+     the mode's neutral ground so the fixed parchment pane always meets the
+     same field. saturate() drains the colour variance (the part that actually
+     breaks a fixed pane); the translucent wash drains the tonal variance and
+     fixes the ground. The blur stays. Values are tuned against the loudest
+     feed (Slate behind a light pane, a saturated Blush). The pane itself is
+     background-independent paper, and the ∀ disc is self-contained
+     (§III.3 — clipped to its own rim), so neither relies on the old
+     blur-only "preserve the ground" justification. The light wash converges
+     to bone-bright (a touch below the bone floor) rather than bone so the
+     ground sits darker than the lighter parchment pane and the modal lifts
+     clearly off it. */
+  .gh-scrim {
+    backdrop-filter: blur(3px) saturate(0.7);
+    -webkit-backdrop-filter: blur(3px) saturate(0.7);
+    background: rgb(var(--ah-bone-bright-rgb) / 0.72);
+  }
+  :root.dark .gh-scrim {
+    background: rgb(var(--ah-ink-925-rgb) / 0.74);
+  }
+
+  /* ----- ∀ trigger (ForallMenu) -----
+     The disc carries no .btn class, so without this it falls through to the
+     UA default focus ring — re-tripped for mouse users every time the menu
+     returns focus to the button (closeAll / selectRow). Suppress the bare
+     :focus outline, keep a genuine keyboard ring via :focus-visible, and kill
+     the grey tap-flash on mobile. */
+  .forall-trigger {
+    -webkit-tap-highlight-color: transparent;
+  }
+  .forall-trigger:focus {
+    outline: none;
+  }
+  .forall-trigger:focus-visible {
+    outline: 2px solid var(--ah-crimson);
+    outline-offset: 2px;
+  }
+
+  /* ----- Drop cap ----- */
+  .prose-dropcap > p:first-of-type::first-letter {
+    font-family: 'Literata', Georgia, serif;
+    font-size: 3.5em;
+    float: left;
+    line-height: 0.8;
+    margin: 0.05em 0.08em 0 0;
+    color: var(--ah-ink);
+    font-weight: 500;
+  }
+
+  /* ----- In-prose citation marker (Upstream Edges) -----
+     Injected imperatively into the rendered body at a citation's char_start
+     (web/src/lib/citation-anchor.ts). A scholarly superscript reference that
+     jumps to the matching citation in the piece-foot apparatus; crimson when
+     the cited author has disputed it. Colour alone carries it, no line. */
+  .citation-marker {
+    font-family: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-size: 0.7em;
+    font-weight: 600;
+    vertical-align: super;
+    line-height: 0;
+    padding: 0 0.15em;
+    color: var(--ah-grey-600);
+    cursor: pointer;
+    text-decoration: none;
+  }
+  .citation-marker:hover {
+    color: var(--ah-crimson);
+  }
+  .citation-marker--disputed {
+    color: var(--ah-crimson);
+  }
+  .citation-marker:focus-visible {
+    outline: 2px solid var(--ah-crimson);
+    outline-offset: 2px;
+  }
+
+  /* ----- Article compose body — Literata 17px/1.8 per spec §3 ----- */
+  .article-compose-body {
+    font-family: 'Literata', Georgia, serif;
+    font-size: 17px;
+    line-height: 1.8;
+    color: var(--ah-ink);
+  }
+  .article-compose-body p {
+    margin-top: 1em;
+    margin-bottom: 1em;
+  }
+  /* Headings ride the rendered-prose rem scale (DESIGN-TUNING-FINDINGS §5), not
+     a separate px scale — so what you type is sized like what you read, and
+     both track the per-device type-size control. */
+  .article-compose-body h2 {
+    font-family: 'Literata', Georgia, serif;
+    font-size: 1.75rem;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    margin-top: 1.2em;
+    margin-bottom: 0.4em;
+  }
+  .article-compose-body h3 {
+    font-family: 'Literata', Georgia, serif;
+    font-size: 1.35rem;
+    font-weight: 500;
+    margin-top: 1em;
+    margin-bottom: 0.4em;
+  }
+  .article-compose-body blockquote {
+    border-left: 4px solid var(--ah-grey-300);
+    padding-left: 16px;
+    color: var(--ah-grey-600);
+    font-style: italic;
+  }
+
+  /* ----- Mobile prose scaling ----- */
+  @media (max-width: 767px) {
+    .prose, .prose-lg {
+      font-size: 1rem;
+    }
+    .prose p, .prose-lg p {
+      margin-top: 1.25em;
+      margin-bottom: 1.25em;
+    }
+  }
+
+  /* ----- Article reading surface in global dark mode -----
+     Tailwind typography's --tw-prose-* vars default to fixed grays that don't
+     invert with html.dark, so the article body's bold/lists/rules/quotes would
+     stay dark-on-dark. Map the load-bearing ones onto the (now-inverted)
+     palette vars so the whole reading surface is legible. Higher specificity
+     than the plugin's `.prose`, same layer, so it wins. */
+  html.dark .prose {
+    --tw-prose-body: var(--ah-ink);
+    --tw-prose-headings: var(--ah-ink);
+    --tw-prose-lead: var(--ah-grey-600);
+    --tw-prose-links: var(--ah-ink);
+    --tw-prose-bold: var(--ah-ink);
+    --tw-prose-counters: var(--ah-grey-600);
+    --tw-prose-bullets: var(--ah-grey-400);
+    --tw-prose-hr: var(--ah-grey-200);
+    --tw-prose-quotes: var(--ah-grey-600);
+    --tw-prose-quote-borders: var(--ah-grey-300);
+    --tw-prose-captions: var(--ah-grey-600);
+    --tw-prose-code: var(--ah-ink);
+    --tw-prose-pre-code: var(--ah-bone);
+    --tw-prose-pre-bg: var(--ah-glasshouse-well);
+    --tw-prose-th-borders: var(--ah-grey-300);
+    --tw-prose-td-borders: var(--ah-grey-200);
+  }
+
+  /* ----- Editor selection highlight ----- */
+  .ProseMirror ::selection,
+  .tiptap ::selection,
+  .prose ::selection {
+    background-color: var(--ah-crimson) !important;
+    color: var(--ah-white) !important;
+  }
+  .ProseMirror .is-editor-empty:first-child::before {
+    color: var(--ah-grey-400);
+  }
+
+  /* ----- Paywall gate marker in editor ----- */
+  .paywall-gate-marker {
+    position: relative;
+    margin: 2rem 0;
+    padding: 0.75rem 1rem;
+    background: var(--ah-grey-100);
+    border: none;
+    border-left: 4px solid var(--ah-crimson);
+    cursor: default;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .paywall-gate-marker .gate-label {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.6875rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ah-crimson);
+  }
+  .paywall-gate-marker .gate-remove {
+    font-size: 0.75rem;
+    color: var(--ah-grey-600);
+    cursor: pointer;
+    transition: color 0.15s ease;
+  }
+  .paywall-gate-marker .gate-remove:hover {
+    color: var(--ah-ink);
+  }
+
+  /* ----- Article hero image ----- */
+  .article-hero {
+    position: relative;
+    width: 100%;
+    min-height: 400px;
+    background-size: cover;
+    background-position: center;
+    display: flex;
+    align-items: flex-end;
+    padding: 3rem 2rem;
+  }
+  .article-hero::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(to top, rgb(var(--ah-ink-rgb) / 0.75) 0%, rgb(var(--ah-ink-rgb) / 0.15) 60%, transparent 100%);
+  }
+  .article-hero-content {
+    position: relative;
+    z-index: 1;
+    max-width: 640px;
+    margin: 0 auto;
+    width: 100%;
+  }
+
+  /* ── The public register ──────────────────────────────────────────────────
+     Three rules for the logged-out chassis (components/public/). See
+     LOGGED-OUT-REGISTER-SWEEP.md §V and §VIII. */
+
+  /* 1. The fitted public page — PublicShell's chassis. The vessel is wholly on
+        screen and its CONTENTS scroll; the page itself does not. A ⊔ whose
+        closing wall is below the fold isn't a vessel, it's a left-and-right
+        pair of rules.
+
+        The height math lives here rather than in the component because the
+        short-viewport fallback is a media query. Above 480px tall the column
+        is fitted to the viewport; below it (landscape phones, split-screen, a
+        window dragged short) the remainder is too little to hold a card, so
+        the fit is abandoned and the page scrolls normally. Either way the
+        BOTTOM PADDING is the nav row's band, so the vessel clears the row.
+
+        The box is a full `100dvh` with the band as padding INSIDE it, not
+        `calc(100dvh - band)` with the band outside: the band is NAV_ROW_H +
+        GRID while the row is only NAV_ROW_H tall, so the GRID of deliberate
+        clearance has to be painted by something. Outside the box it fell
+        through to `body` and drew a stripe of the wrong colour between the
+        floor and the row. `--ah-row-band` is published by LayoutShell and is
+        0 when no row is mounted.
+
+        `dvh`, not `vh`: on mobile Safari `100vh` is the tallest the viewport
+        ever gets, so a `vh`-fitted vessel hides its bottom wall behind the
+        browser chrome — the exact bug the fitted layout exists to fix. The
+        `vh` line is the fallback for anything that doesn't know `dvh`.
+
+        The top padding yields on short screens: `min(64px, 8vh)` keeps the
+        64px headroom on a laptop and gives it back to the vessel on a phone,
+        where 64px of empty floor is 15% of the screen. */
+  .ah-public-fit {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    /* CENTRED ON BOTH AXES (2026-07-27). `align-items` was always here; this is
+       its vertical twin, and it is what makes a short page's vessel sit in the
+       middle of the screen rather than hang from the top padding. It only has
+       an effect because the vessel now HUGS ITS CONTENT — see the note on
+       `.ah-public-vessel` below. The padding stays a minimum clearance: with
+       `justify-content: center` it is what the box may not centre content
+       into, which is the behaviour we want at both ends. */
+    justify-content: center;
+    padding: min(64px, 8vh) 16px var(--ah-row-band, 0px);
+  }
+  @media (min-height: 480px) {
+    .ah-public-fit {
+      height: 100vh;
+      height: 100dvh;
+    }
+  }
+  @media (max-height: 479px) {
+    .ah-public-fit {
+      min-height: 100vh;
+      min-height: 100dvh;
+    }
+  }
+
+  /* 1a-bis. The public ⊔ itself — the walls, and the two places they change.
+             Geometry here, colour inline (`--ah-public-wall`, palette-derived
+             and resolved in JS), for §1c's SSR reason: these pages are
+             server-rendered for logged-out visitors, so a `useIsMobile` branch
+             would paint the walled desktop chassis on a phone and snap after
+             hydration. Border WIDTHS must be declared here too, or the inline
+             shorthand would win over this rule.
+
+             THE VESSEL HUGS ITS CONTENT (2026-07-27). It used to take the
+             shell's whole fitted remainder, so `/auth`'s four fields sat in a
+             ⊔ as tall as the screen — a frame around a great deal of nothing,
+             and the taller the monitor the worse it read. `flex: 0 1 auto` on
+             the frame and its scroll body means the ⊔ is exactly as tall as
+             what it holds, and `.ah-public-fit`'s centring then puts it in the
+             middle of the screen. What has NOT changed is the fitted amendment
+             it looks like it reverses: the vessel is still never taller than
+             the viewport, because `flex-shrink: 1` and `min-height: 0` survive
+             — a page with more content than room still shrinks to the
+             remainder and scrolls INSIDE its walls, bottom wall on screen. So
+             "the vessel is always wholly visible" holds in both directions;
+             what went is only the stretching of a short one.
+
+             ON MOBILE THERE IS NO VESSEL AT ALL (2026-07-27). Same arithmetic
+             and the same conclusion as §1c reached for `/`, taken one notch
+             further: at ≤767px the walls go entirely and the content runs
+             full-bleed on the floor. The ⊔ is the house's way of saying "this
+             is one object among several" — true on a workspace floor holding
+             many feeds, and false on a phone showing a single login form,
+             where it is 16px of ink per side spent framing the only thing on
+             the screen. The mobile workspace made this call first by dropping
+             the vessel chassis outright; the public register now matches it.
+             The frame element stays in the tree as a plain flex column so the
+             component keeps one shape in both form factors. */
+  .ah-public-vessel {
+    border-left: 8px solid var(--ah-public-wall);
+    border-right: 8px solid var(--ah-public-wall);
+    border-bottom: 8px solid var(--ah-public-wall);
+  }
+  @media (max-width: 767px) {
+    .ah-public-vessel {
+      border: 0;
+    }
+  }
+
+  /* 1b. Clear the row from an ordinary scrolling page. The utility form of the
+         same reservation, for surfaces that aren't part of the public register
+         but still sit under the fixed row — the standalone /write editor, and
+         (as an inline style, since they wrap a shared PageShell) /admin/* and
+         /traffology/*. NOT on PageShell itself: PageShell is also the body of
+         five Glasshouse overlay panels, where there is no row to clear. */
+  .ah-clear-row-band {
+    padding-bottom: var(--ah-row-band, 0px);
+  }
+
+  /* 1c. The landing vessel — `/`'s own chassis, and the ONE public surface that
+         changes shape between form factors. The desktop reading is in
+         components/landing/LandingVessel.tsx: a doubled wall (wall / 8px buffer
+         / wall) round a 720px column, floated off the bone floor by a 16px
+         margin. That is an argument about the lattice, and it is worth a frame's
+         weight on the one page whose job is to state the house's terms.
+
+         ON MOBILE IT IS NOT WORTH IT, and the reason is arithmetic. The desktop
+         chassis spends 16 (floor) + 8 (wall) + 8 (buffer) + 8 (wall) + 16 (pad)
+         = 56px per side. On a 390px phone that is 112px — 29% of the screen —
+         to make a point about an 8px square, leaving the prose 278px. So the
+         mobile rules below follow MOBILE-LAYOUT-ADR's actual grammar rather
+         than reflowing the desktop one: the mobile workspace drops the vessel
+         chassis entirely for a FULL-BLEED feed, because position / size /
+         orientation / merge are canvas properties that stay on the desktop.
+         Here the same instinct is applied — and as of 2026-07-27 it is applied
+         in full rather than one notch softer:
+
+           · the floor margin goes (the vessel spans the full viewport width);
+           · the DOUBLED wall collapses to a SINGLE wall (the outer frame
+             becomes a pass-through: no border, no buffer);
+           · and then the single wall goes too — the inner frame keeps its 8px
+             of interior pad and draws no ⊔ at all.
+
+         — which is 8px per side instead of 56, so the prose gets 374px of 390.
+         The first cut kept one wall on the reasoning that "the ⊔ still reads,
+         at mobile weight". It does read; the question it dodged is what the ⊔
+         is FOR. It says "this is one object among several" — true on a
+         workspace floor holding many feeds, and false on a phone showing one
+         column that is the whole page, where it is ink spent framing the only
+         thing on the screen. The mobile workspace reached that conclusion first
+         and dropped its vessel chassis outright; `/` and the rest of the public
+         register (§1a-bis) now match it. This is the deliberate
+         one-rule-per-form-factor asymmetry, not a responsive reflow.
+
+         WHY CSS AND NOT `useIsMobile`: `/` is server-rendered for logged-out
+         visitors, and useIsMobile returns false on the server — a phone would
+         paint the 56px desktop chassis and snap to this one after hydration.
+         The wall COLOUR still comes in inline (it is palette-derived, and the
+         palette resolves in JS); only the geometry lives here, so the border
+         widths must be declared here too or the inline shorthand would win. */
+  .ah-landing-area {
+    padding: 24px 16px 0;
+  }
+  .ah-landing-frame {
+    border-left: 8px solid var(--ah-landing-wall);
+    border-right: 8px solid var(--ah-landing-wall);
+    border-bottom: 8px solid var(--ah-landing-wall);
+  }
+  .ah-landing-frame-outer {
+    padding: 8px;
+  }
+  .ah-landing-frame-inner {
+    padding: 16px;
+  }
+  @media (max-width: 767px) {
+    .ah-landing-area {
+      padding: 8px 0 0;
+    }
+    /* NEITHER frame is a frame here: no walls, no buffer. Both stay in the tree
+       as plain flex pass-throughs so the component keeps one shape across form
+       factors — only the inner one still carries the interior pad, which is
+       what keeps the cards off the screen edge now that no wall does. */
+    .ah-landing-frame-outer {
+      padding: 0;
+      border: 0;
+    }
+    .ah-landing-frame-inner {
+      padding: 8px;
+      border: 0;
+    }
+  }
+
+  /* 1d. The landing demos' GEOMETRY AND REGISTER. `/`'s showcase is three inert
+         reconstructions of the app (components/landing/demos). Each has ONE
+         knob — a base font-size — with everything inside expressed in `em`, so a
+         demo's type, padding, gaps, wall thickness and rules all move together.
+
+         WHY THE KNOBS LIVE HERE. Same reason as §1c: `/` is server-rendered for
+         logged-out visitors, so a JS breakpoint would paint the desktop register
+         on a phone and snap after hydration.
+
+         THE THREE ARE DELIBERATELY UNEQUAL, sized to their jobs rather than to
+         each other — the substantive difference from the three screengrabs they
+         replaced, which were all the same shape because they were all the same
+         capture. */
+
+  /* --- Omnivore: the one a visitor is meant to READ ------------------------
+     Fixed px, and the largest of the three. Its four `via …` provenance lines
+     ARE the argument — a 2.9× downscale reducing them to grey texture is what
+     condemned the screengrab it replaced — and a single column has the width to
+     carry them at any sane viewport, so it needs no fluid behaviour at all.
+
+     This is also the one demo whose ⊔ is drawn INLINE (`wall={8}` in the
+     component) rather than here: it is fixed-size, so its wall has nothing to
+     scale with. The two below are the opposite case. */
+  .ah-demo-omnivore {
+    font-size: 14.5px;
+  }
+  @media (max-width: 767px) {
+    .ah-demo-omnivore {
+      font-size: 13.5px;
+    }
+  }
+
+  /* --- Canvas: the ARRANGEMENT is the argument -----------------------------
+     Four feeds, irregular on purpose: one wide and tall down the left, two
+     narrow stacked in the right-hand column, one horizontal along the bottom.
+     Three equal columns — the previous version — demonstrated the weakest
+     possible reading of the claim, since every app has had columns since 2004.
+
+     IT SCALES, IT NEVER REFLOWS, and that is the whole mobile fix. The earlier
+     version dropped to two columns under a viewport media query and got knocked
+     about, for two reasons: it was sized against a GUESS at the viewport rather
+     than the width the demo was actually handed, so any upstream padding change
+     threw it out; and rearranging was wrong in principle, because a mobile
+     version that tidies the feeds into a regular stack demonstrates the opposite
+     of what the demo is for.
+
+     So the wrapper is a CONTAINER and the base size is fluid. The canvas
+     measures the space it is actually given, at any width, and cannot be thrown
+     out by anything upstream.
+
+     THIS DEPARTS FROM §1c's MEDIA-QUERY RULE, and safely: §1c insists on media
+     queries because a JS breakpoint would snap after hydration. A container
+     query is still CSS — it resolves at paint, on server-rendered markup, with
+     no JS. It gets §1c's SSR safety while measuring the right box. */
+  .ah-demo-canvas-wrap {
+    container-type: inline-size;
+  }
+
+  /* THE ARRANGEMENT IS A LEGAL FLOOR, AND IT IS BUILT THE WAY THE FLOOR IS. The
+     real floor is columnar — an order of columns, each an ordered stack of
+     slots, geometry DERIVED from that order rather than stored
+     (WORKSPACE-COLUMN-LAYOUT-ADR) — so this is two flex columns of slots, [1, 4]
+     and [2, 3], and a slot with no fixed height fills its column's remainder,
+     which is that model's `h: null`. The two columns divide themselves
+     differently, which is where the irregularity comes from.
+
+     It was a grid of interlocking row spans before, and a full-width band under
+     both columns before that. The band is not a shape any stored order can
+     express, and reads as a footer rather than as a feed; the row spans were
+     expressible but had to be steered through `fr` arithmetic, where the size of
+     the sideways feed — the one slot with a hard minimum — was three divisions
+     away from anything you could set.
+
+     THE GUTTER IS THE WALL. `gap` equals the wall thickness, so the space
+     between two vessels reads as three even bands — wall / buffer / wall — which
+     is the floor's own rule (GRID = WALL = 8). Interior padding is 2x the wall
+     and the inter-card gap 1.5x, the real vessel's 8 / 16 / 12 held as ratios so
+     the whole chassis scales as one thing.
+
+     THE VESSELS ARE BOXES THAT CLIP, AND THE CANVAS HAS A FIXED HEIGHT. A vessel
+     on the real floor is a fixed rectangle whose cards scroll inside it, so the
+     last card is cut off at the bar; content-sized vessels are not what the
+     workspace looks like, and — worse — the grid makes the two columns exactly
+     as tall as each other, so whichever column holds less content opens a void
+     inside its own feed. Tuning card counts to close that void is a losing game:
+     it has to come out right at every container width. So each feed is given
+     MORE cards than can fit and clips them, which is both the honest picture and
+     the only stable one.
+
+     THE HEIGHT IS IN `em`, NOT AN ASPECT RATIO. Card heights are `em`, so an
+     `em` height keeps the same number of cards visible at every container width.
+     An aspect ratio would fight the `clamp`: once the base size floors at 8.5px
+     the cards stop shrinking, but a ratio-derived box keeps going with the
+     container, and the feeds would quietly close over their own content.
+
+     63em IS ALSO A CEILING, NOT JUST A PROPORTION. At the 12px cap that is about
+     756px, which fits inside the landing vessel's scroll area on an ordinary
+     laptop — and the arrangement is the whole argument here, so a figure a
+     visitor can only ever see two-thirds of at a time defeats it. Feeds showing
+     one card fewer is the cheaper loss.
+
+     IT IS ALSO WHY THERE IS NO LONGER A DETAIL-SHED RULE. Below 430px of
+     container this used to hide card bodies and provenance tags, so a
+     content-sized canvas would not crush itself; a clipping canvas has no such
+     failure mode, and the shed halved every card height at one width only —
+     precisely the width-dependence the fixed box exists to remove, and it left
+     the vertical feeds showing bare bylines. Every card is now the same card at
+     every size; only the scale changes. */
+  .ah-demo-canvas {
+    font-size: clamp(8.5px, 1.95cqw, 12px);
+    display: flex;
+    gap: 0.55em;
+    height: 63em;
+  }
+
+  .ah-demo-col {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55em;
+    min-width: 0;
+  }
+  .ah-demo-col-a { flex: 1.55; }
+  .ah-demo-col-b { flex: 1; }
+
+  /* Slot heights. `flex: 1 1 0` is the floor's `h: null` — take the column's
+     remaining share. The sideways feed is the one slot with a real minimum (a
+     card has to fit between the top wall and the bar), so it alone is fixed, and
+     everything else divides what is left. Feed 2 takes slightly more of its
+     column than feed 3 because headlines want length. */
+  .ah-demo-c1 { flex: 1 1 0; }
+  .ah-demo-c4 { flex: 0 0 18em; }
+  .ah-demo-c2 { flex: 1.15 1 0; }
+  .ah-demo-c3 { flex: 1 1 0; }
+
+  /* The scrolling card column, standing in for the vessel's scroll body. It
+     takes the inter-card gap; the vessel's own gap now separates it from the
+     bar. `min-height: 0` is what actually lets it clip inside the flex column. */
+  .ah-demo-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 0.82em;
+    flex: 1 1 0;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  /* The vessels take their ⊔ here rather than inline, so wall thickness scales
+     with the canvas like everything else. The wall COLOUR is still inline and
+     palette-derived (`--ah-demo-wall`, set by DemoVessel).
+
+     NO BOTTOM WALL: the bar IS the bottom of a vessel ("the bottom wall is
+     replaced by VesselBar", Vessel.tsx), and DemoBar reaches out through this
+     padding to the walls' inside faces. Drawing a wall under it put two bands of
+     two different colours across the foot of every feed. */
+  .ah-demo-col > * {
+    border-left: 0.55em solid var(--ah-demo-wall);
+    border-right: 0.55em solid var(--ah-demo-wall);
+    padding: 1.1em;
+    gap: 0.82em;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  /* The horizontal vessel is a ⊐, not a ⊔: closed top and right, open on the
+     LEFT where new items arrive. Same rule as Vessel.tsx's `wallStyle`. */
+  .ah-demo-col > .ah-demo-c4 {
+    border-left: 0;
+    border-top: 0.55em solid var(--ah-demo-wall);
+  }
+
+  /* The sideways feed. Cards run off the vessel's own right edge under a
+     gradient to the FLOOR colour (not to white) — a horizontal feed shown
+     statically has to be clipped to read as scrollable, because a row that ends
+     tidily reads as a row that has ended. */
+  .ah-demo-hrow {
+    display: flex;
+    gap: 0.82em;
+    overflow: hidden;
+    position: relative;
+    flex: 1 1 0;
+    min-height: 0;
+  }
+  .ah-demo-hrow > * {
+    flex: 0 0 40%;
+  }
+  .ah-demo-hrow::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 2.5em;
+    background: linear-gradient(to right, transparent, var(--ah-demo-floor));
+  }
+
+  @container (max-width: 430px) {
+    /* The one width concession left, and it is a proportion, not a shed: the
+       sideways feed's column is narrow enough here that a 40% card would be a
+       sliver. Nothing is hidden — see the note above on why the detail-shed
+       went. */
+    .ah-demo-hrow > * {
+      flex: 0 0 64%;
+    }
+  }
+
+  /* --- Reader: the pane ON THE GLASSHOUSE ----------------------------------
+     The gate shown on bare card ground read as text that had gone wrong — a
+     paragraph trailing into a fade, a price, two buttons, floating on nothing.
+     A paywall is legible as a paywall because of the SITUATION it appears in,
+     and the situation was missing. So the demo is now the whole Glasshouse
+     figure: blurred feed floor, scrim, lifted pane. */
+  .ah-demo-reader {
+    position: relative;
+    font-size: 12px;
+    overflow: hidden;
+    padding: 0.6em;
+  }
+
+  .ah-demo-reader-floor {
+    position: absolute;
+    inset: 0;
+    padding: 0.6em;
+    display: grid;
+    gap: 0.6em;
+    grid-template-columns: 1.4fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    /* A `filter` on the floor, NOT `backdrop-filter` on the scrim. The real
+       .gh-scrim needs backdrop-filter because it sits over a live workspace it
+       cannot know the contents of; this floor is inert markup that exists only
+       to be blurred. Blurring it directly renders identically, costs less, and
+       sidesteps the backdrop-filter containment bugs that bite inside clipped
+       ancestors — which this is. Do not "correct" it for consistency. */
+    filter: blur(2.6px) saturate(0.55);
+    opacity: 0.9;
+  }
+  /* The ⊔ again — same reason as the canvas, and needed for the same reason the
+     floor exists at all: four wall COLOURS blurred behind a pane is what says
+     "your feeds", and a floor of borderless interiors says nothing. */
+  .ah-demo-reader-floor > * {
+    border-left: 0.55em solid var(--ah-demo-wall);
+    border-right: 0.55em solid var(--ah-demo-wall);
+    border-bottom: 0.55em solid var(--ah-demo-wall);
+    padding: 0.45em;
+    gap: 0.45em;
+    min-width: 0;
+  }
+
+  /* Matches .gh-scrim's wash. The blur lives on the floor, above. */
+  .ah-demo-reader-scrim {
+    position: absolute;
+    inset: 0;
+    background: rgb(var(--ah-bone-bright-rgb) / 0.72);
+  }
+  :root.dark .ah-demo-reader-scrim {
+    background: rgb(var(--ah-ink-925-rgb) / 0.74);
+  }
+
+  /* Lifted by elevation alone, no top edge — GLASSHOUSE-AND-PALETTE-ADR §III.2.
+     The margin here is just the pane's margin; it is no longer doing the
+     specimen-separation work the bare gate's inset had to do, because a lifted
+     pane over a blurred field cannot be mistaken for the page's own prose. */
+  .ah-demo-reader-pane {
+    position: relative;
+    margin: 1.6em 2.4em;
+    padding: 1.6em 1.8em 1.8em;
+    box-shadow: 0 0.8em 2.4em rgb(var(--ah-true-black-rgb) / 0.22);
+  }
+
+  .ah-demo-grip {
+    width: 2.6em;
+    height: 0.35em;
+    background: var(--ah-stone-300);
+    opacity: 0.7;
+    margin: -0.7em auto 1.2em;
+  }
+  .ah-demo-close {
+    position: absolute;
+    top: 0.9em;
+    right: 1em;
+    font-size: 1.1em;
+    line-height: 1;
+  }
+
+  .ah-demo-art {
+    position: relative;
+    font-size: 1em;
+    line-height: 1.6;
+    padding-bottom: 1.2em;
+  }
+  .ah-demo-art::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 3.2em;
+    background: linear-gradient(to bottom, transparent, var(--ah-demo-pane));
+  }
+
+  @media (max-width: 560px) {
+    /* The pane's margin shrinks but never goes: it is what makes the thing read
+       as FLOATING, and a pane flush to the demo's edges is just a box. */
+    .ah-demo-reader-pane {
+      margin: 1.2em 1em;
+      padding: 1.3em 1.2em 1.4em;
+    }
+  }
+
+  /* 1e. The profile chassis — four tiers (PROFILE-PANE-REDESIGN-ADR D1/D9).
+         Tier 1 is a thickened top bar carrying identity + the action pair + the
+         close; tiers 2–4 sit straight on the interior ground, inset one WALL
+         (8px) on every side, so the interior reads as an even stripe in every
+         direction exactly as the walls do against cards in a vessel.
+
+         THE GEOMETRY LIVES HERE RATHER THAN IN A `useIsMobile` BRANCH, for §1c's
+         reason: `/[username]` and `/author/[authorId]` are SSR'd, and a JS
+         breakpoint would paint the desktop bar on a phone and snap after
+         hydration. Only the palette-derived colours cross into the component.
+
+         MOBILE IS TWO CHANGES, AND THEY ARE ORTHOGONAL — one is how big, one is
+         whether pinned. Size: pfp 56 → 40, the name a step down, and the action
+         pair wraps to a second row within the bar (`flex-basis: 100%`), taking
+         it to ~112px. Pinning: on mobile the bar sits IN THE SCROLL BODY rather
+         than stuck to the top, so scrolling the log reclaims the whole screen —
+         which matters when the sheet is already MOBILE_BAR_H down. That is only
+         safe because nothing load-bearing lives in the bar there: the ∀ disc is
+         the universal minimise, Back and the OS edge-swipe close the sheet, and
+         the pane's own ✕ scrolling away with the bar is intended. Desktop keeps
+         it pinned for the opposite reason — there the bar IS the pane's frame. */
+  /* ----- The reader bar (ReaderOverlay) -----------------------------------
+     The reading pane's thickened top — the ⊓'s bar, carrying the two
+     identities the card carries (BYLINE-AND-PROVENANCE-ADR D1/D7): the source
+     at the left end routing INWARD, the article title at the right routing
+     OUT, and the pane's ✕ beyond it. Height is set inline from the one
+     constant in ReaderOverlay, which the body's `max-height` also subtracts,
+     so the two can't drift.
+
+     THE TITLE'S CAP IS THE POINT OF THIS RULE. `max-width: 50%` is measured on
+     the bar and applied to the title-and-✕ GROUP, so the title can never begin
+     left of the midpoint and crowd the source out of its own end — a long
+     headline truncates instead. The source takes the remaining room
+     (`flex: 1`) and truncates in its turn, so a bar with two long strings
+     degrades symmetrically rather than one winning. */
+  .ah-reader-bar {
+    position: relative;
+    z-index: 3; /* under the pane's frame (z-5) and pinned chrome (z-10) */
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 0 12px;
+    overflow: hidden;
+    /* The bar is the pane's declared drag handle (`dragHandleSelector` on the
+       Glasshouse), replacing the grip pill — which would have been a light
+       fleck floating on a coloured band. Links and the ✕ still win:
+       `isDragSurface` walks NO_DRAG_SELECTOR before the handle. */
+    cursor: grab;
+  }
+  .ah-reader-bar:active {
+    cursor: grabbing;
+  }
+  /* The mobile sheet cannot be dragged at all (`pane.startDrag` is undefined
+     there), so the bar must not claim to be a handle. */
+  @media (max-width: 767px) {
+    .ah-reader-bar,
+    .ah-reader-bar:active {
+      cursor: auto;
+    }
+  }
+  .ah-reader-bar a,
+  .ah-reader-bar button {
+    cursor: pointer;
+  }
+  .ah-reader-bar-source {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* Title + ✕ as one group, so `max-width: 50%` caps THE GROUP and the title
+     can never begin left of the bar's midpoint. Capping the title alone puts
+     its left edge a ✕-and-a-gap short of centre. */
+  .ah-reader-bar-end {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 50%;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .ah-reader-bar-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: right;
+  }
+  .ah-reader-close {
+    flex: none;
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 1rem;
+    line-height: 1;
+    opacity: 0.75;
+  }
+  .ah-reader-close:hover {
+    opacity: 1;
+  }
+  /* On the full-screen sheet the ✕ is one of the two closes a thumb has (the
+     other is the ∀ disc), and a 15×18 glyph is a mouse target, not a thumb one.
+     The padding takes the tap area to ~43×46; the equal negative margin gives
+     the layout back, so the glyph does not move. Same trade as .ah-profile-close. */
+  @media (max-width: 767px) {
+    .ah-reader-close {
+      padding: 14px;
+      margin: -14px;
+    }
+  }
+
+  .ah-profile-bar {
+    position: sticky;
+    top: 0;
+    z-index: 3; /* under the pane's frame (z-5) and pinned chrome (z-10) */
+    /* 72px, down from 88 (2026-08-28). The external bar carried a "VIA BLUESKY"
+       strap above the name and was sized for that third line; the strap is gone
+       — the name itself now links out to the origin network, which is what a
+       reader wanting that network actually wants — so the bar is two lines on
+       both profile kinds and the height follows the pfp (48 + 12 top + 12
+       bottom). It stays a THICK bar: this is the ⊓'s top, not a title strip. */
+    min-height: 72px;
+    /* 24px = `PROFILE_INSET` = VESSEL_WALL + VESSEL_PAD, so the pfp's left edge
+       lands on the cards' left edge (§9.2, 2026-08-28).
+
+       This was 20px for one day, and the reasoning that produced it is worth
+       keeping because only half of it survived. Q1 asked whether the bar should
+       sit at the tiers' inset; at the time that inset was 8px, which put the
+       pfp 4px off a saturated ⊓ rule, so the bar was staggered out to 20 — a
+       number chosen from the house's chrome family (lockup 24, vessel bar 16)
+       precisely BECAUSE aligning was the worse option. Giving the pane the
+       vessel's real geometry moved the interior to 24 and dissolved the choice:
+       the tiers are no longer crowding the rule, 24 is in the same chrome
+       family, and it aligns. A stagger that exists to avoid a collision has
+       nothing left to do once the collision is gone. */
+    padding: 0 24px;
+    display: flex;
+    align-items: center;
+  }
+  /* The whole bar is the pane's drag handle (Q5): the grip pill is gone, and
+     `dragHandleSelector` on the Glasshouse nominates `.ah-profile-bar`, so the
+     name drags the window the way a title bar does. The CURSOR is narrower than
+     the selector on purpose — `--drag` is set only where the bar carries a
+     close, which is the overlay register's own seam (§5.1), because the two
+     standalone pages have no pane to move and a bar promising `grab` there
+     would be a lie. Controls and links inside win either way: `isDragSurface`
+     hits NO_DRAG_SELECTOR before the handle. */
+  .ah-profile-bar--drag {
+    cursor: grab;
+  }
+  .ah-profile-bar--drag:active {
+    cursor: grabbing;
+  }
+  /* The mobile sheet cannot be dragged at all (`pane.startDrag` is undefined
+     there), so the bar must not claim to be a handle. */
+  @media (max-width: 767px) {
+    .ah-profile-bar--drag,
+    .ah-profile-bar--drag:active {
+      cursor: auto;
+    }
+    /* The ✕ glyph is a 15×18 box, which is a mouse target, not a thumb one —
+       and on the full-screen sheet this is the only close a thumb has (Back
+       and the edge-swipe are the OS's, not ours). The padding takes the tap
+       area to ~43×46 and the equal negative margin gives the layout back, so
+       the glyph does not move and the row's measured geometry is unchanged. */
+    .ah-profile-close {
+      padding: 14px;
+      margin: -14px;
+    }
+  }
+  .ah-profile-bar a,
+  .ah-profile-bar button {
+    cursor: pointer;
+  }
+  /* The handle opts out of the handle (`data-no-drag`) so it stays selectable —
+     it is the one identifier on the bar anyone copies. Its cursor must say so. */
+  .ah-profile-bar [data-no-drag] {
+    cursor: auto;
+  }
+  .ah-profile-bar a[data-no-drag] {
+    cursor: pointer;
+  }
+  /* The pfp keeps its own zoom cursor (it opens the lightbox). */
+  .ah-profile-bar button.ah-profile-pfp {
+    cursor: zoom-in;
+  }
+  .ah-profile-bar-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+    width: 100%;
+    padding: 12px 0;
+  }
+  .ah-profile-pfp {
+    width: 48px;
+    height: 48px;
+    flex-shrink: 0;
+  }
+  /* Trails the action pair on desktop; on mobile the actions take order 2 and
+     wrap beneath, leaving the close on line 1 (see the media query below). */
+  .ah-profile-close {
+    order: 1;
+  }
+  @media (max-width: 767px) {
+    .ah-profile-bar {
+      position: static;
+      min-height: 96px;
+    }
+    .ah-profile-pfp {
+      width: 40px;
+      height: 40px;
+    }
+    /* The control row becomes its own line rather than competing for width:
+       pfp 56 · name · handle · + · Message · Follow · close has no chance of
+       one row at 375px, where only 327px of content width exists.
+
+       THE CLOSE DOES NOT GO WITH THEM (Q2, judged on screen 2026-08-28). It is
+       the row's own child, and `order` — not DOM order — decides both layouts:
+       on desktop it trails the actions exactly as before; here the actions take
+       a later order and the whole of `flex-basis: 100%`, so line 1 is pfp ·
+       name · ✕ and line 2 is the action pair. Riding the wrap put a full-screen
+       sheet's close ~60px below the top-right corner, which is the one place a
+       reader looks for it, and further still on an external profile whose name
+       block runs to three lines. The second row is the right answer for the
+       ACTIONS and was never the right answer for the close. */
+    .ah-profile-controls {
+      order: 2;
+      flex-basis: 100%;
+      justify-content: flex-end;
+    }
+  }
+
+  /* 2. The vessel scroll body. A default scrollbar sitting inside a ⊔ a few
+        pixels from an 8px wall is chrome the house never designed — on Windows
+        a 17px light-grey trough that reads as a third wall of the wrong
+        weight. The thumb colour comes in as `--ah-scroll-thumb`, set inline by
+        the vessel to `cardMeta` (outside DARK_SLUGS, so the same quiet grey
+        against either interior). NOT the wall colour, which in dark is
+        true-black on ink-925 — invisible. */
+  .ah-vessel-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: var(--ah-scroll-thumb, currentColor) transparent;
+  }
+  .ah-vessel-scroll::-webkit-scrollbar {
+    width: 8px;
+  }
+  .ah-vessel-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .ah-vessel-scroll::-webkit-scrollbar-thumb {
+    background: var(--ah-scroll-thumb, currentColor);
+    border-radius: 0;
+  }
+
+  /* 3. The indeterminate slab — the register's only animation, replacing the
+        `border-2` spinning ring /auth/verify used to draw. The house has no
+        spinner: a spinning ring is a radius, an animation and a borrowed idiom
+        at once. This is the 4px slab weight moving across the field it already
+        occupies. `prefers-reduced-motion` pins it full-width and lets the
+        heading carry the state, rather than merely slowing it — an
+        indeterminate bar that never resolves is exactly the ambient motion
+        that setting exists to stop. */
+  .ah-indeterminate-slab {
+    width: 40%;
+    animation: ah-slab-sweep 1.1s ease-in-out infinite;
+  }
+  @keyframes ah-slab-sweep {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(250%);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ah-indeterminate-slab {
+      width: 100%;
+      animation: none;
+    }
+  }
+}
+
+/* ── Print ───────────────────────────────────────────────────────────────────── */
+
+@media print {
+  nav,
+  footer,
+  .paywall-gate-marker,
+  .comments,
+  .vote-controls,
+  .share-button,
+  .report-button,
+  button,
+  .sticky,
+  [class*="ReplySection"],
+  [class*="AllowanceExhausted"] {
+    display: none !important;
+  }
+
+  body {
+    font-size: 12pt;
+    line-height: 1.6;
+    color: #000;
+    background: #fff;
+  }
+
+  main {
+    padding-top: 0 !important;
+  }
+
+  .prose, .prose-lg {
+    max-width: none;
+    font-size: 12pt;
+    line-height: 1.6;
+  }
+
+  article {
+    max-width: none;
+  }
+
+  a {
+    color: #000;
+    text-decoration: underline;
+  }
+
+  img {
+    max-width: 100%;
+    page-break-inside: avoid;
+  }
+
+  h1, h2, h3 {
+    page-break-after: avoid;
+  }
+}
+
+/* ── Pushed-screen slide-in (mobile Messages thread drill-down) ─────────────── */
+
+@keyframes ah-push-in-right {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+.animate-push-in {
+  animation: ah-push-in-right 200ms ease-out;
+}
+
+/* ── Scroll without a visible scrollbar ─────────────────────────────────────
+   The workspace floor pans horizontally across an infinitely-wide canvas. A
+   native scrollbar there would draw a thin rule across the bottom of the
+   viewport — exactly the single-pixel treatment the design system bans — so the
+   floor scrolls silently and the canvas edge is read from the content itself. */
+
+.scroll-silent {
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* legacy Edge */
+}
+
+.scroll-silent::-webkit-scrollbar {
+  display: none;
+}

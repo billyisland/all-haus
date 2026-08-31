@@ -1,0 +1,31 @@
+{
+  "workspaces": [
+    "shared",
+    "gateway",
+    "key-service",
+    "key-custody",
+    "feed-ingest"
+  ],
+  "scripts": {
+    "seed": "npx tsx scripts/seed.ts",
+    "seed:clean": "npx tsx scripts/seed.ts --clean",
+    "lint": "eslint",
+    "lint:fix": "eslint --fix",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "pg": "^8.20.0"
+  },
+  "devDependencies": {
+    "@faker-js/faker": "^10.4.0",
+    "@platform-pub/shared": "*",
+    "@types/pg": "^8.20.0",
+    "eslint": "^10.2.0",
+    "knip": "6.5.0",
+    "rss-parser": "^3.13.0",
+    "stripe": "^14.0.0",
+    "typescript-eslint": "^8.58.0"
+  }
+}

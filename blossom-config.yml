@@ -1,0 +1,43 @@
+# Blossom media server — config.yml (v6 Deno schema; image pinned to 6.2.0).
+# See docs/adr/ADR-blossom-migration.md.
+#
+# Internal-only: no published port + default compose network ⇒ reachable solely
+# from the gateway. That internal-only reachability is the real access control;
+# the storage rule below is the MIME allowlist, not a security boundary.
+
+# TCP port. Confirmed honoured by the pinned image (Phase 0). Matches the compose
+# healthcheck, the gateway's BLOSSOM_URL, and the nginx proxy — "3003 everywhere".
+port: 3003
+# Bind all interfaces so the gateway/nginx containers can reach it.
+host: 0.0.0.0
+
+database:
+  path: /app/data/sqlite.db
+
+storage:
+  backend: local
+  local:
+    dir: /app/data/blobs
+
+  # Retention rules double as the upload MIME allowlist. An EMPTY list rejects
+  # EVERY upload (415) — it does not mean "accept any" (Phase 0). So image/* is
+  # required for uploads to succeed. A rule enables the prune loop, hence the
+  # 100-year expiration: pruning becomes an effective no-op so we never drop
+  # user media.
+  rules:
+    - type: "image/*"
+      expiration: 100 years
+
+upload:
+  enabled: true
+  # BUD-11 auth: the gateway signs a kind-24242 authorization event with the
+  # uploader's custodial key server-side (gateway/src/routes/media.ts).
+  requireAuth: true
+
+# Endpoints this internal instance does not use — kept off to shrink surface.
+media:
+  enabled: false
+list:
+  enabled: false
+mirror:
+  enabled: false

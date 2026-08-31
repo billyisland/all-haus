@@ -1,0 +1,42 @@
+{
+  "name": "@platform-pub/gateway",
+  "version": "0.1.0",
+  "description": "API gateway \u2014 auth, session management, and service proxy for all.haus",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@atproto/oauth-client-node": "^0.3.17",
+    "@fastify/cookie": "^9.3.0",
+    "@fastify/cors": "^9.0.0",
+    "@fastify/multipart": "^8.1.0",
+    "@fastify/rate-limit": "^8.1.0",
+    "@fastify/sensible": "^5.5.0",
+    "@mozilla/readability": "^0.6.0",
+    "@platform-pub/shared": "*",
+    "dotenv": "^17.3.1",
+    "fastify": "^4.26.0",
+    "jsdom": "^29.1.1",
+    "nostr-tools": "^2.3.0",
+    "pg": "^8.20.0",
+    "pino": "^8.19.0",
+    "rss-parser": "^3.13.0",
+    "sharp": "^0.34.5",
+    "stripe": "^14.0.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/jsdom": "^28.0.3",
+    "@types/node": "^20.11.0",
+    "@types/pg": "^8.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.4.0"
+  }
+}

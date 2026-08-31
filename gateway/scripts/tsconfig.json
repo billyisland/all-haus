@@ -1,0 +1,14 @@
+{
+  "//2": "module/moduleResolution are overridden away from the base NodeNext because the repo-root package.json declares no type:module, so TS reads these ESM files as CommonJS and rejects import.meta. Nothing is emitted from here — tsx runs the scripts — so this affects type-checking only.",
+  "//": "See scripts/tsconfig.json — same purpose, for the gateway's own operator scripts, which import from gateway/src.",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
+    "rootDir": "..",
+    "declaration": false,
+    "declarationMap": false
+  },
+  "include": ["**/*.ts"]
+}

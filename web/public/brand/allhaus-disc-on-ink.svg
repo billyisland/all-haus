@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img" aria-label="all.haus">
+  <defs><clipPath id="d"><circle cx="100" cy="100" r="94"/></clipPath></defs>
+  <circle cx="100" cy="100" r="94" fill="#F0EFEB"/>
+  <g clip-path="url(#d)">
+    <path d="M54.2 11.4 L100 164.3 L145.8 11.4" fill="none" stroke="#1A1A18" stroke-width="17" stroke-linejoin="miter" stroke-miterlimit="12" stroke-linecap="butt"/>
+    <line x1="73" y1="74" x2="127" y2="74" stroke="#1A1A18" stroke-width="14" stroke-linecap="butt"/>
+  </g>
+</svg>

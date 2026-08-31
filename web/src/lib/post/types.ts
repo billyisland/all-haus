@@ -1,0 +1,153 @@
+// =============================================================================
+// Client Post model — UNIVERSAL-POST-ADR §2.2
+//
+// The browser mirror of the gateway Post shape (gateway/src/lib/post-mapper.ts).
+// Kept structurally identical so the same PostCard renders every feed payload with
+// no re-mapping. All feed surfaces — sources, author, tags, thread, AND the
+// workspace items endpoint (GET /workspace/feeds/:id/items) — now serve gateway
+// Post[] directly; the client-side legacy-item adapter (map-feed-item.ts) was
+// retired in FEED-RETIREMENT-PLAN Slice 6 item 4.
+//
+// A few fields are still marked "client transitional" (render-only ergonomics);
+// the gateway now sources dTag/pricePence/externalSourceId too.
+// =============================================================================
+
+// The six render levels (§3 / §4 matrix). The level governs size/indent/gap/
+// affordance-set — never which fields exist; every Post always carries everything.
+export type Level =
+  | "focal"
+  | "feed"
+  | "thread-parent"
+  | "thread-reply"
+  | "quoted"
+  | "condensed";
+
+export type BiddabilityTier = "A" | "B" | "C" | "D";
+
+export type PipStatus = "known" | "partial" | "unknown" | "contested";
+
+// Media shape as served by feed_items.media (matches the ndk MediaItem the
+// workspace MediaBlock already consumes without translation).
+export interface MediaItem {
+  type: "image" | "video" | "audio" | "link";
+  url: string;
+  thumbnail?: string;
+  alt?: string;
+  width?: number;
+  height?: number;
+  title?: string;
+  description?: string;
+  duration_in_seconds?: number;
+  size_in_bytes?: number;
+}
+
+// Poll shape as carried by external items (PollDisplay-compatible).
+export interface Poll {
+  options: Array<{ title: string; votesCount: number }>;
+  multiple: boolean;
+  expiresAt: string | null;
+  closed: boolean;
+}
+
+export interface PostOrigin {
+  // "nostr" for native all.haus content; the source protocol otherwise.
+  protocol: "nostr" | "atproto" | "activitypub" | "rss" | "email" | string;
+  uri: string; // permalink / at:// / status id / event id — the stable handle
+  sourceName: string | null; // origin-site name shown in the tag
+  // The container the reader subscribed to where that is not the author
+  // (BYLINE-AND-PROVENANCE-ADR D8): a native article's publication, rendered
+  // in the same provenance slot an external card gives `sourceName`. Null
+  // for a native article outside a publication, every note, and external.
+  // `active` is publications.status = 'active' — the only state /pub/:slug
+  // resolves in; the name renders regardless, the link only while active.
+  publication: { name: string; slug: string; active: boolean } | null;
+}
+
+export interface PostAuthor {
+  // Identity record id (native author_id / external_author_id). NULL for tier
+  // C/D — no stable handle ⇒ no profile ⇒ plain-text byline.
+  id: string | null;
+  accountId: string | null; // lazy link to a real all.haus account
+  displayName: string | null; // native: NULL here, resolved at render via useWriterName(pubkey)
+  handle: string | null;
+  handleUri: string | null; // link to profile on origin (external)
+  avatar: string | null;
+  pubkey: string | null; // native only — the useWriterName key + vote target
+  pipStatus: PipStatus;
+}
+
+export interface PostBody {
+  text: string | null;
+  html: string | null;
+  title: string | null; // articles
+  summary: string | null;
+  media: MediaItem[];
+  contentWarning: string | null;
+  poll: Poll | null;
+}
+
+export interface Post {
+  id: string; // deterministic post_id (§2.3); client-side = origin handle until the unified endpoint lands
+  version: string | null; // edit detector (§2.4); native = nostr event id (also the vote target)
+  origin: PostOrigin;
+  author: PostAuthor;
+  type: "article" | "note";
+  // Display discriminator only — gating economics stay in the gate-pass service (§3.1).
+  accessMode: "free" | "gated" | "unlocked";
+  body: PostBody;
+  inReplyTo: string | null; // parent handle (origin id this phase; gateway resolves to post_id)
+  quotes: string | null; // quoted handle (depth-1)
+  originCounts: { like: number; reply: number; repost: number } | null; // external only; null native (§6)
+  scoresheet: { up: number; down: number; reposts: number }; // all.haus reaction layer
+  biddabilityTier: BiddabilityTier;
+  publishedAt: number; // unix seconds
+  score?: number; // §5 hotness (feed only); undefined in thread
+  isContextOnly: boolean;
+  isDeleted: boolean;
+  isMuted: boolean;
+  feedItemId: string | null; // client transitional: keys vote/quote/parent fetches
+  // client transitional: the external_item id the interact-back endpoints key on
+  // (externalItems.like/repost/reply/pollVote, engagement). Distinct from `id`
+  // (the deterministic post_id) and `feedItemId`. NULL for native posts.
+  externalItemId: string | null;
+  // The all.haus external_sources id this card came from (external only; null
+  // native). The workspace matches a card to its feed_source row for drag-to-move.
+  externalSourceId?: string | null;
+  pricePence?: number; // client transitional: gated-article CTA price
+  // client transitional: native article d-tag — the reader-pane (§3.1 / Phase R)
+  // opens native articles at /article/<dTag>. Null for notes + external.
+  dTag?: string | null;
+  // client transitional: native note quote preview (the gateway model resolves
+  // `quotes` to a child Post via /thread; until that is wired, the workspace
+  // payload carries an inline excerpt we render as the quoted-level mini).
+  // `source` + `url` are set when the quoted post is external (migration 102):
+  // the origin label (e.g. "BLUESKY") and the clickable public permalink.
+  quotedPreview?: { title?: string; excerpt?: string; author?: string; source?: string; url?: string };
+  // Slice 8 P1: cross-source provenance. The other linked sources' protocols
+  // carrying the same content as this (winning) card — rendered as a quiet
+  // "ALSO ON BLUESKY · MASTODON" line. Empty/undefined ⇒ nothing rendered.
+  alsoOn?: string[];
+  // SOCIAL-PROOF-RESONANCE-ADR D7, the AUTHOR-relative axis: 0-3 band → the
+  // byline glyph (nothing / ▴ / ▲). null/undefined means NO BAND WAS COMPUTED —
+  // an rss/email or dark-nostr item, or one the crons haven't reached — which
+  // is deliberately distinct from band 0 "quiet" even though both render
+  // nothing. The gateway withholds it unless RESONANCE_GLYPH_ENABLED is set.
+  resonanceBand?: number | null;
+  // D5, the PLATFORM-relative axis: E's position in its own network's
+  // distribution, 0..1, where 0.5 is exactly that network's median and 0.9 its
+  // p90 (PCTL_EXPR is built on those two landmarks). Only the gloss reads it —
+  // it never decides whether the glyph shows, which stays the author axis's
+  // job. Same null semantics and brake as the band.
+  ambientPctl?: number | null;
+}
+
+// Bare reposts are edges, not Posts (§2.2). Mirror of gateway RepostEdgeDTO.
+export interface RepostEdge {
+  targetPostId: string;
+  actorId: string | null;
+  actorHandle: string | null;
+  actorDisplayName: string | null;
+  trustWeight: number;
+  timestamp: number;
+  originUri: string | null;
+}

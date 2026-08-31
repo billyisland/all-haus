@@ -1,0 +1,431 @@
+# =============================================================================
+# all.haus — Local Development Stack
+#
+# Services:
+#   postgres           — shared database — port 5432
+#   strfry             — Nostr relay (content + vault events + receipts) — port 4848
+#   gateway            — API gateway (auth, session, proxy) — port 3000
+#   payment            — payment service — port 3001
+#   keyservice         — key service — port 3002
+#   key-custody        — key custody service (holds user Nostr private keys) — port 3004
+#   feed-ingest        — external-feed poller + Jetstream listener (no HTTP port)
+#   web                — Next.js frontend — port 3010
+#   nginx              — reverse proxy with TLS
+#   blossom            — Nostr media server (BUD-02 blob store — primary media backend)
+#   certbot            — automatic TLS certificates
+#
+# Usage:
+#   docker compose up -d postgres strfry    # infrastructure first
+#   docker compose up                       # all services
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — shared database for all services
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: platformpub
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: platformpub
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U platformpub"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # strfry — Nostr relay
+  # ---------------------------------------------------------------------------
+  strfry:
+    image: dockurr/strfry:latest
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 1000000
+        hard: 1000000
+    ports:
+      # Loopback-only, and this is a rule rather than a preference: a
+      # Docker-published port BYPASSES UFW (the DOCKER chain DNATs before
+      # INPUT), so a 0.0.0.0 bind here puts the raw relay on the public
+      # internet whatever the host firewall says. nginx reaches strfry by
+      # service name over the compose network; dev browser access via
+      # ws://localhost:4848 still works.
+      - "127.0.0.1:4848:7777"
+    volumes:
+      - ./relay/strfry.conf:/etc/strfry.conf:ro
+      - strfry_data:/app/strfry-db
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7777"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Gateway — API gateway (auth, sessions, media uploads, proxies)
+  # ---------------------------------------------------------------------------
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file: gateway/.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Uploads now go through Blossom (media.ts), so the gateway can't serve
+      # /media/upload without it. Gated on the healthcheck actually passing —
+      # requires the blossom port fix (ADR-blossom-migration §1).
+      blossom:
+        condition: service_healthy
+    volumes:
+      # Kept mounted through the migration + one soak cycle for rollback of
+      # PRE-cutover blobs only — post-cutover blobs exist solely in blossom_data,
+      # so a revert needs a Blossom→disk copy first (no script yet; see
+      # ADR-blossom-migration Sequencing §5). Dropped in Phase 4.
+      - media_data:/app/media
+    environment:
+      DATABASE_URL: postgresql://platformpub:${POSTGRES_PASSWORD}@postgres:5432/platformpub
+      PAYMENT_SERVICE_URL: http://payment:3001
+      KEY_SERVICE_URL: http://keyservice:3002
+      # Blossom blob store (internal). Uploads: gateway signs kind-24242 → PUT here.
+      BLOSSOM_URL: http://blossom:3003
+      APP_URL: https://all.haus
+      MEDIA_DIR: /app/media
+      PUBLIC_MEDIA_URL: https://all.haus/media
+      LINKED_ACCOUNT_KEY_HEX: ${LINKED_ACCOUNT_KEY_HEX}
+      ATPROTO_CLIENT_BASE_URL: ${ATPROTO_CLIENT_BASE_URL:-https://all.haus}
+      ATPROTO_PRIVATE_JWK: ${ATPROTO_PRIVATE_JWK}
+      # ASSISTED atproto ("set one up for me" → Bluesky). Ships dark:
+      # ATPROTO_ASSISTED_ENABLED off ⇒ POST /linked-accounts/bluesky/assisted 503s
+      # and the UI keeps the "Set one up · soon" affordance. Do NOT flip on until
+      # the S0 spike passes against the real bsky.social (NETWORK-CONCIERGE-ADR §6.1.1).
+      ATPROTO_ASSISTED_ENABLED: ${ATPROTO_ASSISTED_ENABLED:-0}
+      ATPROTO_DEFAULT_PDS: ${ATPROTO_DEFAULT_PDS:-https://bsky.social}
+      # ASSISTED activitypub ("set one up for me" → Mastodon). Ships dark, same
+      # contract: flag off ⇒ POST /linked-accounts/mastodon/assisted 503s and the
+      # UI keeps "Set one up · soon". Instances is a comma-separated curated
+      # allowlist of open-registration hosts; first entry is the default
+      # (NETWORK-CONCIERGE-ADR §9).
+      MASTODON_ASSISTED_ENABLED: ${MASTODON_ASSISTED_ENABLED:-0}
+      MASTODON_ASSISTED_INSTANCES: ${MASTODON_ASSISTED_INSTANCES:-mastodon.social}
+      # Resolver discovery branch 6 (activitypub account search) queries these
+      # instances' unauthenticated /api/v2/search on submit. One or at most two
+      # hosts — each is a full extra HTTP round-trip per discovery submit
+      # (RESOLVER-DISCOVERY-ADR §5.2). Distinct from the ASSISTED allowlist above.
+      MASTODON_DISCOVERY_INSTANCES: ${MASTODON_DISCOVERY_INSTANCES:-mastodon.social}
+      # addSource liveness probes (resolver audit F1): default on. Set to 0 as
+      # an operator brake (e.g. the default nostr profile relays collectively
+      # down blocking follows) — canonical-form inputs then skip the probe;
+      # normalisation of accts/handles/npubs still runs.
+      SOURCE_LIVENESS_ENFORCED: ${SOURCE_LIVENESS_ENFORCED:-1}
+      # Nostr outbound interop (discovery). Ships dark: DISCOVERY_PUBLISH_ENABLED
+      # off ⇒ no kind 0/3/10002 produced. With it on, PUBLIC_FANOUT_RELAY_URLS
+      # empty ⇒ in-house relay only; set it to fan discovery events to the public
+      # mesh. PLATFORM_RELAY_WS_URL is the internal fan-out target; PUBLIC_RELAY_URL
+      # is the relay we *advertise* in kind 10002 / NIP-05.
+      DISCOVERY_PUBLISH_ENABLED: ${DISCOVERY_PUBLISH_ENABLED:-0}
+      # Follow-graph import (FOLLOW-GRAPH-IMPORT-ADR). Ships dark: master flag
+      # off ⇒ /follow-imports routes 404, the sweep no-ops, and the
+      # followImportProtocols capability list is empty (all import affordances
+      # hidden). The activitypub sub-brake is ANDed with the master switch —
+      # flip it only after the §6.4 poller-fairness soak plus one authed live
+      # self-import (ADR §2 / §6.6).
+      FOLLOW_IMPORT_ENABLED: ${FOLLOW_IMPORT_ENABLED:-0}
+      FOLLOW_IMPORT_ACTIVITYPUB_ENABLED: ${FOLLOW_IMPORT_ACTIVITYPUB_ENABLED:-0}
+      # Feed formulas (FEED-FORMULAS-ADR Phase 1). Ships dark: flag off ⇒ freeze,
+      # the public formula page, redeem, list and revoke all 404, so the feature
+      # is absent rather than half-lit. Server-only — there is no NEXT_PUBLIC
+      # twin, because the web only needs to omit an action, not change layout.
+      # PHASE 2 WARNING: when seedStarterFeeds is repointed at a designated
+      # formula, that path must NOT be gated on this flag — turning it off would
+      # then silently end new-account seeding, which is the §0l outage from the
+      # opposite direction (ADR §6).
+      FEED_FORMULAS_ENABLED: ${FEED_FORMULAS_ENABLED:-0}
+      # Pledge drives + commissioning (parked 2026-07-13). Ships dark: flag off
+      # ⇒ every /drives route 403s (feature_disabled), so no drive/pledge/
+      # commission can be created or read; fulfilment plumbing goes inert. The
+      # web twin is the build-time NEXT_PUBLIC_PLEDGES_ENABLED (web build.args).
+      # Revive by flipping both to 1 (+ rebuild web). See FIX-PROGRAMME 2026-07-13.
+      PLEDGES_ENABLED: ${PLEDGES_ENABLED:-0}
+      # Tribute system (Upstream Edges Phase 2–5) + the Phase-1 credit/citation/
+      # dispute apparatus. SUSPENDED BY OPERATOR DIRECTIVE 2026-08-25 — not part
+      # of launch; do not flip without the operator's explicit all-clear (reason
+      # and restore conditions: docs/adr/LEGAL-BRAKES.md + shared/src/lib/env.ts).
+      # Off ⇒ tribute + upstream-edges routes 404, the lifecycle
+      # sweep is not scheduled, and (payment side) settlement freezes no accruals.
+      # TRIBUTES_ENABLED must carry ONE value here and on the payment service.
+      # Web twins are the build-time NEXT_PUBLIC_* pair (web build.args).
+      TRIBUTES_ENABLED: ${TRIBUTES_ENABLED:-0}
+      UPSTREAM_EDGES_ENABLED: ${UPSTREAM_EDGES_ENABLED:-0}
+      # Publications (multi-author titles). SUSPENDED BY OPERATOR DIRECTIVE
+      # 2026-08-31 — launch is SOLO AUTHOR ACCOUNTS ONLY; do not flip without
+      # the operator's explicit all-clear (reason and restore conditions:
+      # docs/adr/LEGAL-BRAKES.md + shared/src/lib/env.ts). Off ⇒ all 27
+      # /publications* routes 404, publication subscribe/unsubscribe and the
+      # publication RSS feed 404, the publish pipeline throws, the scheduler
+      # un-schedules a publication draft, and a publication subscription expires
+      # instead of renewing. The publication PAYOUT cycle is deliberately NOT
+      # gated (gating it would strand writer money — see env.ts). ONE value here
+      # and on the payment service. Web twin is the build-time NEXT_PUBLIC_* below.
+      PUBLICATIONS_ENABLED: ${PUBLICATIONS_ENABLED:-0}
+      # Stripe funds segregation — see the payment service for the full note.
+      # Present here so the flag has ONE value across the deployment, not because
+      # the gateway uses it today: its only Stripe client (auth.ts) drives Connect
+      # onboarding and reader card setup, and is DELIBERATELY excluded from the
+      # preview API version — neither carries allocation, and a preview version
+      # moving under those paths locks writers out of onboarding or readers out of
+      # attaching a card. Anything here that grows a charge or transfer joins in.
+      STRIPE_ALLOCATED_FUNDS: ${STRIPE_ALLOCATED_FUNDS:-0}
+      # Resonance glyph on feed cards (SOCIAL-PROOF-RESONANCE-ADR D7, step 4,
+      # shipped 2026-07-20; LIT 2026-08-10). Flag off ⇒ the post mapper nulls
+      # Post.resonanceBand on every read path, so the band never leaves the
+      # gateway and no glyph renders. Display-only — the feed-ingest scoring
+      # crons write feed_items.resonance* either way, so flipping needs no
+      # backfill and is instantly reversible in BOTH directions. No web twin.
+      # Default flipped to 1 while the beta is closed: the gate was per-protocol
+      # band-3 re-measurement on prod volume, and with one real reader that
+      # measurement IS the operator browsing real ingested posts. Safe to lead
+      # with because the band gates are platform_config dials
+      # (resonance_band{1,2,3}_min), so a wrong distribution is an UPDATE, not a
+      # deploy. Set RESONANCE_GLYPH_ENABLED=0 in the root .env to douse it.
+      # REVISIT THE DEFAULT THE DAY THE BETA OPENS (CONSOLIDATED-TODO §9.12).
+      RESONANCE_GLYPH_ENABLED: ${RESONANCE_GLYPH_ENABLED:-1}
+      # D6 read-time proof blend (step 5). Off = 'scored' feeds rank on the
+      # cron-baked fi.score exactly as before; on = every item in a scored feed,
+      # native and external alike, ranks by one commensurable expression built
+      # from feed_items.resonance/ambient_pctl. Independent of the glyph brake
+      # above on purpose — ranking on resonance and displaying the band are
+      # separate claims, so the explore A/B can run with the glyph still dark.
+      RESONANCE_RANKING_ENABLED: ${RESONANCE_RANKING_ENABLED:-0}
+      PLATFORM_RELAY_WS_URL: ws://strfry:7777
+      PUBLIC_RELAY_URL: ${PUBLIC_RELAY_URL:-wss://all.haus/relay}
+      PUBLIC_FANOUT_RELAY_URLS: ${PUBLIC_FANOUT_RELAY_URLS:-}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Payment service
+  # ---------------------------------------------------------------------------
+  payment:
+    build:
+      context: .
+      dockerfile: payment-service/Dockerfile
+    restart: unless-stopped
+    env_file: payment-service/.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      strfry:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://platformpub:${POSTGRES_PASSWORD}@postgres:5432/platformpub
+      PLATFORM_RELAY_WS_URL: ws://strfry:7777
+      DB_POOL_MAX: 10
+      # Stripe funds segregation / allocated funds (FUNDS-SEGREGATION-INTEGRATION.md).
+      # Ships dark: flag off ⇒ settlement PaymentIntents carry no allocated_funds,
+      # the allocation-sync sweep is a no-op, and each payout is one aggregate
+      # transfer with the platform fee left implicit — byte-identical to today.
+      # Flag on ⇒ each charge's funds are LOCKED to connected-account payouts and
+      # a payout becomes N child transfers, one per funding charge, each naming it
+      # via source_transaction with an explicit application_fee_amount.
+      # DO NOT FLIP until Stripe enables the beta for this platform and the
+      # sandbox test plan (ADR §5) is green. No web twin — entirely server-side.
+      STRIPE_ALLOCATED_FUNDS: ${STRIPE_ALLOCATED_FUNDS:-0}
+      # Tribute system — SUSPENDED by operator directive 2026-08-25 (see the
+      # gateway's note; one value across the deployment). Read here by settlement
+      # (accrual apportionment) and the tribute payout cycle.
+      TRIBUTES_ENABLED: ${TRIBUTES_ENABLED:-0}
+      # Publications — SUSPENDED by operator directive 2026-08-31 (see the gateway's
+      # note; one value across the deployment). Present here so the flag has ONE
+      # value, NOT because the payout cycle reads it: runPublicationPayoutCycle is
+      # deliberately ungated and stays live so settled publication reads can still
+      # be paid out (gating it would strand that money permanently — env.ts §H1).
+      PUBLICATIONS_ENABLED: ${PUBLICATIONS_ENABLED:-0}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Key service
+  # ---------------------------------------------------------------------------
+  keyservice:
+    build:
+      context: .
+      dockerfile: key-service/Dockerfile
+    restart: unless-stopped
+    env_file: key-service/.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://platformpub:${POSTGRES_PASSWORD}@postgres:5432/platformpub
+      PLATFORM_RELAY_WS_URL: ws://strfry:7777
+      DB_POOL_MAX: 10
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3002/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Key custody — custodial Nostr keypair service (sole holder of ACCOUNT_KEY_HEX)
+  # ---------------------------------------------------------------------------
+  key-custody:
+    build:
+      context: .
+      dockerfile: key-custody/Dockerfile
+    restart: unless-stopped
+    env_file: key-custody/.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://platformpub:${POSTGRES_PASSWORD}@postgres:5432/platformpub
+      DB_POOL_MAX: 10
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3004/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Feed Ingest — external content ingestion (RSS, Nostr, AT Protocol, ActivityPub)
+  # ---------------------------------------------------------------------------
+  feed-ingest:
+    build:
+      context: .
+      dockerfile: feed-ingest/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://platformpub:${POSTGRES_PASSWORD}@postgres:5432/platformpub
+      LINKED_ACCOUNT_KEY_HEX: ${LINKED_ACCOUNT_KEY_HEX}
+      APP_URL: https://all.haus
+      PLATFORM_RELAY_WS_URL: ws://strfry:7777
+      DB_POOL_MAX: 10
+      ATPROTO_CLIENT_BASE_URL: ${ATPROTO_CLIENT_BASE_URL:-https://all.haus}
+      ATPROTO_PRIVATE_JWK: ${ATPROTO_PRIVATE_JWK}
+
+  # ---------------------------------------------------------------------------
+  # Web client (Next.js)
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+      args:
+        NEXT_PUBLIC_RELAY_URL: wss://all.haus/relay
+        NEXT_PUBLIC_GATEWAY_URL: ""
+        NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY:-}
+        # Pledge drives + commissioning (parked 2026-07-13). Build-time inlined,
+        # so flipping to 1 requires `docker compose build web` (not just up).
+        # Gateway twin is PLEDGES_ENABLED. See FIX-PROGRAMME 2026-07-13.
+        NEXT_PUBLIC_PLEDGES_ENABLED: ${NEXT_PUBLIC_PLEDGES_ENABLED:-0}
+        # Tribute system + upstream-edges apparatus — SUSPENDED by operator
+        # directive 2026-08-25 (see the gateway env note). Build-time inlined,
+        # so flipping to 1 requires `docker compose build web`. Gateway twins:
+        # TRIBUTES_ENABLED / UPSTREAM_EDGES_ENABLED.
+        NEXT_PUBLIC_TRIBUTES_ENABLED: ${NEXT_PUBLIC_TRIBUTES_ENABLED:-0}
+        NEXT_PUBLIC_UPSTREAM_EDGES_ENABLED: ${NEXT_PUBLIC_UPSTREAM_EDGES_ENABLED:-0}
+        # Publications — SUSPENDED by operator directive 2026-08-31 (see the
+        # gateway env note). Build-time inlined, so flipping to 1 requires `docker compose
+        # build web`. Gateway twin: PUBLICATIONS_ENABLED.
+        NEXT_PUBLIC_PUBLICATIONS_ENABLED: ${NEXT_PUBLIC_PUBLICATIONS_ENABLED:-0}
+        # Baked into the Next.js /api rewrite at build time (see web/Dockerfile).
+        # Must be the in-cluster gateway address the web server proxies to, else
+        # the proxy falls back to localhost:3000 and every API call ECONNRESETs.
+        GATEWAY_URL: http://gateway:3000
+    restart: unless-stopped
+    ports:
+      # Loopback-only (same UFW-bypass reasoning as strfry, and the stakes are
+      # higher here): a 0.0.0.0 bind serves the whole app — including the /api
+      # rewrite to the gateway — over plaintext, skipping nginx and TLS
+      # entirely.
+      - "127.0.0.1:3010:3000"
+    env_file: web/.env
+    depends_on:
+      - gateway
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Nginx — reverse proxy with TLS (Let's Encrypt)
+  # Serves /media/ directly from the shared media_data volume
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - certbot_data:/var/www/certbot:ro
+      - certbot_certs:/etc/letsencrypt:ro
+      - media_data:/app/media:ro
+    depends_on:
+      - web
+      - gateway
+      - strfry
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/nginx-health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Blossom — Nostr media server (BUD-02). Primary blob store: the gateway signs
+  # a kind-24242 auth event and PUTs each crunched image here (media.ts), and
+  # nginx proxies /media/ to it. Internal-only (no published port, default
+  # network). Image pinned to a release tag. See docs/adr/ADR-blossom-migration.md.
+  # ---------------------------------------------------------------------------
+  blossom:
+    image: ghcr.io/hzrd149/blossom-server:6.2.0
+    restart: unless-stopped
+    volumes:
+      - blossom_data:/app/data
+      - ./blossom-config.yml:/app/config.yml:ro
+    healthcheck:
+      # The pinned image ships only `deno` — no wget/curl (Phase 0), so the old
+      # wget probe could never have passed. `deno eval` runs with full perms.
+      test: ["CMD-SHELL", "deno eval 'const r=await fetch(\"http://localhost:3003/\");Deno.exit(r.ok?0:1)' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Certbot — automatic TLS certificates
+  # ---------------------------------------------------------------------------
+  certbot:
+    image: certbot/certbot
+    volumes:
+      - certbot_data:/var/www/certbot
+      - certbot_certs:/etc/letsencrypt
+
+volumes:
+  pgdata:
+  strfry_data:
+  blossom_data:
+  media_data:
+  certbot_data:
+  certbot_certs:
