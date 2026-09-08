@@ -105,8 +105,8 @@ export type ExplainKind =
   | "dashboard.gifts"
   | "dashboard.pricing"
   | "library"
-  | "library.bookmarks"
-  | "library.history"
+  | "library.recent"
+  | "library.holdings"
   | "network"
   | "network.dmFee"
   | "network.following"
@@ -139,6 +139,10 @@ export type ExplainKind =
   | "profile.name"
   | "profile.subscribe"
   | "profile.identityLinks"
+  // PROFILE-PANE-REDESIGN D7: the ALSO KNOWN AS row. Hover-only like its
+  // siblings, so it joins no sequence array — the union member and the copy
+  // entry are the whole wiring.
+  | "profile.identityRow"
   // BYLINE-AND-PROVENANCE-ADR D6 (S4, 2026-08-29): the tier-C log header —
   // the source a byline-only author writes in, routing inward to /source/:id.
   | "profile.writingIn"
@@ -253,8 +257,19 @@ export interface FirstRunBeat {
   done?: boolean;
 }
 
-// The full six-beat sequence, resolving the provenance fork for beat 1.
-export function firstRunBeats(fromStarter: boolean): FirstRunBeat[] {
+// The sequence, resolving the provenance fork for beat 1 and the arrival fork
+// after the disc.
+//
+// `hasReading` ADDS A BEAT rather than changing one, and it is placed straight
+// after the `disc` beat on purpose: it anchors on the disc too, so it lands
+// while the reader is still looking at the menu it names. A step with nothing
+// to offer is ABSENT rather than rendered empty — the same rule the deleted
+// welcome sheet used, and the reason the count reads 6 or 7 rather than 7 with
+// a hollow slot.
+export function firstRunBeats(
+  fromStarter: boolean,
+  hasReading = false,
+): FirstRunBeat[] {
   return [
     {
       kind: "vessel",
@@ -265,6 +280,9 @@ export function firstRunBeats(fromStarter: boolean): FirstRunBeat[] {
     { kind: "vessel.addSource", copy: FIRST_RUN_COPY.addSource },
     { kind: "card.byline", copy: FIRST_RUN_COPY.byline },
     { kind: "disc", copy: FIRST_RUN_COPY.disc },
+    ...(hasReading
+      ? [{ kind: "disc" as const, copy: FIRST_RUN_COPY.library }]
+      : []),
     { kind: "floor", copy: FIRST_RUN_COPY.floor, alwaysFloat: true },
     {
       kind: "floor",

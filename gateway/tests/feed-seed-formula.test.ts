@@ -471,6 +471,36 @@ describe.skipIf(!DB_URL)("the default seed", () => {
     expect(await designatedId()).toBeNull();
   });
 
+  it("refuses to cut an UNTITLED feed, because a formula must be nameable", async () => {
+    // A feed may have no name (migration 190 — the numeral is its identity);
+    // a formula may not, and this is where the two meet. `feed_formulas.name`
+    // is what this panel prints back and what the seeded cohort's provenance
+    // carries, so an unnamed seed is a load-bearing slot nobody can read.
+    // Without the guard the operator's press answers 500 with a raw
+    // `feed_formulas_name_check` — the same failure migration 190 removed one
+    // level down, reappearing one level up the moment the floor was relaxed.
+    await undesignateAll();
+    const untitled = await adminFeed("");
+    const res = await app.inject({
+      method: "POST",
+      url: "/admin/dashboard/seed-formula",
+      payload: { feedId: untitled },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("seed_feed_unnamed");
+    expect(await designatedId()).toBeNull();
+
+    // And the operator's own override is the way through: the feed stays
+    // untitled, the seed gets a name.
+    const named = await app.inject({
+      method: "POST",
+      url: "/admin/dashboard/seed-formula",
+      payload: { feedId: untitled, name: "House starter" },
+    });
+    expect(named.statusCode).toBe(200);
+    expect(named.json().designated.name).toBe("House starter");
+  });
+
   it("has no branch that designates a row that already exists", async () => {
     // L5 — a seed is CUT, never adopted. With one live link per feed,
     // designating an existing row would let an operator designate a MEMBER's

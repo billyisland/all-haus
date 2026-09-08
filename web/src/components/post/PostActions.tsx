@@ -62,13 +62,34 @@ export function PostActions({
 
   const native = post.origin.protocol === "nostr" && !!post.author.pubkey;
 
+  // YOU MAY READ A GATED CONVERSATION; YOU MAY NOT ADD TO IT.
+  // ARTICLE-HEADED-CONVERSATIONS-ADR D6. On a post whose conversation ROOT is
+  // paywalled and unreadable by this viewer, reply, quote and vote are absent —
+  // SUPPRESSED, not drawn dead: an affordance that cannot work does not appear
+  // (web/CLAUDE.md, "a permissions state must not wear an outage's words").
+  // The head article card is included: a reader who cannot read the piece has
+  // no business voting on it. What it keeps is its click — `reader-pane`, which
+  // is the conversion path the whole policy is built on.
+  //
+  // `=== true` and not falsiness: the field is optional and ABSENT means nobody
+  // resolved access for this post (every feed and log), which is not `false`.
+  //
+  // This is the UI half only. The write path is closed server-side and
+  // independently — POST /replies 403s a gated target (D7) — because a UI rule
+  // is not an access control. Quote needs no server twin: what it can carry is
+  // `content_free` by construction (quote-preview.ts), the same free portion
+  // the head card renders.
+  const locked = post.rootLocked === true;
+  // Report survives: reporting is not participation, and a reader who can see
+  // the conversation must be able to report what is in it.
+
   return (
     <div
       onClick={(e) => e.stopPropagation()}
       className="flex items-center gap-3 mt-3 label-ui"
       style={{ color: palette.cardMeta }}
     >
-      {native && post.version && (
+      {native && post.version && !locked && (
         <VoteControls
           targetEventId={post.version}
           targetKind={post.type === "article" ? 30023 : 1}
@@ -76,7 +97,7 @@ export function PostActions({
           palette={palette}
         />
       )}
-      {onReply && (
+      {onReply && !locked && (
         <button
           type="button"
           onClick={onReply}
@@ -87,7 +108,7 @@ export function PostActions({
           Reply
         </button>
       )}
-      {onQuote && (
+      {onQuote && !locked && (
         <button
           type="button"
           onClick={onQuote}

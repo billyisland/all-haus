@@ -12,7 +12,8 @@
 //
 //   Tier 1  palette.barBg    pfp · name · handle · + · actions · ✕
 //   Tier 2  palette.interior  bio · stats · identity row · subscribe row
-//   Tier 3  palette.interior  tab rig
+//   Tier 3  palette.interior  the view row (native: five counted buttons,
+//                             `WriterActivity`; external: the tab rig)
 //   Tier 4  palette.interior  post log, cards on palette.cardBg
 //
 // PALETTE (D2, AMENDED 2026-08-28): a profile OPENED FROM A FEED wears that
@@ -86,6 +87,20 @@ export function profileIslandStyle(
 
 /** Tier 2–4 inset: clear of the wall, then the vessel's interior padding. */
 export const PROFILE_INSET = VESSEL_WALL + VESSEL_PAD;
+
+/** THE PANE'S WIDTH, and the standalone pages' column with it (2026-09-02).
+ *
+ *  In the workspace a profile is a pane 860px wide; on `/username` and
+ *  `/author/:id` the same body ran the full width of the browser, so the two
+ *  registers of ONE surface had nothing in common dimensionally — a logged-out
+ *  reader met a 1600px-wide bar and a line of cards nobody would choose to set
+ *  text in. The standalone pages now centre the body at this width, so the two
+ *  registers are the same shape and only the chrome around them differs.
+ *
+ *  ONE HOME, because it is one number in two places: `ProfileOverlay` passes it
+ *  to `Glasshouse.maxWidth` and `ProfileSurface` takes it from the two bodies'
+ *  register seams. A literal in either place is a drift waiting to happen. */
+export const PROFILE_PANE_WIDTH = 860;
 
 /** The card column of any log that means to read as a feed. Spread it; do not
  *  re-derive the number, and do not "simplify" it away — a bare wrapper leaves
@@ -522,7 +537,11 @@ export function ProfileMeta({
    *  the same line without this chassis changing. */
   writingIn?: ReactNode;
   bio?: string | null;
-  /** The counts line — mono (D4), ending with RSS where there is one (D12). */
+  /** The counts line — mono (D4), ending with RSS where there is one (D12).
+   *  The NATIVE body passes none: its five counts are the labels of tier 3's
+   *  button row, which is the same navigation and would otherwise be stated
+   *  twice, and RSS rode along to the end of that row. `AuthorProfileView`
+   *  still uses this slot. */
   stats?: ReactNode;
   identities?: ProfileIdentity[];
   /** The profile's one money affordance gets settled ground, never the bar
@@ -564,42 +583,6 @@ export function ProfileMeta({
   );
 }
 
-/** A count in the stats line that is also the way into its view (D11).
- *  Followers/Following left the tab rig, so they carry no fake `role="tab"`
- *  state: each is a button that expands the tier-4 region it controls. */
-export function ProfileStatButton({
-  palette,
-  open,
-  controls,
-  onClick,
-  children,
-}: {
-  palette: VesselPalette;
-  open: boolean;
-  controls: string;
-  onClick: () => void;
-  children: ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-expanded={open}
-      aria-controls={controls}
-      className="focus-ring text-mono-xs transition-opacity hover:opacity-70"
-      style={{
-        background: "none",
-        border: "none",
-        padding: 0,
-        cursor: "pointer",
-        color: open ? palette.cardTitle : "inherit",
-      }}
-    >
-      {children}
-    </button>
-  );
-}
-
 // -----------------------------------------------------------------------------
 // The surface
 // -----------------------------------------------------------------------------
@@ -610,6 +593,7 @@ export function ProfileSurface({
   bar,
   children,
   minHeight,
+  maxWidth,
 }: {
   palette: VesselPalette;
   /** The launching feed's colourway, if any — carried here ONLY to apply the
@@ -620,7 +604,22 @@ export function ProfileSurface({
   children: ReactNode;
   /** The standalone pages own their height; the overlay body does not. */
   minHeight?: string;
+  /** `PROFILE_PANE_WIDTH` on the STANDALONE pages, which have no pane to size
+   *  them, and undefined in the overlay, where the Glasshouse already is that
+   *  width. Set ⇒ the whole body (tier 1 included) centres at this width on the
+   *  interior, so the page reads as the pane it is in the workspace. */
+  maxWidth?: number;
 }) {
+  // Tier 1 is FULL-BLEED, so the horizontal padding lives on the tiers rather
+  // than on the scroller — a pad here would inset the bar and leave a stripe of
+  // pane down each side of it (D9).
+  const body = (
+    <>
+      {bar}
+      <div style={{ padding: PROFILE_INSET, flex: "1 0 auto" }}>{children}</div>
+    </>
+  );
+
   return (
     <div
       data-explain="profile"
@@ -635,11 +634,55 @@ export function ProfileSurface({
         flexDirection: "column",
       }}
     >
-      {/* Tier 1 is FULL-BLEED, so the horizontal padding lives on the tiers
-          rather than on the scroller — a pad on the wrapper would inset the bar
-          and leave a stripe of pane down each side of it (D9). */}
-      {bar}
-      <div style={{ padding: PROFILE_INSET, flex: "1 0 auto" }}>{children}</div>
+      {/* The centring wrapper exists ONLY on the standalone pages. The overlay
+          renders the same DOM it always has — a shared body is where a public
+          page silently redesigns the member surface (PublicPage's own note), so
+          the register that did not ask for this gets no new box in its tree.
+          The interior is painted by the element ABOVE this one, full-bleed, so
+          the gutters either side are the profile's own ground and never fall
+          through to `body` (white in light, ink-900 in dark). */}
+      {maxWidth ? (
+        <div
+          style={{
+            position: "relative",
+            width: "100%",
+            maxWidth,
+            marginInline: "auto",
+            flex: "1 0 auto",
+            display: "flex",
+            flexDirection: "column",
+          }}
+        >
+          {/* THE ⊓, on the standalone pages (2026-09-02). In the workspace the
+              Glasshouse draws the frame in the pane's edge gutter; here nothing
+              was drawing it, so the column read as a centred body rather than as
+              the vessel the overlay register is. Same construction as
+              `Glasshouse`'s: a pointer-events-none colour overlay in the gutter
+              the tiers already inset past (`PROFILE_INSET` = wall + pad), so it
+              costs the content no width and disturbs no scroll geometry.
+              `frameTopSlot`'s twin holds here too — tier 1 IS the top stroke, so
+              there is no top rule to draw; and the ⊓ is OPEN AT THE BOTTOM, which
+              it is by construction, the column running to the foot of the page.
+              Both rules take `palette.walls`, the same object tier 1's `barBg`
+              comes off, so the bar reads as the frame's thick top rather than a
+              slab sitting inside a frame of some other colour (D2 as amended).
+              Desktop only, in CSS not a `useIsMobile` branch — these two
+              registers are SSR'd, and the mobile pane has no frame either. */}
+          <div
+            aria-hidden
+            className="ah-profile-wall pointer-events-none absolute bottom-0 left-0 top-0"
+            style={{ width: VESSEL_WALL, background: palette.walls }}
+          />
+          <div
+            aria-hidden
+            className="ah-profile-wall pointer-events-none absolute bottom-0 right-0 top-0"
+            style={{ width: VESSEL_WALL, background: palette.walls }}
+          />
+          {body}
+        </div>
+      ) : (
+        body
+      )}
     </div>
   );
 }

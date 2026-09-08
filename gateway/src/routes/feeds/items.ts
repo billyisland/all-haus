@@ -12,9 +12,11 @@ import {
 } from "../../lib/post-mapper.js";
 import { UUID_RE, feedRowToResponse, loadFeed } from "./shared.js";
 import {
-  DEDUP_CTES,
+  dedupCtes,
   DEDUP_SUPPRESS_FILTER,
   DEDUP_PROVENANCE_LATERAL,
+  dedupApplicableExistsSql,
+  dedupMinConfidence,
 } from "../../lib/dedup-sql.js";
 import {
   resonanceRankingEnabled,
@@ -121,6 +123,20 @@ export async function loadFeedItemsPage(
 // page. (One-time effect on deploy: cursors held by in-flight paginators are
 // untagged, so they decode to undefined and restart once — the same graceful
 // degradation this endpoint already had for the source-transition case.)
+// The feed's dominant sampling mode: most common across its non-muted source
+// rows, alphabetical tiebreak for determinism. Exported so the plan-probe test
+// runs the route's own text — this used to be a `feed_mode` CTE read by two
+// correlated scalar subqueries inside a per-row CASE, and moving it out of the
+// query is what lets the ranking pass go parallel (see the plan probe below).
+// `$2` is the feed id, matching the main query's param layout.
+export const FEED_SAMPLING_MODE_SQL = `
+  SELECT sampling_mode
+    FROM feed_sources
+   WHERE feed_id = $2 AND muted_at IS NULL
+   GROUP BY sampling_mode
+   ORDER BY COUNT(*) DESC, sampling_mode
+   LIMIT 1`;
+
 const UNBOUNDED_SCORE = 1e18;
 
 type FeedCursor =
@@ -227,7 +243,52 @@ async function sourceFilteredItems(
   // columns, instead of the cron-baked native-only fi.score. Off, the branch
   // below is byte-for-byte what it always was. The extra params are appended
   // AFTER the optional cursor pair so their indices don't shift with it.
-  const blend = resonanceRankingEnabled() ? await loadProofBlendParams() : null;
+  // ── The plan probe (§6.6) ─────────────────────────────────────────────────
+  // Two facts, one cheap round trip, both of which decide the SHAPE of the feed
+  // query rather than a value inside it — so both must be known before it is
+  // built. Postgres will not parallelise a plan whose expression tree contains
+  // a parallel-unsafe or parallel-restricted node ANYWHERE, so a branch that
+  // this feed can never take still costs it the parallel plan; the fix for that
+  // class is always to leave the branch out, never to make it cheaper.
+  //
+  //   sampling_mode — `random()` is PARALLEL RESTRICTED (`pg_proc.proparallel =
+  //     'r'`). Carried as one arm of a per-row CASE, it de-parallelised the
+  //     ranking pass for EVERY feed including the ~all of them that are
+  //     chronological. Measured on dev (717-source feed, ranking core, median
+  //     of 3): 280 ms with the CASE, 172 ms with the mode's own expression
+  //     spliced in and the other arms absent — `Gather Merge` + `Parallel Seq
+  //     Scan` come back. Splicing also drops two correlated scalar subqueries
+  //     per row.
+  //
+  //   has_links — the dedup block's `WITH RECURSIVE` is parallel-UNsafe, the
+  //     same class one step worse. Its cost is real but conditional: at zero
+  //     links the CTEs genuinely short-circuit (`candidates` returns 0 rows in
+  //     0.081 ms) and the recursion adds ~110 ms to the core, all of it the
+  //     lost parallelism — which is why removing it bought nothing until
+  //     `random()` went too, and why the two fixes are one fix.
+  //
+  // The mode read is the feed's dominant sampling_mode, unchanged in meaning
+  // from the `feed_mode` CTE it replaces: most common across non-muted source
+  // rows, alphabetical tiebreak. No row (every source muted) → chronological,
+  // exactly as the old CASE's ELSE did.
+  const minConfidence = await dedupMinConfidence();
+  const {
+    rows: [plan],
+  } = await pool.query<{ sampling_mode: string | null; has_links: boolean }>(
+    `SELECT (${FEED_SAMPLING_MODE_SQL}) AS sampling_mode,
+            ${dedupApplicableExistsSql(3)} AS has_links`,
+    [readerId, feedId, minConfidence],
+  );
+  const dedupOn = plan?.has_links === true;
+  const samplingMode = plan?.sampling_mode ?? "chronological";
+
+  // The blend only ever fed the 'scored' arm, so a non-scored feed no longer
+  // loads it — and MUST not, now that its four params are pushed only when the
+  // expression that reads them is actually spliced in.
+  const blend =
+    resonanceRankingEnabled() && samplingMode === "scored"
+      ? await loadProofBlendParams()
+      : null;
   let alphaCte = "";
   let scoredModeExpr = `COALESCE(fi.score, 0)::float8 * m.weight`;
   // The blend's age term is scored "as of" one pinned instant: page 1 mints it,
@@ -248,17 +309,27 @@ async function sourceFilteredItems(
     scoredModeExpr = proofBlendScoreSql(gravity, floor, asOf);
   }
 
+  // Pushed only on the branch that reads it: Postgres refuses a bind carrying
+  // more parameters than the statement uses, so an unconditional push would
+  // error on every feed page that has no dedup block.
+  const dedupCtesFragment = dedupOn
+    ? `${dedupCtes(params.push(minConfidence))},`
+    : "";
+
+  // One arm, not a CASE over three. `random()` re-rolls per row exactly as it
+  // did — a random feed still pays the serial plan, because that is what
+  // random ordering costs; every other feed no longer pays it for a branch it
+  // cannot take.
+  const effectiveScoreExpr =
+    samplingMode === "scored"
+      ? scoredModeExpr
+      : samplingMode === "random"
+        ? `random() * m.weight`
+        : `EXTRACT(EPOCH FROM fi.published_at)::float8 * m.weight`;
+
   const result = await pool.query<any>(
     `
-    WITH RECURSIVE ${alphaCte}
-    feed_mode AS (
-      SELECT sampling_mode
-        FROM feed_sources
-        WHERE feed_id = $2 AND muted_at IS NULL
-        GROUP BY sampling_mode
-        ORDER BY COUNT(*) DESC, sampling_mode
-        LIMIT 1
-    ),
+    WITH${dedupOn ? " RECURSIVE" : ""} ${alphaCte}
     -- One UNION ALL branch per source_type, each an index-friendly equijoin,
     -- then GROUP BY to collapse multi-source matches (MAX weight / bool_or
     -- allow_replies — a writer subscribed via two sources gets the louder).
@@ -306,7 +377,7 @@ async function sourceFilteredItems(
     -- linked_sources / candidates / suppressed CTEs (page-independent winner +
     -- whole-candidate-set suppression). Factored into lib/dedup-sql.ts so the
     -- integration test runs the exact same SQL — see that module for the design.
-    ${DEDUP_CTES},
+    ${dedupCtesFragment}
     -- Rank-then-project: score, filter, sort and LIMIT over a SLIM row (id +
     -- effective_score + the columns the visibility predicates need), then join
     -- the heavy FEED_SELECT/POST_SELECT projection — with its correlated
@@ -319,13 +390,7 @@ async function sourceFilteredItems(
     ranked AS (
       SELECT * FROM (
         SELECT fi.id AS fi_id,
-          (CASE
-            WHEN (SELECT sampling_mode FROM feed_mode) = 'scored'
-              THEN ${scoredModeExpr}
-            WHEN (SELECT sampling_mode FROM feed_mode) = 'random'
-              THEN random() * m.weight
-            ELSE EXTRACT(EPOCH FROM fi.published_at)::float8 * m.weight
-          END)::float8 AS effective_score
+          (${effectiveScoreExpr})::float8 AS effective_score
         FROM feed_items fi
         JOIN matched m ON m.fi_id = fi.id
         LEFT JOIN notes n ON n.id = fi.note_id
@@ -349,7 +414,7 @@ async function sourceFilteredItems(
           -- matching source still admits replies (migration 107).
           AND (fi.is_reply IS NOT TRUE OR m.allow_replies)
           -- Slice 8 P1: drop the loser of a cross-source duplicate pair.
-          ${DEDUP_SUPPRESS_FILTER}
+          ${dedupOn ? DEDUP_SUPPRESS_FILTER : ""}
       ) s
       WHERE TRUE ${cursorClause}
       ORDER BY effective_score DESC, fi_id DESC
@@ -360,14 +425,14 @@ async function sourceFilteredItems(
     -- actually returned, not every survivor pre-LIMIT (the lateral references
     -- only scored.fi_id, which FEED_SELECT projects).
     -- effective_score/fi_id stay in scored.* for the JS cursor.
-    SELECT scored.*, prov.also_on
+    SELECT scored.*, ${dedupOn ? "prov.also_on" : "NULL::text[] AS also_on"}
     FROM (
       SELECT ${FEED_SELECT}${POST_SELECT}, r.effective_score
       FROM ranked r
       JOIN feed_items fi ON fi.id = r.fi_id
       ${FEED_JOINS}${POST_JOINS}
     ) scored
-    ${DEDUP_PROVENANCE_LATERAL}
+    ${dedupOn ? DEDUP_PROVENANCE_LATERAL : ""}
     -- Re-impose order: the lateral join doesn't preserve the subquery's ORDER,
     -- and the JS reads the last row for nextCursor (below). Cheap — ≤$3 rows.
     ORDER BY effective_score DESC, fi_id DESC

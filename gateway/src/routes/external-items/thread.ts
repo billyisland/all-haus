@@ -16,6 +16,7 @@ import {
   extractBlueskyViewMedia,
   stripHtmlTags,
   extractMastodonStatusId,
+  ensureContextFeedItem,
 } from "../../lib/external-items-shared.js";
 
 interface ExternalThreadEntry {
@@ -191,6 +192,12 @@ async function persistBlueskyFocus(
       ],
     );
 
+
+    // Give the context row its feed_items twin now rather than at 05:00 —
+    // without it the thread projector cannot resolve this post and re-rooting
+    // onto the tile the reader is looking at 404s. Best-effort: a failure here
+    // must not cost the reader the tile itself, and reconcile still catches it.
+    await ensureContextFeedItem(ins.rows[0].id).catch(() => {});
     return {
       id: ins.rows[0].id,
       sourceProtocol: "atproto",
@@ -449,6 +456,12 @@ async function persistMastodonFocus(
       ],
     );
 
+
+    // Give the context row its feed_items twin now rather than at 05:00 —
+    // without it the thread projector cannot resolve this post and re-rooting
+    // onto the tile the reader is looking at 404s. Best-effort: a failure here
+    // must not cost the reader the tile itself, and reconcile still catches it.
+    await ensureContextFeedItem(ins.rows[0].id).catch(() => {});
     return {
       id: ins.rows[0].id,
       sourceProtocol: "activitypub",

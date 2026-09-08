@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import pg from "pg";
 import {
-  DEDUP_CTES,
+  dedupCtes,
   DEDUP_SUPPRESS_FILTER,
   DEDUP_PROVENANCE_LATERAL,
+  dedupApplicableExistsSql,
 } from "../src/lib/dedup-sql.js";
 import {
   assertIdentityLink,
@@ -21,8 +22,7 @@ import {
 // canonical-URL vs text-hash grouping, the zero-link fast path, owner-scoped
 // visibility, and the `also_on` provenance lateral.
 //
-// Skipped unless a DB URL is supplied, so the no-Postgres CI `test` job stays
-// green. Run locally against the dev DB:
+// Skipped unless a DB URL is supplied — CI supplies one (it boots Postgres and FAILS on a skip). Run locally against the dev DB:
 //   POSTGRES_PASSWORD=$(grep -E '^POSTGRES_PASSWORD=' ../.env | cut -d= -f2-) \
 //   TEST_DATABASE_URL=postgresql://platformpub:$POSTGRES_PASSWORD@localhost:5432/platformpub \
 //     npx vitest run tests/dedup-integration.test.ts
@@ -30,13 +30,18 @@ import {
 
 const DB_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
 
+// §6.3: the confidence floor is a bound parameter, so every query below states
+// the floor it runs under rather than inheriting one. DEFAULT_FLOOR is
+// production's seeded value; the floor cases at the foot of the file vary it.
+const DEFAULT_FLOOR = 0.9;
+
 // `matched` is the host query's pre-LIMIT candidate set; here we feed it the
 // seeded feed_items directly so the dedup CTEs run over exactly our fixtures.
 const SUPPRESSED_SQL = `
   WITH RECURSIVE matched AS (
     SELECT id AS fi_id, TRUE AS allow_replies FROM feed_items WHERE id = ANY($2::uuid[])
   ),
-  ${DEDUP_CTES}
+  ${dedupCtes(3)}
   SELECT fi_id FROM suppressed
 `;
 
@@ -48,7 +53,7 @@ const SUPPRESSED_SQL_REPLY_GATED = `
     SELECT id AS fi_id, (id <> ALL($3::uuid[])) AS allow_replies
     FROM feed_items WHERE id = ANY($2::uuid[])
   ),
-  ${DEDUP_CTES}
+  ${dedupCtes(4)}
   SELECT fi_id FROM suppressed
 `;
 
@@ -57,7 +62,7 @@ const SURVIVORS_SQL = `
   WITH RECURSIVE matched AS (
     SELECT id AS fi_id, TRUE AS allow_replies FROM feed_items WHERE id = ANY($2::uuid[])
   ),
-  ${DEDUP_CTES},
+  ${dedupCtes(3)},
   scored AS (
     SELECT fi.id AS fi_id, fi.source_id, ei.dedup_fingerprint AS fp
     FROM feed_items fi
@@ -168,10 +173,15 @@ describe.skipIf(!DB_URL)("dedup integration (Slice 8 P1/P2)", () => {
     );
   }
 
-  async function suppressed(reader: string, ids: string[]): Promise<Set<string>> {
+  async function suppressed(
+    reader: string,
+    ids: string[],
+    floor = DEFAULT_FLOOR,
+  ): Promise<Set<string>> {
     const { rows } = await client.query<{ fi_id: string }>(SUPPRESSED_SQL, [
       reader,
       ids,
+      floor,
     ]);
     return new Set(rows.map((r) => r.fi_id));
   }
@@ -182,7 +192,7 @@ describe.skipIf(!DB_URL)("dedup integration (Slice 8 P1/P2)", () => {
   ): Promise<Map<string, string[] | null>> {
     const { rows } = await client.query<{ fi_id: string; also_on: string[] | null }>(
       SURVIVORS_SQL,
-      [reader, ids],
+      [reader, ids, DEFAULT_FLOOR],
     );
     return new Map(rows.map((r) => [r.fi_id, r.also_on]));
   }
@@ -310,7 +320,7 @@ describe.skipIf(!DB_URL)("dedup integration (Slice 8 P1/P2)", () => {
     const gated = async (disallowed: string[]) => {
       const { rows } = await client.query<{ fi_id: string }>(
         SUPPRESSED_SQL_REPLY_GATED,
-        [readerA, [replyTwin, visibleTwin], disallowed],
+        [readerA, [replyTwin, visibleTwin], disallowed, DEFAULT_FLOOR],
       );
       return new Set(rows.map((r) => r.fi_id));
     };
@@ -604,6 +614,127 @@ describe.skipIf(!DB_URL)("dedup integration (Slice 8 P1/P2)", () => {
       [a, b, readerA],
     );
     expect(rows.length).toBe(0);
+  });
+
+  // --- §6.6 the applicability probe -----------------------------------------
+  //
+  // The probe decides whether the live feed query is built WITH the dedup block
+  // at all, so its failure mode is not a slow page but a SILENT one: answer
+  // false while a link applies and content suppression is switched off for that
+  // reader with nothing to say so. These cases pin the one direction that
+  // matters — the probe is a SUPERSET of `applicable_links`, never a subset.
+  async function probe(reader: string, floor = DEFAULT_FLOOR): Promise<boolean> {
+    const { rows } = await client.query<{ has_links: boolean }>(
+      `SELECT ${dedupApplicableExistsSql(2)} AS has_links`,
+      [reader, floor],
+    );
+    return rows[0].has_links;
+  }
+
+  it("probe: false with no links, true for a global link (every reader)", async () => {
+    const s1 = await source("rss", "https://probe1.example/feed");
+    const s2 = await source("atproto", "did:plc:probe1");
+    expect(await probe(readerA)).toBe(false);
+
+    await link(s1, s2, "domain_match", null);
+    // A global link applies to everyone — a probe keyed on `owner_id = $1`
+    // alone would answer false here and silently un-dedup the whole platform.
+    expect(await probe(readerA)).toBe(true);
+    expect(await probe(readerB)).toBe(true);
+  });
+
+  it("probe: an assertion is visible to its owner and to nobody else", async () => {
+    const s1 = await source("rss", "https://probe2.example/feed");
+    const s2 = await source("atproto", "did:plc:probe2");
+    await assertIdentityLink(client, s1, s2, readerA);
+
+    expect(await probe(readerA)).toBe(true);
+    expect(await probe(readerB)).toBe(false);
+  });
+
+  it("probe: a reader holding only a tombstone has nothing to dedup", async () => {
+    const s1 = await source("rss", "https://probe3.example/feed");
+    const s2 = await source("atproto", "did:plc:probe3");
+    const [a, b] = orderedPair(s1, s2);
+    // A tombstone is a negative override: it suppresses nothing by itself, so
+    // `link_type <> 'user_unlinked'` is load-bearing, not slack.
+    await link(a, b, "user_unlinked", readerA);
+    expect(await probe(readerA)).toBe(false);
+  });
+
+  it("probe: OVER-approximates on a fully tombstoned link, and that is the safe direction", async () => {
+    const { s1, s2, winner, loser } = await dupPair("probeover");
+    await link(s1, s2, "domain_match", null);
+    const [a, b] = orderedPair(s1, s2);
+    await unlinkIdentityPair(client, a, b, readerA);
+
+    // `applicable_links` is now empty for readerA — dedup suppresses nothing…
+    expect((await suppressed(readerA, [winner, loser])).size).toBe(0);
+    // …and the probe still says true, so the reader pays for one correct,
+    // useless dedup pass. Deliberate: the probe omits the tombstone NOT EXISTS,
+    // so it can only ever cost a plan, never hide a merge that should happen.
+    expect(await probe(readerA)).toBe(true);
+  });
+
+  // --- §6.1 + §6.3 the confidence floor -------------------------------------
+  //
+  // The floor is the whole of the answer to "domain_match auto-merges distinct
+  // people sharing a website". These cases are about SUPPRESSION, not about the
+  // detector: a 0.6 link keeps being recorded and keeps being readable, it just
+  // stops hiding a post. Every other test in this file runs at DEFAULT_FLOOR
+  // with confidence-1.0 fixtures, so they pin the admit side by construction.
+
+  /** Link a pair at a stated confidence (the helper above takes the 1.0 default). */
+  async function linkAt(
+    sourceX: string,
+    sourceY: string,
+    linkType: string,
+    confidence: number,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO external_identity_links
+         (source_a_id, source_b_id, link_type, confidence, owner_id)
+       VALUES (LEAST($1::uuid,$2::uuid), GREATEST($1::uuid,$2::uuid), $3, $4, NULL)`,
+      [sourceX, sourceY, linkType, confidence],
+    );
+  }
+
+  it("a 0.6 domain_match hides nothing at the default floor", async () => {
+    const { s1, s2, winner, loser } = await dupPair("floor06");
+    await linkAt(s1, s2, "domain_match", 0.6);
+
+    // Two accounts posting the same headline is ordinary; a shared web host is
+    // not evidence they are the same person. Nothing is suppressed, and the
+    // probe agrees so the reader does not even pay for the plan.
+    expect((await suppressed(readerA, [winner, loser])).size).toBe(0);
+    expect(await probe(readerA)).toBe(false);
+  });
+
+  it("the same 0.6 link DOES merge once an operator lowers the floor", async () => {
+    const { s1, s2, winner, loser } = await dupPair("floor06on");
+    await linkAt(s1, s2, "domain_match", 0.6);
+
+    // The detector's output is not discarded — it is held back. Retuning is an
+    // UPDATE, per the tuning-dial rule, and this is what that UPDATE buys.
+    expect((await suppressed(readerA, [winner, loser], 0.5)).has(loser)).toBe(true);
+    expect(await probe(readerA, 0.5)).toBe(true);
+  });
+
+  it("a 0.95 bridge link merges at the default floor", async () => {
+    const { s1, s2, winner, loser } = await dupPair("floor095");
+    await linkAt(s1, s2, "bridge", 0.95);
+
+    // A bridge mirror EMBEDS the original identity, so the link is a decode
+    // rather than a guess — the one automated signal the floor admits.
+    expect((await suppressed(readerA, [winner, loser])).has(loser)).toBe(true);
+  });
+
+  it("the floor is a bound, not a link-type list: a downgraded bridge stops merging", async () => {
+    const { s1, s2, winner, loser } = await dupPair("floordown");
+    // Confidence is the discriminator, never the type name — so a detector that
+    // later emits a less certain bridge is held back without a code change.
+    await linkAt(s1, s2, "bridge", 0.7);
+    expect((await suppressed(readerA, [winner, loser])).size).toBe(0);
   });
 
   it("re-link after an unlink restores the merge (assert overrides a tombstone)", async () => {

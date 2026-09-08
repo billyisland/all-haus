@@ -105,6 +105,7 @@ export async function loadConfig(forceRefresh = false): Promise<PlatformConfig> 
 
   const config: PlatformConfig = {
     freeAllowancePence: int(map, 'free_allowance_pence', 500),
+    arrivalGiftCapPence: int(map, 'arrival_gift_cap_pence', 200),
     tabSettlementThresholdPence: int(map, 'tab_settlement_threshold_pence', 800),
     monthlyFallbackMinimumPence: int(map, 'monthly_fallback_minimum_pence', 200),
     writerPayoutThresholdPence: int(map, 'writer_payout_threshold_pence', 2000),

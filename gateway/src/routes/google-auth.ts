@@ -21,7 +21,8 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 //
 // Flow:
 //   1. Browser clicks "Continue with Google" → GET /api/v1/auth/google
-//   2. Gateway generates an HMAC-signed state, redirects to Google
+//   2. Gateway generates an HMAC-signed state (carrying any paywall-arrival
+//      intent), redirects to Google
 //   3. Google redirects to ${APP_URL}/auth/google/callback (Next.js page)
 //   4. That page POSTs { code, state } to /api/v1/auth/google/exchange
 //   5. Gateway verifies state HMAC, exchanges code, sets pp_session cookie
@@ -68,13 +69,42 @@ export async function googleAuthRoutes(app: FastifyInstance) {
   // GET /auth/google — redirect to Google
   // ---------------------------------------------------------------------------
 
-  app.get("/auth/google", async (req, reply) => {
+  app.get<{ Querystring: { arrival?: string } }>(
+    "/auth/google",
+    async (req, reply) => {
     const { clientId, redirectUri } = getGoogleConfig();
 
     // Use an HMAC-signed state so no cookie is needed.
     // A cookie set in a redirect response is not reliably forwarded by the
     // Next.js rewrite proxy, so we moved state verification server-side.
-    const state = generateSignedState();
+    //
+    // THE STATE IS ALSO THE ARRIVAL CARRIER (PAYWALL-ARRIVAL §5). It has to
+    // survive a round trip through a third party, and it is already HMAC-signed
+    // and verified server-side — so a d-tag carried in it is tamper-proof
+    // rather than merely safe, which matters because it is the value the grant
+    // looks a PRICE up from. A client-supplied price would be a free-money
+    // endpoint; a signed identifier is neither.
+    //
+    // BOUNDED AT THE SAME 200 THE POST SCHEMAS USE. The d-tag goes into the
+    // state string, which goes into a URL Google has to accept and hand back;
+    // unbounded, a caller could push an arbitrarily long value through the HMAC
+    // and out the other side. `arrivalDTag` is `z.string().min(1).max(200)` on
+    // every POST carrier, and this GET is the same value arriving by a different
+    // door, so it gets the same ceiling. Over-long is DROPPED rather than
+    // refused: the arrival intent is a courtesy on top of a sign-in, and failing
+    // the sign-in over it would trade a lost welcome for a lost account.
+    //
+    // AND TYPED, not just bounded: `arrival?: string` is a TypeScript claim
+    // about a querystring Fastify parses freely, and `?arrival=a&arrival=b`
+    // arrives as an ARRAY whose `.length` passes the bound and reaches the
+    // HMAC. Harmless in outcome (a nonsense d-tag is NO_GIFT), but a bound on
+    // a value of the wrong shape is not a bound (CONSOLIDATED-TODO §0w item 4).
+    const arrival = req.query.arrival;
+    const state = generateSignedState(
+      typeof arrival === "string" && arrival.length > 0 && arrival.length <= 200
+        ? arrival
+        : null,
+    );
 
     const params = new URLSearchParams({
       client_id: clientId,
@@ -86,7 +116,8 @@ export async function googleAuthRoutes(app: FastifyInstance) {
     });
 
     return reply.redirect(`${GOOGLE_AUTH_URL}?${params.toString()}`);
-  });
+  },
+  );
 
   // ---------------------------------------------------------------------------
   // POST /auth/google/exchange — complete OAuth from the frontend callback page
@@ -105,10 +136,12 @@ export async function googleAuthRoutes(app: FastifyInstance) {
       return reply.status(400).send({ error: "Missing code or state" });
     }
 
-    if (!verifySignedState(state)) {
+    const stateCheck = verifySignedState(state);
+    if (!stateCheck.ok) {
       logger.warn("Google OAuth state verification failed in exchange");
       return reply.status(400).send({ error: "State mismatch" });
     }
+    const arrivalDTag = stateCheck.arrivalDTag;
 
     try {
       const { clientId, clientSecret, redirectUri } = getGoogleConfig();
@@ -204,7 +237,8 @@ export async function googleAuthRoutes(app: FastifyInstance) {
         );
         return reply.status(403).send({ error: CLOSED_BETA_ERROR });
       } else {
-        accountId = (await provisionAccount(email, name)).accountId;
+        accountId = (await provisionAccount(email, name, arrivalDTag))
+          .accountId;
         logger.info(
           { accountId, email: email.slice(0, 3) + "***" },
           "Google login — new account created",
@@ -222,7 +256,12 @@ export async function googleAuthRoutes(app: FastifyInstance) {
         nostrPubkey: account.nostrPubkey,
       });
 
-      return reply.status(200).send({ ok: true });
+      // Handed back so the callback page can route to the piece rather than to
+      // the workspace. An EXISTING account gets it too — they came to read
+      // something and should land on it — and gets no gift and no welcome,
+      // because both are gated on `arrival_article_id`, which is stamped at
+      // creation and so is false for everyone who was already a member (§11.5).
+      return reply.status(200).send({ ok: true, arrivalDTag });
     } catch (err) {
       logger.error({ err }, "Google OAuth exchange failed");
       return reply.status(500).send({ error: "Exchange failed" });
@@ -249,35 +288,60 @@ function getStateSecret(): string {
   return secret;
 }
 
-function generateSignedState(): string {
+// Format: <nonce>.<timestamp>.<arrival-b64url>.<hmac-sha256-hex>
+//
+// The third segment is the paywall-arrival intent, base64url-encoded so it can
+// never contain the delimiter, and EMPTY for every ordinary sign-in — which is
+// why it is a fixed four-segment format rather than an optional fifth thing:
+// an optional segment would mean two payload shapes signing to two different
+// strings, and the shorter one would verify against neither.
+//
+// It is inside the SIGNED payload, not beside it. The value decides how much
+// money a new account is granted (`resolveArrivalGift` looks the price up from
+// it), so a tamperable one would be a free-money endpoint reached through a
+// third party's redirect.
+function generateSignedState(arrivalDTag: string | null): string {
   const nonce = randomBytes(16).toString("hex");
   const timestamp = Math.floor(Date.now() / 1000);
-  const payload = `${nonce}.${timestamp}`;
+  const arrival = arrivalDTag
+    ? Buffer.from(arrivalDTag, "utf8").toString("base64url")
+    : "";
+  const payload = `${nonce}.${timestamp}.${arrival}`;
   const sig = createHmac("sha256", getStateSecret())
     .update(payload)
     .digest("hex");
   return `${payload}.${sig}`;
 }
 
-function verifySignedState(state: string): boolean {
+function verifySignedState(state: string): {
+  ok: boolean;
+  arrivalDTag: string | null;
+} {
+  const bad = { ok: false, arrivalDTag: null };
   const parts = state.split(".");
-  if (parts.length !== 3) return false;
-  const [nonce, ts, sig] = parts;
+  if (parts.length !== 4) return bad;
+  const [nonce, ts, arrival, sig] = parts;
   const timestamp = parseInt(ts, 10);
-  if (isNaN(timestamp)) return false;
+  if (isNaN(timestamp)) return bad;
   if (Math.floor(Date.now() / 1000) - timestamp > STATE_MAX_AGE_SECONDS)
-    return false;
-  const payload = `${nonce}.${ts}`;
+    return bad;
+  const payload = `${nonce}.${ts}.${arrival}`;
   const expectedSig = createHmac("sha256", getStateSecret())
     .update(payload)
     .digest();
   const sigBuf = Buffer.from(sig, "hex");
-  if (sigBuf.length !== expectedSig.length) return false;
-  if (!timingSafeEqual(sigBuf, expectedSig)) return false;
+  if (sigBuf.length !== expectedSig.length) return bad;
+  if (!timingSafeEqual(sigBuf, expectedSig)) return bad;
 
-  if (consumedNonces.has(nonce)) return false;
+  if (consumedNonces.has(nonce)) return bad;
   consumedNonces.set(nonce, timestamp);
-  return true;
+
+  return {
+    ok: true,
+    arrivalDTag: arrival
+      ? Buffer.from(arrival, "base64url").toString("utf8")
+      : null,
+  };
 }
 
 async function verifyIdToken(idToken: string): Promise<{

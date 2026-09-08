@@ -7,6 +7,7 @@ import { useUnreadCounts } from '../../stores/unread'
 import { notifications as notificationsApi, type Notification } from '../../lib/api'
 import { routeToOverlay } from '../../lib/workspace/overlays'
 import { timeAgo } from '../../lib/format'
+import { Avatar } from '../ui/Avatar'
 
 // =============================================================================
 // NotificationsPanel — the notifications activity log. It is the left column of
@@ -102,13 +103,13 @@ function NotificationRow({ n, onActivate }: { n: Notification; onActivate: (n: N
       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') onActivate(n) }}
       className={`flex items-start gap-3 px-1 py-4 hover:bg-grey-100/50 transition-colors cursor-pointer ${isUnread ? 'bg-glasshouse-well' : ''}`}
     >
-      {n.actor?.avatar ? (
-        <img src={n.actor.avatar} alt="" className="h-10 w-10 object-cover flex-shrink-0 mt-0.5" />
-      ) : (
-        <span className="flex h-10 w-10 items-center justify-center bg-grey-100 text-sm font-medium text-grey-600 flex-shrink-0 mt-0.5">
-          {(n.actor?.displayName ?? n.actor?.username ?? '?')[0].toUpperCase()}
-        </span>
-      )}
+      <span className="flex flex-shrink-0 mt-0.5">
+        <Avatar
+          src={n.actor?.avatar}
+          name={n.actor?.displayName ?? n.actor?.username ?? '?'}
+          size={40}
+        />
+      </span>
 
       <div className="min-w-0 flex-1">
         {n.type === 'new_reply' ? (

@@ -75,9 +75,15 @@ function edgeKey(e: RepostEdge): string {
 }
 
 export interface State {
-  // The conversation's anchor: what "↑ Full conversation" returns to. The
-  // opened item — until a quote-jump (set-root) re-anchors it on the quoted
-  // post, which then IS its own conversation.
+  // The conversation's anchor: the opened item — until a quote-jump (set-root)
+  // re-anchors it on the quoted post, which then IS its own conversation.
+  //
+  // It used to be what "↑ Full conversation" returned to, and that button is
+  // gone (2026-09-07). Two live readers remain, so this is not dead state:
+  // `set-root` carries the quote-jump's seniority through it, and PostThread
+  // reads `focalId === rootId` to choose where the scroll-in lands — `start`
+  // at the thread's own root, `center` after an intra-thread re-root, where
+  // the ancestors above are the context that makes the re-root legible.
   rootId: string | null;
   focalId: string | null;
   pool: Map<string, Post>;
@@ -87,7 +93,6 @@ export interface State {
   rerooting: boolean; // fetching an unloaded subtree on re-root
   loadingMore: boolean;
   error: boolean;
-  paywallLocked: boolean;
 }
 
 export type Action =
@@ -111,7 +116,6 @@ export const INITIAL: State = {
   rerooting: false,
   loadingMore: false,
   error: false,
-  paywallLocked: false,
 };
 
 // Exported for the reroot-vs-quote-jump state tests (no DOM test rig in web).
@@ -123,9 +127,9 @@ export function reducer(state: State, action: Action): State {
       return { ...state, focalId: action.id };
     case "set-root":
       // A quote-tile jump: the quoted post belongs to a DIFFERENT conversation,
-      // so root and focal move together and it opens with full seniority — no
-      // "↑ Full conversation" residue pointing back at the quoting host. This
-      // is the thread-side twin of the feed-level expandQuote grammar.
+      // so root and focal move together and it opens with full seniority,
+      // anchored on itself rather than on the quoting host. This is the
+      // thread-side twin of the feed-level expandQuote grammar.
       return { ...state, rootId: action.id, focalId: action.id };
     case "reroot-start":
       return { ...state, rerooting: true, error: false };
@@ -175,8 +179,6 @@ export function reducer(state: State, action: Action): State {
         rerooting: false,
         loadingMore: false,
         error: false,
-        // Lock state belongs to the gated root; only reflect it from the host fetch.
-        paywallLocked: action.root ? !!res.paywallLocked : state.paywallLocked,
       };
     }
     case "merge": {
@@ -213,10 +215,8 @@ export interface PostThreadApi {
   rerooting: boolean;
   loadingMore: boolean;
   error: boolean;
-  paywallLocked: boolean;
   reroot: (id: string) => void;
   rerootAsRoot: (id: string) => void; // quote-jump: root + focal move together
-  backToRoot: () => void;
   loadMore: () => void;
 }
 
@@ -403,11 +403,6 @@ export function usePostThread(
     [fetchFocal],
   );
 
-  const backToRoot = useCallback(() => {
-    const root = stateRef.current.rootId;
-    if (root) dispatch({ kind: "set-focal", id: root });
-  }, []);
-
   const loadMore = useCallback(() => {
     const s = stateRef.current;
     if (!s.focalId) return;
@@ -439,10 +434,8 @@ export function usePostThread(
     rerooting: state.rerooting,
     loadingMore: state.loadingMore,
     error: state.error,
-    paywallLocked: state.paywallLocked,
     reroot,
     rerootAsRoot,
-    backToRoot,
     loadMore,
   };
 }

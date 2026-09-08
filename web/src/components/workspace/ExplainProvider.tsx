@@ -17,6 +17,7 @@ import {
 } from "../../lib/explain/registry";
 import { useExplain, type Annotation, type Program } from "../../stores/explain";
 import { useGlasshousePresence } from "../../stores/glasshouse";
+import { readingLog } from "../../lib/api/articles";
 
 // =============================================================================
 // ExplainProvider — the registration substrate for the Explain engine.
@@ -177,7 +178,10 @@ export function useOpenExplain(): () => void {
 // whose target element is absent at render renders free-floating centred.
 // ---------------------------------------------------------------------------
 
-function resolveFirstRunProgram(registry: ExplainRegistry): Program {
+function resolveFirstRunProgram(
+  registry: ExplainRegistry,
+  hasReading: boolean,
+): Program {
   const anchor = registry
     .snapshot()
     .filter((r) => r.kind === "vessel")
@@ -185,7 +189,7 @@ function resolveFirstRunProgram(registry: ExplainRegistry): Program {
   const anchorKey = anchor?.key;
   const fromStarter = !!anchor?.params?.fromStarter;
 
-  const annotations: Annotation[] = firstRunBeats(fromStarter).map((b) => ({
+  const annotations: Annotation[] = firstRunBeats(fromStarter, hasReading).map((b) => ({
     kind: b.kind,
     // Beats 1 (vessel) + 2 (vessel.addSource) anchor to the same vessel; every
     // other beat is a singleton / representative card and carries no key.
@@ -204,36 +208,75 @@ function resolveFirstRunProgram(registry: ExplainRegistry): Program {
 // Resolve the first-run program from the live registry and open it. No-op
 // outside a provider or with zero annotations (unreachable — the six beats are
 // fixed). Used by the FirstRunController's D6 auto-entry.
-export function useOpenFirstRun(): () => void {
+export function useOpenFirstRun(): (hasReading?: boolean) => void {
   const registry = useContext(ExplainContext);
-  return useCallback(() => {
-    if (!registry) return;
-    const program = resolveFirstRunProgram(registry);
-    if (program.annotations.length === 0) return;
-    useExplain.getState().open(program);
-  }, [registry]);
+  return useCallback(
+    (hasReading = false) => {
+      if (!registry) return;
+      const program = resolveFirstRunProgram(registry, hasReading);
+      if (program.annotations.length === 0) return;
+      useExplain.getState().open(program);
+    },
+    [registry],
+  );
+}
+
+// Has this member opened anything in a reader? Gates the arrival beat
+// (PAYWALL-ARRIVAL D6, re-housed), and since 2026-09-04 it reads RECENT READING
+// rather than the library — the beat says "the piece you were just reading",
+// which is a recency claim, so it lands on the log that makes the same claim
+// (READING-LOG-AND-LIBRARY-ADR §8.1; the Path C consequence is written out at
+// the copy itself).
+//
+// RESOLVES ON FAILURE, NEVER REJECTS, and that is the rule rather than
+// defensiveness: a failed read means NO BEAT, which is the same answer as an
+// empty log — whereas a rejection here would take the whole tour down with it,
+// for a member who by construction gets one showing. Losing one pointer to the
+// Library is a smaller failure than losing the introduction.
+//
+// AND THAT SWALLOW IS EXACTLY WHY THE ROUTE BEHIND IT MUST BE DRIVEN. Its
+// predecessor (`/my/reading-history`) answered 500 for every caller from the
+// day it was written, and this `.catch` — correctly — turned that into the
+// ordinary negative answer, so the beat silently never fired for anyone. Prove
+// a gate like this by asserting the ROW, never by the caller's silence.
+async function readHasReading(): Promise<boolean> {
+  try {
+    return (await readingLog.list(1)).items.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 export const FIRSTRUN_SEEN_PREFIX = "workspace:firstrun_seen:";
 
-// Headless D6 auto-entry controller — DORMANT since 2026-07-15 (no longer
-// mounted): auto-running the tour on a fresh device's first load proved
-// disorienting on the live site, so Explain is strictly ∀-menu-invoked. Kept
-// intact for revival — remount it in WorkspaceView's desktop branch.
-// When mounted, it lives inside the provider on the DESKTOP
-// floor only. `armed` carries the WorkspaceView-owned gates: bootstrap ready,
-// the ForallCeremony not pending/playing (defensively subscribed even though it
-// is dark today — D6/§0.2), and BringYourWorld not showing. This component adds
-// the rest of D6: (a) the per-device seen-flag, (d) ≥1 vessel registered, the
-// ≤4s wait for a card.byline (beat-3 readiness) then run-anyway on timeout, and
-// the courtesy of never firing over a deep-linked Glasshouse. The seen-flag is
-// written when first-run OPENS (§6), so a one-gesture dismiss still counts.
+// Headless D6 auto-entry controller. REVIVED 2026-09-04 and mounted again in
+// WorkspaceView's desktop branch. It was dormant from 2026-07-15 —
+// auto-running the tour on a fresh device's first load proved disorienting, so
+// Explain was made strictly ∀-menu-invoked and the tour was reached only by
+// accepting the welcome sheet's last step. That sheet is deleted, so this is the entry again.
+//
+// TWO GATES, AND THE OUTER ONE IS ABOUT THE MEMBER. `armed` carries the
+// caller's: bootstrap ready, no ceremony playing, and `accounts.onboarded_at`
+// still NULL — the last of which is what stops a member who took the tour on
+// their laptop being ambushed by it on their phone (the once-per-member
+// invariant; a localStorage key alone is exactly the failure it names). This
+// component adds the rest of D6: the per-device seen-flag, (d) ≥1 vessel
+// registered, the ≤4s wait for a card.byline (beat-3 readiness) then
+// run-anyway on timeout, and the courtesy of never firing over a deep-linked
+// Glasshouse. The seen-flag is written when first-run OPENS (§6), so a
+// one-gesture dismiss still counts — and `onOpened` fires there too, for the
+// same reason: the caller stamps the member-level fact at the moment the tour
+// is shown, not when it is finished.
 export function FirstRunController({
   userId,
   armed,
+  onOpened,
 }: {
   userId: string;
   armed: boolean;
+  /** Fired at the same instant as the per-device flag is written — the tour is
+   *  on screen. The caller stamps `accounts.onboarded_at` here. */
+  onOpened?: () => void;
 }) {
   const registry = useContext(ExplainContext);
   const openFirstRun = useOpenFirstRun();
@@ -279,7 +322,14 @@ export function FirstRunController({
         // Quota / private browsing — run the tour anyway; it may offer once
         // more next session, which is harmless.
       }
-      openFirstRun();
+      // The arrival beat's gate is the LAST thing resolved, so the wait for it
+      // cannot delay any of the readiness checks above — and it cannot fail
+      // the tour either (`readHasReading` resolves on failure).
+      void readHasReading().then((hasReading) => {
+        if (cancelled) return;
+        openFirstRun(hasReading);
+        onOpened?.();
+      });
     };
 
     poll();
@@ -287,55 +337,88 @@ export function FirstRunController({
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [armed, userId, registry, openFirstRun]);
+  }, [armed, userId, registry, openFirstRun, onOpened]);
 
   return null;
 }
 
-// Headless launcher for the tour ACCEPTED on the welcome sheet's last step
-// (`Welcome.tsx`). Distinct from `FirstRunController` above, which is the
-// dormant AUTO-entry: this fires only on an explicit yes, which is the whole
-// difference EXPLAIN-ADR amendment 1 turned on ("landing in Explain mode on load
-// without asking for it read as a malfunction, not a welcome").
+// ---------------------------------------------------------------------------
+// Headless PREVIEW entry — `/reader?firstrun=1` replays the six beats on
+// demand. Added 2026-09-04 because the sequence had become unwatchable: with
+// the welcome sheet deleted the tour runs exactly once per member, gated on a
+// column and a device key, so seeing it meant minting a fresh account or
+// hand-editing the database — and a piece of copy nobody can look at is a
+// piece of copy nobody checks.
 //
-// IT EXISTS TO OWN THE ORDERING. Floor-mode Explain sits BELOW the Glasshouse
-// band by design (CLAUDE.md, Stacking order), so a tour opened while the welcome
-// pane is still mounted renders behind it — the accepted tour would look like
-// nothing happening. Mounting this only once the sheet has gone means the open
-// lands in a later commit than the unmount, rather than relying on both
-// batching. The caller renders it as `{tourPending && !welcomeOpen && <…/>}`.
+// IT IS A PREVIEW, SO IT CONSUMES NOTHING. No seen-flag is written and
+// `onboarded_at` is not stamped: the whole point is that it can be run twice.
+// That is the entire difference from `FirstRunController` above, and it is why
+// this is a separate component rather than a `preview` prop on that one — a
+// gate with a bypass inside it stops being a gate you can read.
 //
-// Writes the first-run seen-flag on open (D6's seen-on-open), so a revived
-// `FirstRunController` would not re-offer a tour this member has already taken.
-// Declining does NOT write it: they have not seen it, and Explain stays
-// reachable from the ∀ menu either way.
-export function FirstRunLauncher({
-  userId,
-  onLaunched,
-}: {
-  userId: string;
-  onLaunched: () => void;
-}) {
+// GATED ON THE BROWSER BEING ON LOCALHOST, which is an unusual gate and is the
+// honest one available: the web image is a PRODUCTION build even in the dev
+// stack (`NODE_ENV=production` in web/Dockerfile), so the usual environment
+// check is false exactly where this needs to be true. The hostname is the
+// address bar's, so this is inert on the deployed site. It is a low-stakes
+// affordance — it replays copy, moves no money and changes no state — but an
+// ungated `?firstrun=1` is still a URL somebody could hand a member, and a
+// tour that arrives unasked is the thing amendment 1 was written about.
+//
+// WAITS FOR A VESSEL like the controller does, and for the same reason: the
+// beats anchor to real elements, and a program resolved against an empty
+// registry has nothing to point at.
+export function FirstRunPreview() {
+  const registry = useContext(ExplainContext);
   const openFirstRun = useOpenFirstRun();
 
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      try {
-        window.localStorage.setItem(`${FIRSTRUN_SEEN_PREFIX}${userId}`, "true");
-      } catch {
-        // Quota / private browsing — the tour still runs; worst case a revived
-        // auto-entry offers it once more, which is harmless.
+    if (!registry || typeof window === "undefined") return;
+    const { hostname, search } = window.location;
+    if (hostname !== "localhost" && hostname !== "127.0.0.1") return;
+    if (new URLSearchParams(search).get("firstrun") !== "1") return;
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const started = Date.now();
+
+    const poll = () => {
+      if (cancelled) return;
+      const vessels = registry.snapshot().filter((r) => r.kind === "vessel");
+      if (vessels.length === 0 && Date.now() - started < 8000) {
+        timer = setTimeout(poll, 200);
+        return;
       }
-    }
-    openFirstRun();
-    onLaunched();
-    // Fire once per mount: the caller unmounts this via `onLaunched`, and a
-    // re-run would re-open a tour the member may have just dismissed.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+      // Beat-3 readiness, same 4s window as the controller: beat 3 anchors on a
+      // card byline, and without one it free-floats (D8) — fine, but not what
+      // you want to be looking at when you opened this to check the beats.
+      const hasByline = vessels.some((v) =>
+        v.ref.current?.querySelector('[data-explain="card.byline"]'),
+      );
+      if (!hasByline && Date.now() - started < 4000) {
+        timer = setTimeout(poll, 200);
+        return;
+      }
+      void readHasReading().then((hasReading) => {
+        if (!cancelled) openFirstRun(hasReading);
+      });
+    };
+
+    poll();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [registry, openFirstRun]);
 
   return null;
 }
+
+// `FirstRunLauncher` — the headless launcher for the tour ACCEPTED on the
+// welcome sheet's last step — was DELETED 2026-09-04 with the sheet itself. It
+// existed to fire on an explicit yes, which was the distinction EXPLAIN-ADR
+// amendment 1 turned on; with no sheet there is no yes to fire on, and
+// `FirstRunController` above is the entry again.
 
 // Register an explainable ROOT. Pass an existing `ref` (the vessel/floor already
 // owns one) or let the hook mint one and attach the returned ref to the DOM

@@ -101,15 +101,17 @@ const FIGURES: Figure[] = [
 
 export default function HomePage() {
   return (
-    // No topbar: every route is chromeless now, and the one piece of chrome a
-    // visitor meets is the nav row LayoutShell mounts at the foot of the
-    // viewport. A visitor meets the member grammar — bone floor, one ⊔ vessel
-    // at the 8px lattice, cards — with none of the feed furniture that grammar
-    // usually carries. See LandingVessel for what is deliberately absent.
+    // The one piece of chrome a visitor meets is the nav bar LayoutShell
+    // mounts along the top of the viewport (the top bar is the sitewide rule,
+    // 2026-08-31 — brand mark top-left on every page; its predecessor was a
+    // bottom row). A visitor meets the member grammar — bone floor, one ⊔
+    // vessel at the 8px lattice, cards — with none of the feed furniture that
+    // grammar usually carries. See LandingVessel for what is deliberately
+    // absent.
     //
     // AN APP SHELL, NOT A SCROLLING DOCUMENT. The page is a `100dvh` flex column
     // pinned to the viewport (`overflow: hidden`): the vessel area fills the
-    // space above the nav row, the vessel fills that area, and the card column
+    // space below the nav bar, the vessel fills that area, and the card column
     // scrolls INSIDE the vessel. Nothing scrolls at the document level, so the
     // whole vessel is always on screen and the mobile URL-bar rubber-band (which
     // the earlier document-scroll layout suffered) cannot happen. dvh, not vh —
@@ -119,26 +121,27 @@ export default function HomePage() {
     // the same exception that gives it the doubled wall: it is the only public
     // page whose vessel IS the page, at the prose measure, tuned to its own
     // headroom. PublicShell serves the pages that ask the visitor for something.
-    // What `/` no longer owns is the ROW — that was `LandingNavRow`, an in-flow
-    // 56px band at the end of this column, now superseded by the fixed
-    // `PublicNavRow` LayoutShell mounts on every non-workspace route. The space
-    // it used to occupy in the flow is reserved here instead, as
-    // `--ah-row-band` (NAV_ROW_H + GRID) of bottom padding — which comes to
-    // exactly what the in-flow row plus the vessel area's old 8px bottom
-    // padding did, so nothing moves.
+    // What `/` no longer owns is the CHROME — that was `LandingNavRow`, an
+    // in-flow 56px band at the end of this column, superseded by the fixed
+    // nav chrome LayoutShell mounts on every non-workspace route (a bottom
+    // row at first; a TOP bar since 2026-08-31, when the top bar became the
+    // sitewide rule). The bar's space is reserved here as `--ah-bar-band`
+    // (NAV_BAR_H + GRID) of TOP padding, and the vessel area's own top
+    // padding (`.ah-landing-area`) sits inside that as the headroom above the
+    // vessel's mouth.
     //
     // The floor is `--ah-bone`, a neutral slug, so it inverts with the global
     // toggle. It is also the vessel's own interior colour under `basic`, which
     // is the point of choosing that colourway here: the walls read as ink rules
     // laid on a continuous ground rather than as a box drawn around content.
     // Painting it on THIS element — the full 100dvh, with the band inside as
-    // padding — is what keeps the band's clearance above the row bone rather
+    // padding — is what keeps the band's clearance under the bar bone rather
     // than letting `body` show through it.
     <div
       style={{
         background: 'var(--ah-bone)',
         height: '100dvh',
-        paddingBottom: 'var(--ah-row-band, 0px)',
+        paddingTop: 'var(--ah-bar-band, 0px)',
         display: 'flex',
         flexDirection: 'column',
         overflow: 'hidden',
@@ -146,13 +149,12 @@ export default function HomePage() {
     >
       <HomeRedirect />
 
-      {/* Vessel area — fills all space above the nav row's reserved band and
+      {/* Vessel area — fills all space below the nav bar's reserved band and
           centres the column. On desktop its side padding is the bone floor
           showing around the vessel; ON MOBILE THAT MARGIN GOES and the vessel
           runs the full viewport width, which is why the padding lives in
           `.ah-landing-area` (globals.css §1c) rather than inline: the page is
-          SSR'd, so the switch has to be a media query. No bottom padding
-          either way — the band on the parent carries it. */}
+          SSR'd, so the switch has to be a media query. */}
       <div
         className="ah-landing-area"
         style={{

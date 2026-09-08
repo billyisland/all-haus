@@ -166,15 +166,22 @@ describe("publication subscriptions (per-route gate)", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("404s unsubscribe while dark, without touching the database", async () => {
+  it("unsubscribe stays LIVE while dark — a reader can always withdraw", async () => {
     dark();
     const app = await buildApp();
-    const res = await app.inject({
+    await app.inject({
       method: "DELETE",
       url: `/subscriptions/publication/${PUB}`,
     });
-    expect(res.statusCode).toBe(404);
-    expect(calls).toHaveLength(0);
+    // Query count, NOT status code (same reasoning as the writer-routes test
+    // below: the empty mocked DB answers 404 "no such subscription", which is
+    // byte-identical to the suspension 404). That it issued SQL proves the
+    // handler ran. Cancel is deliberately ungated: an auto-renew subscription
+    // is a standing recurring charge, and a cancel that 404s during the dark
+    // window is LOST — re-enabling the flag would then charge a reader who
+    // provably tried to stop it. Re-add requirePublicationsEnabled() to the
+    // DELETE route and this goes red, which is the point of it.
+    expect(calls.length).toBeGreaterThan(0);
   });
 
   it("leaves the WRITER subscription routes alone — no collateral darkening", async () => {
@@ -201,11 +208,9 @@ describe("formula projection (feeds/formulas.ts::freezeSource)", () => {
     source_type: "publication" as const,
     publication_pubkey: "a".repeat(64),
     publication_name: "The Title",
-    publication_avatar: null,
     account_pubkey: null,
     account_display_name: null,
     account_username: null,
-    account_avatar: null,
     tag_name: null,
     external_protocol: null,
     external_source_uri: null,

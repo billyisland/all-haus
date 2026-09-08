@@ -302,6 +302,7 @@ function SourceFollowPicker({
         onDismiss={() => setOpen(false)}
         align="end"
         width={240}
+        ariaLabel="Add this author to a feed"
         className="p-1.5"
       >
         <>
@@ -324,7 +325,12 @@ function SourceFollowPicker({
                     disabled={busy}
                     className="flex w-full items-center justify-between gap-2 px-2 py-1.5 text-left text-ui-sm text-black hover:bg-glasshouse-well transition-colors disabled:opacity-50"
                   >
-                    <span className="truncate">{f.name}</span>
+                    {/* A feed's name is optional (migration 190); without this the row
+                        for an untitled feed is a blank line you cannot tell from
+                        its neighbours. Same wording as the ∀ menu's restore rows. */}
+                    <span className="truncate">
+                      {f.name.trim() || "Unnamed feed"}
+                    </span>
                     <span
                       className={`text-ui-sm ${inFeed ? "text-crimson" : "text-grey-300"}`}
                       aria-hidden

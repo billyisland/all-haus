@@ -219,7 +219,7 @@ export const publications = {
     request<{
       members: Array<{
         memberId: string; accountId: string; username: string; displayName: string;
-        avatarBlossomUrl: string | null; role: string; contributorType: string;
+        role: string; contributorType: string;
         title: string | null; isOwner: boolean; revenueShareBps: number | null;
       }>;
       articleShares: Array<{

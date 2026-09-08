@@ -36,7 +36,8 @@ import { receiptRoutes } from "./routes/receipts.js";
 import { exportRoutes } from "./routes/export.js";
 import { notificationRoutes } from "./routes/notifications.js";
 import { voteRoutes } from "./routes/votes.js";
-import { historyRoutes } from "./routes/history.js";
+import { libraryRoutes } from "./routes/library.js";
+import { readingLogRoutes } from "./routes/reading-log.js";
 import { giftLinkRoutes } from "./routes/gift-links.js";
 import { subscriptionOfferRoutes } from "./routes/subscription-offers.js";
 import { messageRoutes } from "./routes/messages.js";
@@ -50,7 +51,6 @@ import { runTributeSweep } from "./lib/tribute-sweep.js";
 import { expireOverdueDrives } from "./workers/drive-expiry.js";
 import { traffologyRoutes } from "./routes/traffology.js";
 import { unsubscribeRoutes } from "./routes/unsubscribe.js";
-import { bookmarkRoutes } from "./routes/bookmarks.js";
 import { tagRoutes } from "./routes/tags.js";
 import { resolveRoutes } from "./routes/resolve.js";
 import { externalFeedsRoutes } from "./routes/external-feeds.js";
@@ -73,6 +73,7 @@ import {
 } from "./lib/follow-import.js";
 import { getAtprotoClient } from "@platform-pub/shared/lib/atproto-oauth.js";
 import { publishScheduledDrafts } from "./workers/scheduler.js";
+import { sweepReadingLog } from "./workers/reading-log-sweep.js";
 import { sendWaitlistDigest } from "./workers/waitlist-digest.js";
 import { runDiscoverySweep } from "./lib/discovery-publish.js";
 import { relayForAccount } from "./lib/nostr-events.js";
@@ -206,7 +207,8 @@ async function start() {
   await app.register(voteRoutes, { prefix: "/api/v1" });
 
   // Reading history (list previously-read articles for the current reader)
-  await app.register(historyRoutes, { prefix: "/api/v1" });
+  await app.register(libraryRoutes, { prefix: "/api/v1" });
+  await app.register(readingLogRoutes, { prefix: "/api/v1" });
 
   // Gift links (capped shareable access tokens for paywalled articles)
   await app.register(giftLinkRoutes, { prefix: "/api/v1" });
@@ -241,7 +243,6 @@ async function start() {
   await app.register(traffologyRoutes, { prefix: "/api/v1" });
 
   // Bookmarks
-  await app.register(bookmarkRoutes, { prefix: "/api/v1" });
 
   // Tags
   await app.register(tagRoutes, { prefix: "/api/v1" });
@@ -449,6 +450,7 @@ async function start() {
   const LOCK_TRIBUTES = ADVISORY_LOCKS.TRIBUTES;
   const LOCK_FOLLOW_IMPORT = ADVISORY_LOCKS.FOLLOW_IMPORT;
   const LOCK_WAITLIST_DIGEST = ADVISORY_LOCKS.WAITLIST_DIGEST;
+  const LOCK_READING_LOG = ADVISORY_LOCKS.READING_LOG;
   const SCHEDULER_INTERVAL_MS = 60 * 1000; // 1 minute
 
   async function withAdvisoryLock(
@@ -500,6 +502,15 @@ async function start() {
       "Waitlist digest",
       sendWaitlistDigest,
     ).catch((err) => logger.error({ err }, "Waitlist digest worker failed"));
+    // Recent-reading retention (READING-LOG-AND-LIBRARY-ADR D5). Hourly is
+    // ample for a day-grained window — and it reaps reading_positions too,
+    // which since migration 189 dropped its ON DELETE CASCADE has no other
+    // reaper at all.
+    withAdvisoryLock(
+      LOCK_READING_LOG,
+      "Reading-log retention",
+      sweepReadingLog,
+    ).catch((err) => logger.error({ err }, "Reading-log retention sweep failed"));
   }, WORKER_INTERVAL_MS);
 
   setInterval(() => {
@@ -544,6 +555,13 @@ async function start() {
     "Waitlist digest",
     sendWaitlistDigest,
   ).catch((err) => logger.error({ err }, "Waitlist digest worker failed (startup)"));
+  withAdvisoryLock(
+    LOCK_READING_LOG,
+    "Reading-log retention",
+    sweepReadingLog,
+  ).catch((err) =>
+    logger.error({ err }, "Reading-log retention sweep failed (startup)"),
+  );
   withAdvisoryLock(
     LOCK_SCHEDULER,
     "Scheduled publishing",

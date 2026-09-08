@@ -41,7 +41,7 @@ import Fastify from "fastify";
 //                         from accounts; external_sources is owner-less and is
 //                         deleted explicitly).
 //
-// Skipped without a DB URL so the no-Postgres CI job stays green. Run locally
+// Skipped without a DB URL — CI supplies one (it boots Postgres and FAILS on a skip). Run locally
 // (both vars: the fixtures use their own client, the code under test uses the
 // shared pool, which reads DATABASE_URL):
 //   DATABASE_URL=postgresql://platformpub:PASSWORD@localhost:5432/platformpub \
@@ -70,6 +70,7 @@ const {
   freezeFeedSources,
   freezeFeedIntoFormula,
   populateFeedFromFormula,
+  populateFeedFromSources,
   registerFeedFormulaRoutes,
   formulaPublicRoutes,
 } = await import("../src/routes/feeds/formulas.js");
@@ -94,14 +95,11 @@ describe("freezeSource — the portability rules, without a database", () => {
     account_pubkey: null,
     account_display_name: null,
     account_username: null,
-    account_avatar: null,
     publication_pubkey: null,
     publication_name: null,
-    publication_avatar: null,
     external_protocol: null,
     external_source_uri: null,
     external_display_name: null,
-    external_avatar: null,
     external_relay_urls: null,
   };
 
@@ -159,6 +157,46 @@ describe("freezeSource — the portability rules, without a database", () => {
         }),
       ).toBeNull();
     }
+  });
+});
+
+// -----------------------------------------------------------------------------
+// The replay's suspended-protocol skip (§0u.2)
+//
+// No database, and that is the point: the guard runs BEFORE resolution, so a
+// suspended row never reaches addSource at all. Mutate the guard away and this
+// falls through to the resolve-and-add path, which files the failure under the
+// generic `error` arm — which is exactly the bug, a seed silently delivering
+// less than it names at every signup with no reason anyone can read.
+// -----------------------------------------------------------------------------
+describe("the replay's suspended-protocol skip, without a database", () => {
+  const publicationRow = {
+    tagKind: "p" as const,
+    tagValue: "a".repeat(64),
+    tagHint: null,
+    sourceType: "publication" as const,
+    protocol: null,
+    displayName: "The Quarterly",
+    avatarUrl: null,
+    weight: "4.0",
+    samplingMode: "chronological",
+    excludeReplies: false,
+  };
+
+  it("counts a publication row as `suspended` while publications are dark", async () => {
+    // PUBLICATIONS_ENABLED is unset in the suite, which is the shipping state
+    // (suspended 2026-08-31) and the state every signup is currently running
+    // in.
+    expect(process.env.PUBLICATIONS_ENABLED).not.toBe("1");
+    const out = await populateFeedFromSources(
+      "00000000-0000-0000-0000-000000000000",
+      "00000000-0000-0000-0000-000000000000",
+      [publicationRow],
+    );
+    expect(out.added).toBe(0);
+    expect(out.failed).toEqual([
+      { position: 0, label: "The Quarterly", reason: "suspended" },
+    ]);
   });
 });
 
@@ -1014,6 +1052,67 @@ describe.skipIf(!DB_URL)("share links", () => {
     expect(second.statusCode).toBe(200);
     expect(second.json().link.token).not.toBe(first.token);
     expect(await liveLinks(f)).toBe(1);
+  });
+
+  it("stops projecting a withdrawn feed, including its later edits", async () => {
+    // §0u.1. The link's own JOIN is live by design, so before the fix every
+    // field it projected tracked the feed AFTER the author pressed Stop: an
+    // author who withdrew a link and then renamed the feed to something
+    // private had the new name served to anyone still holding the token. The
+    // rename below is the whole test — a revoked link that merely omitted the
+    // name it had at revoke time would pass a weaker version of this.
+    const author = await account("withdrawn-author");
+    caller = author.id;
+    const f = await feed(author.id);
+    await follow(f, (await account("withdrawn-followee")).id);
+    const link = (await mint(f)).json().link;
+    expect(link.name).not.toBeNull();
+
+    await app.inject({ method: "DELETE", url: `/formulas/${link.id}` });
+    await client.query(
+      `UPDATE feeds SET name = $2, appearance = '{"scheme":"winter"}'::jsonb
+        WHERE id = $1`,
+      [f, "Things I am not telling you about"],
+    );
+
+    caller = (await account("withdrawn-stranger")).id;
+    const page = await app.inject({
+      method: "GET",
+      url: `/formulas/${link.token}`,
+    });
+    expect(page.statusCode).toBe(200);
+    const body = page.json().formula;
+    // The withdrawn sentence and the identity that carries it, nothing else.
+    expect(body.revoked).toBe(true);
+    // The AUTHOR survives the strip: it is the link's own author, not the
+    // feed's composition, and the withdrawn sentence names them.
+    expect(body.author.displayName).toBeTruthy();
+    expect(body.name).toBeNull();
+    expect(body.appearance).toEqual({});
+    expect(body.sources).toEqual([]);
+    expect(body.sourceCount).toBe(0);
+    // Derived from the ROW, not from the redacted name: this feed still
+    // exists, and a revoked link must not claim its feed was deleted.
+    expect(body.gone).toBe(false);
+    expect(JSON.stringify(body)).not.toContain("not telling you");
+  });
+
+  it("carries the source cap on the link itself, not only on the status read", async () => {
+    // §0u.6. The composer's `too_large` caveat interpolates this, and the
+    // branch that runs when the initial status GET blipped had nothing to
+    // interpolate — so it fabricated a 0 and told the author to trim the feed
+    // to zero sources.
+    const author = await account("cap-author");
+    caller = author.id;
+    const f = await feed(author.id);
+    await follow(f, (await account("cap-followee")).id);
+    const minted = (await mint(f)).json().link;
+    const status = await app.inject({
+      method: "GET",
+      url: `/workspace/feeds/${f}/formula`,
+    });
+    expect(minted.maxSources).toBeGreaterThan(0);
+    expect(minted.maxSources).toBe(status.json().maxSources);
   });
 
   // ---------------------------------------------------------------------------

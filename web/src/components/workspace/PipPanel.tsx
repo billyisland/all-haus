@@ -39,12 +39,29 @@ import type { PipStatus } from '../../lib/ndk'
 // questions row; slice 16 made weight/sampling_mode actually load-bearing in
 // the items query.
 
+// Every colour here is in the INVERTING family (`ink`/`white`/`bone`/greys),
+// with two deliberate exceptions. The scrim must DARKEN in both modes, so it
+// stays on the never-inverting `ink-925`. This panel is mounted at the
+// WorkspaceView root with NO light island above it, so its `panelBg` resolves
+// through the `html.dark` inversion — and a never-inverting foreground on top
+// of one (`ink-925` on `white` = 26 26 24 on 30 29 26, a contrast ratio of
+// 1.03:1) is invisible. Foreground and ground must be in the SAME inversion
+// family; see web/CLAUDE.md › Global light/dark mode.
+//
+// `meta` was the same miss one shade lighter: `stone-600` (registry: "light-
+// mode standfirst", never inverts) sat at ≈2.6:1 on the inverted panel — above
+// the 2.2 sweep threshold that caught the five panels on 2026-09-06, which is
+// why it survived (CONSOLIDATED-TODO §0w item 3). It is now `grey-600`, the
+// registry's inverting meta grey (≈5.7:1 light, ≈7:1 dark). `hint` is the
+// second exception and stays on `stone-400` knowingly: it is the mid-point of
+// the ramp, so it reads ≈3.5:1 on the light panel and ≈4.8:1 on the dark one
+// without inverting — computed from the registry triples, not read back.
 const TOKENS = {
   scrim: 'rgb(var(--ah-ink-925-rgb) / 0.18)',
   panelBg: 'var(--ah-white)',
-  panelBorder: 'var(--ah-ink-925)',
-  fg: 'var(--ah-ink-925)',
-  meta: 'var(--ah-stone-600)',
+  panelBorder: 'var(--ah-ink)',
+  fg: 'var(--ah-ink)',
+  meta: 'var(--ah-grey-600)',
   hint: 'var(--ah-stone-400)',
   rule: 'var(--ah-bone-bright)',
   crimson: 'var(--ah-crimson)',
@@ -935,13 +952,13 @@ function TrustSignals({ profile }: { profile: TrustProfileResponse }) {
         >
           <span
             className="font-sans text-ui-xs"
-            style={{ color: 'var(--ah-ink-925)', flex: 1 }}
+            style={{ color: 'var(--ah-ink)', flex: 1 }}
           >
             {r.label}
           </span>
           <span
             className="label-ui"
-            style={{ color: 'var(--ah-stone-600)' }}
+            style={{ color: TOKENS.meta }}
           >
             {r.value}
           </span>

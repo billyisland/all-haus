@@ -214,9 +214,17 @@ export function presenceProfileUrl(
 }
 
 // Native all.haus author: account fields + live follow/article counts.
+//
+// `viewerId` is NULL for an anonymous reader (2026-09-02, the /author/:id
+// widening). Everything above `followTarget` is a fact about the SUBJECT and is
+// returned unchanged; `followTarget` is a fact about the RELATIONSHIP between
+// two people, so with no viewer there is no relationship to state and the field
+// is omitted rather than defaulted. `isFollowing: false` handed to somebody who
+// is not logged in is a claim about a relationship that does not exist, and it
+// would render as a live "Follow" button that cannot work.
 export async function resolveNativeAuthor(
   userId: string,
-  viewerId: string,
+  viewerId: string | null,
 ): Promise<AuthorCardResponse> {
   const { rows } = await pool.query<{
     id: string;
@@ -251,12 +259,17 @@ export async function resolveNativeAuthor(
        WHERE writer_id = $1 AND published_at IS NOT NULL AND deleted_at IS NULL`,
         [userId],
       ),
-      pool.query<{ exists: boolean }>(
-        `SELECT EXISTS(
+      // Skipped entirely for an anonymous reader — not run with a NULL param.
+      // `follower_id = NULL` is never true, so it would answer `false`, which is
+      // exactly the fabricated relationship the comment above refuses.
+      viewerId
+        ? pool.query<{ exists: boolean }>(
+            `SELECT EXISTS(
         SELECT 1 FROM follows WHERE follower_id = $1 AND followee_id = $2
       ) AS exists`,
-        [viewerId, userId],
-      ),
+            [viewerId, userId],
+          )
+        : null,
     ]);
 
   return {
@@ -270,14 +283,15 @@ export async function resolveNativeAuthor(
     followingCount: parseInt(followingResult.rows[0].count, 10),
     postCount: parseInt(articleResult.rows[0].count, 10),
     // No followTarget for the viewer's own account — POST /follows rejects
-    // self-follows, so offering the button would only ever silently revert.
+    // self-follows, so offering the button would only ever silently revert —
+    // and none for an anonymous reader, who has no relationship to state.
     followTarget:
-      viewerId === userId
+      !viewerId || viewerId === userId
         ? undefined
         : {
             type: "user",
             id: userId,
-            isFollowing: isFollowingResult.rows[0].exists,
+            isFollowing: isFollowingResult!.rows[0].exists,
           },
   };
 }

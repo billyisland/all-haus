@@ -72,6 +72,14 @@ export interface FeedLink {
    *  travel. Live, so it is true NOW rather than at some moment in the past. */
   excludedCount: number
   refusal: FormulaRefusal | null
+  /** The source cap the refusal is measured against. On the LINK, not only on
+   *  the status read, so a surface whose status GET blipped can still word the
+   *  `too_large` caveat off a real number instead of fabricating a zero. */
+  maxSources: number
+  /** Withdrawn by its author. A revoked link's payload carries this and its
+   *  identity ONLY — the feed projection (`name`, `appearance`, `sources`) is
+   *  stripped server-side, because a link that has been stopped must not keep
+   *  reporting the feed's later edits to whoever still holds the token. */
   revoked: boolean
   /** Always false on a link — the schema forbids otherwise (a designated seed
    *  is a different kind of row, and cutting one no longer adopts a link).
@@ -100,7 +108,10 @@ export interface FeedLinkStatus {
 export interface RedeemFailure {
   position: number
   label: string
-  reason: 'unresolvable' | 'unreachable' | 'invalid' | 'error'
+  /** `suspended` — the source points at a system that is currently switched
+   *  off platform-wide. Reported like any other failure rather than dropped,
+   *  so a seed that silently delivers less than it names has a witness. */
+  reason: 'unresolvable' | 'unreachable' | 'invalid' | 'suspended' | 'error'
 }
 
 export interface RedeemResult {

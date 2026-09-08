@@ -122,7 +122,6 @@ async function loadConversationComments(
             c.author_id,
             acc.display_name AS acc_display_name,
             acc.username AS acc_username,
-            acc.avatar_blossom_url AS acc_avatar,
             acc.nostr_pubkey AS nostr_pubkey,
             tl.pip_status AS pip_status,
             vt.upvote_count AS vt_up, vt.downvote_count AS vt_down
@@ -158,6 +157,11 @@ function assembleNativeThread(
   mutedIds: Set<string>,
   replyLimit: number,
   replyCursor: ReplyCursor | undefined,
+  // D5: the root is paywalled and this viewer cannot read it. Stamped onto
+  // every comment the conversation returns; `rootPost` arrives already stamped
+  // by the caller, because it comes out of `feedItemToPost`, which takes no
+  // viewer and must not learn to.
+  rootLocked: boolean,
 ): {
   posts: Post[];
   focalId: string;
@@ -195,13 +199,13 @@ function assembleNativeThread(
       cur = parent;
     }
     chain.reverse(); // oldest-first
-    ancestors.push(rootPost, ...chain.map((c) => commentToPost(c, rootPostId, mutedIds)));
+    ancestors.push(rootPost, ...chain.map((c) => commentToPost(c, rootPostId, mutedIds, rootLocked)));
   }
 
   // ── focal
   const focalPost: Post = focalIsRoot
     ? rootPost
-    : commentToPost(focalComment!, rootPostId, mutedIds);
+    : commentToPost(focalComment!, rootPostId, mutedIds, rootLocked);
 
   // ── descendants: subtree under the focal, flattened chronologically.
   // (Flat chronological matches the playscript thread render — CLAUDE.md.)
@@ -229,7 +233,7 @@ function assembleNativeThread(
       ? `${last.published_at_epoch}:${last.id}`
       : undefined;
 
-  const descendants = page.map((c) => commentToPost(c, rootPostId, mutedIds));
+  const descendants = page.map((c) => commentToPost(c, rootPostId, mutedIds, rootLocked));
 
   return {
     posts: [...ancestors, focalPost, ...descendants],
@@ -517,8 +521,24 @@ export async function postThreadRoutes(app: FastifyInstance) {
       if (!rootPost || !rootEventId)
         return reply.status(404).send({ error: "Thread not found" });
 
-      // Gate paywalled article conversations exactly like /conversation: locked
-      // viewers get the focal THING (free portion only) but no comment bodies.
+      // THE CONVERSATION IS PUBLIC; THE ARTICLE IS NOT.
+      // ARTICLE-HEADED-CONVERSATIONS-ADR D3. A comment on a paywalled article is
+      // the commenter's own speech ABOUT a piece, not the piece, and the
+      // discussion is the best argument the piece has: a reader who follows a
+      // reply back to the article, reads what four other people said and cannot
+      // read the article is a reader with a reason to buy it. So a locked viewer
+      // gets the whole conversation — the article card at its head carrying only
+      // `content_free` (D4, and that is a property of the mapper, not a
+      // redaction step here) — and what they LOSE is the ability to join it:
+      // every node ships `rootLocked: true` and the card suppresses reply, quote
+      // and vote on it (D6). The write path is closed independently, server-side
+      // (D7, POST /replies).
+      //
+      // This branch used to return the root alone with `paywallLocked: true` and
+      // no comments. That flag is gone with it (D8) — per NODE is what the
+      // profile's Replies log needs, where a comment card renders outside any
+      // conversation envelope, and one field serves both surfaces.
+      let rootLocked = false;
       if (rootPost.accessMode === "gated") {
         let hasAccess = false;
         if (viewerId) {
@@ -547,16 +567,13 @@ export async function postThreadRoutes(app: FastifyInstance) {
             hasAccess = access.hasAccess;
           }
         }
-        if (!hasAccess) {
-          const repostEdges = await fetchRepostEdges([rootPost.id]);
-          return reply.send({
-            focalId: postId === rootPost.id ? rootPost.id : postId,
-            posts: [rootPost],
-            repostEdges,
-            totalDescendants: 0,
-            paywallLocked: true,
-          });
-        }
+        rootLocked = !hasAccess;
+        // The ROOT is stamped here and not in the mapper: it arrives from
+        // `loadFeedItemPost` -> `feedItemToPost`, which takes no viewer, so this
+        // is the one place that knows. Without it the head article card reads a
+        // field nothing sets and keeps affordances the rest of the conversation
+        // has lost (D5, D6).
+        if (rootLocked) rootPost = { ...rootPost, rootLocked: true };
       }
 
       const [comments, mutedIds] = await Promise.all([
@@ -564,7 +581,13 @@ export async function postThreadRoutes(app: FastifyInstance) {
         loadMutes(viewerId),
       ]);
 
-      // If the focal was a comment, ensure it actually exists in this conversation.
+      // A PROJECTOR NEVER RETURNS A FOCAL IT DID NOT SEND (D9). If the focal was
+      // a comment, it must actually exist in this conversation — otherwise the
+      // response would carry a `focalId` absent from its own `posts`,
+      // `deriveThreadView` would return null and PostThread would render
+      // "Loading thread…" for ever: not an error, not a gate, a spinner with no
+      // end, which is why the gated branch above wore one unreported for its
+      // whole life. 404 is the honest answer; a malformed thread is not.
       const focalPostId = focalFeedItem ? rootPost.id : postId;
       if (
         focalPostId !== rootPost.id &&
@@ -580,6 +603,7 @@ export async function postThreadRoutes(app: FastifyInstance) {
         mutedIds,
         replyLimit,
         replyCursor,
+        rootLocked,
       );
       const repostEdges = await fetchRepostEdges(result.posts.map((p) => p.id));
       return reply.send({ ...result, repostEdges });

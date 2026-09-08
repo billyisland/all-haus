@@ -14,7 +14,7 @@ import type { ArticleMetadata } from '../../../../lib/api'
 //
 // It used to sit inside `pub/[slug]/layout.tsx`, which wrapped it in a
 // `max-w-feed` main between a publication nav bar and a footer — a second
-// chassis on a route where LayoutShell already mounts PublicNavRow. The layout
+// chassis on a route where LayoutShell already mounts PublicNavBar. The layout
 // is deleted; an article is the reading experience and takes no frame.
 //
 // THE SLUG IS PART OF THE ADDRESS, NOT DECORATION. The article is fetched by
@@ -126,8 +126,15 @@ export default async function PublicationArticlePage({
     : ''
 
   return (
-    <PublicPage ground={false}>
+    // `barGround`: same reading surface, same white, same reason as
+    // /article/[dTag] — ArticleReader paints `bg-white` and the fixed nav bar
+    // has to be told, or its invisible bottom edge shows as a seam.
+    <PublicPage ground={false} barGround="var(--ah-white)">
     <ArticleReader
+      // The unified key, straight off the article payload — resolved
+      // server-side by `article_post_id()` (READING-LOG-AND-LIBRARY-ADR D8).
+      // No `scrollRef`: this is a page, so the document scrolls.
+      postId={article.postId}
       article={{
         id: article.nostrEventId,
         pubkey: article.writer.pubkey,

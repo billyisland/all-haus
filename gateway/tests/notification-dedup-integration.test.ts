@@ -29,8 +29,7 @@ import pg from "pg";
 // what binding it BUYS.
 //
 // Fixtures live inside a transaction that is ALWAYS rolled back, so the target
-// DB is never mutated. Skipped without a DB URL so the no-Postgres CI job stays
-// green. Run locally:
+// DB is never mutated. Skipped without a DB URL — CI supplies one (it boots Postgres and FAILS on a skip). Run locally:
 //   POSTGRES_PASSWORD=$(grep -E '^POSTGRES_PASSWORD=' ../.env | cut -d= -f2-) \
 //   TEST_DATABASE_URL=postgresql://platformpub:$POSTGRES_PASSWORD@localhost:5432/platformpub \
 //     npx vitest run tests/notification-dedup-integration.test.ts

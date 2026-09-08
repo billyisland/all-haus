@@ -24,7 +24,14 @@
 import type { CSSProperties } from 'react'
 import { PALETTE_REGISTRY, rgbVarName, hexToTriple } from './registry'
 
-/** The neutral chrome slugs the global dark mode inverts. */
+/** The chrome slugs the global dark mode inverts. Neutrals, plus the one
+ *  accent-family member that is defined RELATIVE to the ground rather than
+ *  being an identity of its own (`crimson-dark` = "a step deeper than crimson
+ *  against the page", which is darker on bone and lighter on ink). The accent
+ *  proper (`crimson`) is not here and must never be — it holds in both modes.
+ *  Pinning `crimson-dark` canonical-light on an island is inert today (no
+ *  vessel names it; a vessel's accent is `palette.crimson`) and correct if one
+ *  ever does. */
 export const DARK_SLUGS = [
   'ink',
   'nav-grey',
@@ -41,6 +48,7 @@ export const DARK_SLUGS = [
   'off-white',
   'cream',
   'cream-hover',
+  'crimson-dark',
 ] as const
 
 const REG = new Map(PALETTE_REGISTRY.map((e) => [e.slug, e.hex]))

@@ -24,7 +24,7 @@
 // =============================================================================
 import pg from "pg";
 import {
-  DEDUP_CTES,
+  dedupCtes,
   DEDUP_SUPPRESS_FILTER,
   DEDUP_PROVENANCE_LATERAL,
 } from "../src/lib/dedup-sql.js";
@@ -53,7 +53,7 @@ const DEDUP_QUERY = `
       WHERE fi.deleted_at IS NULL
       GROUP BY fi.id
   ),
-  ${DEDUP_CTES},
+  ${dedupCtes(3)},
   scored AS (
     SELECT fi.id AS fi_id, fi.source_id, fi.published_at,
            ei.dedup_fingerprint AS fp,
@@ -189,7 +189,7 @@ async function main() {
          SELECT fi.id AS fi_id FROM feed_items fi
          JOIN feed_sources fs ON fs.feed_id = $2 AND fs.external_source_id = fi.source_id
          WHERE fi.deleted_at IS NULL
-       ), ${DEDUP_CTES}
+       ), ${dedupCtes(3)}
        SELECT count(*) FROM suppressed`,
       [reader, feed],
     );

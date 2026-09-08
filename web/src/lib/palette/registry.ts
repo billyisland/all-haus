@@ -32,7 +32,7 @@ export interface PaletteEntry {
 
 export const PALETTE_REGISTRY: PaletteEntry[] = [
   { slug: 'ink', hex: '#111111', label: 'Primary ink — text, native card bar, slab rules, buttons, light-mode vessel walls' },
-  { slug: 'true-black', hex: '#000000', label: 'Dark-mode vessel walls & bar; video letterbox' },
+  { slug: 'true-black', hex: '#000000', label: 'Video letterbox; scrim and shadow washes. NO LONGER the dark-mode vessel walls/bar — see `basic-walls-dk`' },
   { slug: 'white', hex: '#FFFFFF', label: 'Page ground, cards, input fields, text on dark' },
   { slug: 'grey-100', hex: '#F2F1ED', label: 'Soft fills — ghost buttons, inactive pills, paywall panel (warmed to agree with bone)' },
   { slug: 'grey-200', hex: '#E7E5DF', label: 'Hover fills, input edges (warmed to agree with bone)' },
@@ -41,7 +41,10 @@ export const PALETTE_REGISTRY: PaletteEntry[] = [
   { slug: 'grey-600', hex: '#666666', label: 'Secondary text on light & glasshouse surfaces' },
   { slug: 'nav-grey', hex: '#333333', label: 'UNUSED since the black topbar was deleted (2026-07-25) — it drew that dropdown\'s 4px rules. Kept: removing it would renumber every slug after it, and position in this list is canonical' },
   { slug: 'crimson', hex: '#B5242A', label: 'Accent — paid bar, selection, votes, errors, focus rings' },
-  { slug: 'crimson-dark', hex: '#921D22', label: 'Crimson dark step (token crimson-dark)' },
+  // The one crimson that INVERTS (DARK_SLUGS / the html.dark block): it is not
+  // an identity but a relation — a step deeper than crimson against the page
+  // ground — so it is darker on bone and lighter (crimson-soft) on ink.
+  { slug: 'crimson-dark', hex: '#921D22', label: 'Crimson hover/emphasis step off crimson (token crimson-dark). INVERTS with the mode — see the html.dark block' },
   { slug: 'crimson-deep', hex: '#8B1B1F', label: 'Danger text-link hover' },
   { slug: 'crimson-soft', hex: '#D9555A', label: 'Dark-mode crimson (vessel palette)' },
   { slug: 'vouch-red', hex: '#C41230', label: 'Vouch modal error text' },
@@ -130,6 +133,26 @@ export const PALETTE_REGISTRY: PaletteEntry[] = [
   // a light well one step darker than the inverted bar ground. NEVER inverts —
   // it only ever renders in dark mode.
   { slug: 'bar-well-dk', hex: '#D9D7D1', label: 'Dark-mode well on an un-islanded vessel bar (profile tier 1: the `+` well, secondary button fills). NEVER inverts — it exists only for the inverted (light) bar' },
+  // Basic's DARK wall/bar/quote surface — the fifth spine.
+  //
+  // The dark grammar (see the seasonal block above) is that interiors and cards
+  // are a shared near-black neutral and a colourway's identity rides its
+  // WALLS/BAR spine, the four seasons tuned to a matched ~0.39 weighted
+  // luminance so they read as one accent family. `basic` was the one colourway
+  // not participating: its dark wall was `true-black`, which is DARKER than the
+  // inverted floor (`bone` → 20 19 17), so the ⊔ frame that is the loudest
+  // thing on screen in light mode disappeared entirely in dark — a feed read as
+  // a seam in a continuous dark field while every season beside it kept its
+  // frame. A relation to the ground, held fixed, inverts its own meaning; same
+  // shape as `crimson-dark`.
+  //
+  // So: a NEUTRAL spine at the seasons' own luminance — basic's identity is
+  // having no hue, not having no frame. Carries the same faint warmth as the
+  // rest of the basic dark family (ink-925/ink-900 are warm by ~3 in blue).
+  // NEVER inverts: like the seasonal surface slugs it is chosen by
+  // `paletteFor`, never flipped by `html.dark`, and it must stay out of
+  // DARK_SLUGS.
+  { slug: 'basic-walls-dk', hex: '#646460', label: 'Feed scheme Basic (dark) — walls, bar & quote embed (neutral spine at the seasons\' matched luminance). NEVER inverts' },
 ]
 
 export const PALETTE_STORAGE_KEY = 'ah:palette-overrides'

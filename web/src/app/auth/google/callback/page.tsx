@@ -69,8 +69,19 @@ export default function GoogleCallbackPage() {
           }
           throw new Error('Exchange failed')
         }
+        // The arrival intent came back inside the HMAC-SIGNED state, so the
+        // gateway has already verified it and looked any price up server-side.
+        // This page still rebuilds the path from the identifier rather than
+        // following one — same rule on all three carriers.
+        const body = (await res.json().catch(() => null)) as {
+          arrivalDTag?: string | null
+        } | null
         await fetchMe()
-        router.replace('/reader')
+        router.replace(
+          body?.arrivalDTag
+            ? `/article/${encodeURIComponent(body.arrivalDTag)}`
+            : '/reader',
+        )
       })
       .catch(() => {
         router.replace('/auth?mode=login&error=google_failed')

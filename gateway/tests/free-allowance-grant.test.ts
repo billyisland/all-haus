@@ -232,9 +232,18 @@ describe("the account statement's starting credit", () => {
     });
     const stmt = issued.find((q) => q.sql.includes("'free_allowance' AS category"));
     expect(stmt).toBeDefined();
+    // THE GRANT IS NOW SPLIT IN TWO (PAYWALL-ARRIVAL D2/§11.3): the welcome
+    // gift at the dial, and the arrival gift at the price of the piece the
+    // reader signed up to finish, dated the same. Left whole, a reader who had
+    // spent nothing would open their account to a meter reading "£5.00 of
+    // £8.00" — already a third drained — with three pounds nowhere on the
+    // statement. What has NOT changed, and is what this test is really for, is
+    // that both halves come off THIS READER'S OWN COLUMNS rather than a literal
+    // or the live dial.
     expect(stmt!.sql).toContain(
-      "a.free_allowance_granted_pence AS amount_pence",
+      "(a.free_allowance_granted_pence - a.arrival_gift_pence) AS amount_pence",
     );
+    expect(stmt!.sql).toContain("a.arrival_gift_pence AS amount_pence");
     expect([200, 404, 500]).toContain(res.statusCode);
 
     // EVERY statement the route issues, not just the one carrying the category
@@ -267,7 +276,15 @@ describe("the account statement's starting credit", () => {
     );
     expect(summary).toBeDefined();
     expect(summary!.sql).toContain(
-      "a.free_allowance_granted_pence AS amount_pence",
+      "(a.free_allowance_granted_pence - a.arrival_gift_pence) AS amount_pence",
     );
+    // The arrival half too. Numerically the split is a no-op in a SUM, so this
+    // assertion is not about the total — it is about the two queries staying
+    // READABLE as the same statement, because the next person to edit one of
+    // them will look at the other. The arithmetic that is NOT a no-op — the
+    // arrival read on the debit side — is pinned for real against Postgres in
+    // `arrival-statement-parity-integration.test.ts`, which asserts the entry
+    // list and the summary agree rather than asserting either one's numbers.
+    expect(summary!.sql).toContain("a.arrival_gift_pence, a.created_at");
   });
 });

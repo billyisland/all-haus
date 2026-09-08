@@ -16,7 +16,6 @@ export interface PostThreadResponse {
   repostEdges: RepostEdge[];
   replyCursor?: string; // present when more descendants remain (keyset)
   totalDescendants: number;
-  paywallLocked?: boolean; // gated article, viewer has no access: only the focal
   // External thread only: the server kicked off background live-source hydration
   // for this (cursorless) fetch, so ancestors/replies may still be filling in.
   // The client refetches shortly after to merge whatever landed.

@@ -58,10 +58,21 @@ import { LIGHT_ISLAND_STYLE } from "../../lib/palette/island";
 // off the "flicker in the corner of the eye" list.
 //
 // GLOBAL CHROME, NOT A FEED ISLAND (§IV.4 / §IV dark-mode note). The discs are
-// drawn from the bar-relative neutral tokens `--ah-ink` / `--ah-bone` /
-// `--ah-stone-350` and are NOT islanded like the ∀ disc — so `html.dark`
-// inverts ink and bone with the bar wholesale, and the mode-neutral stone tone
-// stays put. No per-feed colourway ever reaches here.
+// drawn from the bar-relative neutral tokens `--ah-ink` / `--ah-bone` alone and
+// are NOT islanded like the ∀ disc — so `html.dark` inverts the whole run with
+// the bar wholesale. No per-feed colourway ever reaches here, and no
+// mode-neutral one either: the stone ramp left this file with the hollow ring
+// (see DISC_OFF_BG on why a mode-neutral grey cannot be a ground here).
+//
+// THREE STATES, ONE RAMP (2026-08-31). Every pip is now a SOLID disc; what
+// changes is size and tone. In view: 24px ink, bone numeral. Off screen: 18px
+// ink-at-alpha, bone numeral — the same pip, one step away. Minimised: 18px with
+// the colourway turned over (bone ground, ink ring, ink glyph) and the numeral
+// replaced by the ∀ disc's own close-X. The first two are DISTANCE and read as a
+// ramp; the third is a different fact — shut, not far — and reads as a flip.
+// The hollow ring the two away states used to share is gone: it made "off
+// screen" and "minimised" siblings distinguished only by tint, which is the
+// weakest possible signal for the strongest difference in the set.
 //
 // This is a separate fixed layer over the NavBar band rather than a child of
 // NavBar: the state it needs (geometry, pan, the live feed list) lives in
@@ -145,7 +156,7 @@ const LEFT_RESERVE = 232;
 // vessel outline. Size + fill + ring + numeral colour all ride it, so a state
 // flip reads as one settle. Gated off under prefers-reduced-motion (§VIII.3).
 const DISC_TRANSITION =
-  "width 140ms ease-out, height 140ms ease-out, background-color 140ms ease-out, border-color 140ms ease-out, color 140ms ease-out, font-size 140ms ease-out";
+  "width 140ms ease-out, height 140ms ease-out, background-color 140ms ease-out, box-shadow 140ms ease-out, color 140ms ease-out, font-size 140ms ease-out";
 
 // Hover-name label tokens — the SAME treatment as the vessel's corner roundel
 // name label (Vessel.tsx ROUNDEL_TOKENS), so the muster and the vessel speak
@@ -175,6 +186,26 @@ const STATE_LABEL: Record<MusterState, string> = {
   minimised: "minimised",
 };
 
+// THE OFF-SCREEN GREY IS INK AT ALPHA, NOT A STONE TOKEN (2026-08-31).
+// It reads as "the present pip, greyed" — which is what it is — but the reason
+// it cannot be `--ah-stone-350` is the un-islanded note above. The stone ramp is
+// mode-NEUTRAL and ink/bone INVERT with the bar. That was harmless while grey
+// was a ring beside a grey numeral (both stone, both static). The moment grey
+// became a GROUND under a bone numeral the two had to invert together, or dark
+// mode puts a near-black numeral on a mid-grey disc. Ink at alpha over the bar's
+// own bone is the one construction that mirrors correctly in both modes — and it
+// is composited over the bar, which is why the muster's band must stay a layer
+// ABOVE NavBar's ground rather than a sibling beside it.
+const DISC_OFF_BG = "rgb(var(--ah-ink-rgb) / 0.55)";
+
+// The ring is an INSET BOX-SHADOW, never a border. A 2px border-width on a
+// `box-sizing: border-box` disc eats 4px of the content box, which is where the
+// X spans from — the glyph would come out a quarter smaller than the ∀ disc's
+// and its strokes would fall under the no-single-pixel floor. The shadow draws
+// the same 2px ring on the same radius and leaves the content box the full
+// DISC_OFF.
+const RING = "inset 0 0 0 2px var(--ah-ink)";
+
 function discStyle(state: MusterState, reduced: boolean): CSSProperties {
   const base: CSSProperties = {
     display: "flex",
@@ -201,19 +232,83 @@ function discStyle(state: MusterState, reduced: boolean): CSSProperties {
       fontSize: 12,
     };
   }
-  // Panned off / minimised: 18px hollow disc, a 2px ring (the no-single-pixel
-  // floor — never 1.5px, which slips the tripwire — §IV). Ink for on-floor,
-  // stone-350 for minimised, so "away" reads as greyed and "present but
-  // off-screen" as full ink.
-  const tone = state === "minimised" ? "var(--ah-stone-350)" : "var(--ah-ink)";
+  if (state === "minimised") {
+    // MINIMISED: the present pip with its colourway turned over — bone ground,
+    // ink glyph — and the numeral replaced by the close-X (below). A hidden feed
+    // is not a place you are near or far from; it is a place that is SHUT, and
+    // the run says so with the same mark the ∀ disc uses for the same meaning.
+    //
+    // The ring is what keeps it a roundel. The bar's own ground is
+    // `--ah-bone` (NavBar.tsx), so a bone disc has no rim of its own and the
+    // flip would otherwise read as a bare X floating in the run — the roundel
+    // per feed silently going missing exactly where the muster is meant to be
+    // reporting one. With the ring it reads as a flip, which is the claim.
+    return {
+      ...base,
+      width: DISC_OFF,
+      height: DISC_OFF,
+      position: "relative",
+      background: "var(--ah-bone)",
+      boxShadow: RING,
+      color: "var(--ah-ink)",
+    };
+  }
+  // OFF SCREEN: the present pip, one size down and greyed — same solid disc,
+  // same bone numeral, so "off to the side" reads as a step along one ramp
+  // rather than a different kind of thing. (Until 2026-08-31 both away states
+  // were hollow rings and grey meant MINIMISED; the hollow form has left the
+  // vocabulary entirely. Anything describing these states in the old
+  // filled/hollow/grey terms — the Explain caption is the one — moves with it.)
   return {
     ...base,
     width: DISC_OFF,
     height: DISC_OFF,
-    border: `2px solid ${tone}`,
-    color: tone,
+    background: DISC_OFF_BG,
+    color: "var(--ah-bone)",
     fontSize: 11,
   };
+}
+
+// The minimised pip's X — ForallMenu's close glyph in the same viewBox 56 frame
+// with the same round caps, so it is recognisably the one mark: this is what
+// "the ∀ disc when a pane is open" looks like on a 4-GRID roundel.
+//
+// It differs from the disc's in two numbers, and BOTH are consequences of the
+// size rather than second thoughts about the form. **The stroke is opened
+// 6 → 6.3**, forced: at DISC_OFF 6 units renders 1.93px, under the
+// no-single-pixel floor (§IV), and 6.3 clears 2. **The span is pulled in from
+// 11→45 to 17→39**, because the ∀ disc has 40px for its proportion and this has
+// 18: at the disc's own span the arms landed on the ring and the pip read as ⊗,
+// a crossed-out circle, rather than as a close mark inside a roundel.
+//
+// THE COORDINATES ARE NOT THE EXTENT — A ROUND CAP ADDS HALF A STROKE AT EACH
+// END. At stroke 6.3 that is 3.15 units per end, so these lines actually paint
+// 13.85→42.15 (≈0.505 of the frame), and the ∀ disc's own 11→45 paints ≈8→48 —
+// which is why the disc can carry it and this cannot: the disc CLIPS its glyph
+// at the rim (`forall-clip`, r=28), so its arms are cut flush and the overshoot
+// never shows, while this roundel has no clip and the caps run into the ring.
+// A first attempt at 14→42 was picked as "0.61 down to 0.5" off the raw
+// coordinates and was invisible on screen — it paints 10.85→45.15, within a
+// unit of what it replaced. Any future adjustment here is to the PAINTED
+// extent; convert through the cap before believing a number.
+//
+// Spanning the content box at all is what the inset-shadow ring above buys; a
+// bordered ring would have taken 4px of it before either number was chosen.
+function MusterCloseGlyph() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 56 56"
+      style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }}
+      stroke="currentColor"
+      strokeWidth={6.3}
+      strokeLinecap="round"
+      fill="none"
+    >
+      <line x1="17" y1="17" x2="39" y2="39" />
+      <line x1="39" y1="17" x2="17" y2="39" />
+    </svg>
+  );
 }
 
 export function Muster({
@@ -294,7 +389,6 @@ export function Muster({
       }}
     >
       <div
-        className="scroll-silent"
         // The muster is one Explain subject: report navRow.muster on entering
         // the track, clear on leaving. Per-roundel hover drives only the name
         // label below.
@@ -371,8 +465,13 @@ export function Muster({
                 {/* Upright, bare, and no wrapper. It was briefly turned −90° to
                     honour the left rail's hinge rule and read as a dash at Feed
                     1 — see the header. One numeral form on every surface: here,
-                    the vessel's corner roundel, and the mobile pip strip. */}
-                {f.numeral}
+                    the vessel's corner roundel, and the mobile pip strip.
+
+                    A minimised feed shows the close-X instead — the numeral is
+                    dropped, not overlaid, since the state it reports is "shut"
+                    rather than "which one". The numeral survives in the aria
+                    label, which is where a screen reader needs it. */}
+                {f.state === "minimised" ? <MusterCloseGlyph /> : f.numeral}
               </button>
             </div>
           );

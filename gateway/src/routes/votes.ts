@@ -2,6 +2,9 @@ import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { pool, withTransaction } from '@platform-pub/shared/db/client.js'
 import { requireAuth } from '../middleware/auth.js'
+import { checkArticleAccess } from '../services/article-access/index.js'
+import { resolveLockedRoots } from '../lib/root-locked.js'
+import { zodValidationError } from '@platform-pub/shared/lib/validation.js'
 import logger from '@platform-pub/shared/lib/logger.js'
 
 // =============================================================================
@@ -36,7 +39,7 @@ export async function voteRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const parsed = VoteSchema.safeParse(req.body)
       if (!parsed.success) {
-        return reply.status(400).send({ error: parsed.error.flatten() })
+        return reply.status(400).send(zodValidationError(parsed.error))
       }
 
       const { targetEventId, targetKind, direction } = parsed.data
@@ -47,13 +50,30 @@ export async function voteRoutes(app: FastifyInstance) {
         // 1. Resolve the content author
         // ------------------------------------------------------------------
         let authorId: string | null = null
+        // The article's paywall ingredients ride the same read (30023), or the
+        // comment's root event id does (1111) — for the guard in step 1b.
+        let article: {
+          id: string
+          writer_id: string
+          access_mode: string
+          publication_id: string | null
+        } | null = null
+        let commentRootEventId: string | null = null
 
         if (targetKind === 30023) {
-          const { rows } = await client.query<{ writer_id: string }>(
-            `SELECT writer_id FROM articles WHERE nostr_event_id = $1 AND deleted_at IS NULL`,
+          const { rows } = await client.query<{
+            id: string
+            writer_id: string
+            access_mode: string
+            publication_id: string | null
+          }>(
+            `SELECT id, writer_id, access_mode, publication_id
+               FROM articles
+              WHERE nostr_event_id = $1 AND deleted_at IS NULL`,
             [targetEventId]
           )
-          authorId = rows[0]?.writer_id ?? null
+          article = rows[0] ?? null
+          authorId = article?.writer_id ?? null
         } else if (targetKind === 1) {
           const { rows } = await client.query<{ author_id: string }>(
             `SELECT author_id FROM notes WHERE nostr_event_id = $1`,
@@ -61,15 +81,61 @@ export async function voteRoutes(app: FastifyInstance) {
           )
           authorId = rows[0]?.author_id ?? null
         } else if (targetKind === 1111) {
-          const { rows } = await client.query<{ author_id: string }>(
-            `SELECT author_id FROM comments WHERE nostr_event_id = $1 AND deleted_at IS NULL`,
+          const { rows } = await client.query<{
+            author_id: string
+            target_event_id: string
+          }>(
+            `SELECT author_id, target_event_id
+               FROM comments
+              WHERE nostr_event_id = $1 AND deleted_at IS NULL`,
             [targetEventId]
           )
           authorId = rows[0]?.author_id ?? null
+          commentRootEventId = rows[0]?.target_event_id ?? null
         }
 
         if (!authorId) {
           return reply.status(404).send({ error: 'Content not found' })
+        }
+
+        // ------------------------------------------------------------------
+        // 1b. A vote is a WRITE into gated content, so it carries the READ's
+        //     guard — the same one POST /replies carries (ARTICLE-HEADED-
+        //     CONVERSATIONS-ADR D7). For as long as this route existed nothing
+        //     server-side refused a vote on a paywalled article or on a comment
+        //     under one; the rule was held up by PostActions declining to draw
+        //     the control on `rootLocked`, and a UI rule is not an access
+        //     control (CONSOLIDATED-TODO §0w item 1).
+        //
+        //     GUARD, NOT A BARE CALL. `checkArticleAccess` carries no
+        //     access_mode term — for a free article by somebody else it answers
+        //     {hasAccess: false} exactly as for an unpaid paywalled one — so
+        //     called unconditionally it refuses every vote on every free article
+        //     on the site. The `access_mode === 'paywalled'` branch is the gate.
+        //     Own content is refused one step later anyway (self-vote).
+        //
+        //     A COMMENT's root is answered by `resolveLockedRoots`, the one home
+        //     for "which of these roots is locked to this viewer": a comment's
+        //     `target_event_id` IS the conversation's root (replies-to-replies
+        //     share it — POST /replies enforces that), and the resolver already
+        //     filters to paywalled article roots, so a note-rooted comment costs
+        //     one query that finds nothing and votes through.
+        // ------------------------------------------------------------------
+        if (article && article.access_mode === 'paywalled') {
+          const access = await checkArticleAccess(
+            voterId,
+            article.id,
+            article.writer_id,
+            article.publication_id,
+          )
+          if (!access.hasAccess) {
+            return reply.status(403).send({ error: 'Unlock this article to vote' })
+          }
+        } else if (commentRootEventId) {
+          const locked = await resolveLockedRoots(voterId, [commentRootEventId])
+          if (locked.has(commentRootEventId)) {
+            return reply.status(403).send({ error: 'Unlock this article to vote' })
+          }
         }
 
         // ------------------------------------------------------------------

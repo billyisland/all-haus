@@ -31,7 +31,7 @@ export interface WorkspaceFeed {
   fromStarter: boolean;
 }
 
-// The items + saves endpoints emit the unified Post[] (gateway feedItemToPost) —
+// The items endpoint emits the unified Post[] (gateway feedItemToPost) —
 // the same shape every other feed surface returns — so the workspace renders them
 // through the one Post-model card path with no client-side legacy-item adapter
 // (FEED-RETIREMENT-PLAN Slice 6 item 4). Ranking stays the per-vessel
@@ -71,7 +71,6 @@ export interface WorkspaceFeedSource {
     kind: WorkspaceFeedSourceKind;
     label: string;
     sublabel: string | null;
-    avatar: string | null;
     // In-app destination for the source name — the surface a byline links to on
     // a feed card (account → /:username, publication → /pub/:slug, external →
     // /source/:id, tag → /tag/:name). null when the target is deleted.
@@ -245,39 +244,24 @@ export const workspaceFeeds = {
       method: "DELETE",
     }),
 
-  // Slice 20: per-feed saved-items list. Save key is feed_items.id (the
-  // unified identifier); the BookmarkButton retires with the deprecated
-  // chassis on merge, so the workspace's save story is solely this surface.
-  listSaves: (id: string, opts?: { cursor?: string; limit?: number }) => {
-    const qs = new URLSearchParams();
-    if (opts?.cursor) qs.set("cursor", opts.cursor);
-    if (opts?.limit) qs.set("limit", String(opts.limit));
-    const suffix = qs.toString() ? `?${qs.toString()}` : "";
-    return request<WorkspaceFeedSavesResponse>(
-      `/workspace/feeds/${id}/saves${suffix}`,
-    );
-  },
-
-  listSavedIds: (id: string) =>
-    request<{ feedItemIds: string[] }>(`/workspace/feeds/${id}/saves/ids`),
-
-  saveItem: (id: string, feedItemId: string) =>
-    request<{ ok: true }>(`/workspace/feeds/${id}/saves`, {
-      method: "POST",
-      body: JSON.stringify({ feedItemId }),
-    }),
-
-  unsaveItem: (id: string, feedItemId: string) =>
-    request<void>(`/workspace/feeds/${id}/saves/${feedItemId}`, {
-      method: "DELETE",
-    }),
 };
 
-export interface WorkspaceFeedSavesResponse {
-  feed: WorkspaceFeed;
-  items: Array<Post & { savedAt: number }>;
-  nextCursor?: string;
-}
+// The four `saves` methods and their response type stood here until 2026-09-04.
+// They and their routes are gone with `feed_saves` (migration 189).
+//
+// THE COMMENT THAT WENT WITH THEM IS THE PART WORTH RECORDING, because it
+// declared a plan this decision reverses: "the BookmarkButton retires with the
+// deprecated chassis on merge, so the workspace's save story is solely this
+// surface." Both save mechanisms were fully built and neither was ever placed —
+// `bookmarks` shipped a table, route, client and button with the button mounted
+// nowhere, and `feed_saves` shipped live routes with no caller, 0 rows on every
+// database. Two unmounted mechanisms are not evidence of two wants; they are
+// one want, built twice and placed never, and the second was built *because*
+// the first was never placed. Two automatic logs supersede both: Recent reading
+// (attention) and the library (possession) — READING-LOG-AND-LIBRARY-ADR D10.
+//
+// If "save a piece I have not bought" turns out to be a real want, it comes
+// back as its own decision with its own surface, not as a third empty tab.
 
 export interface AuthorVolume {
   authorPubkey: string;
@@ -389,7 +373,6 @@ export interface SourceMeta {
   protocol: string;
   sourceUri: string;
   displayName: string | null;
-  avatarUrl: string | null;
   description: string | null;
   // Same shape as AuthorProfile.followTarget (type "source"), so the surface
   // mounts the same feed-derived ProfileFollowControl (ADR D6/D7 ⟂).

@@ -3,7 +3,6 @@ import type { Metadata } from 'next'
 import { PublicationMasthead } from '../../../../components/publication/PublicationMasthead'
 import { PubSubscribeTerms } from '../../../../components/publication/pub-sections'
 import { PublicPage } from '../../../../components/public/PublicPage'
-import WorkspacePaneRedirect from '../../../../components/layout/WorkspacePaneRedirect'
 
 // =============================================================================
 // Publication subscribe — /pub/:slug/subscribe
@@ -38,7 +37,6 @@ export default async function SubscribePage({ params }: { params: { slug: string
 
   return (
     <PublicPage>
-      <WorkspacePaneRedirect overlay="surface" params={{ surface: `/pub/${params.slug}/subscribe` }} />
       <PublicationMasthead pub={pub} />
       <div className="mx-auto max-w-article px-4 sm:px-6 pt-14 pb-20">
         <PubSubscribeTerms

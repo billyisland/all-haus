@@ -215,6 +215,7 @@ export function IdentityLinkControl({
         onDismiss={() => setOpen(false)}
         align="start"
         width={288}
+        ariaLabel="Linked accounts"
         className="p-2"
       >
         <>

@@ -346,7 +346,6 @@ export function MobileWorkspace({
             gap: 2,
             marginLeft: "auto",
             overflowX: "auto",
-            scrollbarWidth: "none",
           }}
         >
           {feeds.map((f, i) => {

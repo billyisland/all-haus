@@ -91,7 +91,7 @@ export const FEED_SELECT = `
   n.external_parent_id,
   -- External-specific (NULL for non-external)
   ei.author_name AS ei_author_name, ei.author_handle AS ei_author_handle,
-  ei.author_avatar_url AS ei_author_avatar_url, ei.author_uri AS ei_author_uri,
+  ei.author_uri AS ei_author_uri,
   ei.content_text AS ei_content_text, ei.content_html AS ei_content_html,
   ei.title AS ei_title, ei.summary AS ei_summary,
   ei.source_reply_uri AS ei_source_reply_uri,

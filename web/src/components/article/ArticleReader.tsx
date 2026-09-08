@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, type RefObject } from 'react'
 import { useAuth } from '../../stores/auth'
 import { PaywallGate } from './PaywallGate'
 import { GiftLinkModal } from './GiftLinkModal'
@@ -13,14 +13,27 @@ import { ReportButton } from '../ui/ReportButton'
 import { ShareButton } from '../ui/ShareButton'
 import { ReplySection } from '../replies/ReplySection'
 import { AllowanceExhaustedModal } from '../ui/AllowanceExhaustedModal'
+import { ArrivalWelcome } from './ArrivalWelcome'
 import { UpstreamEdges } from './UpstreamEdges'
 import { useCitationDraft } from '../../stores/citationDraft'
-import { articles as articlesApi, giftLinks, upstreamEdgesEnabled } from '../../lib/api'
+import { articles as articlesApi, giftLinks, upstreamEdgesEnabled, signupOffer, type SignupOffer } from '../../lib/api'
 import { useReadingPosition } from '../../hooks/useReadingPosition'
+import { useReadingLog } from '../../hooks/useReadingLog'
 import type { ArticleEvent } from '../../lib/ndk'
 
 interface ArticleReaderProps {
   article: ArticleEvent
+  /** The piece's `post_id` (READING-LOG-AND-LIBRARY-ADR D8) — the single key
+   *  both the reading log and the scroll-position table take, resolved
+   *  server-side and carried on the article payload. Absent ⇒ neither is
+   *  recorded, which is the honest behaviour for a caller that cannot name the
+   *  piece; never derive one here. */
+  postId?: string | null
+  /** The element that actually scrolls. Omitted on a page (the document
+   *  scrolls); ReaderOverlay passes the pane's own scrolling div, without which
+   *  the resume hook measures a document that never moves and silently records
+   *  nothing (D9). */
+  scrollRef?: RefObject<HTMLElement | null>
   articleDbId?: string
   writerName: string
   writerUsername: string
@@ -58,7 +71,7 @@ function stripHeroImage(content: string, heroUrl: string): string {
     .trim()
 }
 
-export function ArticleReader({ article, articleDbId, writerName, writerUsername, writerAvatar, writerId, subscriptionPricePence, writerSpendThisMonthPence, nudgeShownThisMonth, preRenderedFreeHtml, publicationName, publicationSlug, coverImageUrl }: ArticleReaderProps) {
+export function ArticleReader({ article, postId, scrollRef, articleDbId, writerName, writerUsername, writerAvatar, writerId, subscriptionPricePence, writerSpendThisMonthPence, nudgeShownThisMonth, preRenderedFreeHtml, publicationName, publicationSlug, coverImageUrl }: ArticleReaderProps) {
   const { user } = useAuth()
   const [paywallBody, setPaywallBody] = useState<string | null>(null)
   const [unlocking, setUnlocking] = useState(false)
@@ -70,12 +83,27 @@ export function ArticleReader({ article, articleDbId, writerName, writerUsername
   const [isSubscribed, setIsSubscribed] = useState(false)
   const [subscribing, setSubscribing] = useState(false)
   const [showGiftLinkModal, setShowGiftLinkModal] = useState(false)
+  const [offer, setOffer] = useState<SignupOffer | null>(null)
+  const [arrival, setArrival] = useState<{ welcomeGiftPence: number; unlocked: boolean } | null>(null)
+  // Viewer-derived, and NOT from this page's SSR (see the effect below).
+  const [viewerNudge, setViewerNudge] = useState<{
+    writerSpendThisMonthPence?: number
+    nudgeShownThisMonth: boolean
+  } | null>(null)
+  const seamRef = useRef<HTMLDivElement>(null)
 
   const isOwnContent = user?.id === writerId
   const articleBodyRef = useRef<HTMLDivElement>(null)
   const setCitationDraft = useCitationDraft((s) => s.setDraft)
 
-  useReadingPosition({ nostrEventId: article.id, enabled: !!user })
+  useReadingPosition({ postId, enabled: !!user, scrollRef })
+
+  // THE READING LOG'S WRITE, ON MOUNT — not on unlock (ADR §8.3). The two look
+  // identical in every ordinary session and differ for exactly one reader: the
+  // above-cap arrival (PAYWALL-ARRIVAL D4 Path C), who met the paywall, read
+  // what sits above it, and by §8.1 has a true row and a tour beat pointing at
+  // it. Recent reading is attention; the library is possession.
+  useReadingLog(postId, !!user)
 
   // Explicit cover wins over the legacy scrape; when one is set the body
   // markdown is left intact (no stripHeroImage), so the same author can put
@@ -95,6 +123,100 @@ export function ArticleReader({ article, articleDbId, writerName, writerUsername
     const cached = sessionStorage.getItem(`unlocked:${article.id}`)
     if (cached) setPaywallBody(cached)
   }, [article.id, article.isPaywalled])
+
+  // What a new account comes with, for the LOGGED-OUT gate's copy. Asked of the
+  // server rather than carried as a second copy of `CLOSED_BETA`; null means
+  // "no account can be made", which is also the answer when the probe could not
+  // resolve — see `signupOffer`.
+  useEffect(() => {
+    if (user) return
+    let cancelled = false
+    void signupOffer().then((o) => { if (!cancelled) setOffer(o) })
+    return () => { cancelled = true }
+  }, [user])
+
+  // THE ARRIVAL LANDING (PAYWALL-ARRIVAL §3, §11.4). Fires once per mount for
+  // any authenticated reader; the server answers `arrival: false` for everyone
+  // who did not create their account from THIS piece, which is the only test
+  // that can tell an arrival from a member signing in at the same gate. The
+  // gate pass it may perform is bounded server-side to a read that costs
+  // nothing — no money leaves a reader on a page load.
+  //
+  // Suppressed for the rest of the browser session once answered, so a reload
+  // does not re-raise the aside. The MEMBER-side gate is `arrival_article_id`
+  // and stays the load-bearing one; this is the per-device polish the invariant
+  // reserves for exactly this kind of one-off (`workspace:ceremony_seen:`).
+  const arrivalAsked = useRef(false)
+  useEffect(() => {
+    if (!user || arrivalAsked.current) return
+    arrivalAsked.current = true
+    const seenKey = `arrival_seen:${article.dTag}`
+    let cancelled = false
+    void articlesApi
+      .arrival(article.dTag)
+      .then(async (res) => {
+        if (cancelled || !res.arrival) return
+        if (res.gatePass) {
+          // Down the ONE existing decrypt path, not a second copy of it.
+          try {
+            const ciphertext = res.gatePass.ciphertext ?? article.encryptedPayload
+            if (ciphertext) {
+              const algorithm = (res.gatePass.algorithm ?? article.payloadAlgorithm ?? 'aes-256-gcm') as 'xchacha20poly1305' | 'aes-256-gcm'
+              const contentKeyBase64 = await unwrapContentKey(res.gatePass.encryptedKey)
+              const body = await decryptVaultContent(ciphertext, contentKeyBase64, algorithm)
+              if (cancelled) return
+              setPaywallBody(body)
+              try { sessionStorage.setItem(`unlocked:${article.id}`, body) } catch { /* quota — cache only */ }
+              void useAuth.getState().fetchMe()
+            }
+          } catch (err) {
+            // The piece stays gated and the ordinary button still works. The
+            // welcome then must not claim it opened.
+            console.error('Arrival unlock failed after gate pass:', err)
+          }
+        }
+        let seen = false
+        try { seen = sessionStorage.getItem(seenKey) === '1' } catch { /* private mode */ }
+        if (seen || cancelled) return
+        try { sessionStorage.setItem(seenKey, '1') } catch { /* private mode */ }
+        setArrival({
+          welcomeGiftPence: res.welcomeGiftPence ?? 0,
+          // Bound to what actually happened, not to what was intended: a
+          // decrypt that failed above leaves `paywallBody` null and the gate
+          // standing, and "this one's on the haus" over a still-locked piece is
+          // the one thing this modal must never say.
+          unlocked: !!res.gatePass,
+        })
+      })
+      .catch(() => { /* an arrival that cannot be asked about is not an arrival */ })
+    return () => { cancelled = true }
+  }, [user, article.dTag, article.id, article.encryptedPayload, article.payloadAlgorithm])
+
+  // THE SUBSCRIPTION NUDGE IS VIEWER-DERIVED AND THIS PAGE'S SSR IS NOT.
+  //
+  // `/article/[dTag]` fetches the gateway anonymously behind `revalidate: 60`,
+  // so `writerSpendThisMonthPence` / `nudgeShownThisMonth` arrive as the
+  // ANONYMOUS projection — null and false — for everybody. That was harmless
+  // while a member was bounced off this page before they could see it; D5
+  // deleted the bounce, so without this a member reading a shared link would
+  // silently lose the nudge. The route already does the right thing (it OMITS
+  // viewer fields rather than defaulting them); what was missing is a
+  // viewer-scoped read to put beside it. Cookies ride this one.
+  useEffect(() => {
+    if (!user || !article.isPaywalled) return
+    let cancelled = false
+    void articlesApi
+      .getByDTag(article.dTag)
+      .then((a) => {
+        if (cancelled) return
+        setViewerNudge({
+          writerSpendThisMonthPence: a.writerSpendThisMonthPence ?? undefined,
+          nudgeShownThisMonth: a.nudgeShownThisMonth,
+        })
+      })
+      .catch(() => { /* the nudge is secondary; the gate works without it */ })
+    return () => { cancelled = true }
+  }, [user, article.dTag, article.isPaywalled])
 
   // Redeem gift token from URL query param
   useEffect(() => {
@@ -138,7 +260,14 @@ export function ArticleReader({ article, articleDbId, writerName, writerUsername
   }
 
   async function handleUnlock() {
-    if (!user) { window.location.href = '/waitlist'; return }
+    // Unreachable from the gate (a logged-out reader is served a link, not this
+    // button) and kept as the belt: whichever way in exists is where it goes.
+    if (!user) {
+      window.location.href = offer
+        ? `/auth/signup?arrival=${encodeURIComponent(article.dTag)}`
+        : '/waitlist'
+      return
+    }
     setUnlocking(true); setUnlockError(null); setUnlockNeedsCard(false)
     try {
       let gatePassResult
@@ -175,6 +304,15 @@ export function ArticleReader({ article, articleDbId, writerName, writerUsername
     } finally { setUnlocking(false) }
   }
 
+  // SCROLL ANCHOR: THE SEAM, NOT THE GATE (D4). The gate element is destroyed
+  // by the unlock, so anything holding its offset holds a stale number. The
+  // join between the free run and the paywalled body is the same position, it
+  // survives the swap, and it is literally where the reader stopped.
+  useEffect(() => {
+    if (!arrival) return
+    seamRef.current?.scrollIntoView({ block: 'center' })
+  }, [arrival])
+
   const isUnlocked = !article.isPaywalled || paywallBody !== null
   const pricePounds = article.pricePence ? (article.pricePence / 100).toFixed(2) : null
   const publishDate = new Date(article.publishedAt * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
@@ -185,6 +323,14 @@ export function ArticleReader({ article, articleDbId, writerName, writerUsername
   return (
     <div className="min-h-screen bg-white">
       {showAllowanceModal && <AllowanceExhaustedModal onClose={() => setShowAllowanceModal(false)} />}
+
+      {arrival && (
+        <ArrivalWelcome
+          unlocked={arrival.unlocked}
+          welcomeGiftPence={arrival.welcomeGiftPence}
+          onClose={() => setArrival(null)}
+        />
+      )}
 
       <QuoteSelector
         articleBodyRef={articleBodyRef}
@@ -268,6 +414,10 @@ export function ArticleReader({ article, articleDbId, writerName, writerUsername
             {/* Article body */}
             <article>
               <div ref={articleBodyRef} className="prose prose-lg prose-dropcap" dangerouslySetInnerHTML={{ __html: freeHtml }} />
+              {/* The seam. Zero-height and always present, so it is the same
+                  position before and after the unlock swaps the gate for the
+                  body — which is exactly the property the gate itself lacks. */}
+              <div ref={seamRef} aria-hidden="true" />
 
               {article.isPaywalled && !isUnlocked && (
                 <PaywallGate
@@ -286,8 +436,10 @@ export function ArticleReader({ article, articleDbId, writerName, writerUsername
                   isSubscribed={isSubscribed}
                   onSubscribe={handleSubscribe}
                   subscribing={subscribing}
-                  writerSpendThisMonthPence={writerSpendThisMonthPence}
-                  nudgeShownThisMonth={nudgeShownThisMonth}
+                  dTag={article.dTag}
+                  signupOffer={offer}
+                  writerSpendThisMonthPence={viewerNudge ? viewerNudge.writerSpendThisMonthPence : writerSpendThisMonthPence}
+                  nudgeShownThisMonth={viewerNudge ? viewerNudge.nudgeShownThisMonth : nudgeShownThisMonth}
                   writerId={writerId}
                 />
               )}
@@ -305,10 +457,19 @@ export function ArticleReader({ article, articleDbId, writerName, writerUsername
               />
 
               {/* Foot of the piece — whitespace alone carries the break (the ∀
-                  ornament that stood here was retired 2026-07-25). */}
-              <div className="mt-24">
-                <ReplySection targetEventId={article.id} targetKind={30023} targetAuthorPubkey={article.pubkey} contentAuthorId={undefined} isUnlocked={isUnlocked} />
-              </div>
+                  ornament that stood here was retired 2026-07-25).
+
+                  NOT MOUNTED WHILE THE GATE IS UP, on the same condition that
+                  raises it: a locked piece shows nothing below its gate. The
+                  server would say so too (ReplySection's `paywallLocked` branch
+                  now renders null), but only after a round trip — and its
+                  loading state draws a rule and a skeleton in the meantime, so
+                  leaving it mounted would flash exactly what we are removing. */}
+              {!(article.isPaywalled && !isUnlocked) && (
+                <div className="mt-24">
+                  <ReplySection targetEventId={article.id} targetKind={30023} targetAuthorPubkey={article.pubkey} contentAuthorId={undefined} isUnlocked={isUnlocked} />
+                </div>
+              )}
             </article>
 
           </div>

@@ -115,3 +115,95 @@ describe("dead-job arrival window fallback vs config-defaults.sql", () => {
     ).toEqual([]);
   });
 });
+
+describe("dedup confidence floor fallback vs config-defaults.sql", () => {
+  beforeEach(() => {
+    configMock.current = new Map();
+  });
+
+  it("the in-code fallback matches the seeded default", async () => {
+    // Fourth copy of the same rule (§6.3), and the one where a drift is worst:
+    // this dial decides whether a guessed identity link is allowed to HIDE a
+    // post. A fallback that drifted DOWN would switch domain-matching on for
+    // every database missing the row — which is every freshly bootstrapped one
+    // — and the symptom would be somebody's posts silently absent from a feed.
+    const { dedupMinConfidence } = await import("../src/lib/dedup-sql.js");
+    expect(
+      diffAgainstDefaults({ dedup_min_confidence: await dedupMinConfidence() }),
+    ).toEqual([]);
+  });
+
+  it("a seeded value wins over the fallback", async () => {
+    const { dedupMinConfidence } = await import("../src/lib/dedup-sql.js");
+    configMock.current = new Map([["dedup_min_confidence", "0.5"]]);
+    expect(await dedupMinConfidence()).toBe(0.5);
+  });
+
+  it("falls back rather than trusting junk, and rejects out-of-range", async () => {
+    // A NaN floor compares false against every confidence, which disables dedup
+    // altogether and looks exactly like the feature working; a floor above 1
+    // does the same thing while reading as deliberate. Both fall back.
+    const { dedupMinConfidence } = await import("../src/lib/dedup-sql.js");
+    for (const junk of ["", "not-a-number", "-0.1", "1.5"]) {
+      configMock.current = new Map([["dedup_min_confidence", junk]]);
+      expect(
+        diffAgainstDefaults({ dedup_min_confidence: await dedupMinConfidence() }),
+      ).toEqual([]);
+    }
+  });
+});
+
+describe("reading-log retention fallback vs config-defaults.sql", () => {
+  beforeEach(() => {
+    configMock.current = new Map();
+  });
+
+  it("the in-code fallback matches the seeded default", async () => {
+    // Fifth copy of the same rule (READING-LOG-AND-LIBRARY-ADR D5). This dial
+    // is the whole of the feature's privacy posture — Recent reading is on by
+    // default *because* it forgets — so a fallback that drifted UP would widen
+    // the window on every database missing the row, which is every freshly
+    // bootstrapped one, and nothing would say so.
+    const { readingLogRetentionDays } = await import(
+      "../src/workers/reading-log-sweep.js"
+    );
+    expect(
+      diffAgainstDefaults({
+        reading_log_retention_days: await readingLogRetentionDays(),
+      }),
+    ).toEqual([]);
+  });
+
+  it("a seeded value wins over the fallback", async () => {
+    const { readingLogRetentionDays } = await import(
+      "../src/workers/reading-log-sweep.js"
+    );
+    configMock.current = new Map([["reading_log_retention_days", "30"]]);
+    expect(await readingLogRetentionDays()).toBe(30);
+  });
+
+  it("falls back rather than trusting junk in the row", async () => {
+    // The two failure directions are opposite and both silent. A NaN window
+    // makes `now() - interval` NULL, which matches no row: the sweep deletes
+    // nothing, forever, while reporting success — and the table it exists to
+    // bound grows without limit. A zero or negative window deletes the log the
+    // reader is looking at.
+    //
+    // "0.5" is the case that matters: the config editor's numeric regex accepts
+    // it, it is finite and positive, and the floor that stops `7.5` throwing in
+    // `make_interval` turns it into 0 — a whole-log delete, hourly. The guard
+    // has to run on the FLOORED value; on the raw one this case returns 0.
+    const { readingLogRetentionDays } = await import(
+      "../src/workers/reading-log-sweep.js"
+    );
+    for (const junk of ["", "not-a-number", "0", "-5", "0.5", "0.999"]) {
+      configMock.current = new Map([["reading_log_retention_days", junk]]);
+      expect(await readingLogRetentionDays()).toBeGreaterThan(0);
+      expect(
+        diffAgainstDefaults({
+          reading_log_retention_days: await readingLogRetentionDays(),
+        }),
+      ).toEqual([]);
+    }
+  });
+});

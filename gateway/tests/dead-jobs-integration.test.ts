@@ -34,7 +34,7 @@ const { DEAD_JOBS_SQL, deadJobWindowHoursDial } = await import(
 //
 // Fixtures live inside a transaction that is ALWAYS rolled back, so the target
 // DB's real job queue is never touched. Skipped without a DB URL so the
-// no-Postgres CI job stays green. Run locally:
+// CI supplies one (it boots Postgres and FAILS on a skip). Run locally:
 //   POSTGRES_PASSWORD=$(grep -E '^POSTGRES_PASSWORD=' ../.env | cut -d= -f2-) \
 //   TEST_DATABASE_URL=postgresql://platformpub:$POSTGRES_PASSWORD@localhost:5432/platformpub \
 //     npx vitest run tests/dead-jobs-integration.test.ts

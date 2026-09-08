@@ -2,7 +2,7 @@
 
 import type { CSSProperties, ReactNode } from 'react'
 import { LIGHT_ISLAND_STYLE } from '../../lib/palette/island'
-import { usePublicPalette, scrollThumb, PAD, GAP } from './palette'
+import { usePublicPalette, PAD, GAP } from './palette'
 
 // =============================================================================
 // PublicVessel — the SINGLE-WALL ⊔. Chassis for every logged-out page except
@@ -102,16 +102,14 @@ export function PublicVessel({ children, style }: PublicVesselProps) {
     >
       <div
         data-vessel-scroll=""
-        className="ah-vessel-scroll"
         style={{
-          // The scrollbar thumb, handed to CSS as a variable. It was originally
-          // `currentColor` in the stylesheet on the claim that the scroll body
-          // inherits the walls colour from the frame — it does not; nothing sets
-          // `color` on the frame, so it picked up whatever text colour was
-          // ambient. Passing it explicitly also lets the thumb use a card-
-          // relative grey rather than the wall colour, which is invisible in
-          // dark (see the note in palette.ts).
-          ['--ah-scroll-thumb' as string]: scrollThumb(palette),
+          // No scroll marker: the register's pages are not reading surfaces,
+          // and silence is the default (globals.css). What stood here was the
+          // one deliberately DESIGNED bar in the product — 8px, a `cardMeta`
+          // thumb piped in as `--ah-scroll-thumb` — and being styled is exactly
+          // what made it the loudest, since an explicit `::-webkit-scrollbar`
+          // rule opts an element out of the platform's overlay auto-hiding and
+          // draws the thumb permanently on every OS.
           padding: PAD,
           // Matches the frame: hug the cards, shrink and scroll when there are
           // more of them than fit. `1 1 0` here would have re-stretched the

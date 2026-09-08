@@ -29,7 +29,7 @@ import {
 // Mutation-proved: restoring the `xs.display_name` arm in any one statement
 // fails that statement's NULL/'' cases and the repair case.
 //
-// Skipped unless a DB URL is supplied (CI's no-Postgres `test` job stays green).
+// Skipped unless a DB URL is supplied (CI supplies one and fails on a skip).
 //   POSTGRES_PASSWORD=$(grep -E '^POSTGRES_PASSWORD=' ../.env | cut -d= -f2-) \
 //   TEST_DATABASE_URL=postgresql://platformpub:$POSTGRES_PASSWORD@localhost:5432/platformpub \
 //     npx vitest run src/tasks/feed-items-author-name-integration.test.ts

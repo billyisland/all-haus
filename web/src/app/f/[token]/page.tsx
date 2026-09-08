@@ -210,7 +210,15 @@ export default function FormulaPage() {
     <PublicShell>
       <PublicVessel>
         <PublicCard>
-          <PublicTitle>{formula.name ?? 'A feed'}</PublicTitle>
+          {/* `|| `, NOT `?? `. A feed's name is OPTIONAL and the DB's floor was
+              dropped in migration 190, but the gateway sends `link.feed_name`
+              straight through and the create schema is `z.string().trim()
+              .default("")` — so an untitled feed arrives here as `""`, never as
+              null, and `??` walks straight past it and renders an empty title on
+              a public page. `.trim()` because a whitespace-only name is the same
+              untitled case. Same rule the workspace already follows everywhere
+              ("Unnamed feed", "No name", `Feed N`); this page was the outlier. */}
+          <PublicTitle>{formula.name?.trim() || 'A feed'}</PublicTitle>
           <div style={{ marginTop: 10 }}>
             <PublicBody>
               {/* D7 — attribution travels, adoption counts do not. There is no

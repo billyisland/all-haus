@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { postThread } from "../lib/api/post";
 import type { FeedScheme } from "../components/workspace/tokens";
+import type { MediaItem } from "../lib/post/types";
 import { claimOverlayEntry, popOverlayEntry } from "../lib/overlayHistory";
 
 // =============================================================================
@@ -34,6 +35,12 @@ export type ReaderTarget =
       // launcher had no Post in hand (a cold /read/:postId reload), or for a
       // context-only row whose source is not this post's.
       sourceId: string | null;
+      // The item's OWN media (an RSS <enclosure> / <media:content>), carried so
+      // the pane can play a video the origin page has no player for. The card
+      // has always played these; the pane rendered only the /extract body, so
+      // opening a video item was where the video went away. Null on a cold
+      // /read/:postId reload before the thread lookup answers.
+      media: MediaItem[] | null;
     }
   | {
       kind: "native";
@@ -63,6 +70,7 @@ export type ReaderNavEntry =
       title: string | null;
       siteName: string | null;
       sourceId: string | null;
+      media: MediaItem[] | null;
     };
 
 /** The ordered article list of the launching feed + the current position. */
@@ -95,6 +103,7 @@ interface ReaderState {
       title?: string | null;
       siteName?: string | null;
       sourceId?: string | null;
+      media?: MediaItem[] | null;
       frameScheme?: FeedScheme | null;
     },
   ) => void;
@@ -179,6 +188,7 @@ export const useReader = create<ReaderState>((set, get) => {
           title: entry.title,
           siteName: entry.siteName,
           sourceId: entry.sourceId,
+          media: entry.media,
         },
         frameScheme: frame.frameScheme,
         nav: frame.nav,
@@ -201,6 +211,7 @@ export const useReader = create<ReaderState>((set, get) => {
           title: opts?.title ?? null,
           siteName: opts?.siteName ?? null,
           sourceId: opts?.sourceId ?? null,
+          media: opts?.media ?? null,
         },
         { frameScheme: opts?.frameScheme ?? null, nav: null },
       );
@@ -236,6 +247,7 @@ export const useReader = create<ReaderState>((set, get) => {
           title: focal.body.title,
           siteName: focal.origin.sourceName,
           sourceId: focal.externalSourceId ?? null,
+          media: focal.body.media ?? null,
         });
       } catch {
         /* non-fatal — reopening is best-effort; the workspace stays open */

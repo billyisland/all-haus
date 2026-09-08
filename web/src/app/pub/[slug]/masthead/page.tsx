@@ -7,7 +7,6 @@ import {
   type MastheadMember,
 } from '../../../../components/publication/pub-sections'
 import { PublicPage } from '../../../../components/public/PublicPage'
-import WorkspacePaneRedirect from '../../../../components/layout/WorkspacePaneRedirect'
 
 const GATEWAY = process.env.GATEWAY_INTERNAL_URL ?? process.env.GATEWAY_URL ?? 'http://localhost:3000'
 
@@ -55,7 +54,6 @@ export default async function MastheadPage({ params }: { params: { slug: string 
 
   return (
     <PublicPage>
-      <WorkspacePaneRedirect overlay="surface" params={{ surface: `/pub/${params.slug}/masthead` }} />
       <PublicationMasthead pub={pub} view="masthead" />
       <div className="mx-auto max-w-feed px-4 sm:px-6 pt-14 pb-20">
         {failed ? (

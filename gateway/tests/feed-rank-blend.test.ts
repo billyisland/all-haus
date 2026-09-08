@@ -19,8 +19,7 @@ import {
 // ORDER and on the boundary cases the expression exists to handle (absence,
 // clamping, alpha selection), not on "the query returns rows".
 //
-// Skipped unless a DB URL is supplied, so the no-Postgres CI `test` job stays
-// green. Run locally against the dev DB:
+// Skipped unless a DB URL is supplied — CI supplies one (it boots Postgres and FAILS on a skip). Run locally against the dev DB:
 //   TEST_DATABASE_URL=postgresql://platformpub:PASSWORD@localhost:5432/platformpub \
 //     npx vitest run tests/feed-rank-blend.test.ts
 // =============================================================================

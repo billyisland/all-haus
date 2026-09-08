@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   nostrTargetPostId,
   POST_SELECT,
@@ -10,53 +10,61 @@ import { FEED_SELECT, FEED_JOINS } from "../src/lib/feed-sql.js";
 // These guard the P1-2 fix: a native kind-1 reply/quote stores the target's raw
 // nostr EVENT id, but a native article's deterministic post_id is minted from its
 // naddr COORDINATE '30023:<pubkey>:<dtag>' (migration 098). Deriving straight from
-// the event id therefore dangles the edge for article targets. The fix routes both
-// nostr branches through nostrTargetPostId(), which resolves an article event id to
-// its coordinate before deriving (falling back to the event id for note targets).
+// the event id therefore dangles the edge for article targets. Both nostr branches
+// route through nostrTargetPostId(), which resolves an article event id to the
+// article's post_id before falling back to the event id for note targets.
 //
-// The runtime behaviour was validated against the dev DB; these tests are a
-// structural regression guard against silently reverting to the naive derivation.
+// AMENDED 2026-09-05. The resolver used to REBUILD the coordinate itself
+// ('30023:' || pubkey || ':' || dtag) and hash that; it now calls
+// `article_post_id(uuid)`, which READS feed_items.post_id and derives only where
+// no row exists (READING-LOG-AND-LIBRARY-ADR D7). The three assertions that
+// pinned the rebuilt coordinate are gone, because the string they looked for is
+// the thing that was wrong: a re-derivation cannot produce the mint's own
+// fallback form, `('nostr_article', <article id>)`.
+//
+// AND NOTE WHAT A TEXT PIN CAN NO LONGER SEE. One assertion here used to be
+// "POST_SELECT does NOT contain feed_items_derive_post_id('nostr',
+// n.reply_to_event_id)", the naive form. That exact string is now present and
+// CORRECT — it is the COALESCE's fallback arm, which is what a note target must
+// take. So the structural guard can no longer tell the shipped expression from
+// the bug it replaced, and it does not pretend to: the behavioural guard is
+// `tests/root-post-id-resolution.test.ts`, DB-backed, which constructs the one
+// row where reading and re-deriving disagree and asserts both answers. These
+// remain what they always said they were — a cheap check that the resolver is
+// still WIRED IN, not a check that it is right.
 
-describe("nostrTargetPostId (P1-2 article-coordinate resolution)", () => {
+describe("nostrTargetPostId (article-target resolution)", () => {
   const sql = nostrTargetPostId("n.reply_to_event_id");
 
-  it("derives under the 'nostr' protocol", () => {
-    expect(sql).toContain("feed_items_derive_post_id('nostr',");
-  });
-
-  it("resolves an article event id to its naddr coordinate", () => {
-    expect(sql).toContain("'30023:'");
+  it("reads the article's post_id through the one home, never rebuilding the coord", () => {
+    expect(sql).toContain("article_post_id(art2.id)");
     expect(sql).toContain("FROM articles");
-    expect(sql).toContain("JOIN accounts");
-    // looks up the article by the stored event id
+    // looks the article up by the stored event id
     expect(sql).toContain("nostr_event_id = n.reply_to_event_id");
+    // The re-derivation is GONE. This is the regression that matters now: it
+    // invents an id for any article the mint's fallback branch minted.
+    expect(sql).not.toContain("'30023:'");
   });
 
   it("falls back to the raw event id for non-article (note) targets", () => {
     expect(sql).toContain("COALESCE(");
+    expect(sql).toContain("feed_items_derive_post_id('nostr',");
     // the column appears both in the lookup predicate and as the COALESCE fallback
     const occurrences = sql.split("n.reply_to_event_id").length - 1;
     expect(occurrences).toBeGreaterThanOrEqual(2);
   });
-
-  it("guards the coordinate against null pubkey/dtag", () => {
-    expect(sql).toContain("nostr_pubkey IS NOT NULL");
-    expect(sql).toContain("nostr_d_tag IS NOT NULL");
-  });
 });
 
 describe("POST_SELECT routes nostr reply/quote edges through the resolver", () => {
-  it("does NOT derive the reply edge naively from the raw event id", () => {
-    // the pre-fix form — its reintroduction is the regression we guard against
-    expect(POST_SELECT).not.toContain(
-      "feed_items_derive_post_id('nostr', n.reply_to_event_id)",
-    );
-    expect(POST_SELECT).not.toContain(
-      "feed_items_derive_post_id('nostr', n.quoted_event_id)",
-    );
+  it("routes both nostr branches through the resolver, not straight at the event id", () => {
+    // The naive form is no longer distinguishable by text — it IS the
+    // resolver's fallback arm (see the header) — so what is pinned instead is
+    // that the article lookup is present on both branches. Below.
+    expect(POST_SELECT).toContain("article_post_id(art2.id)");
+    expect(POST_SELECT).not.toContain("'30023:'");
   });
 
-  it("resolves both the reply and quote nostr branches via the article coordinate", () => {
+  it("resolves both the reply and quote nostr branches via the article lookup", () => {
     expect(POST_SELECT).toContain("nostr_event_id = n.reply_to_event_id");
     expect(POST_SELECT).toContain("nostr_event_id = n.quoted_event_id");
   });
@@ -113,6 +121,29 @@ describe("feedItemToPost surfaces the external interact-back key", () => {
 // slot an external card gives its source. The join is structural (only
 // Postgres evaluates it) and the mapper's projection of it is behavioural.
 describe("origin.publication (BYLINE-AND-PROVENANCE-ADR D8)", () => {
+  // The embed darks with the publications suspension AT THIS MAPPER — the one
+  // choke point every card path shares — so the projection tests below run
+  // with the flag on, and one test pins the dark state.
+  beforeEach(() => {
+    process.env.PUBLICATIONS_ENABLED = "1";
+  });
+  afterEach(() => {
+    delete process.env.PUBLICATIONS_ENABLED;
+  });
+
+  it("is withheld ENTIRELY while PUBLICATIONS_ENABLED is off — no card may wear a /pub link into a suspended surface", () => {
+    delete process.env.PUBLICATIONS_ENABLED;
+    const post = feedItemToPost({
+      item_type: "article",
+      post_id: "f00d",
+      published_at_epoch: 1000,
+      pub_name: "The Recurse",
+      pub_slug: "the-recurse",
+      pub_status: "active",
+    });
+    expect(post.origin.publication).toBeNull();
+  });
+
   it("FEED_SELECT/FEED_JOINS carry the publication off articles.publication_id", () => {
     // Structural pin: the columns the mapper reads must be projected, and
     // from a join keyed on the ARTICLE's publication (never a feed_source's).
@@ -187,7 +218,6 @@ describe("origin.publication (BYLINE-AND-PROVENANCE-ADR D8)", () => {
         author_id: "a",
         acc_display_name: "A",
         acc_username: "a",
-        acc_avatar: null,
         nostr_pubkey: "pk",
         pip_status: null,
         vt_up: 0,

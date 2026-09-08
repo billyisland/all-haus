@@ -53,13 +53,26 @@ export async function writerRoutes(app: FastifyInstance) {
 
       const writer = rows[0]
 
-      // Count published articles, paywalled articles, followers, and following.
+      // Count published articles, paywalled articles, notes, replies, followers,
+      // and following.
       // `presences` is the profile's `verified` identity row (PROFILE-PANE-
       // REDESIGN-ADR D7) — network identities the subject proved, consent-gated
       // on show_on_profile so an OAuth link never becomes public retroactively.
+      //
+      // noteCount/replyCount exist because the profile's button row renders a
+      // view's button ONLY when that view has something in it, and it must know
+      // that before it paints. Derived client-side from the logs' own fetches,
+      // the row would gain two buttons a beat after load and the selected view
+      // would move under the reader — the counts have to arrive with the
+      // profile. They are the SAME populations the two logs draw
+      // (`GET /author/:id/posts?kind=note` and `/author/:id/replies`), so their
+      // predicates are copied from those queries and must move with them: a
+      // count that disagrees with its log is a button that opens an empty view.
       const [
         countResult,
         paywalledResult,
+        noteResult,
+        replyResult,
         followerResult,
         followingResult,
         presences,
@@ -74,6 +87,22 @@ export async function writerRoutes(app: FastifyInstance) {
           `SELECT COUNT(*) AS count FROM articles
            WHERE writer_id = $1 AND published_at IS NOT NULL AND deleted_at IS NULL AND access_mode = 'paywalled'
              AND (publication_id IS NULL OR show_on_writer_profile = TRUE)`,
+          [writer.id]
+        ),
+        pool.query<{ count: string }>(
+          // Mirrors /author/:id/posts' native arm (item_type = 'note'). The
+          // context filter that query also carries is over external_items, and
+          // a native note has no such row, so it is a no-op here — hence no
+          // join rather than a forgotten predicate.
+          `SELECT COUNT(*) AS count FROM feed_items
+           WHERE author_id = $1 AND item_type = 'note' AND deleted_at IS NULL`,
+          [writer.id]
+        ),
+        pool.query<{ count: string }>(
+          // Mirrors /author/:id/replies — kind-1111 comments live in `comments`,
+          // not feed_items.
+          `SELECT COUNT(*) AS count FROM comments
+           WHERE author_id = $1 AND deleted_at IS NULL`,
           [writer.id]
         ),
         pool.query<{ count: string }>(
@@ -100,6 +129,8 @@ export async function writerRoutes(app: FastifyInstance) {
         showCommissionButton: writer.show_commission_button,
         articleCount: parseInt(countResult.rows[0].count, 10),
         hasPaywalledArticle: parseInt(paywalledResult.rows[0].count, 10) > 0,
+        noteCount: parseInt(noteResult.rows[0].count, 10),
+        replyCount: parseInt(replyResult.rows[0].count, 10),
         followerCount: parseInt(followerResult.rows[0].count, 10),
         followingCount: parseInt(followingResult.rows[0].count, 10),
         presences,
@@ -457,6 +488,15 @@ export async function writerRoutes(app: FastifyInstance) {
   // GET /writers/:username/following — public following list
   //
   // Returns a paginated list of accounts this user follows.
+  //
+  // The has_paywalled_article EXISTS below reads articles.WRITER_id. There is no
+  // articles.author_id, so the version that named one raised 42703 and the whole
+  // route 500'd — and FollowingTab swallows a bad response into an empty list,
+  // so the outage rendered as "Not following anyone yet": a claim about the
+  // member, made by a broken query, on every profile there has ever been. It
+  // surfaced the day the profile's button row started printing the count beside
+  // the view it opens, because "9 FOLLOWING" over nobody is a contradiction a
+  // reader can see and a swallowed 500 is not.
   // ---------------------------------------------------------------------------
 
   app.get<{
@@ -497,7 +537,7 @@ export async function writerRoutes(app: FastifyInstance) {
                   a.subscription_price_pence,
                   EXISTS(
                     SELECT 1 FROM articles
-                    WHERE author_id = a.id AND price_pence > 0 AND deleted_at IS NULL
+                    WHERE writer_id = a.id AND price_pence > 0 AND deleted_at IS NULL
                   ) AS has_paywalled_article
            FROM follows f
            JOIN accounts a ON a.id = f.followee_id

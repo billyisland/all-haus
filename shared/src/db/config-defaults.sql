@@ -179,6 +179,16 @@ ON CONFLICT (key) DO NOTHING;
 -- ---------------------------------------------------------------------------
 INSERT INTO platform_config (key, value, description) VALUES
   ('free_allowance_pence',           '500',  'New reader free allowance (£5.00)'),
+  -- The paywall-arrival cap, and it is DELIBERATELY NOT the allowance dial.
+  -- The arrival grant is `free_allowance_pence + p`, so a piece priced at the
+  -- full allowance doubles what a single signup is worth — and the gift is
+  -- fungible, so the doubling is spendable anywhere. Allowance reads earn
+  -- writers nothing, which puts the cost of that on writers rather than on the
+  -- platform. Capping the ARRIVAL below the allowance bounds the amplification
+  -- without touching the ordinary welcome (operator decision 2026-09-06,
+  -- CONSOLIDATED-TODO §0v). Above this the piece stays gated and the reader
+  -- presses the button — D4 Path C, which the modal already words.
+  ('arrival_gift_cap_pence',         '200',  'Max article price the paywall-arrival gift will cover (£2.00); above this the piece stays gated'),
   ('tab_settlement_threshold_pence', '800',  'Reader tab threshold that triggers Stripe charge (£8.00)'),
   ('monthly_fallback_minimum_pence', '200',  'Minimum balance for time-based settlement trigger (£2.00)'),
   ('monthly_fallback_days',          '30',   'Days since last read before monthly settlement fires'),
@@ -408,4 +418,54 @@ ON CONFLICT (key) DO NOTHING;
 -- ---------------------------------------------------------------------------
 INSERT INTO platform_config (key, value, description) VALUES
   ('feed_ingest_atproto_max_replay_hours', '24', 'How far back a Jetstream reconnect may resume. Caps the oldest per-source cursor, which otherwise ages without bound and makes every reconnect replay weeks of the whole firehose. Read by feed-ingest listener.ts::resumePoint.')
+ON CONFLICT (key) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- Cross-source dedup — the confidence below which a recorded identity link
+-- suppresses nothing (§6.1 + §6.3).
+--
+-- Dedup hides content, so the question a link answers is not "are these two
+-- posts the same text" (they demonstrably are — that is what the fingerprint
+-- measures) but "is this the same PERSON". The fingerprint cannot answer the
+-- second and never could: two accounts posting the same headline is ordinary,
+-- and a hand read of dev's multi-source fingerprint groups found 88 of 89 were
+-- different authors syndicating the same tech-news line. All of the identity
+-- claim therefore rides on the link, and the floor is what stops the weakest
+-- kind of link — a `domain_match` guessed from a shared website, confidence
+-- 0.6 — from silently deleting a stranger's post from somebody's feed.
+--
+-- 0.9 admits `bridge` (0.95: a bridge mirror embeds the original identity, so
+-- it is a decode rather than a guess) and `user_asserted` (1.0: the reader
+-- said so), and excludes `domain_match`. It is a dial because the right answer
+-- depends on how domain_match performs against real feeds, which nobody can
+-- know until IDENTITY_LINK_DETECT_ENABLED has run somewhere with volume:
+-- measure first, then lower it to ~0.5 to switch domain-matching on. The
+-- detector keeps running and keeps recording either way — a 0.6 link is
+-- evidence worth having, just not an instruction.
+-- ---------------------------------------------------------------------------
+INSERT INTO platform_config (key, value, description) VALUES
+  ('dedup_min_confidence',           '0.9',  'Minimum external_identity_links.confidence for a link to suppress a cross-posted duplicate. 0.9 admits bridge (0.95) and user_asserted (1.0) and excludes domain_match (0.6). Read by gateway dedup-sql.ts::dedupMinConfidence.')
+ON CONFLICT (key) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- Recent reading — how long a piece stays in the reader's log (D5).
+--
+-- The window is the whole of the privacy posture. Recent reading is on by
+-- default because a log you had to predict you would want is empty on the day
+-- you finally want it; what makes that default defensible rather than
+-- acquisitive is that it forgets. Widening this dial re-opens D1 rather than
+-- extending it.
+--
+-- It is also the difference between a rounding error and the largest table on
+-- the box. At 323 bytes/row, measured on real post_id values with both indexes:
+-- seven days of heavy reading (100 pieces/day) is 226 KB per reader, 2.3 GB at
+-- ten thousand readers. Unbounded, the same reader costs ~12 MB per YEAR each
+-- and never stops — 118 GB at the same population.
+--
+-- Read by the gateway retention sweep (reading-log-sweep.ts) and nothing else,
+-- which is the whole reader set a dial needs: a seeded key no code consults is
+-- a dial whose UPDATE succeeds, reports nothing and changes nothing.
+-- ---------------------------------------------------------------------------
+INSERT INTO platform_config (key, value, description) VALUES
+  ('reading_log_retention_days', '7', 'How many days a piece stays in a reader''s Recent reading log, measured on its LATEST open so a piece returned to never ages out. Also the age at which a reading_positions row is swept, which since migration 189 has no other reaper. Read by gateway workers/reading-log-sweep.ts.')
 ON CONFLICT (key) DO NOTHING;

@@ -17,13 +17,19 @@
 // the mapper tolerates their absence (boost_count defaults to 0).
 // =============================================================================
 
+import { publicationsEnabled } from "@platform-pub/shared/lib/env.js";
+
 export interface PostAuthor {
   id: string | null; // identity record (native author_id / external_author_id). NULL = tier C/D plain-text byline
   accountId: string | null; // lazy link to a real all.haus account
   displayName: string | null;
   handle: string | null;
   handleUri: string | null; // link to profile on origin (external)
-  avatar: string | null;
+  // No avatar. A card body carries no pfp (web/CLAUDE.md › Feed card chassis:
+  // left bar + pip + mono-caps name carry identity), and the hover card fetches
+  // its own from /author-card — so the three avatar columns this used to select
+  // (accounts, external_authors, external_items) reached no renderer at all.
+  // Re-adding one here is not how a card gets a picture.
   pubkey: string | null; // native only
   pipStatus: "known" | "partial" | "unknown" | "contested";
 }
@@ -61,6 +67,18 @@ export interface Post {
   author: PostAuthor;
   type: "article" | "note";
   accessMode: "free" | "gated";
+  // ARTICLE-HEADED-CONVERSATIONS-ADR D5. "The article this conversation hangs
+  // off is paywalled AND THIS VIEWER cannot read it" — a different question
+  // from `accessMode`, which carries no viewer term (see :201) and so says
+  // `gated` on a paying reader's card too.
+  //
+  // OPTIONAL, and absent is not `false`. Only the two routes that already know
+  // the viewer stamp it — the thread projector and the profile's Replies log —
+  // so on every other surface an absent field reads as "nobody asked this
+  // question about this post", which is the truth. `feedItemToPost` takes no
+  // viewer and must not learn to; a required boolean here is exactly what would
+  // force it to. Readers key on `=== true`, never on falsiness.
+  rootLocked?: boolean;
   body: PostBody;
   inReplyTo: string | null; // parent post_id
   quotes: string | null; // quoted post_id (depth-1)
@@ -121,20 +139,37 @@ export interface RepostEdgeDTO {
 // post_id (§2.3, the same SQL function migration 098 uses) so each Post carries
 // real inReplyTo/quotes edges that GET /thread can resolve.
 //
-// Article-target resolution (UNIVERSAL-POST P1-2 fix): a native article's post_id is
-// minted from its naddr COORDINATE '30023:<pubkey>:<dtag>' (migration 098), but a
-// kind-1 reply/quote stores the article's raw EVENT id in reply_to_event_id /
-// quoted_event_id. Deriving straight from the event id would mint a post_id that
-// matches no THING → dangling edge → orphaned thread node. So when the stored event
-// id is in fact an article's event id, resolve it to that article's coordinate before
-// deriving; otherwise (a note target) fall through to the event id, which is correct.
+// Article-target resolution — THE ONE HOME for "a native event id, resolved to
+// the post_id it actually names". Three questions turn out to be one: a kind-1
+// note's `reply_to_event_id`, its `quoted_event_id`, and a comment's
+// `target_event_id` on GET /author/:authorId/replies.
+//
+// THE PROBLEM. A native article's post_id is minted from its naddr COORDINATE
+// ('30023:<pubkey>:<dtag>', migration 098), while everything that points AT an
+// article stores its raw EVENT id. Deriving straight from the event id mints a
+// post_id that matches no THING — a dangling edge, an orphaned thread node.
+// A note target is the opposite: its post_id IS derived from its event id, so
+// falling through is exactly right there.
+//
+// IT READS THE post_id; IT DOES NOT RE-DERIVE THE COORD. This used to rebuild
+// '30023:' || pubkey || ':' || dtag itself, which is the thing
+// `article_post_id`'s own comment forbids in as many words: post_id is minted
+// ONCE and the mint's native branch has a fallback ('nostr_article' || id, for
+// an article whose writer/d-tag the trigger could not see), so a re-derivation
+// mints an id matching no row in precisely the case the fallback exists for.
+// Re-deriving also has the wrong shape for the failure — it produced a
+// *plausible* 64-hex string rather than nothing, so the gap was invisible.
+// `article_post_id(uuid)` is the one home (READING-LOG-AND-LIBRARY-ADR D7): it
+// READS feed_items.post_id and derives, with the full fallback, only where no
+// row exists. Both legs are indexed — `articles_nostr_event_id_key` unique,
+// then `idx_feed_items_article` unique.
+//
 // Read-side only — repairs existing rows with no migration / re-ingest.
-export const nostrTargetPostId = (col: string) => `feed_items_derive_post_id('nostr', COALESCE(
-    (SELECT '30023:' || ac2.nostr_pubkey || ':' || art2.nostr_d_tag
-       FROM articles art2 JOIN accounts ac2 ON ac2.id = art2.writer_id
-      WHERE art2.nostr_event_id = ${col}
-        AND ac2.nostr_pubkey IS NOT NULL AND art2.nostr_d_tag IS NOT NULL),
-    ${col}))`;
+export const nostrTargetPostId = (col: string) => `COALESCE(
+    (SELECT article_post_id(art2.id)
+       FROM articles art2
+      WHERE art2.nostr_event_id = ${col}),
+    feed_items_derive_post_id('nostr', ${col}))`;
 
 // Leading comma: appended directly after FEED_SELECT in `SELECT ${FEED_SELECT}${POST_SELECT}`.
 export const POST_SELECT = `,
@@ -142,9 +177,8 @@ export const POST_SELECT = `,
   fi.biddability_tier AS biddability_tier_persisted,
   fi.external_author_id AS external_author_id,
   acc.display_name AS acc_display_name, acc.username AS acc_username,
-  acc.avatar_blossom_url AS acc_avatar,
   xa.account_id AS xa_account_id, xa.display_name AS xa_display_name,
-  xa.handle AS xa_handle, xa.handle_uri AS xa_handle_uri, xa.avatar AS xa_avatar,
+  xa.handle AS xa_handle, xa.handle_uri AS xa_handle_uri,
   vt.upvote_count AS vt_up, vt.downvote_count AS vt_down,
   CASE
     WHEN n.reply_to_event_id IS NOT NULL THEN ${nostrTargetPostId("n.reply_to_event_id")}
@@ -205,7 +239,6 @@ export function feedItemToPost(row: any): Post {
         displayName: row.acc_display_name ?? null,
         handle: row.acc_username ?? null,
         handleUri: null, // native profile is internal (/username); no origin link
-        avatar: row.acc_avatar ?? null,
         pubkey: row.nostr_pubkey ?? null,
         pipStatus: row.pip_status ?? "unknown",
       }
@@ -222,7 +255,6 @@ export function feedItemToPost(row: any): Post {
         displayName: row.xa_display_name ?? (row.ei_author_name || null),
         handle: row.xa_handle ?? (row.ei_author_handle || null),
         handleUri: row.xa_handle_uri ?? row.ei_author_uri ?? null,
-        avatar: row.xa_avatar ?? row.ei_author_avatar_url ?? null,
         pubkey: null,
         pipStatus: "unknown",
       };
@@ -234,9 +266,13 @@ export function feedItemToPost(row: any): Post {
         sourceName: null,
         // pub_name/pub_slug come off FEED_JOINS' publications join, keyed on
         // articles.publication_id — so they are already NULL on every row
-        // that is not an article in a publication.
+        // that is not an article in a publication. Darked with the publications
+        // suspension HERE, the mapper every card path shares (same choke point
+        // as resonanceBand below): while the flag is off every /pub route 404s,
+        // so an embed that left the gateway would render a live VIA link into
+        // a dead surface.
         publication:
-          row.pub_slug && row.pub_name
+          publicationsEnabled() && row.pub_slug && row.pub_name
             ? {
                 name: row.pub_name,
                 slug: row.pub_slug,
@@ -266,6 +302,12 @@ export function feedItemToPost(row: any): Post {
   const body: PostBody = isNative
     ? row.item_type === "article"
       ? {
+          // LOAD-BEARING: `content_free` is what sits ABOVE the gate, so a
+          // native article Post has never carried the paywalled body and a
+          // thread containing a gated article is safe to render by
+          // construction. ARTICLE-HEADED-CONVERSATIONS-ADR D4 rests entirely on
+          // this line and adds no redaction step of its own — widen this to the
+          // full body and a locked conversation silently leaks the piece.
           text: row.content_free ?? null,
           html: null,
           title: row.title ?? null,
@@ -382,7 +424,6 @@ export interface CommentRow {
   author_id: string;
   acc_display_name: string | null;
   acc_username: string | null;
-  acc_avatar: string | null;
   nostr_pubkey: string | null;
   pip_status: Post["author"]["pipStatus"] | null;
   vt_up: number | null;
@@ -393,6 +434,12 @@ export function commentToPost(
   c: CommentRow,
   rootPostId: string,
   mutedIds: Set<string>,
+  // The comment's ROOT is paywalled and this viewer cannot read it (D5). Passed
+  // by the two callers that have resolved access — the thread projector and
+  // GET /author/:authorId/replies — and left undefined by anyone who has not
+  // asked the question. Never `false` by default: absent and false are
+  // different facts here.
+  rootLocked?: boolean,
 ): Post {
   return {
     id: c.derived_post_id,
@@ -409,12 +456,17 @@ export function commentToPost(
       displayName: c.acc_display_name,
       handle: c.acc_username,
       handleUri: null,
-      avatar: c.acc_avatar,
       pubkey: c.nostr_pubkey,
       pipStatus: c.pip_status ?? "unknown",
     },
     type: "note",
+    // The comment ITSELF is free — this is a fact about the comment and stays
+    // true however locked its root is. The locked-ness of the conversation it
+    // sits in is `rootLocked` below, deliberately a separate field: overloading
+    // `accessMode` would put two questions under one name, and one of them has
+    // a viewer term while the other does not (D5).
     accessMode: "free",
+    ...(rootLocked ? { rootLocked: true } : {}),
     body: {
       text: c.deleted_at ? "[deleted]" : c.content,
       html: null,

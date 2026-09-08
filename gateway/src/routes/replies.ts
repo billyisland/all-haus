@@ -47,12 +47,18 @@ export async function replyRoutes(app: FastifyInstance) {
       // Verify target exists and replies are enabled
       let targetQuery;
       if (data.targetKind === 30023) {
+        // `id`, `access_mode` and `publication_id` ride along for the paywall
+        // guard below — they are not display fields.
         targetQuery = await pool.query<{
+          id: string;
           writer_id: string;
           comments_enabled: boolean;
+          access_mode: string;
+          publication_id: string | null;
         }>(
-          `SELECT writer_id, comments_enabled FROM articles
-           WHERE nostr_event_id = $1 AND deleted_at IS NULL`,
+          `SELECT id, writer_id, comments_enabled, access_mode, publication_id
+             FROM articles
+            WHERE nostr_event_id = $1 AND deleted_at IS NULL`,
           [data.targetEventId],
         );
       } else {
@@ -88,6 +94,38 @@ export async function replyRoutes(app: FastifyInstance) {
         return reply
           .status(403)
           .send({ error: "You cannot reply to this content" });
+      }
+
+      // A comment on a piece you cannot read is a write into a conversation the
+      // paywall holds, so the WRITE path carries the same guard the GET does
+      // (:270-291 below). It had none for as long as the route has existed; the
+      // rule was enforced only by the article page declining to draw a composer,
+      // which is a UI rule and a UI rule is not an access control.
+      //
+      // GUARD, NOT A BARE CALL. `checkArticleAccess` carries no access_mode term
+      // — for a free article by somebody else it returns {hasAccess: false}
+      // exactly as it does for an unpaid paywalled one — so called
+      // unconditionally it would 403 EVERY comment on EVERY free article on the
+      // site. The `access_mode === "paywalled"` branch is what makes it a gate
+      // rather than a wall. Own content is covered inside the checker
+      // (readerId === writerId), so an author commenting under their own
+      // paywalled piece is unaffected.
+      // ARTICLE-HEADED-CONVERSATIONS-ADR D7.
+      // Narrowed by `in`, not by `data.targetKind`: the discriminator lives on
+      // the REQUEST and the union lives on the row, which is the same idiom the
+      // block check above uses (`"writer_id" in target`).
+      if ("access_mode" in target && target.access_mode === "paywalled") {
+        const access = await checkArticleAccess(
+          authorId,
+          target.id,
+          target.writer_id,
+          target.publication_id,
+        );
+        if (!access.hasAccess) {
+          return reply
+            .status(403)
+            .send({ error: "Unlock this article to reply" });
+        }
       }
 
       // If replying to another reply, verify parent exists and references same target
@@ -301,7 +339,6 @@ export async function replyRoutes(app: FastifyInstance) {
         author_id: string;
         author_username: string | null;
         author_display_name: string | null;
-        author_avatar: string | null;
         author_pip_status: "known" | "partial" | "unknown" | "contested" | null;
       }>(
         `SELECT c.id, c.nostr_event_id, c.parent_comment_id,
@@ -309,7 +346,6 @@ export async function replyRoutes(app: FastifyInstance) {
                 c.author_id,
                 a.username AS author_username,
                 a.display_name AS author_display_name,
-                a.avatar_blossom_url AS author_avatar,
                 tl.pip_status AS author_pip_status
          FROM comments c
          JOIN accounts a ON a.id = c.author_id
@@ -337,7 +373,6 @@ export async function replyRoutes(app: FastifyInstance) {
           id: string;
           username: string | null;
           displayName: string | null;
-          avatar: string | null;
           pipStatus: "known" | "partial" | "unknown" | "contested";
         };
         parentCommentId: string | null;
@@ -359,7 +394,6 @@ export async function replyRoutes(app: FastifyInstance) {
             id: r.author_id,
             username: r.author_username,
             displayName: r.author_display_name,
-            avatar: r.author_avatar,
             pipStatus: r.author_pip_status ?? "unknown",
           },
           parentCommentId: r.parent_comment_id,

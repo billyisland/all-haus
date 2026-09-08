@@ -12,6 +12,7 @@ import {
   type ParentItem,
   extractMastodonStatusId,
   rowToParentItem,
+  ensureContextFeedItem,
 } from "../../lib/external-items-shared.js";
 
 interface ParentContextResponse {
@@ -240,6 +241,12 @@ async function fetchBlueskyParent(
       ],
     );
 
+
+    // Give the context row its feed_items twin now rather than at 05:00 —
+    // without it the thread projector cannot resolve this post and re-rooting
+    // onto the tile the reader is looking at 404s. Best-effort: a failure here
+    // must not cost the reader the tile itself, and reconcile still catches it.
+    await ensureContextFeedItem(insertResult.rows[0].id).catch(() => {});
     const parent: ParentItem = {
       id: insertResult.rows[0].id,
       sourceProtocol: "atproto",
@@ -410,6 +417,10 @@ async function fetchMastodonParent(
         new Date(status.created_at),
       ],
     );
+
+    // Same dual-write as the atproto arm above: the context row is useless to
+    // the thread projector without its feed_items twin.
+    await ensureContextFeedItem(insertResult.rows[0].id).catch(() => {});
 
     const parent: ParentItem = {
       id: insertResult.rows[0].id,

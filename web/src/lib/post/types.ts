@@ -71,7 +71,8 @@ export interface PostAuthor {
   displayName: string | null; // native: NULL here, resolved at render via useWriterName(pubkey)
   handle: string | null;
   handleUri: string | null; // link to profile on origin (external)
-  avatar: string | null;
+  // No avatar — a card body carries no pfp (CLAUDE.md › Feed card chassis);
+  // the hover card (AuthorModal) fetches its own from /author-card.
   pubkey: string | null; // native only — the useWriterName key + vote target
   pipStatus: PipStatus;
 }
@@ -93,7 +94,19 @@ export interface Post {
   author: PostAuthor;
   type: "article" | "note";
   // Display discriminator only — gating economics stay in the gate-pass service (§3.1).
+  // It carries NO VIEWER TERM (the gateway derives it from access_mode alone),
+  // so a paying reader's article card says `gated` too. Never key an affordance
+  // on it; that is what `rootLocked` below is for.
   accessMode: "free" | "gated" | "unlocked";
+  // ARTICLE-HEADED-CONVERSATIONS-ADR D5. "The article this conversation hangs
+  // off is paywalled AND THIS VIEWER cannot read it." Stamped only by the two
+  // routes that already know the viewer — GET /thread/:postId and
+  // GET /author/:authorId/replies — so it is OPTIONAL and absent is NOT false:
+  // absent means nobody asked this question about this post, which is the truth
+  // on every feed, source surface and Articles log. Read it as `=== true`.
+  // Its one reader is PostActions (D6): reply, quote and vote are SUPPRESSED,
+  // not disabled, on a conversation you may read but may not join.
+  rootLocked?: boolean;
   body: PostBody;
   inReplyTo: string | null; // parent handle (origin id this phase; gateway resolves to post_id)
   quotes: string | null; // quoted handle (depth-1)

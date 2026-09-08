@@ -18,7 +18,11 @@ import { authorMark, platformMark } from "./resonance";
 // here it only governs parent/reply offset in the harness.
 const INDENT_STEP_PX = 32;
 
-const GAP_PX = { feed: 8, tight: 5, none: 0 } as const; // CLAUDE feed/thread rhythm
+// CLAUDE feed/thread rhythm. Exported because the feed gap is a card's own
+// half of the 20px a vessel renders (the column's `VESSEL_GAP` is the other),
+// and a non-post card in a feed-rhythm log — the profile's `PersonCard` — has
+// to take it from here rather than restate the number.
+export const GAP_PX = { feed: 8, tight: 5, none: 0 } as const;
 
 type BodyMode = "expanded" | "full" | "one-line";
 type MediaMode = "full-width" | "sized" | "single-thumbnail" | "none";
@@ -81,6 +85,27 @@ export const LEVEL_SPEC: Record<Level, LevelSpec> = {
     click: "expand-focal",
     resonance: true,
   },
+  // THE SPINE IS CONTEXT, EXCEPT WHERE IT IS AN ARTICLE (2026-09-05).
+  // ARTICLE-HEADED-CONVERSATIONS-ADR D1. This row went full-size and flush on
+  // 2026-09-02 to fix a real complaint — an ARTICLE at the head of a chain
+  // rendered as a 90%-scale inset preview of itself, which is not what an
+  // article is anywhere else in the product. But the complaint was about
+  // articles in threads and the fix was applied to the shared row, so every
+  // conversation on every surface got the article's treatment and the whole of
+  // the workspace, where a chain almost never terminates in an article, lost
+  // the inset that says "this is what is being replied to".
+  //
+  // So the table goes back to what it was and the ARTICLE case is an override
+  // in resolveSpec, keyed on POST TYPE — beside the `click` override that is
+  // already keyed the same way, one line away. A note or an external post above
+  // the focal is context and the smaller inset is what says so; the article is
+  // the thing the conversation is about and renders as itself.
+  //
+  // The 32px channel the gutter pointers live in is this step-in, so with the
+  // inset back the channel is continuous again — but PostThread keeps reading
+  // the SPINE rect for its clash test, because a full-size flush article
+  // ancestor has no channel beside it and the spine rect is the more general
+  // test of the two.
   "thread-parent": {
     textScale: 0.9,
     indentStep: 1,
@@ -245,9 +270,18 @@ export function resolveSpec(
     !!post.author.handle;
   const showByline = namesSomeone || !spec.originTag;
 
+  // D1 — an ARTICLE at the head of a chain is the thing the whole conversation
+  // is about and the one node with a full card treatment everywhere else in the
+  // product, so it renders as itself: full size, flush. Everything else at
+  // `thread-parent` is context and keeps the table's inset. Keyed on post type
+  // rather than on surface, because an article ancestor is equally wrong at 0.9
+  // in a workspace vessel — where the 2026-09-02 change would never have caught
+  // it — and a level-plus-type key needs no new prop threaded through four hosts.
+  const articleHead = level === "thread-parent" && post.type === "article";
+
   return {
-    textScale: spec.textScale,
-    indentPx: spec.indentStep === 1 ? INDENT_STEP_PX : 0,
+    textScale: articleHead ? 1.0 : spec.textScale,
+    indentPx: articleHead ? 0 : spec.indentStep === 1 ? INDENT_STEP_PX : 0,
     insideHost: spec.indentStep === "host",
     gapBelowPx: GAP_PX[spec.gapBelow],
     body: spec.body,

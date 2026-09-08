@@ -94,8 +94,7 @@ const wrote = () =>
   txCalls.some(
     (c) =>
       c.sql.includes("DELETE FROM feeds") ||
-      c.sql.includes("UPDATE feed_sources SET feed_id") ||
-      c.sql.includes("feed_saves"),
+      c.sql.includes("UPDATE feed_sources SET feed_id"),
   );
 
 beforeEach(() => {
@@ -121,9 +120,8 @@ describe("feed merge", () => {
     expect(
       txCalls.find((c) => c.sql.includes("DELETE FROM feed_sources"))?.params,
     ).toEqual([SOURCE]);
-    expect(
-      txCalls.find((c) => c.sql.includes("feed_saves"))?.params,
-    ).toEqual([TARGET, SOURCE]);
+    // The saves-move step that stood here is gone with `feed_saves`
+    // (migration 189, READING-LOG-AND-LIBRARY-ADR D10).
     // The direction is the whole asymmetry of this route.
     expect(
       txCalls.find((c) => c.sql.includes("DELETE FROM feeds"))?.params,

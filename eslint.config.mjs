@@ -1,4 +1,5 @@
 import tseslint from 'typescript-eslint';
+import reactHooks from 'eslint-plugin-react-hooks';
 
 // Shared rule set, applied identically to backend services and the web
 // frontend so standards don't drift between the two. The promise-safety
@@ -39,17 +40,41 @@ const sharedRules = {
   'no-duplicate-imports': 'error',
 };
 
-// The web frontend's React/hooks/a11y/next-image rules are owned by `next lint`
-// (web/package.json), a separate pass we deliberately leave for later. The
-// source carries inline `eslint-disable` comments targeting those rules; declare
-// them here as no-ops so this root type-aware pass recognises the directives
-// instead of erroring "rule not found". No enforcement happens here — that stays
-// with next lint.
+// THE HOOKS RULES ARE LIVE HERE, AND THIS IS THE ONLY LINT PASS THE WEB HAS.
+//
+// Until 2026-09-06 the story was that React/hooks/a11y/next-image rules were
+// owned by `next lint` (web/package.json), a separate pass "left for later".
+// It had never run: web/ carried no ESLint dependency and no config, so the CI
+// step opened Next's interactive setup prompt, read EOF, and exited 1 on every
+// run the job ever had — and since it preceded vitest, the web suite never
+// executed in CI either. Sized against the real code (CONSOLIDATED-TODO §11,
+// "CI has two RED jobs", item 8): the a11y rules found nothing, rules-of-hooks
+// found nothing, no-img-element flagged the deliberate `<img>` for arbitrary-
+// host media, no-unescaped-entities flagged apostrophes in prose. The one rule
+// that earns its place is `exhaustive-deps` — §0v item 13(c) was exactly its
+// bug class (an inline arrow in a dependency array restarting an effect every
+// render, invisible to tsc and to tests). So that rule and its sibling live
+// here, in the pass that already parses web/src type-aware, and `next lint` is
+// gone: one lint pass that means one thing.
+//
+// The two are set by name rather than via the plugin's `recommended` preset,
+// which since v6 also ships the React Compiler rule set — a different, much
+// larger decision. `exhaustive-deps` is a WARNING under the standing 0-errors
+// rule (warnings are accepted hygiene debt); `rules-of-hooks` is an ERROR
+// because a violation is a bug by construction and there are none today.
+const reactHooksRules = {
+  'react-hooks/rules-of-hooks': 'error',
+  'react-hooks/exhaustive-deps': 'warn',
+};
+
+// The source still carries inline `eslint-disable` comments targeting a11y and
+// next-image rule names from the retired `next lint` era; declare those as
+// no-ops so the directives stay valid instead of erroring "rule not found".
+// Nothing enforces them, and that is now a decision rather than a gap.
 const noop = () => ({ create: () => ({}) });
 const externalRuleStubs = (names) => ({
   rules: Object.fromEntries(names.map((n) => [n, noop()])),
 });
-const reactHooksStub = externalRuleStubs(['exhaustive-deps', 'rules-of-hooks']);
 const jsxA11yStub = externalRuleStubs([
   'click-events-have-key-events',
   'no-static-element-interactions',
@@ -100,7 +125,7 @@ export default tseslint.config(
     files: ['web/src/**/*.{ts,tsx}'],
     extends: [tseslint.configs.recommendedTypeChecked],
     plugins: {
-      'react-hooks': reactHooksStub,
+      'react-hooks': reactHooks,
       'jsx-a11y': jsxA11yStub,
       '@next/next': nextStub,
     },
@@ -110,6 +135,6 @@ export default tseslint.config(
         tsconfigRootDir: import.meta.dirname,
       },
     },
-    rules: sharedRules,
+    rules: { ...sharedRules, ...reactHooksRules },
   },
 );

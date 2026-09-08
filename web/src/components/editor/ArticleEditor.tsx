@@ -15,6 +15,7 @@ import { EmbedNode } from './EmbedNode'
 import { PaywallGateNode, PAYWALL_GATE_MARKER } from './PaywallGateNode'
 import { uploadImage } from '../../lib/media'
 import { validatePaywalledPublish } from '../../lib/publish-validation'
+import { NAV_BAR_H } from '../workspace/NavBar'
 
 // =============================================================================
 // Article Editor
@@ -464,17 +465,21 @@ export function ArticleEditor({
     // data-explain: the editor's Explain base kind (C2) — answers any interior
     // hover a more specific leaf doesn't. Inert on the standalone /write page
     // (Explain only runs in the workspace).
-    <div data-explain="editor" className={isOverlay ? 'px-6 sm:px-10 py-12 flex-1 flex flex-col' : 'mx-auto max-w-editor-frame px-4 sm:px-6 pt-8 pb-8 bg-glasshouse min-h-screen ah-clear-row-band'}>
-      {/* Sticky title + toolbar — stays visible while scrolling the body. It
-          sticks to `top-0` in BOTH chromes now: the overlay to the Glasshouse
-          pane's top, and the page to the viewport's. The page branch used to
-          carry `top-[53px] lg:top-0`, offsetting the black topbar's mobile
-          height — there is no topbar anywhere any more, so the offset was
-          53px of dead space pushing the bar down the screen on a phone.
+    <div data-explain="editor" className={isOverlay ? 'px-6 sm:px-10 py-12 flex-1 flex flex-col' : 'mx-auto max-w-editor-frame px-4 sm:px-6 pb-8 bg-glasshouse min-h-screen ah-clear-bar-band'}>
+      {/* Sticky title + toolbar — stays visible while scrolling the body. The
+          overlay chrome sticks to `top: 0` (the Glasshouse pane's top); the
+          standalone page sticks to the sitewide nav bar's inner edge
+          (NAV_BAR_H — the bar is fixed at z-58, so a toolbar pinned at 0
+          would slide underneath it and stay hidden). The page's top
+          clearance is `.ah-clear-bar-band` (the bar's band), which replaced
+          the old `pt-8` when the bar moved to the top edge (2026-08-31).
           The cards span the full width (matching the body editor below); only the
           title card — the row that pins under the floating ✕ when scrolled — gets
           its own right inset (pr-12) so a long title still clears it. */}
-      <div className="sticky top-0 z-20 bg-glasshouse pb-4 mb-6">
+      <div
+        className="sticky z-20 bg-glasshouse pb-4 mb-6"
+        style={{ top: isOverlay ? 0 : NAV_BAR_H }}
+      >
       {/* Title card */}
       <div className={`bg-glasshouse-well py-4 mb-2 pl-5 ${isOverlay ? 'pr-12' : 'pr-5'}`}>
         <input

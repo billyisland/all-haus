@@ -45,7 +45,7 @@ export const OVERLAY_PARAM_KEYS = [
   "pub",
   // The three URL-backed *pane* overlays (reader/profile/surface) carry their
   // target here when a standalone page reloads into the workspace (see
-  // WorkspacePaneRedirect). Unlike the ?overlay= panels above, these overlays
+  // standalone pages). Unlike the ?overlay= panels above, these overlays
   // push their own canonical URL on open — so WorkspaceView strips the workspace
   // URL to /reader *before* opening them, letting that canonical URL land on a
   // clean /reader base entry (so Back/close returns to the workspace).
@@ -103,7 +103,7 @@ export function openOverlayFromParams(params: URLSearchParams): boolean {
       });
       return true;
     // The three URL-backed pane overlays, reopened when their standalone page
-    // reloads into the workspace (WorkspacePaneRedirect). Native targets open
+    // reloads into the workspace (?overlay= on /reader). Native targets open
     // directly; the external reader resolves its origin URL from the postId.
     case "reader": {
       const article = params.get("article");

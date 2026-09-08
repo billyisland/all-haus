@@ -32,6 +32,16 @@ const WHEEL_DECAY_MS = 400;
 // conversation from rolling straight into a refresh — the user must stop, then
 // scroll toward the mouth again.
 const ARM_IDLE_MS = 220;
+// How long an armed feed stays armed with no toward-mouth pull. Arming used to
+// be sticky: a feed scrolled to its top and left there was armed for the rest
+// of the session, and the idle rule above did nothing for it. On the columnar
+// floor a trackpad gesture's sideways component pans the floor under a
+// stationary pointer, so a NEIGHBOURING vessel could slide under the cursor
+// mid-pull, already armed from minutes ago, and refresh off the tail of a
+// gesture aimed at the vessel beside it. Past this window the pull has to be
+// earned again — rest at the mouth, then pull — so a feed you have not touched
+// in a while behaves like one you have just scrolled to.
+const ARM_TTL_MS = 4000;
 
 function findScrollParent(el: HTMLElement, axis: Axis): HTMLElement {
   let cur = el.parentElement;
@@ -49,8 +59,10 @@ function findScrollParent(el: HTMLElement, axis: Axis): HTMLElement {
 // the floor pan or on to the browser's back gesture. That removes the ambiguity
 // this component used to arbitrate with a `floorCanConsume` guard — which, kept,
 // would now simply refuse to refresh whenever the floor happened to be panned.
-// The arm-after-idle rule below is the whole guard: come to rest at the mouth,
-// then scroll toward it again.
+// The arm-after-idle rule below is the guard: come to rest at the mouth, then
+// scroll toward it again — and the arm it grants is held only while the pointer
+// stays on this feed and only for ARM_TTL_MS, so it cannot outlive the gesture
+// that earned it.
 
 export function PullToRefresh({
   onRefresh,
@@ -72,6 +84,7 @@ export function PullToRefresh({
   // can't trigger a refresh.
   const armed = useRef(false);
   const armTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const armExpiry = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // The mouth-ward scroll offset (scrollLeft when horizontal, scrollTop else):
   // 0 means the feed is resting at the mouth, where a pull is allowed.
@@ -81,12 +94,42 @@ export function PullToRefresh({
     [horizontal],
   );
 
-  const doRefresh = useCallback(() => {
+  // The one way out of the armed state. Clears the pending arm (a gesture
+  // still settling) and the expiry (an arm still standing) together, so no
+  // timer can re-arm or re-clear a feed behind the caller's back.
+  const disarm = useCallback(() => {
     armed.current = false;
     if (armTimer.current) {
       clearTimeout(armTimer.current);
       armTimer.current = null;
     }
+    if (armExpiry.current) {
+      clearTimeout(armExpiry.current);
+      armExpiry.current = null;
+    }
+  }, []);
+
+  // (Re)start the armed window. Called when the feed arms and on every
+  // toward-mouth pull while armed, so a slow deliberate pull keeps its arm and
+  // only a feed left alone loses it. On expiry the indicator is withdrawn too:
+  // a partial pull that never finished must not sit half-open on the feed.
+  const scheduleArmExpiry = useCallback(() => {
+    if (armExpiry.current) clearTimeout(armExpiry.current);
+    armExpiry.current = setTimeout(() => {
+      armExpiry.current = null;
+      armed.current = false;
+      wheelAccum.current = 0;
+      if (wheelTimer.current) {
+        clearTimeout(wheelTimer.current);
+        wheelTimer.current = null;
+      }
+      setPullDistance((d) => (d > 0 ? 0 : d));
+      setPulling(false);
+    }, ARM_TTL_MS);
+  }, []);
+
+  const doRefresh = useCallback(() => {
+    disarm();
     setRefreshing(true);
     setPullDistance(THRESHOLD * 0.6);
     void onRefresh().finally(() => {
@@ -94,7 +137,7 @@ export function PullToRefresh({
       setPullDistance(0);
       setPulling(false);
     });
-  }, [onRefresh]);
+  }, [onRefresh, disarm]);
 
   // Touch handlers (mobile)
   const onTouchStart = useCallback(
@@ -155,11 +198,7 @@ export function PullToRefresh({
         // Scrolling through content or away from the mouth: disarm. Reaching the
         // mouth via this gesture must not count toward a refresh.
         wheelAccum.current = 0;
-        armed.current = false;
-        if (armTimer.current) {
-          clearTimeout(armTimer.current);
-          armTimer.current = null;
-        }
+        disarm();
         if (pullDistance > 0 && !refreshing) {
           setPullDistance(0);
           setPulling(false);
@@ -175,9 +214,11 @@ export function PullToRefresh({
         armTimer.current = setTimeout(() => {
           armed.current = true;
           armTimer.current = null;
+          scheduleArmExpiry();
         }, ARM_IDLE_MS);
         return;
       }
+      scheduleArmExpiry();
       wheelAccum.current += Math.abs(delta);
       if (wheelTimer.current) clearTimeout(wheelTimer.current);
       wheelTimer.current = setTimeout(() => {
@@ -199,13 +240,48 @@ export function PullToRefresh({
         setPulling(dampened >= THRESHOLD * 0.8);
       }
     },
-    [refreshing, pullDistance, doRefresh, scrollRef, axis, horizontal, scrollOffsetOf],
+    [
+      refreshing,
+      pullDistance,
+      doRefresh,
+      disarm,
+      scheduleArmExpiry,
+      scrollRef,
+      axis,
+      horizontal,
+      scrollOffsetOf,
+    ],
+  );
+
+  // The pointer leaving the feed ends its claim on the next pull. Mouse only:
+  // a lifted finger fires pointerleave too, just before touchend, and the touch
+  // path neither arms nor reads `armed` — resetting its indicator here would
+  // race the release that is about to refresh. Without this, moving the mouse
+  // from a feed left resting at its mouth to the one beside it carried the
+  // first feed's arm with it, and any later pan that slid the first feed back
+  // under the cursor refreshed it off a gesture meant for the second.
+  const onPointerLeave = useCallback(
+    (e: React.PointerEvent) => {
+      if (e.pointerType !== "mouse") return;
+      disarm();
+      wheelAccum.current = 0;
+      if (wheelTimer.current) {
+        clearTimeout(wheelTimer.current);
+        wheelTimer.current = null;
+      }
+      if (!refreshing && pullDistance > 0) {
+        setPullDistance(0);
+        setPulling(false);
+      }
+    },
+    [disarm, refreshing, pullDistance],
   );
 
   useEffect(() => {
     return () => {
       if (wheelTimer.current) clearTimeout(wheelTimer.current);
       if (armTimer.current) clearTimeout(armTimer.current);
+      if (armExpiry.current) clearTimeout(armExpiry.current);
     };
   }, []);
 
@@ -224,6 +300,7 @@ export function PullToRefresh({
       onTouchMove={onTouchMove}
       onTouchEnd={onTouchEnd}
       onWheel={onWheel}
+      onPointerLeave={onPointerLeave}
       style={{
         position: "relative",
         // Horizontal: the indicator sits left of the card row and grows it

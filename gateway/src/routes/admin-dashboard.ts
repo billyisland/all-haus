@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { pool, loadConfig, withTransaction } from '@platform-pub/shared/db/client.js'
 import { zodValidationError } from '@platform-pub/shared/lib/validation.js'
 import logger from '@platform-pub/shared/lib/logger.js'
-import { requireEnv } from '@platform-pub/shared/lib/env.js'
+import { requireEnv, publicationsEnabled } from '@platform-pub/shared/lib/env.js'
 import { requireAdmin } from '../middleware/admin.js'
 import { getParityReport } from '../lib/internal-parity.js'
 import { invalidatePlatformConfig } from '../lib/platform-config.js'
@@ -1572,6 +1572,25 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
            FROM feed_formulas ff JOIN accounts a ON a.id = ff.author_id
           WHERE ff.is_default_seed`
       )
+      // WHAT IN THIS SEED WOULD FAIL AT EVERY SIGNUP, RIGHT NOW (§0u.2).
+      // A seed is FROZEN at designation (L3), so one cut before the 2026-08-31
+      // publications suspension still carries its publication rows — and the
+      // replay skips them per source, per account, forever, with nothing on
+      // this page to say so. The whole reason the panel exists is that an
+      // operator cannot otherwise see which object is load-bearing; a seed that
+      // silently delivers less than it names is that failure one level in.
+      //
+      // Counted only while the flag is dark, because it is a fact about NOW
+      // rather than about the row: reinstating publications makes these rows
+      // travel again with no re-cut, and the panel must stop warning the moment
+      // that happens.
+      const suspended = designated[0] && !publicationsEnabled()
+        ? await pool.query(
+            `SELECT COUNT(*)::int AS n FROM feed_formula_sources
+              WHERE formula_id = $1 AND source_type = 'publication'`,
+            [designated[0].id]
+          )
+        : null
       // The admin's own feeds, because cutting one of them is now the only
       // thing this panel can do (L5). The `candidates` list went with the
       // `{ formulaId }` branch: with nothing to designate, a list of things to
@@ -1600,6 +1619,7 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
               authorName: designated[0].author_name,
               authorIsSelf: designated[0].author_id === adminId,
               sourceFeedId: designated[0].source_feed_id,
+              suspendedSourceCount: num(suspended?.rows[0]?.n ?? 0),
             }
           : null,
         feeds: feeds.map((r: any) => ({
@@ -1667,10 +1687,23 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
         )
         if (owned.length === 0) return { error: 'feed_not_found' as const }
 
+        // A FEED may be untitled (migration 190 — the numeral is its identity);
+        // a FORMULA may not, and the two constraints diverge on purpose:
+        // `feed_formulas.name` is what the *Default seed* panel prints back to
+        // the operator and what `fromStarter` provenance carries for the whole
+        // cohort seeded from it, so a nameless one is a slot nobody can read.
+        // Caught here rather than left to `feed_formulas_name_check`, which
+        // would answer the operator's press with a raw 500 naming a constraint
+        // — which is exactly the failure migration 190 exists to end, one level
+        // up. `name` on the body is the operator's own override, so this is
+        // only reachable when they neither named the feed nor supplied one.
+        const seedName = (parsed.data.name ?? owned[0].name).trim()
+        if (!seedName) return { error: 'unnamed' as const }
+
         const frozen = await freezeFeedIntoFormula(client, {
           feedId: parsed.data.feedId,
           ownerId: adminId,
-          name: parsed.data.name ?? owned[0].name,
+          name: seedName,
           description: parsed.data.description ?? null,
           appearance: owned[0].appearance ?? {},
           maxSources: await formulaMaxSources(),
@@ -1703,6 +1736,12 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
       if ('error' in outcome) {
         if (outcome.error === 'feed_not_found')
           return reply.status(404).send({ error: 'feed_not_found' })
+        if (outcome.error === 'unnamed')
+          return reply.status(400).send({
+            error: 'seed_feed_unnamed',
+            message:
+              'This feed has no name. A feed can go without one, but the default seed cannot — name the feed, or give the seed a name here.',
+          })
         if (outcome.error === 'empty')
           return reply.status(400).send({
             error: 'formula_empty',

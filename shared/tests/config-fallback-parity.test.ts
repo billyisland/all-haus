@@ -45,6 +45,7 @@ afterEach(() => {
 // pin below fails if the loader grows a tenth and this map does not.
 const FALLBACK_KEYS = [
   'free_allowance_pence',
+  'arrival_gift_cap_pence',
   'tab_settlement_threshold_pence',
   'monthly_fallback_minimum_pence',
   'writer_payout_threshold_pence',
@@ -65,6 +66,7 @@ describe('loadConfig fallbacks vs config-defaults.sql', () => {
 
     const bad = diffAgainstDefaults({
       free_allowance_pence: c.freeAllowancePence,
+      arrival_gift_cap_pence: c.arrivalGiftCapPence,
       tab_settlement_threshold_pence: c.tabSettlementThresholdPence,
       monthly_fallback_minimum_pence: c.monthlyFallbackMinimumPence,
       writer_payout_threshold_pence: c.writerPayoutThresholdPence,

@@ -60,8 +60,15 @@ function weightToStep(weight: number): number {
 // + space — no borders anywhere (the site never renders thin rules). Fields read
 // as bright (white) raised wells on the pane; rows are a lighter tile; emphasis
 // is a dark fill.
+// Every colour here is in the INVERTING family (`ink`/`white`/`bone`/greys).
+// This panel is mounted at the WorkspaceView root with NO light island above
+// it, so its ground resolves through the `html.dark` inversion — and a
+// never-inverting foreground on top of one (`ink-925` on `white` = 26 26 24 on
+// 30 29 26, a contrast ratio of 1.03:1) is invisible. Foreground and ground
+// must be in the SAME inversion family; see web/CLAUDE.md › Global light/dark
+// mode.
 const TOKENS = {
-  panelBorder: "var(--ah-ink-925)",
+  panelBorder: "var(--ah-ink)",
   rowBg: "var(--ah-bone)",
   fieldBg: "var(--ah-white)",
   hintFg: "var(--ah-grey-600)",
@@ -403,7 +410,10 @@ export function FeedComposer({
     <Glasshouse
       onClose={onClose}
       maxWidth={520}
-      ariaLabel={`Feed composer: ${feed.name}`}
+      // An untitled feed is an ordinary feed (migration 190), so the label
+      // cannot end in the name — it would announce "Feed composer:" and stop.
+      // The visible title already says "No name"; this is its spoken twin.
+      ariaLabel={`Feed composer: ${feed.name.trim() || "unnamed feed"}`}
       persistKey="feed-composer"
     >
       {/* Right padding clears the Glasshouse ✕ at top-right. data-explain is

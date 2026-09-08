@@ -44,6 +44,12 @@ export type PipOpen = (
   status: PipStatus | undefined,
 ) => void;
 
+/** The card's own padding, both densities. Exported because a card that is not
+ *  a post — the profile's `PersonCard` — must take the same shell numbers
+ *  rather than restate them; the shell itself is not reusable there (it hard-
+ *  codes `data-explain="card"`, whose copy names a feed item). */
+export const CARD_PADDING = { standard: "16px", tight: "8px 12px" } as const;
+
 export function PostCardShell({
   ctx,
   indentPx,
@@ -62,7 +68,8 @@ export function PostCardShell({
   explainParam?: string | null;
   children: React.ReactNode;
 }) {
-  const padding = ctx.density !== "standard" ? "8px 12px" : "16px";
+  const padding =
+    ctx.density !== "standard" ? CARD_PADDING.tight : CARD_PADDING.standard;
   // Every density can be dragged. The old standard-only gate existed because a
   // tightened card has almost no bare chrome left to grab by — but the byline
   // handle below is present at every density, and a condensed / headline feed is

@@ -13,7 +13,6 @@ function makePost(over: Partial<Post> = {}): Post {
       displayName: null,
       handle: null,
       handleUri: null,
-      avatar: null,
       pubkey: "pub-1",
       pipStatus: "known",
     },
@@ -50,12 +49,46 @@ describe("LEVEL_SPEC table", () => {
   it("has a row for every level", () => {
     for (const lvl of ALL_LEVELS) expect(LEVEL_SPEC[lvl]).toBeTruthy();
   });
-  it("text scale matches §4 (focal/feed 1.0, parent/reply .9, quoted/condensed .85)", () => {
+  it("text scale matches §4 (focal/feed/parent 1.0, reply .9, quoted/condensed .85)", () => {
     expect(LEVEL_SPEC.focal.textScale).toBe(1.0);
     expect(LEVEL_SPEC.feed.textScale).toBe(1.0);
-    expect(LEVEL_SPEC["thread-parent"].textScale).toBe(0.9);
+    expect(LEVEL_SPEC["thread-reply"].textScale).toBe(0.9);
     expect(LEVEL_SPEC.quoted.textScale).toBe(0.85);
     expect(LEVEL_SPEC.condensed.textScale).toBe(0.85);
+  });
+  // THE SPINE IS CONTEXT, EXCEPT WHERE IT IS AN ARTICLE (2026-09-05,
+  // ARTICLE-HEADED-CONVERSATIONS-ADR D1). These assertions are the inverse of
+  // the 2026-09-02 ones, which asserted the table cell that had been changed to
+  // fix an ARTICLE at the head of a chain — a fix applied to the shared row, so
+  // every conversation on every surface got the article's treatment. The row
+  // goes back; the article case is an override keyed on POST TYPE.
+  //
+  // BOTH fixtures, because either alone passes against the wrong key: `native`
+  // is a NOTE (makePost defaults to type "note"), so a test that only checks it
+  // would go green against a table row of 1.0/0 with no override at all, and a
+  // test that only checks the article would go green against the 2026-09-02
+  // state this reverses.
+  it("the spine is inset context; an ARTICLE at its head is not", () => {
+    expect(LEVEL_SPEC["thread-parent"].textScale).toBe(0.9);
+    expect(LEVEL_SPEC["thread-parent"].indentStep).toBe(1);
+    expect(LEVEL_SPEC["thread-reply"].indentStep).toBe(1);
+
+    // A note ancestor: context, so inset and smaller.
+    const note = resolveSpec("thread-parent", "A", native);
+    expect(note.textScale).toBe(0.9);
+    expect(note.indentPx).toBeGreaterThan(0);
+
+    // An article ancestor: the thing the conversation is about, so it renders
+    // as itself — full size, flush.
+    const article = resolveSpec("thread-parent", "A", makePost({ type: "article" }));
+    expect(article.textScale).toBe(1.0);
+    expect(article.indentPx).toBe(0);
+
+    // The override is scoped to the spine: an article in a FEED is not
+    // re-scaled by it, and neither is one at thread-reply.
+    expect(resolveSpec("thread-reply", "A", makePost({ type: "article" })).indentPx)
+      .toBeGreaterThan(0);
+    expect(resolveSpec("thread-reply", "A", native).indentPx).toBeGreaterThan(0);
   });
 });
 

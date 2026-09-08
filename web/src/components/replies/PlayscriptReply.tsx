@@ -157,7 +157,14 @@ export function PlayscriptReply({
               {confirmDelete ? 'Confirm?' : 'Delete'}
             </button>
           )}
-          <ReportButton targetNostrEventId={reply.nostrEventId} />
+          {/* This row sets its own register (11px mono caps, grey-400) and
+              its Reply/Delete siblings simply inherit it and add a hover. The
+              trigger does the same rather than taking the default
+              `.btn-text-muted`, which is the reader row's 13px sans. */}
+          <ReportButton
+            targetNostrEventId={reply.nostrEventId}
+            triggerClassName="hover:text-black transition-colors"
+          />
         </div>
       )}
     </div>

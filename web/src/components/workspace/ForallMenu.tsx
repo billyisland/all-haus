@@ -47,6 +47,8 @@ export interface HiddenFeed {
 
 interface ForallMenuProps {
   onAction: (key: ForallAction) => void;
+  /** Minimised feeds, offered as restore rows on MOBILE ONLY (the desktop
+   *  muster already shows them in the nav bar — see `restoreRows`). */
   hiddenFeeds?: HiddenFeed[];
   onRestore?: (feedId: string) => void;
   /** The feed the menu is relativised to — the one under the reader's thumb on
@@ -84,11 +86,6 @@ type FocusRow =
       onOpen: () => void;
       label: string;
       count: number;
-      // Secondary-tier destinations (Library / Network / Ledger / Settings)
-      // render in the muted weight so the menu reads as a primary pair
-      // (Messages · Dashboard) over a quieter account cluster, without dropping
-      // any destination (they all stay reachable here).
-      muted?: boolean;
       // Generic disable machinery (dim + title, inert on select). Currently
       // unused — the D10 Explain-while-pane-open disable was retired when
       // pane-mode Explain shipped (2026-07-15) — but kept as row plumbing.
@@ -212,7 +209,8 @@ export function ForallMenu({
   useExplainable<HTMLButtonElement>("disc", { ref: buttonRef });
 
   // Rows are grouped find → make → go: search first (the way in), then the
-  // create actions, then the destinations, then any hidden-feed restores. The
+  // create actions, then the destinations, then (mobile only) any hidden-feed
+  // restores — see `restoreRows` for why desktop has none. The
   // groups render with a tight gap between them and flatten into `rows` for
   // arrow-key navigation.
   const findRows: FocusRow[] = [
@@ -263,9 +261,13 @@ export function ForallMenu({
           count: 0,
         },
       ];
-  // The go-group keeps all six destinations but reads in two tiers: a primary
-  // pair (the high-traffic inbox + dashboard) over a muted account cluster.
-  // Same group-gap separates them; the muted weight does the demoting.
+  // The go-group keeps all six destinations, SET IN ONE WEIGHT (2026-09-06).
+  // Library / Network / Ledger / Settings used to render grey against the black
+  // of Messages / Dashboard, demoting them to an account cluster under a
+  // high-traffic pair. Grey in this menu reads as unavailable rather than
+  // secondary — every row here is a live destination, and the group gap already
+  // says which belong together. The two groups survive; only the colour split
+  // is gone.
   const goPrimaryRows: FocusRow[] = [
     {
       // Notifications folded into Messages — one merged inbox surface. The count
@@ -288,35 +290,41 @@ export function ForallMenu({
       onOpen: () => useLibraryOverlay.getState().open(),
       label: "Library",
       count: 0,
-      muted: true,
     },
     {
       kind: "overlay",
       onOpen: () => useNetworkOverlay.getState().open(),
       label: "Network",
       count: 0,
-      muted: true,
     },
     {
       kind: "overlay",
       onOpen: () => useLedgerOverlay.getState().open(),
       label: "Ledger",
       count: 0,
-      muted: true,
     },
     {
       kind: "overlay",
       onOpen: () => useSettingsOverlay.getState().open(),
       label: "Settings",
       count: 0,
-      muted: true,
     },
   ];
-  const restoreRows: FocusRow[] = hiddenFeeds.map((hf) => ({
-    kind: "restore",
-    id: hf.id,
-    label: hf.name,
-  }));
+  // Restore rows are MOBILE-ONLY. On desktop the muster already carries every
+  // live feed including the minimised ones — a shut feed sits in the nav bar as
+  // a flipped pip wearing the close-X, and clicking it restores and scrolls to
+  // it (Muster.tsx, NAV-ROW-MUSTER-ADR §IV/§V) — so listing them again down
+  // here was a second, worse copy of an affordance that is on screen at all
+  // times. Mobile has no muster: its pip strip is the swipe sequence and
+  // EXCLUDES hidden feeds (MobileWorkspace.tsx §V), which leaves this menu the
+  // only way back to one. Do not "simplify" this to an unconditional list.
+  const restoreRows: FocusRow[] = isMobile
+    ? hiddenFeeds.map((hf) => ({
+        kind: "restore",
+        id: hf.id,
+        label: hf.name,
+      }))
+    : [];
   // Sign-out is the terminal action, in its own group at the very bottom. It
   // lives here because the retired black topbar's avatar dropdown used to carry
   // it and there is no topbar anywhere any more — the ∀ is the member's sole
@@ -928,11 +936,10 @@ const MenuRow = forwardRef<HTMLButtonElement, MenuRowProps>(function MenuRow(
 ) {
   const isRestore = row.kind === "restore";
   const disabled = row.kind === "overlay" && row.disabled === true;
-  // Secondary-tier destinations dim to the muted weight too, but keep the
-  // normal row font (only restores get the small label-ui treatment). A disabled
-  // row (D10 Explain-while-pane-open) reads muted as well.
-  const muted =
-    disabled || isRestore || (row.kind === "overlay" && row.muted === true);
+  // Only a restore row (the small label-ui list of hidden feeds, mobile-only)
+  // and a disabled row (D10 Explain-while-pane-open) take the muted weight. The
+  // destinations are all one colour — see the go-group note above.
+  const muted = disabled || isRestore;
   const count =
     row.kind === "open" || row.kind === "link" || row.kind === "overlay"
       ? row.count

@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -9,8 +10,8 @@ import {
   useState,
 } from "react";
 import { useRouter } from "next/navigation";
-import nextDynamic from "next/dynamic";
 import { useAuth } from "../../stores/auth";
+import { useWorkspaceSurface } from "../../stores/workspaceSurface";
 import { useWorkspace } from "../../stores/workspace";
 import { GRID } from "../../lib/workspace/grid";
 import {
@@ -39,7 +40,8 @@ import { Vessel } from "./Vessel";
 import {
   ExplainProvider,
   useExplainable,
-  FirstRunLauncher,
+  FirstRunController,
+  FirstRunPreview,
 } from "./ExplainProvider";
 import { useExplain } from "../../stores/explain";
 import { ExplainOverlay } from "./ExplainOverlay";
@@ -130,6 +132,9 @@ function articleToReaderEntry(p: Post): ReaderNavEntry | null {
     // provenance line offers, carried over so the pane names the thing the
     // reader subscribed to and not just the site (BYLINE-AND-PROVENANCE D7).
     sourceId: p.externalSourceId ?? null,
+    // The item's own enclosures — the pane plays a video the origin page may
+    // have no player for (the card already did; the pane did not).
+    media: p.body.media ?? null,
   };
 }
 
@@ -149,29 +154,31 @@ const EXTERNAL_QUOTE_LABEL: Record<string, string> = {
 // no equivalent gate since it's a per-action animation, not an onboarding.
 const CEREMONY_SEEN_PREFIX = "workspace:ceremony_seen:";
 
-// The first-session welcome (CONSOLIDATED-TODO §3.3), which ABSORBED the
-// "Bring your world" import offer it supersedes (FOLLOW-GRAPH-IMPORT-ADR §7.4 —
-// that sheet was explicitly a stand-in until this built) as its step 2.
+// THE FIRST-SESSION WELCOME SHEET IS DELETED (owner decision, 2026-09-04).
+// Its five steps — profile, follow-import, Library, publish, and the tour offer
+// — were all chores or offers standing between a new member and the workspace,
+// and none of them explained the thing they were standing in front of. What
+// replaces them is the Explain tour itself, which annotates the real surface
+// rather than describing it in a modal beforehand.
 //
-// THE SIGNAL CHANGED, AND THAT WAS THE BUG. `BringYourWorld` fired on
-// `mintedFounderFeed` — the bootstrap returning zero feeds — which stopped
-// meaning "brand-new account" once `/workspace/bootstrap` began seeding starter
-// feeds through `listFeedsForOwner`. A healthy new account now never has zero
-// feeds, so that branch is the FAILURE path (nothing is designated as the
-// default seed): the offer appeared on prod only because the §0l incident had
-// destroyed the starter template, and would have gone silent the moment it was
-// repaired. The welcome instead reads `accounts.onboarded_at` (migration 176),
-// which is about the member rather than about the state of their feeds — and,
-// being server-side, does not re-ask on every new browser the way the two
-// `localStorage` seen-flags above do.
+// SO THE AUTO-ENTRY IS REVIVED, AND THAT REVERSES A REVERSAL. `FirstRunController`
+// has been dormant since EXPLAIN-ADR amendment 1 ("landing in Explain mode on
+// load without asking for it read as a malfunction, not a welcome") — Explain
+// was made strictly ∀-menu-invoked and the tour reached only by accepting the
+// welcome's last step. With the sheet gone that route goes with it, and an
+// unoffered tour is an unfindable one; the owner's call is that the tour runs
+// itself. Recorded rather than quietly re-enabled, because the objection it was
+// switched off for is a real one and may come back — if it does, the fix is an
+// offer, not a return of the five-step sheet.
 //
-// Lazy like the LazyOverlays surfaces: only un-welcomed accounts ever render
-// it, so its chunk (resolver input + import hooks) stays out of /reader.
-const Welcome = nextDynamic(
-  () => import("./Welcome").then((m) => m.Welcome),
-  { ssr: false },
-);
-
+// AND IT IS GATED ON THE MEMBER, NOT ON THE DEVICE. `FirstRunController`'s own
+// guard is `workspace:firstrun_seen:<id>` in localStorage, which is right for a
+// per-device animation and wrong for this: auto-running an onboarding tour at
+// somebody who did it last week on their laptop is exactly what the
+// once-per-member invariant exists to stop. So `accounts.onboarded_at`
+// (migration 176) — the fact the deleted sheet was gated on — keeps its job and
+// arms this instead, and opening the tour stamps it the way answering the sheet
+// used to. The per-device key stays underneath as the second gate.
 // Ceremony box dimensions (mirrors ForallCeremony's BOX_W / BOX_H — kept
 // duplicated locally so the positioning math doesn't need to import the
 // component's internals). Referenced only by the commented-out Task 7 entrance
@@ -258,6 +265,15 @@ export function WorkspaceView() {
   // in-workspace surface that lives outside this component requests a note
   // compose by calling useCompose.open('note'); we mirror that into local state
   // here. (Article writing is the global EditorOverlay, opened directly.)
+  // Register the workspace surface's presence for as long as this component is
+  // mounted (`stores/workspaceSurface.ts` has the full why: it is what stops
+  // LayoutShell mounting the public nav bar over the workspace during the
+  // popstate transition a URL-synced overlay's close rides).
+  const setWorkspaceMounted = useWorkspaceSurface((s) => s._setMounted);
+  useEffect(() => {
+    setWorkspaceMounted(true);
+    return () => setWorkspaceMounted(false);
+  }, [setWorkspaceMounted]);
   const composeReqOpen = useCompose((s) => s.isOpen);
   const composeReqMode = useCompose((s) => s.mode);
   useEffect(() => {
@@ -335,12 +351,32 @@ export function WorkspaceView() {
     null,
   );
   const [ceremony, setCeremony] = useState<PendingCeremony | null>(null);
-  const [welcomeOpen, setWelcomeOpen] = useState(false);
-  // Set when the welcome's last step is accepted. The launcher mounts only once
-  // `welcomeOpen` has gone false, so the tour opens in a LATER commit than the
-  // pane's unmount — floor-mode Explain sits below the Glasshouse band, so a
-  // tour opened under a live pane would render behind it.
-  const [tourPending, setTourPending] = useState(false);
+  // Armed once the bootstrap has settled and this account has never been
+  // onboarded. Read as a fact about the MEMBER (see the FirstRunController note
+  // above); the controller adds the per-device key, the ≥1-vessel wait, the
+  // beat-3 readiness window and the never-over-a-deep-linked-pane courtesy.
+  const [tourArmed, setTourArmed] = useState(false);
+
+  // STABLE, AND THE STABILITY IS THE POINT. This is `FirstRunController`'s
+  // `onOpened`, and it sits in that component's effect deps. As an inline arrow
+  // it was a new identity on every WorkspaceView render, so the effect tore down
+  // and re-ran each time — cancelling its poll timer and resetting `started`,
+  // which is the clock the 4s "run anyway" fallback is measured against. On a
+  // surface that re-renders on drag, scroll and every bootstrap tick, a member
+  // whose first vessels carry no linked byline could wait for that fallback for
+  // ever and never be shown the tour. `useCallback` with no deps because both
+  // things it closes over are stable: a `useState` setter, and the auth store's
+  // action.
+  //
+  // The sheet used to stamp `onboarded_at` on complete, dismiss and walk-away
+  // alike, because all three are answers. Opening the tour is the same kind of
+  // answer: the member has been shown the thing, and must not meet it again on
+  // another browser. Idempotent server-side (first-write-wins), so
+  // fire-and-forget — a lost call costs one repeat, never an error anybody sees.
+  const handleTourOpened = useCallback(() => {
+    setTourArmed(false);
+    void auth.markOnboarded().catch(() => {});
+  }, []);
   const [pendingMerge, setPendingMerge] = useState<{
     source: WorkspaceFeed;
     target: WorkspaceFeed;
@@ -527,7 +563,6 @@ export function WorkspaceView() {
     !!pipPanel ||
     !!feedComposerFor ||
     !!composerOpen ||
-    welcomeOpen ||
     !!ceremony;
 
   // `\` toggles the regimented layout (§V): every visible feed on screen at
@@ -1216,7 +1251,7 @@ export function WorkspaceView() {
 
   // Deep-link → overlay. Retired routes (dashboard, messages, notifications)
   // redirect here as /reader?overlay=<name>[&…seed params]; so do the standalone
-  // pane pages on reload (WorkspacePaneRedirect → ?overlay=reader|profile|surface).
+  // pane pages via a shared link (?overlay=reader|profile|surface).
   // We strip the seed params and clean the URL to /reader *first*, then open the
   // overlay — the order matters for the pane overlays (reader/profile/surface),
   // which push their own canonical URL on open: opening after the strip lands that
@@ -1390,7 +1425,7 @@ export function WorkspaceView() {
         // gate is server-side and survives, so it simply offers on a later
         // mount; nothing is consumed by not showing it here.
         if (user.onboardedAt === null && !useGlasshousePresence.getState().isOpen) {
-          setWelcomeOpen(true);
+          setTourArmed(true);
         }
 
         for (const feed of list) {
@@ -1494,7 +1529,13 @@ export function WorkspaceView() {
                     // open card again collapses it.
                     const toggleExpand = () =>
                       setExpandedByFeed((prev) => {
-                        if (prev[v.feed.id]?.key === expandKey) {
+                        const open = prev[v.feed.id];
+                        // Open on this slot but rooted on a post this card
+                        // QUOTES: the quoting card is still in the feed above
+                        // that conversation, so a body click there opens ITS
+                        // conversation rather than closing everything. That is
+                        // the whole point of leaving it up there.
+                        if (open?.key === expandKey && open.root === post.id) {
                           const next = { ...prev };
                           delete next[v.feed.id];
                           return next;
@@ -1504,6 +1545,16 @@ export function WorkspaceView() {
                           ...prev,
                           [v.feed.id]: { key: expandKey, root: post.id },
                         };
+                      });
+                    // The focal click is a CLOSE, never the toggle above: while
+                    // a quote expansion is open the toggle swings to the host,
+                    // and the focal must still collapse the conversation (§4).
+                    const collapseHere = () =>
+                      setExpandedByFeed((prev) => {
+                        if (prev[v.feed.id]?.key !== expandKey) return prev;
+                        const next = { ...prev };
+                        delete next[v.feed.id];
+                        return next;
                       });
                     // Clicking the embedded quote tile opens the QUOTED post as
                     // the focal of an expanded conversation — full seniority, no
@@ -1628,27 +1679,12 @@ export function WorkspaceView() {
                           title: entry.title,
                           siteName: entry.siteName,
                           sourceId: entry.sourceId,
+                          media: entry.media,
                           frameScheme: frame.frameScheme,
                         });
                     };
-                    if (isExpanded && post.type !== "article") {
-                      return (
-                        <PostThread
-                          key={item.id}
-                          rootPostId={expandedHere?.root ?? post.id}
-                          ctx={ctx}
-                          onCollapse={toggleExpand}
-                          onReply={replyFromPost}
-                          onQuote={quoteFromPost}
-                          onOpenReader={openReaderFromPost}
-                          onPipOpen={onPipOpen}
-                          refreshKey={threadRefreshTick}
-                        />
-                      );
-                    }
-                    return (
+                    const collapsedCard = (
                       <PostCardInteractive
-                        key={item.id}
                         post={post}
                         level="feed"
                         expanded={false}
@@ -1665,6 +1701,34 @@ export function WorkspaceView() {
                         onQuote={() => quoteFromPost(post)}
                       />
                     );
+                    if (isExpanded && post.type !== "article") {
+                      const root = expandedHere?.root ?? post.id;
+                      // A QUOTE expansion keeps the quoting card in the feed,
+                      // directly above the conversation it opened — in effect
+                      // the next card up — so the reader can find it again and
+                      // open its own conversation next. Thread SENIORITY is
+                      // untouched: the thread is still rooted on the quoted post
+                      // with no back-link. What survives is feed context, not
+                      // thread residue. A Fragment (not a wrapper) keeps both as
+                      // direct children of the log, so the gap between them is
+                      // the feed's ordinary rhythm.
+                      return (
+                        <Fragment key={item.id}>
+                          {root !== post.id ? collapsedCard : null}
+                          <PostThread
+                            rootPostId={root}
+                            ctx={ctx}
+                            onCollapse={collapseHere}
+                            onReply={replyFromPost}
+                            onQuote={quoteFromPost}
+                            onOpenReader={openReaderFromPost}
+                            onPipOpen={onPipOpen}
+                            refreshKey={threadRefreshTick}
+                          />
+                        </Fragment>
+                      );
+                    }
+                    return <Fragment key={item.id}>{collapsedCard}</Fragment>;
                   })(),
               )}
       </>
@@ -2047,32 +2111,6 @@ export function WorkspaceView() {
           if (target) void loadVesselItems(target.feed);
         }}
       />
-      {welcomeOpen && (
-        <Welcome
-          onClose={() => {
-            setWelcomeOpen(false);
-            // Answered — by completing it, by walking out of it into the editor,
-            // or by closing it. All three are answers, so all three stamp. The
-            // route is idempotent (first-write-wins), so this is fire-and-forget:
-            // a lost call costs one repeat offer, never an error the member sees.
-            void auth.markOnboarded().catch(() => {});
-          }}
-          onLaunchTour={() => {
-            setTourPending(true);
-            setWelcomeOpen(false);
-            void auth.markOnboarded().catch(() => {});
-          }}
-        />
-      )}
-      {/* Mounts only once the welcome pane has gone, so the tour opens in a
-          later commit than the unmount — floor-mode Explain sits below the
-          Glasshouse band and would otherwise render behind it. */}
-      {tourPending && !welcomeOpen && user && (
-        <FirstRunLauncher
-          userId={user.id}
-          onLaunched={() => setTourPending(false)}
-        />
-      )}
       {ceremony && (
         <ForallCeremony
           key={ceremony.feedId}
@@ -2113,16 +2151,33 @@ export function WorkspaceView() {
           sheet the disc-X dismisses. */}
       {!isMobile && <ExplainOverlay />}
       <AboutOverlay />
-      {/* First-run AUTO-entry (D6) stays DORMANT (2026-07-15): auto-dropping a
-          fresh device into Explain on load proved disorienting on the live
-          site, so the six-beat tour never mounts by itself. The tour itself is
-          NOT dormant — the welcome sheet's last step offers it, and
-          <FirstRunLauncher> above opens it on an explicit yes; that offer is
-          what amendment 1's verdict on the ENTRY leaves intact. Revive the
-          auto-entry, should it ever be wanted again, by remounting
-          <FirstRunController userId
-          armed={bootstrap === "ready" && !ceremony && !welcomeOpen} /> here
-          (ExplainProvider.tsx keeps the controller + program intact). */}
+      {/* FIRST-RUN AUTO-ENTRY, REVIVED (owner decision, 2026-09-04). It was
+          dormant from 2026-07-15: auto-dropping a fresh device into Explain
+          "read as a malfunction, not a welcome" (EXPLAIN-ADR amendment 1), and
+          the tour was reached instead by accepting the welcome sheet's last
+          step. That sheet is now deleted, so this is the only route left and
+          an unoffered tour is an unfindable one.
+
+          DESKTOP ONLY, like <ExplainOverlay> above and for the same reason: the
+          six beats annotate the floor, which the mobile branch does not have.
+
+          `tourArmed` is the MEMBER-level half of the gate (`onboarded_at` NULL
+          + bootstrap settled + no ceremony playing); the controller adds the
+          per-device key, the ≥1-vessel wait, beat-3 readiness and the courtesy
+          of never opening over a deep-linked pane. Stamping `onboarded_at` is
+          this component's job now that nothing else does it — see `onOpened`. */}
+      {/* PREVIEW ENTRY — `/reader?firstrun=1`, localhost only, consumes
+          nothing (no seen-flag, no `onboarded_at` stamp), so the sequence can
+          be watched more than once. See FirstRunPreview for why it is a
+          separate component and why the gate is a hostname. */}
+      {!isMobile && <FirstRunPreview />}
+      {!isMobile && tourArmed && user && (
+        <FirstRunController
+          userId={user.id}
+          armed
+          onOpened={handleTourOpened}
+        />
+      )}
       </Floor>
     </ExplainProvider>
   );
@@ -2180,7 +2235,6 @@ function Floor({
   return (
     <div
       ref={ref}
-      className="scroll-silent"
       style={{
         background: FLOOR,
         minHeight: `calc(100vh - ${insetTop}px)`,

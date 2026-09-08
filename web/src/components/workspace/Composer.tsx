@@ -14,13 +14,20 @@ import { useEditorOverlay, seedFromNote } from '../../stores/editorOverlay'
 const NOTE_CHAR_LIMIT = 1000
 const NUDGE_WORDS_THRESHOLD = 400
 
+// Every colour here is in the INVERTING family (`ink`/`white`/`bone`/greys).
+// This panel is mounted at the WorkspaceView root with NO light island above
+// it, so its ground resolves through the `html.dark` inversion — and a
+// never-inverting foreground on top of one (`ink-925` on `white` = 26 26 24 on
+// 30 29 26, a contrast ratio of 1.03:1) is invisible. Foreground and ground
+// must be in the SAME inversion family; see web/CLAUDE.md › Global light/dark
+// mode.
 const TOKENS = {
-  panelBorder: 'var(--ah-ink-925)',
+  panelBorder: 'var(--ah-ink)',
   bannerBg: 'var(--ah-bone)',
-  bannerFg: 'var(--ah-ink-925)',
+  bannerFg: 'var(--ah-ink)',
   hintFg: 'var(--ah-grey-600)',
   errorFg: 'var(--ah-crimson)',
-  publishBg: 'var(--ah-ink-925)',
+  publishBg: 'var(--ah-ink)',
   publishFg: 'var(--ah-bone)',
   publishDisabled: 'var(--ah-grey-300)',
   // Inset well a touch darker than the now-white Glasshouse pane (bg-glasshouse).

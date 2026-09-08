@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useState, type ReactNode } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { PostCardInteractive } from "../../../components/post/PostCardInteractive";
@@ -15,6 +15,7 @@ import {
 import {
   ProfileBar,
   ProfileMeta,
+  PROFILE_PANE_WIDTH,
   ProfileSurface,
   ProfileWritingIn,
   FEED_LOG_STYLE,
@@ -102,7 +103,17 @@ export function AuthorProfileView({
         padding: 8,
       }}
     >
-      {children}
+      {/* Standalone, the pre-identity states take the same column the loaded
+          profile does, so the page does not snap from full width to the pane's
+          width once the author arrives. */}
+      <div
+        style={{
+          maxWidth: inOverlay ? undefined : PROFILE_PANE_WIDTH,
+          marginInline: inOverlay ? undefined : "auto",
+        }}
+      >
+        {children}
+      </div>
     </div>
   );
   const [profile, setProfile] = useState<AuthorProfile | null>(null);
@@ -112,6 +123,13 @@ export function AuthorProfileView({
   const [loadingMore, setLoadingMore] = useState(false);
   const [notFound, setNotFound] = useState(false);
   const [error, setError] = useState(false);
+  // A 401 is a DIFFERENT FACT from "something went wrong", and this page is the
+  // one that proved it: `/author/:id/profile` was `requireAuth` until
+  // 2026-09-02, so every logged-out visit to a share surface rendered the
+  // outage sentence below and blamed the platform for a door it had locked.
+  // The route is open now and this branch should be unreachable — it is kept so
+  // that if a gate ever comes back the page says which of the two happened.
+  const [needsAuth, setNeedsAuth] = useState(false);
   // host post id → thread root id. Usually root === host; a quote-tile click on
   // a collapsed card roots the thread on the QUOTED post instead (fresh focal,
   // no residue of the quoting host — the WorkspaceView expandQuote grammar).
@@ -128,6 +146,7 @@ export function AuthorProfileView({
     setLoading(true);
     setError(false);
     setNotFound(false);
+    setNeedsAuth(false);
     setHydrating(false);
     Promise.all([authorProfile(authorId), authorPosts(authorId)])
       .then(([prof, posts]) => {
@@ -156,6 +175,11 @@ export function AuthorProfileView({
       .catch((err) => {
         if (cancelled) return;
         if (err instanceof ApiError && err.status === 404) setNotFound(true);
+        else if (
+          err instanceof ApiError &&
+          (err.status === 401 || err.status === 403)
+        )
+          setNeedsAuth(true);
         else setError(true);
       })
       .finally(() => {
@@ -179,11 +203,25 @@ export function AuthorProfileView({
       .finally(() => setLoadingMore(false));
   }, [authorId, cursor, loadingMore]);
 
+  // Not open -> open on the host. Open on a post this card QUOTES -> swing to
+  // the host's own conversation (the quoting card sits above it in the log, so
+  // this click is how the reader gets to it). Open on the host -> close.
   const toggleExpand = useCallback((id: string) => {
     setExpanded((prev) => {
       const next = new Map(prev);
-      if (next.has(id)) next.delete(id);
+      if (next.get(id) === id) next.delete(id);
       else next.set(id, id);
+      return next;
+    });
+  }, []);
+
+  // The focal click is a CLOSE, never the toggle above: while a quote expansion
+  // is open the toggle swings to the host, and the focal must still collapse.
+  const collapseExpand = useCallback((id: string) => {
+    setExpanded((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Map(prev);
+      next.delete(id);
       return next;
     });
   }, []);
@@ -232,6 +270,17 @@ export function AuthorProfileView({
         This author isn&apos;t available.{" "}
         <Link href="/reader" className="btn-text">
           Back to workspace
+        </Link>
+      </p>,
+    );
+  }
+
+  if (needsAuth) {
+    return frame(
+      <p className="font-sans text-ui-sm py-12" style={{ color: palette.cardMeta }}>
+        Log in to see this profile.{" "}
+        <Link href="/auth?mode=login" className="btn-text">
+          Log in
         </Link>
       </p>,
     );
@@ -315,6 +364,9 @@ export function AuthorProfileView({
       palette={palette}
       scheme={scheme}
       minHeight={inOverlay ? "100%" : "100dvh"}
+      // Standalone → the pane's own width (the overlay's Glasshouse already is
+      // it). Same seam as the height above.
+      maxWidth={inOverlay ? undefined : PROFILE_PANE_WIDTH}
       bar={
         <ProfileBar
           palette={palette}
@@ -376,19 +428,10 @@ export function AuthorProfileView({
         // would double the 8px margin — true, and 8px was never the feed's
         // figure; it was the margin measured without the column it lives in.
         <div style={FEED_LOG_STYLE}>
-          {items.map((post) =>
-            expanded.has(post.id) && post.type !== "article" ? (
-              <PostThread
-                key={post.id}
-                rootPostId={expanded.get(post.id) ?? post.id}
-                ctx={CTX}
-                onCollapse={() => toggleExpand(post.id)}
-                onReply={replyFromPost}
-                onOpenReader={openReader}
-              />
-            ) : (
+          {items.map((post) => {
+            const root = expanded.get(post.id);
+            const card = (
               <PostCardInteractive
-                key={post.id}
                 post={post}
                 level="feed"
                 expanded={false}
@@ -400,8 +443,29 @@ export function AuthorProfileView({
                   post.author.pubkey ? () => replyFromPost(post) : undefined
                 }
               />
-            ),
-          )}
+            );
+            if (root === undefined || post.type === "article")
+              return <Fragment key={post.id}>{card}</Fragment>;
+            // A QUOTE expansion keeps the quoting card in the log, directly
+            // above the conversation it opened — in effect the next card up —
+            // so the reader can find it again and open its own conversation
+            // next. Thread seniority is untouched (the thread is still rooted
+            // on the quoted post, no back-link); what survives is FEED context,
+            // not thread residue. A Fragment, not a wrapper, so both stay direct
+            // children of FEED_LOG_STYLE and keep the log's ordinary rhythm.
+            return (
+              <Fragment key={post.id}>
+                {root !== post.id ? card : null}
+                <PostThread
+                  rootPostId={root}
+                  ctx={CTX}
+                  onCollapse={() => collapseExpand(post.id)}
+                  onReply={replyFromPost}
+                  onOpenReader={openReader}
+                />
+              </Fragment>
+            );
+          })}
         </div>
       )}
 

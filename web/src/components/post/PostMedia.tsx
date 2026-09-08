@@ -201,12 +201,17 @@ export function PostMedia({
   );
 }
 
-// Inline player for the focal video. Direct files (Mastodon/RSS MP4/WebM) play
+// Inline player for the focal video. Also the reader pane's player, via the
+// export (ExternalArticleReader) — the pane shows an item's own enclosure above
+// the extracted body, and one player means HLS, the poster fallback and the
+// no-autoplay-with-sound posture are decided once.
+//
+// Direct files (Mastodon/RSS MP4/WebM) play
 // via the native <video src>. HLS playlists (.m3u8 — Bluesky) play natively on
 // Safari and via a lazily-imported hls.js everywhere else; if neither can play
 // the poster simply remains. Muted so the browser honours autoplay; controls let
 // the reader unmute. stopPropagation keeps scrubbing from collapsing the card.
-function InlineVideo({ item, expanded }: { item: MediaItem; expanded: boolean }) {
+export function InlineVideo({ item, expanded }: { item: MediaItem; expanded: boolean }) {
   const ref = React.useRef<HTMLVideoElement>(null);
   const isHls = /\.m3u8(\?|#|$)/i.test(item.url);
   // A fatal load failure drops the player for the poster — never a forever

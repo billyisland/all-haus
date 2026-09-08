@@ -26,7 +26,7 @@ import { RELAY_OUTBOX_PRUNE_SQL } from "./relay-outbox-prune.js";
 // so it must SURVIVE — which is what separates this from a query that keys on
 // created_at and would look correct on every other fixture here.
 //
-// Skipped unless a DB URL is supplied (CI's no-Postgres `test` job stays green).
+// Skipped unless a DB URL is supplied (CI supplies one and fails on a skip).
 //   POSTGRES_PASSWORD=$(grep -E '^POSTGRES_PASSWORD=' ../.env | cut -d= -f2-) \
 //   TEST_DATABASE_URL=postgresql://platformpub:$POSTGRES_PASSWORD@localhost:5432/platformpub \
 //     npx vitest run src/tasks/relay-outbox-prune-integration.test.ts

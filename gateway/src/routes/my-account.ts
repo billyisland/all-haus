@@ -3,6 +3,365 @@ import { requireAuth } from "../middleware/auth.js";
 import { pool } from "@platform-pub/shared/db/client.js";
 import { readNetSql } from "@platform-pub/shared/lib/per-read-net.js";
 
+// =============================================================================
+// The arrival read, in the reader's own statement (PAYWALL-ARRIVAL-ADR D2/§11.3)
+//
+// A paywall arrival is granted `dial + p` and then spends exactly `p` on the
+// piece they came for. Both halves have to be VISIBLE or the statement stops
+// adding up in the reader's favour and then against it: the credit line would
+// read `dial + p` while the debit side showed nothing, leaving `p` simply
+// missing — on the money surface, shown to the one reader the whole flow exists
+// to impress.
+//
+// The read itself is `chargeable_pence = 0` (it is a gift, charged to nobody and
+// earning nobody, exactly like any allowance-covered read), so BOTH statement
+// queries' debit arms exclude it by construction: each carries
+// `re.chargeable_pence > 0`. It is admitted deliberately, at its LIST price,
+// because a read PAID FOR BY A GIFT is a different fact from a read that cost
+// nothing — and saying so is what makes the columns add up.
+//
+// THE TWO QUERIES CHANGE TOGETHER OR NEITHER CHANGES. The entry list and the
+// summary totals are independent copies of the same idea, not a projection of
+// one onto the other. Admitting the read to one alone nets the entries to `dial`
+// while the summary nets to `dial + p` — which is D2's own failure rebuilt
+// inside the remedy for it, three pounds moving from one place to another. Hence
+// one fragment, used in both.
+//
+// `IS NOT DISTINCT FROM`, NOT `=`. `arrival_article_id` is NULL for every
+// account that arrived any other way, and `re.article_id = NULL` is NULL rather
+// than false — so a plain `=` inside the free-reads arm's `NOT (…)` would
+// evaluate to NULL and silently drop EVERY free read from EVERY ordinary
+// reader's statement. The three-valued logic is the whole trap here.
+//
+// IT KEYS ON THE GIFT, NOT ON THE ARTICLE ALONE, and `arrival_gift_pence > 0`
+// lives INSIDE the subselect rather than beside it — which is the same
+// three-valued point one turn on. A gift-0 account is stamped with an
+// `arrival_article_id` like any other (the piece was above the cap, or
+// undeliverable at signup); it just never received the enlargement, so the
+// 'arrival-gift' credit line below is ABSENT for it — that arm carries its own
+// `a.arrival_gift_pence > 0`. If the piece is later repriced or its vault fixed
+// and the reader unlocks it with the ordinary button at or below the cap, that
+// read consumes allowance on the stamped article and matched this fragment.
+// It was then hoisted onto the DEBIT side at its list price with NO credit
+// anywhere to answer it, and excluded from the free-reads arm that would
+// otherwise have shown it at zero — so the statement netted `dial − p` where an
+// ordinary reader's nets `dial`. Both queries share this fragment, so they
+// agreed with each other about it and the parity test passed; the entries and
+// the summary were wrong together, which is the failure that surface is hardest
+// to notice. Putting the term in the subselect makes it return NO ROW for such
+// an account, so `IS NOT DISTINCT FROM (…)` compares against NULL and is false
+// for every real `re.article_id` — the read falls through to the free-reads arm
+// at zero, which is what it is. Inside rather than beside because the fragment
+// then stays ONE self-contained predicate over one subselect: a second
+// `(SELECT arrival_gift_pence …) > 0` conjunct would be correct too (it is FALSE,
+// not NULL, for a gift-0 account, so the free-reads arm's `NOT (…)` survives it)
+// but it is a second copy of the account lookup that has to be kept in step with
+// the first, in a fragment whose entire reason for existing is that two queries
+// share exactly one of it.
+//
+// It carries no `list-price-ok` marker because it names no list price: the sum
+// of `chargeable_pence` and the allowance actually consumed IS what this read
+// cost, arrived at from the two columns that record it.
+// =============================================================================
+
+const ARRIVAL_READ_SQL = `re.article_id IS NOT DISTINCT FROM (
+        SELECT acc.arrival_article_id FROM accounts acc
+         WHERE acc.id = $1 AND acc.arrival_gift_pence > 0
+      )
+      AND re.allowance_consumed_pence > 0
+      AND re.is_subscription_read = FALSE`;
+
+// The two statement statements, EXPORTED so the DB-backed parity test executes
+// the real ones rather than a retyped copy of them (the
+// `CONVERT_PROVISIONAL_READS_SQL` precedent). §11.3's rule is that the entry
+// list and the summary change together or neither changes, and a test that
+// restated the SQL could not fail when production drifted — which is exactly
+// the failure the rule exists to prevent.
+//
+// $1 = reader/account id, $2 = platform fee bps.
+export function buildStatementSQL(
+  includeFreeReads: boolean,
+  filter: string,
+): string {
+  return `
+    WITH statement AS (
+      -- Free allowance credit — what THIS reader was granted at signup
+      -- (migration 169), not a literal and not the current dial: this is
+      -- a statement line, so it must say what actually happened to them.
+      --
+      -- MINUS THE ARRIVAL GIFT, which is its own line below. A paywall
+      -- arrival is granted dial + p; showing that as one 'Starting
+      -- credit' would tell a reader who has spent nothing that their gift
+      -- meter is already a third drained, with no line anywhere saying
+      -- where the rest went (D2). The two lines are dated the same because
+      -- they were given at the same instant.
+      SELECT
+        'free-allowance' AS id,
+        a.created_at AS date,
+        'credit' AS type,
+        'free_allowance' AS category,
+        'Starting credit' AS description,
+        (a.free_allowance_granted_pence - a.arrival_gift_pence) AS amount_pence,
+        NULL AS link
+      FROM accounts a
+      WHERE a.id = $1
+
+      UNION ALL
+
+      -- The arrival gift — the piece they signed up to finish, given to
+      -- them so they could. Absent (not zero) for every account that
+      -- arrived any other way, which is every account until the beta
+      -- opens. It pairs visibly with the read debit of the same amount for
+      -- the same article, so the two cancel where the reader can see it.
+      SELECT
+        'arrival-gift' AS id,
+        a.created_at AS date,
+        'credit' AS type,
+        'free_allowance' AS category,
+        'Arrival gift — ' || art.title AS description,
+        a.arrival_gift_pence AS amount_pence,
+        '/article/' || art.nostr_d_tag AS link
+      FROM accounts a
+      JOIN articles art ON art.id = a.arrival_article_id
+      WHERE a.id = $1 AND a.arrival_gift_pence > 0
+
+      UNION ALL
+
+      -- Article read debits (reader pays to read), plus the arrival read,
+      -- which the reader did not pay for but a gift on their own statement
+      -- did — see ARRIVAL_READ_SQL above.
+      SELECT
+        'read-' || re.id AS id,
+        re.read_at AS date,
+        'debit' AS type,
+        'article_read' AS category,
+        art.title AS description,
+        (re.chargeable_pence
+          + CASE WHEN ${ARRIVAL_READ_SQL}
+                 THEN re.allowance_consumed_pence ELSE 0 END)::int AS amount_pence,
+        '/article/' || art.nostr_d_tag AS link
+      FROM read_events re
+      JOIN articles art ON art.id = re.article_id
+      WHERE re.reader_id = $1
+        AND (re.chargeable_pence > 0 OR (${ARRIVAL_READ_SQL}))
+        AND re.is_subscription_read = FALSE
+
+      ${
+        includeFreeReads
+          ? `
+      UNION ALL
+
+      -- Free reads (no charge)
+      SELECT
+        'freeread-' || re.id AS id,
+        re.read_at AS date,
+        'debit' AS type,
+        'free_read' AS category,
+        art.title AS description,
+        0 AS amount_pence,
+        '/article/' || art.nostr_d_tag AS link
+      FROM read_events re
+      JOIN articles art ON art.id = re.article_id
+      WHERE re.reader_id = $1
+        AND (re.chargeable_pence = 0 OR re.is_subscription_read = TRUE)
+        -- The arrival read is a £0 read by this arm's test, and it is
+        -- already on the debit side above. Without this it renders twice.
+        AND NOT (${ARRIVAL_READ_SQL})
+      `
+          : ""
+      }
+
+      UNION ALL
+
+      -- Article earning credits (writer earns from readers, after platform fee)
+      SELECT
+        'earning-' || re.id AS id,
+        re.read_at AS date,
+        'credit' AS type,
+        'article_earning' AS category,
+        COALESCE(reader.display_name, reader.username, 'Reader') || ' read ' || art.title AS description,
+        -- Tribute carve (Upstream Edges Phase 3): a tributed read's earning
+        -- credit is net of the inspirer-bound (released|paid) shares.
+        -- Dial A: released|paid are the only accrual states. No-op when no
+        -- accruals exist (feature dark).
+        (${readNetSql("re.chargeable_pence", "$2")}
+          - COALESCE((SELECT SUM(ta.amount_pence) FROM tribute_accruals ta
+                      WHERE ta.read_event_id = re.id
+                        AND ta.state IN ('released', 'paid')), 0))::int AS amount_pence,
+        '/article/' || art.nostr_d_tag AS link
+      FROM read_events re
+      JOIN articles art ON art.id = re.article_id
+      JOIN accounts reader ON reader.id = re.reader_id
+      WHERE re.writer_id = $1
+        AND re.reader_id != $1
+        AND re.chargeable_pence > 0
+        AND re.state IN ('platform_settled', 'writer_paid')
+
+      UNION ALL
+
+      -- Subscription charge debits (reader pays for subscription)
+      SELECT
+        'subcharge-' || se.id AS id,
+        se.created_at AS date,
+        'debit' AS type,
+        'subscription_charge' AS category,
+        'Subscription to ' || COALESCE(w.display_name, w.username) AS description,
+        se.amount_pence,
+        '/' || w.username AS link
+      FROM subscription_events se
+      JOIN accounts w ON w.id = se.writer_id
+      WHERE se.reader_id = $1
+        AND se.event_type = 'subscription_charge'
+
+      UNION ALL
+
+      -- Subscription earning credits (writer earns from subscriber)
+      SELECT
+        'subearning-' || se.id AS id,
+        se.created_at AS date,
+        'credit' AS type,
+        'subscription_earning' AS category,
+        'Subscriber: ' || COALESCE(r.display_name, r.username) AS description,
+        se.amount_pence,
+        '/' || r.username AS link
+      FROM subscription_events se
+      JOIN accounts r ON r.id = se.reader_id
+      WHERE se.writer_id = $1
+        AND se.event_type = 'subscription_earning'
+
+      UNION ALL
+
+      -- Vote charge debits (voter pays)
+      SELECT
+        'votecharge-' || vc.id AS id,
+        vc.created_at AS date,
+        'debit' AS type,
+        'vote_charge' AS category,
+        CASE v.direction WHEN 'up' THEN 'Upvote' ELSE 'Downvote' END
+          || COALESCE(': ' || art.title, '') AS description,
+        vc.amount_pence::int AS amount_pence,
+        CASE WHEN art.nostr_d_tag IS NOT NULL THEN '/article/' || art.nostr_d_tag ELSE NULL END AS link
+      FROM vote_charges vc
+      JOIN votes v ON v.id = vc.vote_id
+      LEFT JOIN articles art ON art.nostr_event_id = v.target_nostr_event_id
+      WHERE vc.voter_id = $1
+
+      UNION ALL
+
+      -- Vote earning credits (author receives upvote money)
+      SELECT
+        'voteearning-' || vc.id AS id,
+        vc.created_at AS date,
+        'credit' AS type,
+        'vote_earning' AS category,
+        'Upvote from ' || COALESCE(voter.display_name, voter.username, 'Someone')
+          || COALESCE(' on ' || art.title, '') AS description,
+        vc.amount_pence::int AS amount_pence,
+        CASE WHEN art.nostr_d_tag IS NOT NULL THEN '/article/' || art.nostr_d_tag ELSE NULL END AS link
+      FROM vote_charges vc
+      JOIN votes v ON v.id = vc.vote_id
+      JOIN accounts voter ON voter.id = vc.voter_id
+      LEFT JOIN articles art ON art.nostr_event_id = v.target_nostr_event_id
+      WHERE vc.recipient_id = $1
+
+      UNION ALL
+
+      -- Settlements (balance cleared via Stripe)
+      SELECT
+        'settlement-' || ts.id AS id,
+        ts.settled_at AS date,
+        'settlement' AS type,
+        'settlement' AS category,
+        'Balance settled' AS description,
+        ts.amount_pence,
+        NULL AS link
+      FROM tab_settlements ts
+      WHERE ts.reader_id = $1
+    )
+    SELECT * FROM statement
+    ${filter === "credits" ? "WHERE type = 'credit'" : filter === "debits" ? "WHERE type = 'debit'" : ""}
+    ORDER BY date DESC
+  `;
+
+
+}
+
+// $1 = account id, $2 = last settled at (nullable), $3 = platform fee bps.
+export const SUMMARY_STATEMENT_SQL = `
+    WITH statement AS (
+      -- The reader's OWN grant, never the dial and never a literal: the
+      -- entry list above reads the same column, and a literal here made
+      -- the two disagree the moment free_allowance_pence was retuned —
+      -- which is the only reason that dial was made live at all.
+      -- Split exactly as the entry list splits it. Numerically this is a
+      -- no-op — the summary is a SUM, and dial + p sums the same whether
+      -- it arrives as one row or two — and it is written out anyway so the
+      -- two queries are readable as the same statement. The DEBIT arm
+      -- below is where the split stops being harmless.
+      SELECT 'credit' AS type,
+             (a.free_allowance_granted_pence - a.arrival_gift_pence) AS amount_pence,
+             a.created_at AS date
+      FROM accounts a WHERE a.id = $1
+
+      UNION ALL
+
+      SELECT 'credit', a.arrival_gift_pence, a.created_at
+      FROM accounts a WHERE a.id = $1 AND a.arrival_gift_pence > 0
+
+      UNION ALL
+
+      SELECT 'debit',
+        (re.chargeable_pence
+          + CASE WHEN ${ARRIVAL_READ_SQL}
+                 THEN re.allowance_consumed_pence ELSE 0 END)::int,
+        re.read_at
+      FROM read_events re
+      WHERE re.reader_id = $1
+        AND (re.chargeable_pence > 0 OR (${ARRIVAL_READ_SQL}))
+        AND re.is_subscription_read = FALSE
+
+      UNION ALL
+
+      SELECT 'credit',
+        (${readNetSql("re.chargeable_pence", "$3")}
+          - COALESCE((SELECT SUM(ta.amount_pence) FROM tribute_accruals ta
+                      WHERE ta.read_event_id = re.id
+                        AND ta.state IN ('released', 'paid')), 0))::int,
+        re.read_at
+      FROM read_events re
+      WHERE re.writer_id = $1 AND re.reader_id != $1 AND re.chargeable_pence > 0
+        AND re.state IN ('platform_settled', 'writer_paid')
+
+      UNION ALL
+
+      SELECT 'debit', se.amount_pence, se.created_at
+      FROM subscription_events se
+      WHERE se.reader_id = $1 AND se.event_type = 'subscription_charge'
+
+      UNION ALL
+
+      SELECT 'credit', se.amount_pence, se.created_at
+      FROM subscription_events se
+      WHERE se.writer_id = $1 AND se.event_type = 'subscription_earning'
+
+      UNION ALL
+
+      SELECT 'debit', vc.amount_pence::int, vc.created_at
+      FROM vote_charges vc WHERE vc.voter_id = $1
+
+      UNION ALL
+
+      SELECT 'credit', vc.amount_pence::int, vc.created_at
+      FROM vote_charges vc WHERE vc.recipient_id = $1
+    )
+    SELECT
+      COALESCE(SUM(CASE WHEN type = 'credit' THEN amount_pence ELSE 0 END), 0) AS credits_total,
+      COALESCE(SUM(CASE WHEN type = 'debit' THEN amount_pence ELSE 0 END), 0) AS debits_total
+    FROM statement
+    WHERE date > COALESCE($2::timestamptz, '1970-01-01'::timestamptz)
+  `;
+
+
 export async function myAccountRoutes(app: FastifyInstance) {
   // GET /my/tab
   app.get("/my/tab", { preHandler: requireAuth }, async (req, reply) => {
@@ -118,172 +477,7 @@ export async function myAccountRoutes(app: FastifyInstance) {
         // 2. Build the unified statement via UNION ALL
         //    Each sub-query produces: id, date, type, category, description, amount_pence, link
 
-        const statementSQL = `
-          WITH statement AS (
-            -- Free allowance credit — what THIS reader was granted at signup
-            -- (migration 169), not a literal and not the current dial: this is
-            -- a statement line, so it must say what actually happened to them.
-            SELECT
-              'free-allowance' AS id,
-              a.created_at AS date,
-              'credit' AS type,
-              'free_allowance' AS category,
-              'Starting credit' AS description,
-              a.free_allowance_granted_pence AS amount_pence,
-              NULL AS link
-            FROM accounts a
-            WHERE a.id = $1
-
-            UNION ALL
-
-            -- Article read debits (reader pays to read)
-            SELECT
-              'read-' || re.id AS id,
-              re.read_at AS date,
-              'debit' AS type,
-              'article_read' AS category,
-              art.title AS description,
-              re.chargeable_pence AS amount_pence,
-              '/article/' || art.nostr_d_tag AS link
-            FROM read_events re
-            JOIN articles art ON art.id = re.article_id
-            WHERE re.reader_id = $1
-              AND re.chargeable_pence > 0
-              AND re.is_subscription_read = FALSE
-
-            ${
-              includeFreeReads
-                ? `
-            UNION ALL
-
-            -- Free reads (no charge)
-            SELECT
-              'freeread-' || re.id AS id,
-              re.read_at AS date,
-              'debit' AS type,
-              'free_read' AS category,
-              art.title AS description,
-              0 AS amount_pence,
-              '/article/' || art.nostr_d_tag AS link
-            FROM read_events re
-            JOIN articles art ON art.id = re.article_id
-            WHERE re.reader_id = $1
-              AND (re.chargeable_pence = 0 OR re.is_subscription_read = TRUE)
-            `
-                : ""
-            }
-
-            UNION ALL
-
-            -- Article earning credits (writer earns from readers, after platform fee)
-            SELECT
-              'earning-' || re.id AS id,
-              re.read_at AS date,
-              'credit' AS type,
-              'article_earning' AS category,
-              COALESCE(reader.display_name, reader.username, 'Reader') || ' read ' || art.title AS description,
-              -- Tribute carve (Upstream Edges Phase 3): a tributed read's earning
-              -- credit is net of the inspirer-bound (released|paid) shares.
-              -- Dial A: released|paid are the only accrual states. No-op when no
-              -- accruals exist (feature dark).
-              (${readNetSql("re.chargeable_pence", "$2")}
-                - COALESCE((SELECT SUM(ta.amount_pence) FROM tribute_accruals ta
-                            WHERE ta.read_event_id = re.id
-                              AND ta.state IN ('released', 'paid')), 0))::int AS amount_pence,
-              '/article/' || art.nostr_d_tag AS link
-            FROM read_events re
-            JOIN articles art ON art.id = re.article_id
-            JOIN accounts reader ON reader.id = re.reader_id
-            WHERE re.writer_id = $1
-              AND re.reader_id != $1
-              AND re.chargeable_pence > 0
-              AND re.state IN ('platform_settled', 'writer_paid')
-
-            UNION ALL
-
-            -- Subscription charge debits (reader pays for subscription)
-            SELECT
-              'subcharge-' || se.id AS id,
-              se.created_at AS date,
-              'debit' AS type,
-              'subscription_charge' AS category,
-              'Subscription to ' || COALESCE(w.display_name, w.username) AS description,
-              se.amount_pence,
-              '/' || w.username AS link
-            FROM subscription_events se
-            JOIN accounts w ON w.id = se.writer_id
-            WHERE se.reader_id = $1
-              AND se.event_type = 'subscription_charge'
-
-            UNION ALL
-
-            -- Subscription earning credits (writer earns from subscriber)
-            SELECT
-              'subearning-' || se.id AS id,
-              se.created_at AS date,
-              'credit' AS type,
-              'subscription_earning' AS category,
-              'Subscriber: ' || COALESCE(r.display_name, r.username) AS description,
-              se.amount_pence,
-              '/' || r.username AS link
-            FROM subscription_events se
-            JOIN accounts r ON r.id = se.reader_id
-            WHERE se.writer_id = $1
-              AND se.event_type = 'subscription_earning'
-
-            UNION ALL
-
-            -- Vote charge debits (voter pays)
-            SELECT
-              'votecharge-' || vc.id AS id,
-              vc.created_at AS date,
-              'debit' AS type,
-              'vote_charge' AS category,
-              CASE v.direction WHEN 'up' THEN 'Upvote' ELSE 'Downvote' END
-                || COALESCE(': ' || art.title, '') AS description,
-              vc.amount_pence::int AS amount_pence,
-              CASE WHEN art.nostr_d_tag IS NOT NULL THEN '/article/' || art.nostr_d_tag ELSE NULL END AS link
-            FROM vote_charges vc
-            JOIN votes v ON v.id = vc.vote_id
-            LEFT JOIN articles art ON art.nostr_event_id = v.target_nostr_event_id
-            WHERE vc.voter_id = $1
-
-            UNION ALL
-
-            -- Vote earning credits (author receives upvote money)
-            SELECT
-              'voteearning-' || vc.id AS id,
-              vc.created_at AS date,
-              'credit' AS type,
-              'vote_earning' AS category,
-              'Upvote from ' || COALESCE(voter.display_name, voter.username, 'Someone')
-                || COALESCE(' on ' || art.title, '') AS description,
-              vc.amount_pence::int AS amount_pence,
-              CASE WHEN art.nostr_d_tag IS NOT NULL THEN '/article/' || art.nostr_d_tag ELSE NULL END AS link
-            FROM vote_charges vc
-            JOIN votes v ON v.id = vc.vote_id
-            JOIN accounts voter ON voter.id = vc.voter_id
-            LEFT JOIN articles art ON art.nostr_event_id = v.target_nostr_event_id
-            WHERE vc.recipient_id = $1
-
-            UNION ALL
-
-            -- Settlements (balance cleared via Stripe)
-            SELECT
-              'settlement-' || ts.id AS id,
-              ts.settled_at AS date,
-              'settlement' AS type,
-              'settlement' AS category,
-              'Balance settled' AS description,
-              ts.amount_pence,
-              NULL AS link
-            FROM tab_settlements ts
-            WHERE ts.reader_id = $1
-          )
-          SELECT * FROM statement
-          ${filter === "credits" ? "WHERE type = 'credit'" : filter === "debits" ? "WHERE type = 'debit'" : ""}
-          ORDER BY date DESC
-        `;
+        const statementSQL = buildStatementSQL(includeFreeReads, filter);
 
         // Get total count for pagination
         const countSQL = `SELECT COUNT(*) AS total FROM (${statementSQL}) AS counted`;
@@ -300,63 +494,8 @@ export async function myAccountRoutes(app: FastifyInstance) {
         );
 
         // 3. Compute summary totals (since last settlement, unfiltered)
-        const summarySQL = `
-          WITH statement AS (
-            -- The reader's OWN grant, never the dial and never a literal: the
-            -- entry list above reads the same column, and a literal here made
-            -- the two disagree the moment free_allowance_pence was retuned —
-            -- which is the only reason that dial was made live at all.
-            SELECT 'credit' AS type,
-                   a.free_allowance_granted_pence AS amount_pence,
-                   a.created_at AS date
-            FROM accounts a WHERE a.id = $1
+        const summarySQL = SUMMARY_STATEMENT_SQL;
 
-            UNION ALL
-
-            SELECT 'debit', re.chargeable_pence, re.read_at
-            FROM read_events re
-            WHERE re.reader_id = $1 AND re.chargeable_pence > 0 AND re.is_subscription_read = FALSE
-
-            UNION ALL
-
-            SELECT 'credit',
-              (${readNetSql("re.chargeable_pence", "$3")}
-                - COALESCE((SELECT SUM(ta.amount_pence) FROM tribute_accruals ta
-                            WHERE ta.read_event_id = re.id
-                              AND ta.state IN ('released', 'paid')), 0))::int,
-              re.read_at
-            FROM read_events re
-            WHERE re.writer_id = $1 AND re.reader_id != $1 AND re.chargeable_pence > 0
-              AND re.state IN ('platform_settled', 'writer_paid')
-
-            UNION ALL
-
-            SELECT 'debit', se.amount_pence, se.created_at
-            FROM subscription_events se
-            WHERE se.reader_id = $1 AND se.event_type = 'subscription_charge'
-
-            UNION ALL
-
-            SELECT 'credit', se.amount_pence, se.created_at
-            FROM subscription_events se
-            WHERE se.writer_id = $1 AND se.event_type = 'subscription_earning'
-
-            UNION ALL
-
-            SELECT 'debit', vc.amount_pence::int, vc.created_at
-            FROM vote_charges vc WHERE vc.voter_id = $1
-
-            UNION ALL
-
-            SELECT 'credit', vc.amount_pence::int, vc.created_at
-            FROM vote_charges vc WHERE vc.recipient_id = $1
-          )
-          SELECT
-            COALESCE(SUM(CASE WHEN type = 'credit' THEN amount_pence ELSE 0 END), 0) AS credits_total,
-            COALESCE(SUM(CASE WHEN type = 'debit' THEN amount_pence ELSE 0 END), 0) AS debits_total
-          FROM statement
-          WHERE date > COALESCE($2::timestamptz, '1970-01-01'::timestamptz)
-        `;
         const summaryResult = await pool.query<{
           credits_total: string;
           debits_total: string;

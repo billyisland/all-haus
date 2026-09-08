@@ -3,7 +3,6 @@ import type { Metadata } from 'next'
 import { renderMarkdown } from '../../../../lib/markdown'
 import { PublicationMasthead } from '../../../../components/publication/PublicationMasthead'
 import { PublicPage } from '../../../../components/public/PublicPage'
-import WorkspacePaneRedirect from '../../../../components/layout/WorkspacePaneRedirect'
 
 const GATEWAY = process.env.GATEWAY_INTERNAL_URL ?? process.env.GATEWAY_URL ?? 'http://localhost:3000'
 const SITE_URL = process.env.APP_URL ?? 'https://all.haus'
@@ -40,7 +39,6 @@ export default async function AboutPage({ params }: { params: { slug: string } }
 
   return (
     <PublicPage>
-      <WorkspacePaneRedirect overlay="surface" params={{ surface: `/pub/${params.slug}/about` }} />
       <PublicationMasthead pub={pub} view="about" />
       <div className="mx-auto max-w-article px-4 sm:px-6 pt-14 pb-20">
         {aboutHtml ? (

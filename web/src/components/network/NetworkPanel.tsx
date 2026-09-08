@@ -16,6 +16,7 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import { ProfileLink } from "../ui/ProfileLink";
+import { Avatar } from "../ui/Avatar";
 import { useRouter } from "next/navigation";
 import { useAuth } from "../../stores/auth";
 import { useFollows } from "../../stores/follows";
@@ -215,17 +216,11 @@ export function NetworkPanel({
               {writers.map((w) => (
                 <div key={w.id} className="flex items-center gap-4 py-4">
                   <ProfileLink href={`/${w.username}`} className="flex-shrink-0">
-                    {w.avatar ? (
-                      <img
-                        src={w.avatar}
-                        alt=""
-                        className="h-11 w-11  object-cover"
-                      />
-                    ) : (
-                      <span className="flex h-11 w-11 items-center justify-center bg-grey-100 text-sm font-medium text-grey-400 ">
-                        {(w.displayName ?? w.username)[0].toUpperCase()}
-                      </span>
-                    )}
+                    <Avatar
+                      src={w.avatar}
+                      name={w.displayName ?? w.username}
+                      size={44}
+                    />
                   </ProfileLink>
                   <div className="flex-1 min-w-0">
                     <ProfileLink href={`/${w.username}`} className="group">
@@ -270,17 +265,11 @@ export function NetworkPanel({
               {followers.map((f) => (
                 <div key={f.id} className="flex items-center gap-4 py-4">
                   <ProfileLink href={`/${f.username}`} className="flex-shrink-0">
-                    {f.avatar ? (
-                      <img
-                        src={f.avatar}
-                        alt=""
-                        className="h-11 w-11  object-cover"
-                      />
-                    ) : (
-                      <span className="flex h-11 w-11 items-center justify-center bg-grey-100 text-sm font-medium text-grey-400 ">
-                        {(f.displayName ?? f.username)[0].toUpperCase()}
-                      </span>
-                    )}
+                    <Avatar
+                      src={f.avatar}
+                      name={f.displayName ?? f.username}
+                      size={44}
+                    />
                   </ProfileLink>
                   <div className="flex-1 min-w-0">
                     <ProfileLink href={`/${f.username}`} className="group">

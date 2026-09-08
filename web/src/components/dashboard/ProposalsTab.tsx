@@ -191,7 +191,7 @@ function OffersSection({ offers, onUpdate }: { offers: SubscriptionOffer[]; onUp
       <p className="label-ui text-grey-600 mb-4">Offers</p>
 
       {active.length > 0 && (
-        <div className="overflow-x-auto bg-glasshouse-well">
+        <div className="overflow-x-auto ah-scrollbar bg-glasshouse-well">
           <table className="w-full text-ui-xs">
             <thead>
               <tr className="border-b-2 border-grey-200">

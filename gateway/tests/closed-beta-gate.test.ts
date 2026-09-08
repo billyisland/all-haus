@@ -35,11 +35,24 @@ process.env.APP_URL = "https://test.all.haus";
 
 const STATE_SECRET = "test-state-secret";
 
-/** Mint a state the route's own verifySignedState will accept. */
-function signedState(): string {
+/**
+ * Mint a state the route's own verifySignedState will accept.
+ *
+ * FOUR SEGMENTS SINCE PAYWALL-ARRIVAL §5: the third carries the arrival intent,
+ * base64url-encoded, and is EMPTY for an ordinary sign-in — a fixed shape rather
+ * than an optional extra, because an optional segment would mean two payload
+ * forms signing to two different strings and the shorter one verifying against
+ * neither. The d-tag is INSIDE the signed payload because it decides how much
+ * money a new account is granted, so a tamperable one would be a free-money
+ * endpoint reached through a third party's redirect.
+ */
+function signedState(arrivalDTag: string | null = null): string {
   const nonce = randomBytes(16).toString("hex");
   const timestamp = Math.floor(Date.now() / 1000);
-  const payload = `${nonce}.${timestamp}`;
+  const arrival = arrivalDTag
+    ? Buffer.from(arrivalDTag, "utf8").toString("base64url")
+    : "";
+  const payload = `${nonce}.${timestamp}.${arrival}`;
   const sig = createHmac("sha256", STATE_SECRET).update(payload).digest("hex");
   return `${payload}.${sig}`;
 }
@@ -173,7 +186,10 @@ describe("closed beta — Google OAuth account creation gate", () => {
     const res = await exchangeAs("member@example.com");
 
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ ok: true });
+    // `arrivalDTag` rides the response so the callback page can land the
+    // visitor on the piece they came for rather than the workspace. NULL for an
+    // ordinary sign-in, which is what this case is.
+    expect(res.json()).toEqual({ ok: true, arrivalDTag: null });
     expect(createSession).toHaveBeenCalledOnce();
     expect(insertedAccounts).toBe(0);
   });

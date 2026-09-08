@@ -51,13 +51,23 @@ export async function sendEmail(params: EmailParams): Promise<void> {
 // Magic link email — the specific email template
 // ---------------------------------------------------------------------------
 
+/**
+ * `arrivalDTag` carries a paywall-arrival intent through the ONE auth terminus
+ * that may be opened on a different device (PAYWALL-ARRIVAL-ADR §5). It is the
+ * article's IDENTIFIER, never a path or a URL: `/auth/verify` reconstructs
+ * `/article/<dTag>` from it rather than navigating to a string it was handed,
+ * which is what keeps an emailed value out of the classic open-redirect shape.
+ */
 export async function sendMagicLinkEmail(
   to: string,
   token: string,
-  expiresAt: Date
+  expiresAt: Date,
+  arrivalDTag: string | null = null
 ): Promise<void> {
   const appUrl = process.env.APP_URL ?? 'http://localhost:3000'
-  const verifyUrl = `${appUrl}/auth/verify?token=${encodeURIComponent(token)}`
+  const verifyUrl =
+    `${appUrl}/auth/verify?token=${encodeURIComponent(token)}` +
+    (arrivalDTag ? `&arrival=${encodeURIComponent(arrivalDTag)}` : '')
   const expiresInMinutes = Math.round((expiresAt.getTime() - Date.now()) / 60000)
 
   await sendEmail({

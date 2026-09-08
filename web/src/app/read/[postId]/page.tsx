@@ -1,8 +1,9 @@
 import { notFound } from 'next/navigation'
 import type { Metadata } from 'next'
 import { ExternalArticleReader } from '../../../components/article/ExternalArticleReader'
-import WorkspacePaneRedirect from '../../../components/layout/WorkspacePaneRedirect'
+import type { MediaItem } from '../../../lib/post/types'
 import { PublicPage } from '../../../components/public/PublicPage'
+import { ReadingScrollbar } from '../../../components/layout/ReadingScrollbar'
 
 // =============================================================================
 // Reader Page — /read/:postId  (Server Component) — UNIVERSAL-POST-ADR Phase R
@@ -27,6 +28,9 @@ interface FocalTarget {
   url: string
   title: string | null
   sourceName: string | null
+  // The focal Post's own media — the same array the workspace pane is handed,
+  // so a video item plays identically in the overlay and at its own URL.
+  media: MediaItem[] | null
 }
 
 async function getExternalArticleTarget(postId: string): Promise<FocalTarget | null> {
@@ -47,6 +51,7 @@ async function getExternalArticleTarget(postId: string): Promise<FocalTarget | n
     url: focal.origin.uri,
     title: focal.body?.title ?? null,
     sourceName: focal.origin?.sourceName ?? null,
+    media: Array.isArray(focal.body?.media) ? (focal.body.media as MediaItem[]) : null,
   }
 }
 
@@ -71,7 +76,9 @@ export default async function ReaderPage({ params }: { params: { postId: string 
 
   return (
     <PublicPage>
-      <WorkspacePaneRedirect overlay="reader" params={{ read: params.postId }} />
+      {/* A reading surface keeps its scroll marker (globals.css). This page
+          scrolls the DOCUMENT, so the opt-in goes on the root. */}
+      <ReadingScrollbar />
       {/* The reading column sits on the bone floor with no shadow. The house has
           no elevation: a card is distinguished from its ground by being a
           different colour, which is what every card in the workspace does. The
@@ -85,8 +92,14 @@ export default async function ReaderPage({ params }: { params: { postId: string 
       >
         <ExternalArticleReader
           url={target.url}
+          // The route's own parameter IS the key (D7/D8) — this page needed no
+          // resolution site, which is what the native readers gaining `postId`
+          // on the article payload brought them level with. No `scrollRef`:
+          // this is a page, so the document scrolls.
+          postId={params.postId}
           title={target.title}
           siteName={target.sourceName}
+          media={target.media}
         />
       </div>
     </PublicPage>

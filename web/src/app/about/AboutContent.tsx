@@ -1,5 +1,6 @@
 'use client'
 
+import type { ReactNode } from 'react'
 import { PublicShell } from '../../components/public/PublicShell'
 import {
   PublicVessel,
@@ -7,7 +8,7 @@ import {
   PublicTitle,
   PublicBody,
 } from '../../components/public/PublicVessel'
-import { GAP } from '../../components/public/palette'
+import { GAP, PAD, WALL, usePublicPalette } from '../../components/public/palette'
 
 // =============================================================================
 // About.
@@ -85,33 +86,72 @@ const SECTIONS: { heading?: string; paragraphs: string[] }[] = [
   },
 ]
 
-export function AboutContent() {
+export function AboutContent({ inOverlay = false }: { inOverlay?: boolean }) {
+  const cards = (
+    <>
+      <PublicCard>
+        <PublicTitle size={30}>{HEADLINE}</PublicTitle>
+      </PublicCard>
+
+      {SECTIONS.map((section, i) => (
+        <PublicCard key={i}>
+          {section.heading && (
+            <div style={{ marginBottom: 14 }}>
+              <PublicTitle as="h2" size={20}>
+                {section.heading}
+              </PublicTitle>
+            </div>
+          )}
+          <div
+            style={{ display: 'flex', flexDirection: 'column', gap: GAP + 8 }}
+          >
+            {section.paragraphs.map((paragraph, j) => (
+              <PublicBody key={j}>{paragraph}</PublicBody>
+            ))}
+          </div>
+        </PublicCard>
+      ))}
+    </>
+  )
+
+  // TWO REGISTERS, ONE SET OF CARDS (2026-09-04). The standalone page keeps its
+  // public chassis — bone floor, the fitted single-wall ⊔, cards on the
+  // interior. In the workspace the GLASSHOUSE is the container: AboutOverlay
+  // draws the ⊓ at the vessel's own 8px wall with the pane bar as its thick
+  // top, so a second frame in here would be a vessel inside a vessel, which is
+  // what the pane looked like before. Only the chassis is switched; the cards
+  // are the same components in both, per the two-registers rule (web/CLAUDE.md).
+  if (inOverlay) return <AboutPaneInterior>{cards}</AboutPaneInterior>
+
   return (
     <PublicShell measure="prose">
-      <PublicVessel>
-        <PublicCard>
-          <PublicTitle size={30}>{HEADLINE}</PublicTitle>
-        </PublicCard>
-
-        {SECTIONS.map((section, i) => (
-          <PublicCard key={i}>
-            {section.heading && (
-              <div style={{ marginBottom: 14 }}>
-                <PublicTitle as="h2" size={20}>
-                  {section.heading}
-                </PublicTitle>
-              </div>
-            )}
-            <div
-              style={{ display: 'flex', flexDirection: 'column', gap: GAP + 8 }}
-            >
-              {section.paragraphs.map((paragraph, j) => (
-                <PublicBody key={j}>{paragraph}</PublicBody>
-              ))}
-            </div>
-          </PublicCard>
-        ))}
-      </PublicVessel>
+      <PublicVessel>{cards}</PublicVessel>
     </PublicShell>
+  )
+}
+
+// The pane register's interior: the ⊓'s ground, with the cards inset past the
+// walls the Glasshouse draws in the pane's edge gutter (WALL + PAD, the same
+// arithmetic as ProfileChrome's PROFILE_INSET — the frame costs the content no
+// width, so the content has to clear it or the wall lands on a card). Padding
+// sits on this scrolling column rather than on the pane, so the interior
+// padding TRAVELS WITH THE CARDS — the vessel rule PublicVessel follows too.
+// The palette is whatever the pane provided (globalContentPalette, un-islanded).
+function AboutPaneInterior({ children }: { children: ReactNode }) {
+  const palette = usePublicPalette()
+
+  return (
+    <div
+      style={{
+        background: palette.interior,
+        minHeight: '100%',
+        padding: WALL + PAD,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: GAP,
+      }}
+    >
+      {children}
+    </div>
   )
 }

@@ -39,8 +39,8 @@ import { publicationsEnabled } from '../../../lib/featureFlags'
 // the rule forbids is softened rectangles.
 //
 // MIXED REGISTER: a member reaches this from their email, a visitor from a
-// forwarded one. Both get the public chassis; the row underneath adapts (see
-// PublicNavRow). During the closed beta a masthead can only recruit existing
+// forwarded one. Both get the public chassis; the nav bar adapts (see
+// PublicNavBar). During the closed beta a masthead can only recruit existing
 // members (CLOSED-BETA-ADR §IV, §VIII open item) — a token-scoped signup
 // exemption for outside writers is a deferred design call, so a logged-out
 // invitee is asked to log in rather than to sign up.

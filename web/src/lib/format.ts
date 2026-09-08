@@ -99,3 +99,15 @@ export function formatPence(pence: number): string {
     maximumFractionDigits: 2,
   })}`
 }
+
+/**
+ * Pence → the STICKER PRICE, as a reader reads it: `50p` under a pound,
+ * `£3.00` at or over one. Distinct from `formatPence` above on purpose —
+ * that one is the money-UI/ledger form and is always `£X.XX` so a column of
+ * figures aligns. This one is prose: a price named inside a sentence, where
+ * "£0.50 to keep reading" reads as a form field and "50p to keep reading"
+ * reads as a price. Use `formatPence` for anything tabular or reconcilable.
+ */
+export function formatPrice(pence: number): string {
+  return pence < 100 ? `${pence}p` : formatPence(pence)
+}

@@ -2,9 +2,13 @@
 
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useAuth } from '../../stores/auth'
+import { useLoginHref } from '../../lib/auth-return'
 import { ReplyComposer } from './ReplyComposer'
 import { PlayscriptThread } from './PlayscriptThread'
 import type { ReplyData, PlayscriptEntry } from './types'
+// The house's 4px slab weight (`.slab-rule-4`). A plain constant, not a hook —
+// nothing of the public register's palette machinery comes with it.
+import { SLAB } from '../public/palette'
 import { replies as repliesApi, votes as votesApi, type VoteTally, type MyVoteCount } from '../../lib/api'
 
 interface ReplySectionProps {
@@ -39,6 +43,7 @@ export function ReplySection({
   refreshKey,
 }: ReplySectionProps) {
   const { user } = useAuth()
+  const loginHref = useLoginHref()
   const [replies, setReplies] = useState<ReplyData[]>([])
   const [totalCount, setTotalCount] = useState(0)
   const [repliesEnabled, setRepliesEnabled] = useState(true)
@@ -125,27 +130,69 @@ export function ReplySection({
     return entries.slice(-previewLimit)
   }, [entries, previewLimit])
 
+  // THE SECTION'S OUTER SHELL. The break between a piece and its replies is
+  // whitespace, exactly as the foot of the piece itself is — the divider that
+  // used to sit here was a grey rule one pixel high, which the sitewide
+  // no-single-pixel-lines ban forbids, and both surviving copies of it had
+  // already drifted apart from the third (the locked branch, now gone).
+  //
+  // THE SPACING IS UNCHANGED. Keep the margin AND the padding rather than
+  // folding them into one measure: this section's wrapper in ArticleReader is
+  // `mt-24`, and `mt-8` COLLAPSES into it (no border, no padding between them)
+  // while `pt-6` does not — so the rendered gap is 96 + 24, and a tidy-looking
+  // `mt-14` would silently take 24px off it.
+  //
+  // What marks the section now is what marked it before: the `label-ui` count
+  // heading below.
+  const SHELL = compact ? '' : 'mt-8 pt-6'
+
+  // WAITING IS THE SLAB, NOT A SKELETON. This drew two pulsing grey bars
+  // indented to where it guessed the playscript would land — a guess about a
+  // layout made at the one moment you cannot know it, which is the house's
+  // stated objection to skeletons (Field.tsx's IndeterminateSlab). The 4px
+  // weight sweeping the width the section already occupies says "waiting"
+  // without claiming to know what arrives, and it is the same gesture the
+  // register uses on `/auth`.
+  //
+  // BUILT FROM TOKENS RATHER THAN IMPORTING THAT COMPONENT, and the reason is
+  // a dark-mode trap worth knowing. `IndeterminateSlab` takes its track from
+  // `controlLine(usePublicPalette())`, which is `--ah-ink` in light but
+  // BASIC_DARK's `--ah-bone` in dark — a value that only resolves to bone
+  // INSIDE `LIGHT_ISLAND_STYLE`, which `PublicVessel` applies and this section
+  // has no business being wrapped in. Un-islanded, html.dark would inflict a
+  // SECOND inversion on it (bone -> 20 19 17) and the track would be
+  // near-black on the reader's 30 29 26 ground: an invisible progress bar.
+  // `var(--ah-ink)` is a DARK_SLUG, so it inverts once, on its own, correctly
+  // in both modes — which is exactly the symmetry palette.ts describes, 4px of
+  // ink on white and 4px of bone on a dark ground being one gesture.
+  //
+  // The animation itself is NOT duplicated: `.ah-indeterminate-slab` in
+  // globals.css owns the sweep and its `prefers-reduced-motion` full-width
+  // resting state, so the only thing local here is which two colours it wears.
   if (loading) {
     return (
-      <div className={compact ? '' : 'mt-8 pt-6 border-t border-grey-200'}>
-        <div className="ml-8 space-y-[32px] py-2">
-          {[1, 2].map(i => (
-            <div key={i} className="h-10 animate-pulse bg-grey-100" />
-          ))}
+      <div className={SHELL}>
+        <div
+          role="progressbar"
+          aria-label="Loading replies"
+          style={{ height: SLAB, background: 'var(--ah-ink)', overflow: 'hidden' }}
+        >
+          <div
+            className="ah-indeterminate-slab"
+            style={{ height: SLAB, background: 'var(--ah-crimson)' }}
+          />
         </div>
       </div>
     )
   }
 
-  if (paywallLocked) {
-    return (
-      <div className={compact ? '' : 'mt-8 pt-6 border-t border-grey-200'}>
-        <p className="text-xs text-grey-300 italic mb-4">
-          Unlock the article to read and leave replies.
-        </p>
-      </div>
-    )
-  }
+  // A locked article shows NOTHING below its gate (2026-09-02). This branch
+  // used to draw a rule one pixel high and then tell the reader to unlock the
+  // article — a weight the no-single-pixel-lines ban forbids, under advice the
+  // crimson gate immediately above had already given, in grey-300 italic that
+  // read as an apology for the page ending. The gate is the whole of the
+  // message; the foot of a locked piece is quiet.
+  if (paywallLocked) return null
 
   const targetForComposer =
     replyTarget && replies.some(r => containsReply(r, replyTarget.replyId))
@@ -153,7 +200,7 @@ export function ReplySection({
       : null
 
   return (
-    <div className={compact ? '' : 'mt-8 pt-6 border-t border-grey-200'}>
+    <div className={SHELL}>
       {!compact && (
         <h3 className="label-ui text-grey-600 mb-6">
           {totalCount > 0
@@ -206,7 +253,10 @@ export function ReplySection({
           </p>
         ) : (
           <p className="text-xs text-grey-300 mb-4">
-            <a href="/auth?mode=login" className="text-crimson hover:text-crimson-dark">
+            {/* Carries the piece too — somebody pressing this is unambiguously
+                mid-article, and losing their place to log in is exactly what
+                the carrier exists to prevent (lib/auth-return.ts). */}
+            <a href={loginHref} className="text-crimson hover:text-crimson-dark">
               Log in
             </a>{' '}
             to leave a reply.

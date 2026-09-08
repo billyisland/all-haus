@@ -8,12 +8,19 @@ import { AdminShell } from '../../../components/admin/AdminShell'
 import { SeedFormulaPanel } from '../../../components/admin/SeedFormulaPanel'
 
 // Ordered grouping — first matching rule wins.
+//
+// The Money list is a SECOND COPY of "which dials are money": the keys share
+// no prefix, so a new money dial that is not added here lands under "Other",
+// which is where `arrival_gift_cap_pence` sat for a day after it was split
+// from `free_allowance_pence` (CONSOLIDATED-TODO §0w item 5). When adding a
+// money dial to `config-defaults.sql`, add it here too.
 const GROUPS: Array<{ label: string; match: (key: string) => boolean }> = [
   {
     label: 'Money',
     match: (k) =>
       [
         'free_allowance_pence',
+        'arrival_gift_cap_pence',
         'tab_settlement_threshold_pence',
         'monthly_fallback_minimum_pence',
         'monthly_fallback_days',

@@ -2,6 +2,7 @@
 
 import type { ReactNode } from 'react'
 import { usePublicPalette } from './palette'
+import { BarGround } from './BarGround'
 
 // =============================================================================
 // PublicShell — the bone floor and the measure, FITTED TO THE VIEWPORT.
@@ -36,10 +37,12 @@ import { usePublicPalette } from './palette'
 // JS branch. Above 480px tall the box is `100dvh`; below it (landscape phones,
 // split-screen) the fit is abandoned — the remainder would be too little to
 // hold a card — and it becomes `min-height` so the page scrolls normally.
-// Either way the nav row's band is PADDING INSIDE the box, not subtracted from
-// its height, so this element's floor paints the whole way down to the row
+// Either way the nav bar's band is PADDING INSIDE the box, not subtracted from
+// its height, so this element's floor paints the whole way up to the bar
 // rather than leaving the band's GRID of clearance showing `body` through.
-// `--ah-row-band` is set by LayoutShell when the row is mounted, 0 otherwise.
+// `--ah-bar-band` is set by LayoutShell when the bar is mounted, 0 otherwise;
+// the fitted chassis takes the MAX of the band and its own top headroom
+// (`.ah-public-fit`), so on a desktop the vessel sits where it always did.
 //
 // `dvh`, NOT `vh`. On mobile Safari `100vh` is the tallest the viewport ever
 // gets, so a `vh`-fitted vessel hides its bottom wall behind the browser chrome
@@ -93,6 +96,13 @@ export function PublicShell({ children, measure = 'form' }: PublicShellProps) {
 
   return (
     <div className="ah-public-fit" style={{ background: palette.interior }}>
+      {/* The floor this shell paints, declared to the fixed nav bar so its
+          bottom edge stays invisible. Identical to the bar's `--ah-bone`
+          fallback in light; in DARK `interior` is ink-925 (26 26 24) against
+          bone's 20 19 17 — six points, which is the same gap this file's own
+          header calls enough to read as a panel edge, and it was reading as one
+          along the top of every fitted page. See BarGround.tsx. */}
+      <BarGround value={palette.interior} />
       <div
         style={{
           width: '100%',

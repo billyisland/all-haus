@@ -16,14 +16,15 @@
 //     client component, so it still SSRs, and the page keeps its share/SEO HTML.
 //     Having nothing to close, it passes no `onClose` and gets no ✕.
 //
-// It also owns everything that spans tiers: the action pair (tier 1), the
-// subscribe row (tier 2), and the Followers/Following count views, which are
-// opened from a count in tier 2 and REPLACE the log in tier 4 (D11) — so their
-// state cannot live in either tier alone.
+// It also owns the two things that span tiers: the action pair (tier 1) and the
+// subscribe row (tier 2). Followers/Following used to be here too — counts in
+// tier 2 that reached down and REPLACED the log in tier 4, which is why they
+// needed a `← back`. They are now two of the five buttons in `WriterActivity`'s
+// own row, so the whole of that navigation lives in one place with the region
+// it drives (D11, as amended 2026-09-02).
 // =============================================================================
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useAuth } from "../../stores/auth";
 import { useResolvedDark } from "../../stores/colorScheme";
@@ -40,13 +41,11 @@ import { trustEnabled } from "../../lib/featureFlags";
 import { TrustProfile } from "../trust/TrustProfile";
 import { VouchModal } from "../trust/VouchModal";
 import { WriterActivity } from "./WriterActivity";
-import { FollowersTab } from "./FollowersTab";
-import { FollowingTab } from "./FollowingTab";
 import {
   BarButton,
+  PROFILE_PANE_WIDTH,
   ProfileBar,
   ProfileMeta,
-  ProfileStatButton,
   ProfileSurface,
   profilePalette,
   protocolChipLabel,
@@ -60,10 +59,6 @@ interface SubStatus {
   pricePence?: number;
   currentPeriodEnd?: string;
 }
-
-type CountView = "followers" | "following";
-
-const LOG_REGION_ID = "profile-log";
 
 export function NativeProfileBody({
   username,
@@ -99,7 +94,6 @@ export function NativeProfileBody({
   const [showVouchModal, setShowVouchModal] = useState(false);
   const [trustData, setTrustData] = useState<TrustProfileResponse | null>(null);
   const [trustKey, setTrustKey] = useState(0);
-  const [countView, setCountView] = useState<CountView | null>(null);
 
   // Subscription status (native follow state comes from the shared store).
   useEffect(() => {
@@ -234,21 +228,19 @@ export function NativeProfileBody({
     [writer.presences],
   );
 
-  const n = (v: number) => v.toLocaleString("en-GB");
-
   // ---- Tier 1's action pair -------------------------------------------------
-  // A branch, not a gate (D6): own profile → Edit profile, no Message; logged
-  // out → the single `Log in` link, because the SSR page is where strangers
-  // land and the bar must read complete without auth (D12).
-  const actions = authLoading ? null : !user ? (
-    <Link
-      href="/auth?mode=login"
-      className="focus-ring text-ui-xs font-medium transition-opacity hover:opacity-70"
-      style={{ color: palette.barText }}
-    >
-      Log in
-    </Link>
-  ) : isOwnProfile ? (
+  // A branch, not a gate (D6): own profile → Edit profile, no Message.
+  //
+  // LOGGED OUT, TIER 1 CARRIES NOTHING (operator, 2026-09-02). D12 put a `Log
+  // in` link here on the reasoning that "the SSR page is where strangers land
+  // and the bar must read complete without auth" — written when this page had no
+  // bar above it. It has had one since the sitewide top bar landed
+  // (LOGGED-OUT-REGISTER-ADR §X), and that bar's logged-out right end IS `Log
+  // in` + the waiting list, so the two sat forty pixels apart offering the same
+  // destination. The register above owns the way in; the profile's own bar is
+  // about the person it names. An action that is already on screen is not
+  // completeness, it is repetition.
+  const actions = authLoading || !user ? null : isOwnProfile ? (
     <BarButton
       palette={palette}
       variant="secondary"
@@ -349,54 +341,16 @@ export function NativeProfileBody({
       </div>
     ) : null;
 
-  // ---- Tier 2's stats line --------------------------------------------------
-  // Mono, not sans (D4): counts are tabular data, and mono numerals sit still
-  // while the tab content changes underneath them. Followers/Following are the
-  // live links into their views (D11); RSS keeps its seat at the end (D12) —
-  // it is the only HUMAN-visible RSS affordance, the <link rel="alternate">
-  // metadata serving machines rather than readers.
-  const stats = (
-    <>
-      {n(writer.articleCount)} ARTICLE{writer.articleCount === 1 ? "" : "S"}
-      {" · "}
-      <ProfileStatButton
-        palette={palette}
-        open={countView === "followers"}
-        controls={LOG_REGION_ID}
-        onClick={() =>
-          setCountView((v) => (v === "followers" ? null : "followers"))
-        }
-      >
-        {n(writer.followerCount)} FOLLOWER
-        {writer.followerCount === 1 ? "" : "S"}
-      </ProfileStatButton>
-      {" · "}
-      <ProfileStatButton
-        palette={palette}
-        open={countView === "following"}
-        controls={LOG_REGION_ID}
-        onClick={() =>
-          setCountView((v) => (v === "following" ? null : "following"))
-        }
-      >
-        {n(writer.followingCount)} FOLLOWING
-      </ProfileStatButton>
-      {" · "}
-      <a
-        href={`/rss/${username}`}
-        className="hover:underline"
-        style={{ color: "inherit" }}
-      >
-        RSS
-      </a>
-    </>
-  );
-
   return (
     <ProfileSurface
       palette={palette}
       scheme={scheme}
       minHeight={minHeight}
+      // The standalone page has no pane to size it, so it takes the pane's own
+      // width — the same seam that decides the ✕ (§5.1). In the overlay the
+      // Glasshouse IS 860 and this must stay undefined, or the body would cap
+      // itself inside a pane that is already capped.
+      maxWidth={onClose ? undefined : PROFILE_PANE_WIDTH}
       bar={
         <ProfileBar
           palette={palette}
@@ -411,7 +365,6 @@ export function NativeProfileBody({
       <ProfileMeta
         palette={palette}
         bio={writer.bio}
-        stats={stats}
         identities={identities}
         subscribeRow={subscribeRow}
       >
@@ -435,42 +388,19 @@ export function NativeProfileBody({
         />
       )}
 
-      {/* Tiers 3–4. A count view REPLACES the log and the rig is simply absent
-          while it is open — honest semantics, one path in, one path back (D11).
-          An in-pane view swap is not a dismissal, so the `← back` here does not
-          touch the overlay-close rule (cf. /admin/reports' `← Workspace`). */}
-      <div id={LOG_REGION_ID}>
-        {countView ? (
-          <div>
-            <div className="mb-6 flex items-center gap-4">
-              <button
-                type="button"
-                onClick={() => setCountView(null)}
-                className="btn-text-muted"
-              >
-                ← back
-              </button>
-              <h2 className="label-ui" style={{ color: palette.cardStandfirst }}>
-                {countView === "followers"
-                  ? `${n(writer.followerCount)} FOLLOWERS`
-                  : `${n(writer.followingCount)} FOLLOWING`}
-              </h2>
-            </div>
-            {countView === "followers" ? (
-              <FollowersTab username={username} isOwnProfile={isOwnProfile} />
-            ) : (
-              <FollowingTab username={username} isOwnProfile={isOwnProfile} />
-            )}
-          </div>
-        ) : (
-          <WriterActivity
-            username={username}
-            writer={writer}
-            isOwnProfile={isOwnProfile}
-            palette={palette}
-          />
-        )}
-      </div>
+      {/* Tiers 3–4 — the five-view button row and the log it drives, which now
+          own the Followers/Following views too (D11, as amended 2026-09-02).
+          There is nothing left here to hold: the whole of that navigation lives
+          with the region it changes. `inOverlay` rides `onClose`, this body's
+          one register seam (§5.1) — in the overlay the pushed URL is the
+          profile's own, so the ambient workspace `?tab` must not steer it. */}
+      <WriterActivity
+        username={username}
+        writer={writer}
+        isOwnProfile={isOwnProfile}
+        palette={palette}
+        inOverlay={!!onClose}
+      />
     </ProfileSurface>
   );
 }

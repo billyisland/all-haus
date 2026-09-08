@@ -4,7 +4,6 @@ import { PublicationMasthead } from '../../../components/publication/Publication
 import { LoadFailed } from '../../../components/publication/article-shared'
 import { PubHomepage } from '../../../components/publication/pub-sections'
 import { PublicPage } from '../../../components/public/PublicPage'
-import WorkspacePaneRedirect from '../../../components/layout/WorkspacePaneRedirect'
 
 // =============================================================================
 // Publication homepage — /pub/:slug  (Server Component)
@@ -12,8 +11,8 @@ import WorkspacePaneRedirect from '../../../components/layout/WorkspacePaneRedir
 // THE CHASSIS IS THE PUBLIC REGISTER, not a chassis of its own. This route used
 // to sit inside `pub/[slug]/layout.tsx`, which mounted a `PublicationNav` bar
 // and a `PublicationFooter` — on a route where `LayoutShell` already mounts the
-// sitewide `PublicNavRow`, so the page carried two navigations and, because the
-// layout never cleared `--ah-row-band`, the fixed row sat over the footer. Both
+// sitewide `PublicNavBar`, so the page carried two navigations and, because the
+// layout never cleared the reserved band, the fixed chrome sat over the footer. Both
 // are deleted; `PublicPage` paints the bone ground and reserves the band, and
 // the publication's identity is carried by `PublicationMasthead`.
 //
@@ -86,7 +85,6 @@ export default async function PublicationHomepage({ params }: { params: { slug: 
 
   return (
     <PublicPage>
-      <WorkspacePaneRedirect overlay="surface" params={{ surface: `/pub/${params.slug}` }} />
       <PublicationMasthead pub={pub} view="home" />
       <div className="mx-auto max-w-content px-4 sm:px-6 pt-14 pb-20">
         {/* An outage renders as an outage, not as a publication with nothing in

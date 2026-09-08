@@ -7,6 +7,7 @@
 
 export interface PlatformConfig {
   freeAllowancePence: number           // default 500  (£5.00)
+  arrivalGiftCapPence: number          // default 200  (£2.00) — NOT the allowance
   tabSettlementThresholdPence: number  // default 800  (£8.00)
   monthlyFallbackMinimumPence: number  // default 200  (£2.00)
   writerPayoutThresholdPence: number   // default 2000 (£20.00)

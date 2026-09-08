@@ -409,6 +409,12 @@ export interface AdminSeedFormula {
      *  Present = *Re-cut from this feed* can refresh the seed from its current
      *  state; absent = only a different feed can replace it. */
     sourceFeedId: string | null
+    /** Sources in this frozen seed that point at a SUSPENDED system and are
+     *  therefore skipped at every signup (§0u.2). A seed is frozen at
+     *  designation, so one cut before a suspension keeps carrying rows that can
+     *  no longer travel; counted only while the suspension is live, so
+     *  reinstating the system clears the warning with no re-cut. */
+    suspendedSourceCount: number
   } | null
   /** The admin's own feeds — what this panel can cut into a new seed formula.
    *  The only thing it can act on: designating an EXISTING row retired with the

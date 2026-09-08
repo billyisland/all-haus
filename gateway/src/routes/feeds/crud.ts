@@ -544,20 +544,13 @@ export function registerFeedCrudRoutes(app: FastifyInstance) {
             sourceFeedId,
           ]);
 
-          // 4. Move non-duplicate saves.
-          await client.query(
-            `INSERT INTO feed_saves (id, feed_id, feed_item_id, created_at)
-             SELECT gen_random_uuid(), $1, feed_item_id, created_at
-             FROM feed_saves WHERE feed_id = $2
-             ON CONFLICT (feed_id, feed_item_id) DO NOTHING`,
-            [targetId, sourceFeedId],
-          );
-
-          // 5. Delete the source feed (cascades remaining feed_saves).
+          // 4. Delete the source feed. (Step 4 used to move its feed_saves
+          // across; that table was dropped in migration 189 with the rest of
+          // the intention-list apparatus — READING-LOG-AND-LIBRARY-ADR D10.)
           await client.query(`DELETE FROM feeds WHERE id = $1`, [sourceFeedId]);
         });
 
-        // 6. Return the updated target feed.
+        // 5. Return the updated target feed.
         const updatedFeed = await loadFeed(targetId, ownerId);
         if (!updatedFeed)
           return reply.status(404).send({ error: "Feed not found" });

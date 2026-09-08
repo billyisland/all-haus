@@ -55,6 +55,14 @@ export const VESSEL_PAD = 16
 /** Flex gap on the card column; ADDS to each card's own `GAP_PX.feed` margin. */
 export const VESSEL_GAP = 12
 
+/** The height of a Glasshouse pane's thickened top (`.ah-pane-bar`) — the ⊓'s
+ *  bar. Sized off the type it carries (`label-ui` at 11px, ~17px line box) plus
+ *  a 6px breath either side, NOT off the 8px stroke it replaces, which held no
+ *  text. Every pane that draws one subtracts it from `--gh-h` for its scroll
+ *  body, so bar + body is exactly the pane; one home so the reader and About
+ *  panes cannot drift to different tops. */
+export const PANE_BAR_H = 29
+
 export type FeedScheme =
   | 'basic'
   | 'spring'
@@ -226,30 +234,58 @@ const BASIC_LIGHT: VesselPalette = {
   barDropdownBg: 'var(--ah-ink-925)',
   barDropdownHover: 'var(--ah-ink-850)',
 }
+// Basic's spine is `basic-walls-dk`, NOT `true-black`. The dark grammar these
+// eight seasonal palettes are built on is a shared near-black interior with the
+// colourway's identity carried by the WALLS/BAR, the four seasons tuned to a
+// matched ~0.39 weighted luminance (see SCHEME_SURFACES / the registry). Basic
+// was the one colourway not in that set: `true-black` is DARKER than the
+// inverted floor (`bone` → 20 19 17) and barely off the `ink-925` interior, so
+// the ⊔ frame that is the loudest thing on screen in light mode disappeared in
+// dark — a basic feed read as a seam in one continuous dark field while every
+// season beside it kept its frame. `quoteBg` follows the walls here exactly as
+// it does for the seasons (a quote embed rides the wall surface, not the
+// interior). `barTextMuted` is the one place basic deliberately DIVERGES from
+// the seasonal derivation: on a ~0.39 wall the seasons put `stone-400` at
+// 1.68:1, and basic is a hand-tuned literal precisely so it need not inherit
+// that — `stone-300` reads at 2.80:1 against the same spine. (The seasons'
+// figure is untouched and is its own question.)
 const BASIC_DARK: VesselPalette = {
   scheme: 'basic',
   isDark: true,
-  walls: 'var(--ah-true-black)',
+  walls: 'var(--ah-basic-walls-dk)',
   interior: 'var(--ah-ink-925)',
   nameLabel: 'var(--ah-stone-350)',
   cardBg: 'var(--ah-ink-900)',
   cardTitle: 'var(--ah-bone)',
   cardStandfirst: 'var(--ah-stone-300)',
   cardMeta: 'var(--ah-stone-400)',
-  quoteBg: 'var(--ah-true-black)',
+  quoteBg: 'var(--ah-basic-walls-dk)',
   quoteText: 'var(--ah-bone-bright)',
-  quoteMeta: 'var(--ah-stone-350)',
+  // stone-350 is what the seasonal derivation puts here and it lands at 2.11:1
+  // on a spine of this luminance; it was 7.46:1 while this surface was
+  // true-black, so inheriting it would have been a real regression for basic
+  // rather than parity. Same divergence, same reason, as `barTextMuted` below.
+  quoteMeta: 'var(--ah-stone-300)',
   crimson: 'var(--ah-crimson-soft)',
   resizeHandle: 'var(--ah-stone-600)',
   pipOpacity: 1,
-  barBg: 'var(--ah-true-black)',
+  barBg: 'var(--ah-basic-walls-dk)',
   barText: 'var(--ah-bone-bright)',
-  barTextMuted: 'var(--ah-stone-400)',
-  barInputBg: 'var(--ah-ink-850)',
+  barTextMuted: 'var(--ah-stone-300)',
+  // The bar wells LIFT off the bar, they do not sink into it. `ink-850`/
+  // `ink-925` were tuned when this bar was `true-black`, where they were the
+  // lighter step; against the spine they are darker than the surface they are
+  // inset into, which reads as a hole and inverts the grammar every seasonal
+  // bar follows (`deriveVesselPalette`'s `well()` mixes the WALL toward white).
+  // So they are the same mix, written out — BASIC_DARK stays a literal — and
+  // `ink-grey`, a placeholder tuned against black, would have landed at 1.10:1
+  // on the new well. The bar's ramp is now bone-bright (text) → stone-300
+  // (muted) → stone-350 (placeholder), brightest to faintest.
+  barInputBg: 'color-mix(in srgb, var(--ah-basic-walls-dk), var(--ah-white) 9%)',
   barInputText: 'var(--ah-bone-bright)',
-  barInputPlaceholder: 'var(--ah-ink-grey)',
-  barDropdownBg: 'var(--ah-ink-925)',
-  barDropdownHover: 'var(--ah-ink-850)',
+  barInputPlaceholder: 'var(--ah-stone-350)',
+  barDropdownBg: 'color-mix(in srgb, var(--ah-basic-walls-dk), var(--ah-white) 5%)',
+  barDropdownHover: 'color-mix(in srgb, var(--ah-basic-walls-dk), var(--ah-white) 9%)',
 }
 
 // Precompute the four seasonal colourways × {light, dark} = 8 derived palettes,

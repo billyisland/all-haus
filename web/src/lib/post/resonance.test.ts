@@ -14,7 +14,6 @@ function makePost(over: Partial<Post> = {}): Post {
       displayName: "Jane",
       handle: "jane.bsky.social",
       handleUri: null,
-      avatar: null,
       pubkey: null,
       pipStatus: "known",
     },

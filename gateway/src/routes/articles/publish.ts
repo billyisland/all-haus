@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
 import { requireAuth, optionalAuth } from "../../middleware/auth.js";
+import { publicationsEnabled } from "@platform-pub/shared/lib/env.js";
 import { matchDriveForPublish, queueDriveFulfilment } from "../drives.js";
 import { sendPublishNotifications } from "@platform-pub/shared/lib/publish-emails.js";
 import { slugify } from "@platform-pub/shared/lib/slug.js";
@@ -249,6 +250,7 @@ export async function articlePublishRoutes(app: FastifyInstance) {
 
       const { rows } = await pool.query<{
         id: string;
+        post_id: string;
         writer_id: string;
         nostr_event_id: string;
         nostr_d_tag: string;
@@ -271,9 +273,11 @@ export async function articlePublishRoutes(app: FastifyInstance) {
         publication_id: string | null;
         publication_slug: string | null;
         publication_name: string | null;
+        publication_status: string | null;
         publication_subscription_price_pence: number | null;
       }>(
-        `SELECT a.id, a.writer_id, a.nostr_event_id, a.nostr_d_tag,
+        `SELECT a.id, article_post_id(a.id) AS post_id,
+                a.writer_id, a.nostr_event_id, a.nostr_d_tag,
                 a.title, a.slug, a.summary, a.content_free, a.word_count,
                 a.access_mode, a.price_pence, a.gate_position_pct,
                 a.vault_event_id, a.cover_image_url, a.published_at,
@@ -285,6 +289,7 @@ export async function articlePublishRoutes(app: FastifyInstance) {
                 a.publication_id,
                 p.slug AS publication_slug,
                 p.name AS publication_name,
+                p.status AS publication_status,
                 p.subscription_price_pence AS publication_subscription_price_pence
          FROM articles a
          JOIN accounts w ON w.id = a.writer_id
@@ -328,6 +333,20 @@ export async function articlePublishRoutes(app: FastifyInstance) {
 
       return reply.status(200).send({
         id: r.id,
+        // THE UNIFIED KEY, AND THIS IS ITS ONE RESOLUTION SITE for native
+        // pieces (READING-LOG-AND-LIBRARY-ADR D8). The reader needs it to name
+        // this piece to /reading-log and /reading-positions, and the external
+        // readers already hold one — supplying it here is what lets all of
+        // those routes take a single key rather than two shapes.
+        //
+        // `article_post_id()` READS feed_items.post_id where a row exists and
+        // derives only where one does not. Never re-derive the naddr coord
+        // inline: post_id is minted once and its native branch falls back to
+        // ('nostr_article', article_id), so a re-derivation mints an id
+        // matching no row in exactly those cases — and the symptom is a log
+        // row that renders as nothing, which is indistinguishable from the
+        // deleted piece the reader is meant to see nothing for.
+        postId: r.post_id,
         nostrEventId: r.nostr_event_id,
         dTag: r.nostr_d_tag,
         title: r.title,
@@ -352,14 +371,24 @@ export async function articlePublishRoutes(app: FastifyInstance) {
           pubkey: r.writer_pubkey,
           subscriptionPricePence: r.writer_subscription_price_pence,
         },
-        publication: r.publication_id
-          ? {
-              id: r.publication_id,
-              slug: r.publication_slug,
-              name: r.publication_name,
-              subscriptionPricePence: r.publication_subscription_price_pence,
-            }
-          : null,
+        // The embed is the ONLY thing the reader surfaces (ReaderOverlay's bar,
+        // the /article page masthead) know about the publication, so it is
+        // gated HERE, once: absent while the publications system is suspended
+        // (every /pub route 404s) and absent for a non-active publication
+        // (its /pub surface 404s too) — a renderer holding the embed may link
+        // it without a second check. Both consumers fall back to the writer's
+        // own identity when it is null.
+        publication:
+          publicationsEnabled() &&
+          r.publication_id &&
+          r.publication_status === "active"
+            ? {
+                id: r.publication_id,
+                slug: r.publication_slug,
+                name: r.publication_name,
+                subscriptionPricePence: r.publication_subscription_price_pence,
+              }
+            : null,
       });
     },
   );
@@ -368,7 +397,11 @@ export async function articlePublishRoutes(app: FastifyInstance) {
   // GET /articles/by-event/:nostrEventId — fetch article by Nostr event ID
   //
   // Used by the editor to load an article for editing when only the event ID
-  // is known. Returns the same shape as GET /articles/:dTag.
+  // is known. This is the EDITOR's loader — it is requireAuth, it returns the
+  // writer's own paywall content, and it does NOT carry `postId`: nothing here
+  // reads or resumes, so there is no piece to name. (It once claimed "the same
+  // shape as GET /articles/:dTag"; the shapes have never quite matched and now
+  // differ by a field that matters.)
   // When the requester is the article's author and it's paywalled, also fetches
   // and includes the decrypted paywall content so the full article can be edited.
   // ---------------------------------------------------------------------------

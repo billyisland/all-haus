@@ -8,15 +8,16 @@ import { PageShell } from '../ui/PageShell'
 
 // =============================================================================
 // Owner dashboard chrome — shared auth guard + tab navigation for /admin/*.
-// The admin surface has no topbar (nothing does), so the shell carries its own
-// way back to the workspace. Spec: planning-archive/OWNER-DASHBOARD-SPEC.md
+// The only chrome here is the sitewide nav bar (whose lockup points a member
+// at /reader); the shell still carries its own labelled way back to the
+// workspace. Spec: planning-archive/OWNER-DASHBOARD-SPEC.md
 //
-// IT ALSO CLEARS THE NAV ROW. LayoutShell mounts the fixed PublicNavRow on
+// IT ALSO CLEARS THE NAV BAR. LayoutShell mounts the fixed PublicNavBar on
 // every non-workspace route, `/admin/*` included — a member who lands here from
-// a bookmark has no ∀ otherwise. The row is fixed, so the page has to reserve
-// its band itself or the last rows of a long table sit underneath it. That's
-// what `--ah-row-band` is for, and PageShell can't own it: PageShell is also
-// the body of five Glasshouse overlay panels, where there is no row to clear.
+// a bookmark has no ∀ otherwise. The bar is fixed along the top, so the page
+// has to reserve its band itself or the title sits underneath it. That's
+// what `--ah-bar-band` is for, and PageShell can't own it: PageShell is also
+// the body of five Glasshouse overlay panels, where there is no bar to clear.
 // =============================================================================
 
 const TABS = [
@@ -51,7 +52,7 @@ export function AdminShell({
 
   if (loading || !user?.isAdmin) {
     return (
-      <div style={{ paddingBottom: 'var(--ah-row-band, 0px)' }}>
+      <div style={{ paddingTop: 'var(--ah-bar-band, 0px)' }}>
         <PageShell width={width}>
           <div className="h-32 animate-pulse bg-white" />
         </PageShell>
@@ -60,7 +61,7 @@ export function AdminShell({
   }
 
   return (
-    <div style={{ paddingBottom: 'var(--ah-row-band, 0px)' }}>
+    <div style={{ paddingTop: 'var(--ah-bar-band, 0px)' }}>
     <PageShell
       width={width}
       title={title}

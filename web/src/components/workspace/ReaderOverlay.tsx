@@ -42,7 +42,7 @@
 // under the pinned grip, and nothing scrolls under an in-flow bar.
 // =============================================================================
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, type RefObject } from "react";
 import { useReader } from "../../stores/reader";
 import { useIsMobile } from "../../hooks/useIsMobile";
 import { Glasshouse } from "./Glasshouse";
@@ -53,13 +53,7 @@ import { InwardLink } from "../ui/InwardLink";
 import { ProfileLink } from "../ui/ProfileLink";
 import { profilePalette } from "../profile/ProfileChrome";
 import { useResolvedDark } from "../../stores/colorScheme";
-import type { FeedScheme, VesselPalette } from "./tokens";
-
-// The bar's height. Sized off the type it carries (`label-ui` at 11px, ~17px
-// line box) plus a 6px breath either side — not off the 8px stroke it replaces,
-// which held no text. The scroll region below subtracts it from `--gh-h`, so
-// bar + body is exactly the pane.
-const READER_BAR_H = 29;
+import { PANE_BAR_H, type FeedScheme, type VesselPalette } from "./tokens";
 
 export function ReaderOverlay() {
   const {
@@ -288,7 +282,7 @@ export function ReaderOverlay() {
       // it, no grey ✕ on the band, no grip pill floating in it.
       frameTopSlot
       hideClose
-      dragHandleSelector=".ah-reader-bar"
+      dragHandleSelector=".ah-pane-bar"
       sideNav={sideNav}
     >
       <ReaderBar {...bar} onClose={close} palette={palette} frameScheme={frameScheme} />
@@ -300,17 +294,32 @@ export function ReaderOverlay() {
         // hover a more specific leaf (reader.gate) doesn't, ahead of the
         // generic `pane` tag on the Glasshouse root.
         data-explain="reader"
-        className="overflow-y-auto"
+        // A reading surface keeps its scroll marker; every other scroller in
+        // the product is silent by default (globals.css). The overlay and the
+        // standalone /article page are the same piece read two ways, so they
+        // must agree — see ReadingScrollbar, which does this for that page.
+        className="overflow-y-auto ah-scrollbar"
         // The bar is in flow above this, so the body's share of the pane is
         // what the bar leaves. Inline rather than an arbitrary Tailwind calc so
         // the one constant stays the only place the height is written.
-        style={{ maxHeight: `calc(var(--gh-h) - ${READER_BAR_H}px)` }}
+        style={{ maxHeight: `calc(var(--gh-h) - ${PANE_BAR_H}px)` }}
       >
         {target.kind === "external" ? (
           <ExternalArticleReader
             url={target.url}
+            // Inside a Glasshouse the DOCUMENT does not scroll — this div does.
+            // Handing the resume hook the pane's own scroller is the whole of
+            // D9's repair; without it the hook measures a document that never
+            // moves and saves a ratio of 0 forever, which reads as an entirely
+            // ordinary position and so said nothing for its whole life.
+            scrollRef={scrollRef}
+            postId={target.postId ?? null}
             title={target.title}
             siteName={target.siteName}
+            // The item's own enclosure video, which the card plays and the pane
+            // did not — the /extract body is the ORIGIN PAGE, and an RSS item's
+            // video is often carried by the item alone.
+            media={target.media}
             paddingX="px-6 sm:px-12 md:px-24"
             // The site name has moved to the bar; leaving it in the header too
             // would print the same identity twice, three lines apart.
@@ -321,6 +330,7 @@ export function ReaderOverlay() {
             article={article}
             error={articleError}
             preview={target.preview}
+            scrollRef={scrollRef}
           />
         )}
       </div>
@@ -387,10 +397,10 @@ function ReaderBar({
 
   return (
     <div
-      className="ah-reader-bar"
+      className="ah-pane-bar"
       data-explain="reader.bar"
       style={{
-        height: READER_BAR_H,
+        height: PANE_BAR_H,
         background: palette.barBg,
         color: palette.barText,
       }}
@@ -418,7 +428,7 @@ function ReaderBar({
           type="button"
           onClick={onClose}
           aria-label="Close"
-          className="ah-reader-close"
+          className="ah-pane-bar-close"
           style={{ color: "inherit" }}
         >
           ✕
@@ -441,10 +451,14 @@ function NativeArticleBody({
   article,
   error,
   preview,
+  scrollRef,
 }: {
   article: ArticleMetadata | null;
   error: boolean;
   preview?: { title: string | null; summary: string | null } | null;
+  // Passed straight through to ArticleReader: the pane's scroller, not the
+  // document's. See the external branch above for why that matters.
+  scrollRef: RefObject<HTMLDivElement | null>;
 }) {
   if (error) {
     return (
@@ -498,6 +512,8 @@ function NativeArticleBody({
 
   return (
     <ArticleReader
+      postId={article.postId}
+      scrollRef={scrollRef}
       article={{
         id: article.nostrEventId,
         pubkey: article.writer.pubkey,

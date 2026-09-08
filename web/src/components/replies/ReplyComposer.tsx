@@ -80,7 +80,6 @@ export function ReplyComposer({
           id: user.id,
           username: user.username,
           displayName: user.displayName,
-          avatar: user.avatar,
           pipStatus: 'unknown',
         },
         parentCommentId: parentCommentId ?? null,

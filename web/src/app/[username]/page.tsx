@@ -1,7 +1,6 @@
 import { notFound } from 'next/navigation'
 import type { Metadata } from 'next'
 import { NativeProfileBody } from '../../components/profile/NativeProfileBody'
-import WorkspacePaneRedirect from '../../components/layout/WorkspacePaneRedirect'
 import { PublicPage } from '../../components/public/PublicPage'
 import type { WriterProfile } from '../../lib/api'
 
@@ -69,9 +68,14 @@ export default async function WriterProfilePage({ params }: { params: { username
   // `ground={false}`: the profile surface paints its own interior and stands
   // its own height (PublicPage's bone floor behind it would be a layer nobody
   // sees, and stacking two full viewports leaves dead scroll at the foot).
+  //
+  // `barGround` is bone all the same — the same colour the bar already falls
+  // back to. It is not about the bar here but about the 8px clearance band
+  // under it, which `ground={false}` leaves transparent: it fell through to
+  // `body` and drew a white (dark: ink-900) stripe between the bone bar and
+  // this page's bone floor. See PublicPage.
   return (
-    <PublicPage ground={false}>
-      <WorkspacePaneRedirect overlay="profile" params={{ user: params.username }} />
+    <PublicPage ground={false} barGround="var(--ah-bone)">
       <NativeProfileBody
         username={params.username}
         writer={writer}

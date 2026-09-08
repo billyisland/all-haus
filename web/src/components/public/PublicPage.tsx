@@ -1,6 +1,7 @@
 'use client'
 
 import type { ReactNode } from 'react'
+import { BarGround } from './BarGround'
 
 // =============================================================================
 // PublicPage — the SCROLLING counterpart of PublicShell, for the standalone
@@ -14,22 +15,22 @@ import type { ReactNode } from 'react'
 // the wrong behaviour for a long read. So: bone floor, the page's own body,
 // ordinary page scroll.
 //
-// WHICH MEANS THE ROW BAND WORKS THE OPPOSITE WAY ROUND HERE. A fitted page
-// (PublicShell) reserves `--ah-row-band` at the foot of a viewport-height box
-// so the vessel sits clear of the nav row. A scrolling page adds it as bottom
-// padding so its last line clears the row. Both read the same variable; neither
-// could use the other's rule.
+// WHICH MEANS THE BAR BAND IS A PLAIN TOP PADDING HERE. A fitted page
+// (PublicShell) folds `--ah-bar-band` into its own headroom arithmetic (a max,
+// not a sum — `.ah-public-fit`); a scrolling page simply adds the whole band as
+// top padding so its first line clears the fixed bar. Both read the same
+// variable; neither could use the other's rule.
 //
 // THE GROUND IS A FULL `100dvh`, WITH THE BAND AS PADDING INSIDE IT — not
-// `calc(100dvh - band)` with the padding on top. Both keep the CONTENT clear of
-// the row, but only the first paints the ground the whole way down. The band is
-// NAV_ROW_H + GRID while the row is only NAV_ROW_H tall, so the GRID of
-// deliberate clearance above the row has to be painted by something: under the
-// `calc` form it fell through to `body` (white in light, ink-900 in dark) and
-// drew an 8px stripe between the page and the row. Here it is the page's own
-// floor. `box-sizing: border-box` (preflight) means the padding is inside the
-// 100dvh, so short content still comes to exactly one viewport and doesn't
-// invent a scrollbar.
+// `calc(100dvh - band)` with the box offset below the bar. Both keep the
+// CONTENT clear of the bar, but only the first paints the ground the whole way
+// up. The band is NAV_BAR_H + GRID while the bar is only NAV_BAR_H tall, so
+// the GRID of deliberate clearance under the bar has to be painted by
+// something: outside the box it falls through to `body` (white in light,
+// ink-900 in dark) and draws an 8px stripe between the bar and the page. Here
+// it is the page's own floor. `box-sizing: border-box` (preflight) means the
+// padding is inside the 100dvh, so short content still comes to exactly one
+// viewport and doesn't invent a scrollbar.
 //
 // `ground` IS OPTIONAL because some of these surfaces bring their own.
 // ArticleReader's root is `min-h-screen bg-white` — it is a reading surface and
@@ -42,6 +43,9 @@ import type { ReactNode } from 'react'
 // ground -> a 100dvh box with the band as padding inside it; no ground -> the
 // band alone, and the child decides how tall the page is.
 //
+// (2026-08-31: the band moved from the foot to the head with the bar. All of
+// the above holds with the edges swapped.)
+//
 // WHAT THIS COMPONENT MUST NOT DO IS TOUCH THE BODIES. Every one of these
 // routes renders a component that is ALSO mounted inside a workspace overlay —
 // ArticleReader in ReaderOverlay, TagBrowser and SourceSurface in
@@ -53,11 +57,38 @@ import type { ReactNode } from 'react'
 // sweep doc for the audit.
 // =============================================================================
 
+// =============================================================================
+// AND A PAGE THAT BRINGS ITS OWN GROUND HAS TO TELL THE BAR (2026-09-02).
+//
+// `barGround` is the ground the CHILD paints, declared to the fixed nav bar as
+// `--ah-bar-ground`. `BarGround.tsx` carries the whole argument — why the bar
+// cannot work it out for itself, and why it travels through `:root`.
+//
+// IT ALSO PAINTS THE BAND, WHICH IS THE HALF THIS COMPONENT'S OWN HEADER
+// PREDICTED. `--ah-bar-band` is NAV_BAR_H + GRID while the bar is only
+// NAV_BAR_H tall, so a GRID of deliberate clearance under the bar has to be
+// painted by somebody. In the `ground` case this box paints it. In the
+// `ground={false}` case nothing did: the padding is transparent, the child
+// starts below it, and it fell through to `body` — white in light, ink-900 in
+// dark. On the reader routes that was invisible (the article is white too);
+// on the profile routes it drew an 8px stripe between a bone bar and the
+// profile's own bone floor, in both modes. Painting this box `barGround` fixes
+// both at once, and is free where the child covers it.
+//
+// So `barGround` is wanted whenever `ground={false}`, INCLUDING when the child
+// paints plain bone — bone is the bar's fallback, but it is not the body's.
+// =============================================================================
+
 interface PublicPageProps {
   children: ReactNode
   /** Paint the bone floor AND stand a full viewport tall. Pass false when the
    *  child supplies both (e.g. ArticleReader's `min-h-screen bg-white`). */
   ground?: boolean
+  /** The ground the CHILD paints, as a `var(--ah-*)` reference. Declared to the
+   *  fixed nav bar so its bottom edge stays invisible, and painted behind the
+   *  bar's clearance band so it isn't left showing `body`. Pass whenever
+   *  `ground={false}` — bone included. */
+  barGround?: string
   /** Centre the body at a pixel measure. Omit for full-bleed. */
   measure?: number
 }
@@ -65,16 +96,21 @@ interface PublicPageProps {
 export function PublicPage({
   children,
   ground = true,
+  barGround,
   measure,
 }: PublicPageProps) {
   return (
     <div
       style={{
-        background: ground ? 'var(--ah-bone)' : undefined,
+        // `barGround` when the child owns the floor: the child paints over
+        // this, so all it is doing is putting the right colour behind the bar's
+        // clearance band instead of leaving `body` to show through.
+        background: ground ? 'var(--ah-bone)' : barGround,
         minHeight: ground ? '100dvh' : undefined,
-        paddingBottom: 'var(--ah-row-band, 0px)',
+        paddingTop: 'var(--ah-bar-band, 0px)',
       }}
     >
+      {barGround && <BarGround value={barGround} />}
       {measure ? (
         <div style={{ maxWidth: measure, margin: '0 auto', width: '100%' }}>
           {children}

@@ -31,6 +31,12 @@
   --ah-crimson: rgb(var(--ah-crimson-rgb));
   --ah-crimson-dark-rgb: 146 29 34;
   --ah-crimson-dark: rgb(var(--ah-crimson-dark-rgb));
+  /* `.btn-text-danger:hover`, its one consumer. Same shape as `crimson-dark`
+     (a step DEEPER than crimson, so on a dark ground it recedes where it should
+     lift) and deliberately left fixed for now: unlike crimson-dark it is a
+     hover on a single control, never a resting colour carrying meaning, so
+     nothing is unreadable — it just fades instead of lifting. Inverting it is
+     one line here (to crimson-soft's `217 85 90`) plus DARK_SLUGS. */
   --ah-crimson-deep-rgb: 139 27 31;
   --ah-crimson-deep: rgb(var(--ah-crimson-deep-rgb));
   --ah-crimson-soft-rgb: 217 85 90;
@@ -158,15 +164,29 @@
      exists only to be painted on the already-inverted bar. */
   --ah-bar-well-dk-rgb: 217 215 209;
   --ah-bar-well-dk: rgb(var(--ah-bar-well-dk-rgb));
+
+  /* Basic's DARK wall/bar/quote surface — the fifth spine. The dark grammar is
+     a shared near-black interior with identity carried by the WALLS/BAR, the
+     four seasons matched at ~0.39 weighted luminance; `basic` alone used
+     `true-black`, which is DARKER than the inverted floor (`bone` → 20 19 17),
+     so the frame that is the loudest thing on screen in light mode vanished in
+     dark. A neutral at the seasons' own luminance — basic's identity is having
+     no hue, not having no frame. Like the seasonal slugs it NEVER inverts:
+     `paletteFor` picks it, `html.dark` must not touch it, and it stays out of
+     DARK_SLUGS. */
+  --ah-basic-walls-dk-rgb: 100 100 96;
+  --ah-basic-walls-dk: rgb(var(--ah-basic-walls-dk-rgb));
 }
 
 /* ── Global dark mode ────────────────────────────────────────────────────────
    Toggled on <html> by useColorScheme (web/src/stores/colorScheme.ts). Dark
    mode = invert the canonical NEUTRAL ramp at the root: surfaces darken, text
-   lightens. Only these global-chrome neutral slugs flip — accent (crimson*),
-   semantic (trust-*, danger/vouch, klein-blue), already-dark (true-black,
-   ink-925/900/850, stone-*, wall-grey), and per-feed season slugs are left
-   untouched. The plain `--ah-<slug>` vars read the `-rgb` triple, so flipping
+   lightens. Only these global-chrome neutral slugs flip — the accent itself
+   (`crimson`), semantic (trust-*, danger/vouch, klein-blue), already-dark
+   (true-black, ink-925/900/850, stone-*, wall-grey), and per-feed season slugs
+   are left untouched. `crimson-dark` is the ONE accent-family exception and is
+   listed below with its reason. The plain `--ah-<slug>` vars read the `-rgb`
+   triple, so flipping
    the triple cascades. Desktop feed vessels (+ the ∀ disc and the scheme
    swatch) re-pin these to canonical light via LIGHT_ISLAND_STYLE
    (web/src/lib/palette/island.ts) so feeds keep their per-scheme colours; keep
@@ -192,6 +212,19 @@ html.dark {
   --ah-off-white-rgb: 33 32 29;
   --ah-cream-rgb: 28 27 24;
   --ah-cream-hover-rgb: 40 39 36;
+  /* accent-relative (deeper → lighter). The one crimson slug that moves, and it
+     moves because it was never the accent: `crimson` IS the accent and holds in
+     both modes, while `crimson-dark` means "a step deeper than crimson AGAINST
+     THE PAGE GROUND" — which is darker on bone and lighter on ink. Held fixed
+     it inverted its own meaning: 13 sites use it (12 as the hover step off
+     `text-crimson`, so hovering made a link recede in dark mode; one — the
+     ledger's debit type label — as a RESTING colour, at 2.03:1 on the inverted
+     well, which is what surfaced this). The dark value is `crimson-soft`, the
+     registry's designated dark-mode crimson, rather than a new number: two
+     slugs coinciding in one mode is already how `white`/`glasshouse` work.
+     `crimson-deep` (`.btn-text-danger:hover`) is the same shape and is
+     deliberately NOT changed here — see the note on its :root declaration. */
+  --ah-crimson-dark-rgb: 217 85 90;
 }
 
 /* ── Self-hosted fonts ───────────────────────────────────────────────────────── */
@@ -544,6 +577,62 @@ html.dark {
     padding: 0.625rem 1.5rem;
   }
 
+  /* A button docked in a nav bar's 40px content band (NAV_BAR_INSET + 40 =
+     NAV_BAR_H). Add it beside a face class; it states the height and nothing
+     else.
+
+     WHY IT HAS TO STATE THE HEIGHT. None of the `.btn*` families declares a
+     `line-height`, so every button's height is `2 x padding + 1.6 x font-size`
+     — body's leading, inherited. `.btn` lands on exactly 48 by arithmetic
+     accident; `.btn-sm` lands on 10 + 22.4 + 10 = 42.4, which is 2.4px taller
+     than the band it was being asked to sit in. Centred by the bar's flex row
+     it therefore stood 1.2px proud at BOTH ends: into the clearance above, and
+     — the visible half — below the bar's own bottom edge, which is the one
+     edge the bar is designed not to have (PublicNavBar: "NO DIVIDER"). A
+     42.4px crimson slab was the only thing on the page announcing where the
+     bar stopped.
+
+     Collapsing the line box to 1 is what makes the height dialable at all: the
+     padding then no longer competes with an inherited leading, and 14px of
+     text in 20px of padding (34px) sits inside the stated 40 with room. The
+     underlying debt — that `.btn*` should declare `line-height` and express
+     height in padding, sitewide — is NOT fixed here; that moves every button
+     on the site and wants its own pass. */
+  .btn-bar {
+    height: 40px;
+    display: inline-flex;
+    align-items: center;
+    line-height: 1;
+  }
+
+  /* A floating layer whose GROUND IS AT ITS OWN RUNG — use instead of
+     `shadow-lg`, never as well as it.
+
+     The elevation ladder (see the `html.dark` block: bone < well < white <
+     glasshouse) separates layers by colour, and `shadow-lg` is only ever
+     finishing the job: the Glasshouse pane floats over a frosted scrim, the
+     ForallMenu dropdown and SearchPanel over the bone floor, so a 10%-black
+     shadow is enough to seat something already a step lighter than what is
+     behind it.
+
+     A reading surface is `--ah-white`, and glasshouse IS white in light — so a
+     menu opened over an article has no colour step available and the ladder has
+     no rung above to climb to. There the shadow is not finishing the job, it IS
+     the job, and `shadow-lg` is far too thin for that: the share menu read as
+     white paper on white paper. (In DARK the colour step exists — glasshouse
+     35 34 31 over white's 30 29 26 — so this is a light-mode problem wearing a
+     both-modes class.)
+
+     The figure is the house's own lifted-paper shadow, not a new invention: the
+     landing demo's `.ah-demo-reader-pane` states it as `0 0.8em 2.4em` at 22%,
+     which at that figure's own root is ~10px/29px. `--ah-true-black` is outside
+     DARK_SLUGS, so the shadow is the same black in both modes — correct, since
+     in dark the colour step is already carrying the separation and the shadow
+     is only softening the edge. */
+  .ah-lift {
+    box-shadow: 0 10px 28px rgb(var(--ah-true-black-rgb) / 0.22);
+  }
+
   /* ----- Text-link action buttons ----- */
   .btn-text {
     font-family: 'Jost', system-ui, sans-serif;
@@ -840,24 +929,32 @@ html.dark {
         is fitted to the viewport; below it (landscape phones, split-screen, a
         window dragged short) the remainder is too little to hold a card, so
         the fit is abandoned and the page scrolls normally. Either way the
-        BOTTOM PADDING is the nav row's band, so the vessel clears the row.
+        TOP PADDING clears the nav bar's band (the top bar became the sitewide
+        rule 2026-08-31; the band moved from the foot to the head with it).
 
         The box is a full `100dvh` with the band as padding INSIDE it, not
-        `calc(100dvh - band)` with the band outside: the band is NAV_ROW_H +
-        GRID while the row is only NAV_ROW_H tall, so the GRID of deliberate
-        clearance has to be painted by something. Outside the box it fell
-        through to `body` and drew a stripe of the wrong colour between the
-        floor and the row. `--ah-row-band` is published by LayoutShell and is
-        0 when no row is mounted.
+        `calc(100dvh - band)` with the band outside: the band is NAV_BAR_H +
+        GRID while the bar is only NAV_BAR_H tall, so the GRID of deliberate
+        clearance under the bar has to be painted by something. Outside the
+        box it fell through to `body` and drew a stripe of the wrong colour
+        between the bar and the floor. `--ah-bar-band` is published by
+        LayoutShell and is 0 when no bar is mounted.
+
+        THE TOP PADDING IS A MAX, NOT A SUM. The band (56) and the old-era
+        headroom (`min(64px, 8vh)`) ask for the same edge, and on a desktop
+        the headroom is the larger — so the vessel sits exactly where it
+        always did. On a short screen the headroom yields as it always has,
+        but never below the band: the bar is fixed and opaque, so the band is
+        the floor under the yield. When no bar is mounted (band 0) the max
+        degrades to the plain headroom.
 
         `dvh`, not `vh`: on mobile Safari `100vh` is the tallest the viewport
         ever gets, so a `vh`-fitted vessel hides its bottom wall behind the
         browser chrome — the exact bug the fitted layout exists to fix. The
         `vh` line is the fallback for anything that doesn't know `dvh`.
 
-        The top padding yields on short screens: `min(64px, 8vh)` keeps the
-        64px headroom on a laptop and gives it back to the vessel on a phone,
-        where 64px of empty floor is 15% of the screen. */
+        The bottom padding is the yielding headroom alone — nothing docks at
+        the foot any more, so it is clearance, not a reservation. */
   .ah-public-fit {
     display: flex;
     flex-direction: column;
@@ -870,7 +967,7 @@ html.dark {
        `justify-content: center` it is what the box may not centre content
        into, which is the behaviour we want at both ends. */
     justify-content: center;
-    padding: min(64px, 8vh) 16px var(--ah-row-band, 0px);
+    padding: max(var(--ah-bar-band, 0px), min(64px, 8vh)) 16px min(64px, 8vh);
   }
   @media (min-height: 480px) {
     .ah-public-fit {
@@ -929,14 +1026,14 @@ html.dark {
     }
   }
 
-  /* 1b. Clear the row from an ordinary scrolling page. The utility form of the
+  /* 1b. Clear the bar from an ordinary scrolling page. The utility form of the
          same reservation, for surfaces that aren't part of the public register
-         but still sit under the fixed row — the standalone /write editor, and
+         but still sit under the fixed bar — the standalone /write editor, and
          (as an inline style, since they wrap a shared PageShell) /admin/* and
          /traffology/*. NOT on PageShell itself: PageShell is also the body of
-         five Glasshouse overlay panels, where there is no row to clear. */
-  .ah-clear-row-band {
-    padding-bottom: var(--ah-row-band, 0px);
+         five Glasshouse overlay panels, where there is no bar to clear. */
+  .ah-clear-bar-band {
+    padding-top: var(--ah-bar-band, 0px);
   }
 
   /* 1c. The landing vessel — `/`'s own chassis, and the ONE public surface that
@@ -1341,21 +1438,24 @@ html.dark {
          the universal minimise, Back and the OS edge-swipe close the sheet, and
          the pane's own ✕ scrolling away with the bar is intended. Desktop keeps
          it pinned for the opposite reason — there the bar IS the pane's frame. */
-  /* ----- The reader bar (ReaderOverlay) -----------------------------------
-     The reading pane's thickened top — the ⊓'s bar, carrying the two
-     identities the card carries (BYLINE-AND-PROVENANCE-ADR D1/D7): the source
-     at the left end routing INWARD, the article title at the right routing
-     OUT, and the pane's ✕ beyond it. Height is set inline from the one
-     constant in ReaderOverlay, which the body's `max-height` also subtracts,
-     so the two can't drift.
+  /* ----- The pane bar -----------------------------------------------------
+     `.ah-pane-bar` is the SHARED chassis for a Glasshouse's thickened top —
+     the ⊓'s bar: an in-flow flex row that is also the pane's declared drag
+     handle, with the pane's own ✕ (`.ah-pane-bar-close`) at its end. Two panes
+     draw one: the READER (ReaderOverlay — source left routing INWARD, article
+     title right routing OUT, per BYLINE-AND-PROVENANCE-ADR D1/D7, laid out by
+     the `.ah-reader-bar-*` children below) and ABOUT (AboutOverlay — a single
+     slug, no second identity to split). Height is `PANE_BAR_H` (tokens.ts),
+     set inline by each pane, which its body's `max-height` also subtracts from
+     `--gh-h`, so bar + body is exactly the pane and the two can't drift.
 
-     THE TITLE'S CAP IS THE POINT OF THIS RULE. `max-width: 50%` is measured on
+     THE TITLE'S CAP IS THE POINT OF THE READER'S CHILD RULES. `max-width: 50%` is measured on
      the bar and applied to the title-and-✕ GROUP, so the title can never begin
      left of the midpoint and crowd the source out of its own end — a long
      headline truncates instead. The source takes the remaining room
      (`flex: 1`) and truncates in its turn, so a bar with two long strings
      degrades symmetrically rather than one winning. */
-  .ah-reader-bar {
+  .ah-pane-bar {
     position: relative;
     z-index: 3; /* under the pane's frame (z-5) and pinned chrome (z-10) */
     display: flex;
@@ -1369,19 +1469,19 @@ html.dark {
        `isDragSurface` walks NO_DRAG_SELECTOR before the handle. */
     cursor: grab;
   }
-  .ah-reader-bar:active {
+  .ah-pane-bar:active {
     cursor: grabbing;
   }
   /* The mobile sheet cannot be dragged at all (`pane.startDrag` is undefined
      there), so the bar must not claim to be a handle. */
   @media (max-width: 767px) {
-    .ah-reader-bar,
-    .ah-reader-bar:active {
+    .ah-pane-bar,
+    .ah-pane-bar:active {
       cursor: auto;
     }
   }
-  .ah-reader-bar a,
-  .ah-reader-bar button {
+  .ah-pane-bar a,
+  .ah-pane-bar button {
     cursor: pointer;
   }
   .ah-reader-bar-source {
@@ -1409,7 +1509,7 @@ html.dark {
     white-space: nowrap;
     text-align: right;
   }
-  .ah-reader-close {
+  .ah-pane-bar-close {
     flex: none;
     background: none;
     border: none;
@@ -1418,7 +1518,7 @@ html.dark {
     line-height: 1;
     opacity: 0.75;
   }
-  .ah-reader-close:hover {
+  .ah-pane-bar-close:hover {
     opacity: 1;
   }
   /* On the full-screen sheet the ✕ is one of the two closes a thumb has (the
@@ -1426,9 +1526,25 @@ html.dark {
      The padding takes the tap area to ~43×46; the equal negative margin gives
      the layout back, so the glyph does not move. Same trade as .ah-profile-close. */
   @media (max-width: 767px) {
-    .ah-reader-close {
+    .ah-pane-bar-close {
       padding: 14px;
       margin: -14px;
+    }
+  }
+
+  /* The standalone profile's ⊓ side rules (ProfileChrome's `maxWidth` branch).
+     DESKTOP ONLY, and this media query is the whole reason the class exists —
+     the pane draws no frame on mobile (`Glasshouse`: `frameColor && !isMobile`),
+     and two 8px rules at the screen edges of a full-bleed sheet would be walls
+     around nothing. Same 767px boundary as the bar's own branch below, and CSS
+     rather than a `useIsMobile` branch because both standalone registers are
+     SSR'd. */
+  .ah-profile-wall {
+    display: none;
+  }
+  @media (min-width: 768px) {
+    .ah-profile-wall {
+      display: block;
     }
   }
 
@@ -1554,28 +1670,6 @@ html.dark {
     }
   }
 
-  /* 2. The vessel scroll body. A default scrollbar sitting inside a ⊔ a few
-        pixels from an 8px wall is chrome the house never designed — on Windows
-        a 17px light-grey trough that reads as a third wall of the wrong
-        weight. The thumb colour comes in as `--ah-scroll-thumb`, set inline by
-        the vessel to `cardMeta` (outside DARK_SLUGS, so the same quiet grey
-        against either interior). NOT the wall colour, which in dark is
-        true-black on ink-925 — invisible. */
-  .ah-vessel-scroll {
-    scrollbar-width: thin;
-    scrollbar-color: var(--ah-scroll-thumb, currentColor) transparent;
-  }
-  .ah-vessel-scroll::-webkit-scrollbar {
-    width: 8px;
-  }
-  .ah-vessel-scroll::-webkit-scrollbar-track {
-    background: transparent;
-  }
-  .ah-vessel-scroll::-webkit-scrollbar-thumb {
-    background: var(--ah-scroll-thumb, currentColor);
-    border-radius: 0;
-  }
-
   /* 3. The indeterminate slab — the register's only animation, replacing the
         `border-2` spinning ring /auth/verify used to draw. The house has no
         spinner: a spinning ring is a radius, an animation and a borrowed idiom
@@ -1602,6 +1696,98 @@ html.dark {
       animation: none;
     }
   }
+
+  /* 1f. Pointers — the caret family ---------------------------------------
+         A solid isosceles triangle drawn from borders, for every affordance
+         that means "there is more THAT way": the thread gutter's jump-to-start
+         and jump-to-end, and the re-root's return to the conversation root. It
+         replaces the typed arrow glyphs, which at `.label-ui`'s 11px put barely
+         a stroke's worth of ink behind something meant to be pressed.
+
+         THE GEOMETRY LIVES HERE RATHER THAN IN A `useIsMobile` BRANCH, for
+         1c's reason: PostThread mounts inside the SSR'd /author/[authorId] and
+         /source/[id] surfaces as well as the workspace, so a JS breakpoint
+         would paint the desktop pointer on a phone and snap after hydration.
+         Only the colour crosses in from the component, and it crosses as
+         `currentColor` off the button's own palette field — which is what keeps
+         a pointer inverting with the feed variant it sits in.
+
+         THE RAIL POINTER IS ELONGATED ALONG ITS AXIS OF TRAVEL (`md`, base
+         10 / rise 22). It navigates a long ribbon — the thread gutter beside a
+         conversation that runs well past the viewport — and its proportion is
+         the argument for the distance: a squat wedge says "one step", a drawn-
+         out dart says "a long way, this way". Because the two custom properties
+         are perpendicular-half-base and along-axis rise, the elongation is
+         direction-agnostic by construction: an up/down pointer is tall and
+         narrow, a left/right one is long and shallow, both stretched along the
+         direction they point rather than simply scaled.
+
+         MOBILE GROWS ON BOTH AXES AND STAYS EMPHATICALLY ELONGATED (10x22 ->
+         14x30). The rise carries the character, so it must not be traded away
+         for bulk; but a dart scaled only lengthways thins to a needle at arm's
+         length over a thumb, so the base grows a touch faster (+40% against
+         +36%) and the ratio eases 2.2 -> 2.14. Sturdier, not blunter — the
+         earlier squat-wedge rule was written for a mark that no longer exists.
+
+         TWO SIZES, NOT INTERCHANGEABLE, AND THEY DIFFER IN PROPORTION AS WELL
+         AS SCALE — because they have different jobs. `md` is the rail pointer
+         above. `sm` (10x6 / 14x9) marks a LABEL, inline against 11px mono-caps,
+         and stays squat: it is not navigating a ribbon, and an elongated dart
+         beside a word reads as a stray mark rather than as part of it. */
+  .ah-pointer {
+    --ah-pointer-half: 5px; /* half the base, PERPENDICULAR to the travel */
+    --ah-pointer-rise: 22px; /* apex height, ALONG the travel */
+    display: inline-block;
+    width: 0;
+    height: 0;
+    border: 0 solid transparent;
+  }
+
+  .ah-pointer-sm {
+    --ah-pointer-half: 5px;
+    --ah-pointer-rise: 6px;
+  }
+
+  .ah-pointer-up {
+    border-left-width: var(--ah-pointer-half);
+    border-right-width: var(--ah-pointer-half);
+    border-bottom-width: var(--ah-pointer-rise);
+    border-bottom-color: currentColor;
+  }
+
+  .ah-pointer-down {
+    border-left-width: var(--ah-pointer-half);
+    border-right-width: var(--ah-pointer-half);
+    border-top-width: var(--ah-pointer-rise);
+    border-top-color: currentColor;
+  }
+
+  .ah-pointer-left {
+    border-top-width: var(--ah-pointer-half);
+    border-bottom-width: var(--ah-pointer-half);
+    border-right-width: var(--ah-pointer-rise);
+    border-right-color: currentColor;
+  }
+
+  .ah-pointer-right {
+    border-top-width: var(--ah-pointer-half);
+    border-bottom-width: var(--ah-pointer-half);
+    border-left-width: var(--ah-pointer-rise);
+    border-left-color: currentColor;
+  }
+
+  @media (max-width: 767px) {
+    .ah-pointer {
+      --ah-pointer-half: 7px;
+      --ah-pointer-rise: 30px;
+    }
+
+    .ah-pointer-sm {
+      --ah-pointer-half: 7px;
+      --ah-pointer-rise: 9px;
+    }
+  }
+
 }
 
 /* ── Print ───────────────────────────────────────────────────────────────────── */
@@ -1668,17 +1854,52 @@ html.dark {
   animation: ah-push-in-right 200ms ease-out;
 }
 
-/* ── Scroll without a visible scrollbar ─────────────────────────────────────
-   The workspace floor pans horizontally across an infinitely-wide canvas. A
-   native scrollbar there would draw a thin rule across the bottom of the
-   viewport — exactly the single-pixel treatment the design system bans — so the
-   floor scrolls silently and the canvas edge is read from the content itself. */
+/* ── A scroll marker is a READING affordance, and nowhere else ──────────────
+   Silence is the DEFAULT and the marker is opted into, which is the way round
+   that survives contact: a scroller added later is quiet without anyone
+   remembering to quieten it, and the loud cases are a short list you can read.
 
-.scroll-silent {
-  scrollbar-width: none; /* Firefox */
+   What it replaces: `.scroll-silent` (three opt-outs — the floor, the muster,
+   the landing column) and `.ah-vessel-scroll` (a designed 8px thumb on the
+   public vessel). Between them they covered four of the ~35 scrollers in the
+   product; the other thirty wore the platform default nobody chose, and on the
+   workspace vessels that default was a progress bar through a feed that has no
+   end to be a proportion of. `.scroll-silent`'s own comment already argued
+   from the sitewide single-pixel ban; this generalises that rather than
+   inventing anything.
+
+   WHERE THE MARKER STAYS, and why each earns it:
+     • a READING surface (`.ah-scrollbar` on the reader pane, and on <html> for
+       /article/:dTag + /read/:postId via ReadingScrollbar) — a piece HAS a
+       bottom, and how far off it is, is information about the piece;
+     • anything scrolling SIDEWAYS (the ledger/dashboard tables, the media
+       strip) — vertical scroll is a universal assumption and horizontal is
+       not, so with no marker the extra columns are simply undiscoverable;
+     • <pre>, which is the same case one level down, inside article bodies we
+       do not control the markup of.
+
+   MECHANISM. `:where()` zeroes the hide rule's specificity, so an opt-in wins
+   on its own weight — `.ah-scrollbar` (0,1,0) and the bare `pre` (0,0,1) both
+   beat (0,0,0) — with no `!important` and no re-declaration. The standard
+   `scrollbar-width` carries this on its own in every current browser; the
+   WebKit pseudo-element is the pre-Safari-18.2 / pre-Chrome-121 fallback and
+   is written with two chained `:not()`s rather than a selector list, because
+   the old engines it exists for are the ones that drop a rule they cannot
+   parse — which would show every scrollbar on exactly the browsers the line is
+   there to serve. It cannot be undone once it matches (a re-shown
+   `::-webkit-scrollbar` needs its width, track and thumb redefined — which is
+   the styled bar we just deleted), so the exclusions live in the selector. */
+
+:where(*) {
+  scrollbar-width: none;
   -ms-overflow-style: none; /* legacy Edge */
 }
 
-.scroll-silent::-webkit-scrollbar {
+:where(*):not(.ah-scrollbar):not(pre)::-webkit-scrollbar {
   display: none;
+}
+
+.ah-scrollbar,
+pre {
+  scrollbar-width: auto;
 }

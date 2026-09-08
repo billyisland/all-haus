@@ -8,7 +8,6 @@ import {
   type PubArticle,
 } from '../../../../components/publication/article-shared'
 import { PubArchive } from '../../../../components/publication/pub-sections'
-import WorkspacePaneRedirect from '../../../../components/layout/WorkspacePaneRedirect'
 
 // =============================================================================
 // Publication archive — /pub/:slug/archive
@@ -57,7 +56,6 @@ export default async function ArchivePage({ params }: { params: { slug: string }
 
   return (
     <PublicPage>
-      <WorkspacePaneRedirect overlay="surface" params={{ surface: `/pub/${params.slug}/archive` }} />
       <PublicationMasthead pub={pub} view="archive" />
       <div className="mx-auto max-w-feed px-4 sm:px-6 pt-14 pb-20">
         {failed ? (

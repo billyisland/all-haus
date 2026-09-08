@@ -19,9 +19,10 @@ import { requirePublicationsEnabled } from "../../middleware/publication-auth.js
 // =============================================================================
 
 export async function subscriptionPublicationRoutes(app: FastifyInstance) {
-  // Publications suspended 2026-08-31 — these two routes cannot use the
-  // plugin-level hook (their siblings are the WRITER subscription routes, which
-  // are not suspended), so they carry the gate per route. See env.ts.
+  // Publications suspended 2026-08-31 — subscribe cannot use the plugin-level
+  // hook (its siblings are the WRITER subscription routes, which are not
+  // suspended), so it carries the gate per route; cancel below is deliberately
+  // ungated. See env.ts.
   app.post<{ Params: { id: string }; Body: { period?: string } }>(
     "/subscriptions/publication/:id",
     { preHandler: [requirePublicationsEnabled(), requireAuth] },
@@ -226,9 +227,18 @@ export async function subscriptionPublicationRoutes(app: FastifyInstance) {
     },
   );
 
+  // Cancel is DELIBERATELY NOT behind requirePublicationsEnabled(), unlike its
+  // subscribe sibling above: an active auto-renew subscription is a standing
+  // recurring charge, and the reader's power to withdraw from it must survive
+  // the surface going dark. Gated, a cancel attempted during the suspension
+  // 404s and is LOST — there is no other path (the writer cancel route keys on
+  // writer_id, NULL here) — so re-enabling the flag would renew and charge a
+  // reader who demonstrably tried to stop it. Cancelling touches no suspended
+  // surface: it only ends a commitment. Same money-over-darkness reasoning as
+  // the deliberately ungated publication payout cycle (env.ts).
   app.delete<{ Params: { id: string } }>(
     "/subscriptions/publication/:id",
-    { preHandler: [requirePublicationsEnabled(), requireAuth] },
+    { preHandler: [requireAuth] },
     async (req, reply) => {
       const readerId = req.session!.sub;
       const { id: publicationId } = req.params;

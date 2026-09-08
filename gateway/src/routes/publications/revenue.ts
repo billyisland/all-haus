@@ -117,7 +117,7 @@ export async function publicationRevenueRoutes(app: FastifyInstance) {
       const { rows: members } = await pool.query(
         `SELECT pm.id AS member_id, pm.account_id, pm.role, pm.contributor_type, pm.title,
                 pm.revenue_share_bps, pm.is_owner,
-                a.username, a.display_name, a.avatar_blossom_url
+                a.username, a.display_name
          FROM publication_members pm
          JOIN accounts a ON a.id = pm.account_id
          WHERE pm.publication_id = $1 AND pm.removed_at IS NULL
@@ -146,7 +146,6 @@ export async function publicationRevenueRoutes(app: FastifyInstance) {
           accountId: m.account_id,
           username: m.username,
           displayName: m.display_name,
-          avatarBlossomUrl: m.avatar_blossom_url,
           role: m.role,
           contributorType: m.contributor_type,
           title: m.title,

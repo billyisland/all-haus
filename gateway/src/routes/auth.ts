@@ -23,7 +23,11 @@ import {
   requestMagicLink,
   verifyMagicLink,
 } from "@platform-pub/shared/auth/magic-links.js";
-import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
+import {
+  pool,
+  withTransaction,
+  loadConfig,
+} from "@platform-pub/shared/db/client.js";
 import {
   sendMagicLinkEmail,
   sendEmail,
@@ -45,6 +49,7 @@ import crypto from "crypto";
 // =============================================================================
 // Auth Routes — mounted on the gateway
 //
+// GET  /auth/open                — is account creation open? (200/404 probe)
 // POST /auth/signup              — create account — CLOSED (403 closed_beta)
 // POST /auth/login               — magic link login (sends email)
 // POST /auth/verify              — verify magic link token → set session
@@ -66,6 +71,56 @@ const stripe = new Stripe(requireEnv("STRIPE_SECRET_KEY"), {
 });
 
 export async function authRoutes(app: FastifyInstance) {
+  // ---------------------------------------------------------------------------
+  // GET /auth/open — the probe the paywall gate reads
+  //
+  // The logged-out paywall has two entirely different things to say depending
+  // on whether an account can be made (PAYWALL-ARRIVAL D3/§11.6 vs the
+  // closed-beta waiting list), and the web must therefore KNOW. It asks rather
+  // than carrying a second copy of the flag: reaching this route IS the proof,
+  // so there is no second value to drift, and 200/404 is the same
+  // terminal-vs-ambiguous split the Stripe classifiers and the internal-parity
+  // probe use — anything else is treated as dark for that render and cached as
+  // nothing, so a blip cannot switch the offer off for the session.
+  //
+  // Deliberately not a boolean in a 200 body: a body has to be parsed, and a
+  // parse failure would need its own third answer. The status IS the answer.
+  // ---------------------------------------------------------------------------
+
+  // Rate-limited like its siblings. It is unauthenticated by necessity — the
+  // logged-out gate is the only caller — and cheap (`loadConfig` is cached for
+  // 30s, so the open branch is a constant), but "cheap" is a reason for a
+  // generous ceiling rather than for none: every other unauthenticated route on
+  // this file carries one, and a probe with no bound is the one an idle script
+  // finds first. 30/min because a session probes once and caches the answer.
+  app.get(
+    "/auth/open",
+    { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } },
+    async (_req, reply) => {
+    if (CLOSED_BETA) {
+      return reply.status(404).send({ error: CLOSED_BETA_ERROR });
+    }
+    // BOTH dials ride the 200, because the gate needs each for a DIFFERENT
+    // sentence and neither can be inferred from the other.
+    //
+    // `freeAllowancePence` is the figure the copy NAMES ("make an account and
+    // this one's on the haus — plus £5 of reading"). `arrivalGiftCapPence` is
+    // what the gate TESTS this piece's price against to decide whether it may
+    // promise the piece is free at all. They were one number until 2026-09-06,
+    // and splitting them is the operator's call on arrival amplification (see
+    // `resolveArrivalGift`'s rule 2) — but the split is exactly where a gate
+    // still testing against the allowance would promise "on the haus" for a
+    // piece the server then refuses, silently, on the one surface built to
+    // convert a stranger. A figure typed into either sentence would be a second
+    // copy of a dial; both are read at request time from the one home, so
+    // retuning either retunes the gate in the same move.
+    const { freeAllowancePence, arrivalGiftCapPence } = await loadConfig();
+    return reply
+      .status(200)
+      .send({ open: true, freeAllowancePence, arrivalGiftCapPence });
+    },
+  );
+
   // ---------------------------------------------------------------------------
   // POST /auth/signup
   // ---------------------------------------------------------------------------
@@ -94,11 +149,11 @@ export async function authRoutes(app: FastifyInstance) {
       } catch (err: any) {
         // Unique constraint violations (duplicate username, email, or pubkey)
         if (err.code === "23505") {
-          const field = err.constraint?.includes("username")
-            ? "username"
-            : err.constraint?.includes("email")
-              ? "email"
-              : "account";
+          // `username` is DERIVED now (PAYWALL-ARRIVAL D9), so a collision on it
+          // is our advisory-uniqueness check losing a race, not something the
+          // reader typed — it is retryable and must not be reported to them as
+          // a field they got wrong. Email is still theirs to fix.
+          const field = err.constraint?.includes("email") ? "email" : "account";
           return reply.status(409).send({ error: `${field}_taken` });
         }
         logger.error({ err }, "Signup failed");
@@ -114,8 +169,22 @@ export async function authRoutes(app: FastifyInstance) {
   // link contains a signed token → POST /auth/verify validates it → session set.
   // ---------------------------------------------------------------------------
 
+  // `arrivalDTag` rides the emailed URL — the only carrier that survives the
+  // reader opening the link on a different device (PAYWALL-ARRIVAL §5). It is
+  // an IDENTIFIER, never a path: the terminus reconstructs `/article/<dTag>`
+  // from a value it has validated rather than navigating to a string it was
+  // handed, which is what keeps this off the classic open-redirect shape.
+  //
+  // WHO THIS CARRIES IS NOT WHO §5's TABLE FIRST SAID (§11.7). Magic link
+  // creates nothing — `requestMagicLink` issues a token only for an existing
+  // account — so this arm carries SIGN-IN intent, for the logged-out MEMBER who
+  // meets the gate. They should still land on the piece they came for. They get
+  // no gift and no welcome: both are gated on `arrival_article_id`, which is a
+  // fact recorded at account creation and therefore false for everyone who was
+  // already a member.
   const LoginSchema = z.object({
     email: z.string().email(),
+    arrivalDTag: z.string().min(1).max(200).optional(),
   });
 
   app.post(
@@ -138,6 +207,7 @@ export async function authRoutes(app: FastifyInstance) {
             parsed.data.email,
             result.token,
             result.expiresAt,
+            parsed.data.arrivalDTag ?? null,
           );
         } catch (err) {
           logger.error(
@@ -845,15 +915,22 @@ export async function authRoutes(app: FastifyInstance) {
           "DELETE FROM follows WHERE follower_id = $1 OR followee_id = $1",
           [accountId],
         );
-        await client.query("DELETE FROM bookmarks WHERE user_id = $1", [
+        // The two intention lists (bookmarks, feed_saves) were dropped in
+        // migration 189 and their sweeps with them.
+        //
+        // reading_log and reading_positions are cleared HERE rather than left
+        // to their FK: account deletion is a SOFT delete (see below — hard
+        // deletion would violate ON DELETE RESTRICT on articles, read_events
+        // and the rest), so `reading_log`'s ON DELETE CASCADE never fires. A
+        // deleted account's reading is the one thing on this list that is
+        // nobody's business afterwards, so it goes with the display name and
+        // the avatar.
+        await client.query("DELETE FROM reading_log WHERE user_id = $1", [
           accountId,
         ]);
-        // feed_saves is feed-scoped (no user column) — clear via the owner's feeds
-        await client.query(
-          `DELETE FROM feed_saves
-           WHERE feed_id IN (SELECT id FROM feeds WHERE owner_id = $1)`,
-          [accountId],
-        );
+        await client.query("DELETE FROM reading_positions WHERE user_id = $1", [
+          accountId,
+        ]);
         await client.query(
           `UPDATE accounts
            SET status = 'deleted', email = 'deleted-' || id || '@deleted',

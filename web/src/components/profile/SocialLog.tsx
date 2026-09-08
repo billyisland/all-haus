@@ -19,26 +19,40 @@ import type { WriterProfile } from "../../lib/api";
 import { useCompose } from "../../stores/compose";
 
 // =============================================================================
-// Profile Social tab — the writer's notes + replies, rendered through the one
-// Post-model path (PostCardInteractive / PostThread), the same as the workspace
-// and the constructed author profile. Notes come from GET /author/:id/posts?
-// kind=note; replies (kind-1111 comments, which aren't feed_items) from
-// GET /author/:id/replies. Each card expands inline to the unified thread
-// (parent context above) instead of the old "→ replied to X" provenance line.
+// SocialLog — ONE log body for the profile's Posts view and its Replies view,
+// which are two POPULATIONS and not two components: everything below the fetch
+// (thread expansion, the reply composer, the reader route, the feed rhythm) is
+// identical, and the pair spent its previous life as one "Social" tab that
+// stacked both under `Notes` / `Replies` headings.
+//
+// Those headings are gone with the tab rig that replaced them: the button that
+// opened the view already names it, and a heading repeating the button is the
+// same thing said twice — the exact fault that had Followers/Following living
+// as counts AND as pills.
+//
+// Notes come from GET /author/:id/posts?kind=note; replies (kind-1111 comments,
+// which aren't feed_items) from GET /author/:id/replies. Each card expands
+// inline to the unified thread, parent context above.
 // =============================================================================
 
-interface SocialTabProps {
-  username: string;
+export type SocialKind = "notes" | "replies";
+
+interface SocialLogProps {
+  kind: SocialKind;
   writer: WriterProfile;
   isOwnProfile: boolean;
   /** The profile surface's palette — resolved once at the top of the surface. */
   palette: VesselPalette;
 }
 
-export function SocialTab({ writer, isOwnProfile, palette }: SocialTabProps) {
+export function SocialLog({
+  kind,
+  writer,
+  isOwnProfile,
+  palette,
+}: SocialLogProps) {
   const router = useRouter();
-  const [notes, setNotes] = useState<Post[]>([]);
-  const [replies, setReplies] = useState<Post[]>([]);
+  const [posts, setPosts] = useState<Post[]>([]);
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const CTX: CardContext = {
@@ -50,14 +64,14 @@ export function SocialTab({ writer, isOwnProfile, palette }: SocialTabProps) {
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    Promise.all([
-      authorPosts(writer.id, undefined, "note", 50),
-      authorReplies(writer.id, undefined, 50),
-    ])
-      .then(([notesRes, repliesRes]) => {
-        if (cancelled) return;
-        setNotes(notesRes.items);
-        setReplies(repliesRes.items);
+    setExpanded(new Set());
+    const load =
+      kind === "notes"
+        ? authorPosts(writer.id, undefined, "note", 50)
+        : authorReplies(writer.id, undefined, 50);
+    load
+      .then((res) => {
+        if (!cancelled) setPosts(res.items);
       })
       .catch(() => {
         /* silently fail */
@@ -68,7 +82,7 @@ export function SocialTab({ writer, isOwnProfile, palette }: SocialTabProps) {
     return () => {
       cancelled = true;
     };
-  }, [writer.id]);
+  }, [writer.id, kind]);
 
   const toggleExpand = useCallback((id: string) => {
     setExpanded((prev) => {
@@ -138,13 +152,10 @@ export function SocialTab({ writer, isOwnProfile, palette }: SocialTabProps) {
     );
   }
 
-  const hasNotes = notes.length > 0;
-  const hasReplies = replies.length > 0;
-
-  if (!hasNotes && !hasReplies) {
+  if (posts.length === 0) {
     return (
       <p className="text-ui-sm py-10" style={{ color: palette.cardMeta }}>
-        No notes or replies yet.
+        {kind === "notes" ? "No posts yet." : "No replies yet."}
       </p>
     );
   }
@@ -152,26 +163,5 @@ export function SocialTab({ writer, isOwnProfile, palette }: SocialTabProps) {
   // The feed's own rhythm: `FEED_LOG_STYLE`'s column gap PLUS each PostCard's
   // own margin = 20px, which is what a vessel renders (§9.2). The card margin
   // alone is 8px and was never the feed's figure.
-  return (
-    <div>
-      {hasNotes && (
-        <>
-          <h3 className="label-ui mb-4" style={{ color: palette.cardMeta }}>
-            Notes
-          </h3>
-          <div style={FEED_LOG_STYLE}>{notes.map(renderPost)}</div>
-        </>
-      )}
-
-      {hasReplies && (
-        <>
-          {hasNotes && <div className="rule-inset my-8" />}
-          <h3 className="label-ui mb-4" style={{ color: palette.cardMeta }}>
-            Replies
-          </h3>
-          <div style={FEED_LOG_STYLE}>{replies.map(renderPost)}</div>
-        </>
-      )}
-    </div>
-  );
+  return <div style={FEED_LOG_STYLE}>{posts.map(renderPost)}</div>;
 }

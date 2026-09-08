@@ -1,14 +1,10 @@
 import {
-  pool,
   withTransaction,
   loadConfig,
 } from "@platform-pub/shared/db/client.js";
 import { generateKeypair } from "./key-custody-client.js";
-import {
-  USERNAME_MAX_LENGTH,
-  USERNAME_MIN_LENGTH,
-} from "@platform-pub/shared/auth/username-rule.js";
-import { randomBytes } from "crypto";
+import { deriveUsername } from "@platform-pub/shared/auth/username-derive.js";
+import { resolveArrivalGift } from "@platform-pub/shared/auth/arrival-gift.js";
 
 // =============================================================================
 // provisionAccount — create an account for an email, WITHOUT a session
@@ -32,119 +28,29 @@ import { randomBytes } from "crypto";
 //
 // What it does create, matching signup() field for field: the account row with
 // its custodial keypair (minted by key-custody, so the gateway never sees the
-// account key), status 'active', the 500p free allowance, and the reading tab
-// every reader needs. Starter feeds are NOT seeded here — they seed lazily on
-// the owner's first feed list (`seedStarterFeeds`, feeds/crud.ts), so a member
+// account key), status 'active', the free allowance, and the reading tab every
+// reader needs. Starter feeds are NOT seeded here — they seed lazily on the
+// owner's first feed list (`seedStarterFeeds`, feeds/crud.ts), so a member
 // provisioned by either path gets them on first load.
 //
 // The allowance comes from the `free_allowance_pence` dial (migration 169), not
 // a literal — and it is stamped onto BOTH columns: granted (what this reader was
 // gifted, a historical fact never restated) and remaining (what is left, which
 // starts equal). `signup()` must stay in step; it is the twin of this INSERT.
+//
+// THE ARRIVAL GIFT IS THE SECOND THING THE TWO MUST AGREE ON (PAYWALL-ARRIVAL
+// D2). A reader who made this account from a paywall gets `dial + p`, and the
+// arithmetic, the price lookup and the cap live in ONE place —
+// `resolveArrivalGift` — precisely because this INSERT and signup()'s are two
+// copies in two packages. A gift the Google path doesn't give is worse than no
+// gift, because the copy still promises it.
+//
+// `deriveUsername` MOVED to shared/auth (D9): `signup()` needs it too and
+// cannot import from a service. Re-exported here so the existing callers and
+// `gateway/tests/derive-username.test.ts` are unchanged by the move.
 // =============================================================================
 
-// A collision suffix is "-" + 6 hex characters. The BASE must be short enough
-// that base + suffix still fits USERNAME_MAX_LENGTH — the old code sliced the
-// base to the full 30 and then appended, minting 37-character handles that
-// change-username would refuse.
-const SUFFIX_LENGTH = 7;
-const MAX_BASE_WITH_SUFFIX = USERNAME_MAX_LENGTH - SUFFIX_LENGTH;
-
-/**
- * Reduce an arbitrary string to the character set a username may use.
- *
- * Hyphens survive only in the INTERIOR (USERNAME_RE forbids them at either
- * end), so they are trimmed after filtering rather than before — "-ed-" must
- * become "ed", and filtering first is what let a leading hyphen through.
- * Underscores are dropped rather than kept: the old code preserved them from
- * the email's local part, which produced handles like `a_b` that no member
- * could ever have chosen or retyped.
- */
-function normaliseUsernamePart(raw: string, maxLength: number): string {
-  return raw
-    .toLowerCase()
-    .replace(/[^a-z0-9-]/g, "")
-    .slice(0, maxLength)
-    .replace(/^-+|-+$/g, "");
-}
-
-/**
- * Derive a username from what we know: display name first (it is what a person
- * would have picked), the email's local part second.
- *
- * WHEN NEITHER IS LONG ENOUGH, THE ANSWER KEEPS THE PERSON IN IT. The floor
- * used to be the literal `user`, so every member whose address had a short
- * local part — `ed@all.haus`, `jo@…`, any two-letter initials — was handed
- * `user`, and the next one `user-a1b2c3`. That is not a cosmetic default: the
- * welcome sheet SHOWS a new member their handle and deliberately does not let
- * them change it there (the 30-day cooldown makes a hasty choice expensive), so
- * a derived handle is what someone lives with for a month. `ed` is a perfectly
- * good name that merely fails a length rule, so it is kept and disambiguated —
- * `ed-a1b2c3` — rather than thrown away for a word about nobody. Only a string
- * with no usable characters at all falls back to `user`, and even then it is
- * suffixed, because a bare `user` is a handle we hand out repeatedly.
- *
- * Everything returned satisfies USERNAME_RE, which is the point: a derived
- * handle outside the change-username rule is one its owner could not retype to
- * keep.
- *
- * The uniqueness check is advisory, not a guarantee: two concurrent provisions
- * of the same base can both read "free". The UNIQUE constraint on
- * accounts.username is the real defence, and the caller surfaces a 23505 as a
- * retryable failure rather than pretending it can't happen.
- *
- * Exported for tests — the branch table is the whole behaviour, and it is
- * pure apart from the one availability read.
- */
-export async function deriveUsername(
-  email: string,
-  displayName: string,
-): Promise<string> {
-  const fromDisplayName = normaliseUsernamePart(
-    displayName,
-    USERNAME_MAX_LENGTH,
-  );
-  const fromEmail = normaliseUsernamePart(
-    email.split("@")[0] ?? "",
-    USERNAME_MAX_LENGTH,
-  );
-
-  // A base long enough to stand alone. Display name wins; the email's local
-  // part is the fallback.
-  const standalone = [fromDisplayName, fromEmail].find(
-    (c) => c.length >= USERNAME_MIN_LENGTH,
-  );
-
-  // Otherwise keep whatever usable characters we have and let the suffix carry
-  // it over the minimum. `user` is the floor only when there is nothing at all.
-  const shortBase = [fromDisplayName, fromEmail].find((c) => c.length > 0);
-  const base = (standalone ?? shortBase ?? "user").slice(
-    0,
-    standalone ? USERNAME_MAX_LENGTH : MAX_BASE_WITH_SUFFIX,
-  );
-
-  // A base that could not stand alone is ALWAYS suffixed — it is under the
-  // minimum length, so the bare form is not a legal username at all.
-  const mustSuffix = standalone === undefined;
-
-  const { rows: existing } = await pool.query<{ username: string }>(
-    `SELECT username FROM accounts WHERE username = $1 OR username LIKE $2 ORDER BY username`,
-    [base, `${base}-%`],
-  );
-  const taken = new Set(existing.map((r) => r.username));
-
-  if (!mustSuffix && !taken.has(base)) return base;
-
-  // Truncate before suffixing so the result still fits. A standalone base can
-  // be up to the full 30; adding a suffix to that would overflow.
-  const suffixBase = base.slice(0, MAX_BASE_WITH_SUFFIX).replace(/-+$/g, "");
-  let username: string;
-  do {
-    username = `${suffixBase}-${randomBytes(3).toString("hex")}`;
-  } while (taken.has(username));
-
-  return username;
-}
+export { deriveUsername };
 
 export interface ProvisionedAccount {
   accountId: string;
@@ -161,18 +67,21 @@ export interface ProvisionedAccount {
 export async function provisionAccount(
   email: string,
   displayName: string,
+  arrivalDTag?: string | null,
 ): Promise<ProvisionedAccount> {
   const keypair = await generateKeypair();
   const username = await deriveUsername(email, displayName);
 
   const { freeAllowancePence } = await loadConfig();
+  const arrival = await resolveArrivalGift(arrivalDTag ?? null);
 
   return withTransaction(async (client) => {
     const result = await client.query<{ id: string }>(
       `INSERT INTO accounts (
          nostr_pubkey, nostr_privkey_enc, username, display_name, email,
-         status, free_allowance_granted_pence, free_allowance_remaining_pence
-       ) VALUES ($1, $2, $3, $4, $5, 'active', $6, $6)
+         status, free_allowance_granted_pence, free_allowance_remaining_pence,
+         arrival_article_id, arrival_gift_pence
+       ) VALUES ($1, $2, $3, $4, $5, 'active', $6, $6, $7, $8)
        RETURNING id`,
       [
         keypair.pubkeyHex,
@@ -180,7 +89,9 @@ export async function provisionAccount(
         username,
         displayName,
         email,
-        freeAllowancePence,
+        freeAllowancePence + arrival.giftPence,
+        arrival.articleId,
+        arrival.giftPence,
       ],
     );
 

@@ -1,10 +1,6 @@
 import { z } from 'zod'
-import {
-  USERNAME_MIN_LENGTH,
-  USERNAME_MAX_LENGTH,
-  USERNAME_RE,
-  USERNAME_RULE_MESSAGE,
-} from './username-rule.js'
+import { deriveUsername } from './username-derive.js'
+import { resolveArrivalGift } from './arrival-gift.js'
 import { pool, withTransaction, loadConfig } from '../db/client.js'
 import { createSession } from './session.js'
 import logger from '../lib/logger.js'
@@ -17,14 +13,21 @@ import type { FastifyReply } from 'fastify'
 //
 // Signup flow (both paths — magic-link here, Google OAuth in
 // gateway/src/routes/google-auth.ts):
-//   1. User provides email + display name
+//   1. User provides email + display name — and NOTHING ELSE. The username is
+//      DERIVED (PAYWALL-ARRIVAL-ADR D9), by the same `deriveUsername` the
+//      Google path has always used, from its new home in this package.
 //   2. Platform generates a custodial Nostr keypair
 //   3. Account created with full capability — free allowance from the
 //      `free_allowance_pence` dial (£5 seeded), stamped onto both the granted
-//      and remaining columns (migration 169). Twin of provisionAccount's
-//      INSERT in gateway/src/lib/account-provision.ts; keep the two in step.
+//      and remaining columns (migration 169), PLUS the arrival gift when the
+//      signup came from a paywall (`resolveArrivalGift`, migration 188). Twin of
+//      provisionAccount's INSERT in gateway/src/lib/account-provision.ts; keep
+//      the two in step — a gift only one path gives is worse than no gift,
+//      because the copy still promises it.
 //   4. Reading tab created (one per account)
-//   5. Session cookie set
+//   5. Session cookie set — synchronously, inside this request, which is what
+//      makes the arrival landing possible at all: the browser never leaves, so
+//      the client's own held state is a sufficient carrier for the intent.
 //
 // There is no reader→writer upgrade: every account can write from signup.
 // (The vestigial is_writer/is_reader columns were dropped in migration 145;
@@ -46,14 +49,31 @@ import type { FastifyReply } from 'fastify'
 // Validation schemas
 // ---------------------------------------------------------------------------
 
+// TWO FIELDS, AND THE THIRD IS DERIVED (PAYWALL-ARRIVAL-ADR D9). The username
+// used to be required here against USERNAME_RE. A stranger stopped mid-article
+// has a fixed amount of patience and has already spent most of it on the piece;
+// a username field spends what is left on a decision they have no basis for
+// making — they have not seen a profile, a byline or another member — and its
+// failure mode is a REJECTION (23505 on a name they typed hopefully) at the one
+// moment in this reader's life with us where a rejection costs the most. The
+// Google button never showed that field at all, so leaving it here put two
+// offers on the same gate at visibly different prices, and the cheaper one
+// handed the account to a third party.
+//
+// Deriving is not taking the decision away: `username_changed_at` starts NULL,
+// so the first change is free and immediate, and `previous_username` +
+// `username_redirect_until` keep the old handle resolving for 90 days. The name
+// is a default, revisable the moment they have any basis for revising it.
+//
+// `arrivalDTag` is the carried intent, and it is an IDENTITY rather than a
+// price or a path: the price is looked up server-side (`resolveArrivalGift`)
+// because a client-supplied one is a free-money endpoint, and the terminus
+// reconstructs `/article/<dTag>` rather than navigating to a string it was
+// handed, which is what keeps the emailed carrier off the open-redirect shape.
 export const SignupSchema = z.object({
   email: z.string().email(),
   displayName: z.string().min(1).max(100),
-  username: z
-    .string()
-    .min(USERNAME_MIN_LENGTH)
-    .max(USERNAME_MAX_LENGTH)
-    .regex(USERNAME_RE, { message: USERNAME_RULE_MESSAGE }),
+  arrivalDTag: z.string().min(1).max(200).optional(),
 })
 
 export type SignupInput = z.infer<typeof SignupSchema>
@@ -73,7 +93,12 @@ export async function signup(
   reply: FastifyReply,
   keypair: { pubkeyHex: string; privkeyEncrypted: string }
 ): Promise<SignupResult> {
+  const email = input.email.toLowerCase().trim()
   const { freeAllowancePence } = await loadConfig()
+  const username = await deriveUsername(email, input.displayName)
+  // The enlarged grant. Both figures come from ONE place because this INSERT
+  // and provisionAccount's are two copies in two packages (D2).
+  const arrival = await resolveArrivalGift(input.arrivalDTag ?? null)
 
   return withTransaction(async (client) => {
     // Create account
@@ -84,10 +109,20 @@ export async function signup(
     }>(
       `INSERT INTO accounts (
          nostr_pubkey, nostr_privkey_enc, username, display_name, email,
-         status, free_allowance_granted_pence, free_allowance_remaining_pence
-       ) VALUES ($1, $2, $3, $4, $5, 'active', $6, $6)
+         status, free_allowance_granted_pence, free_allowance_remaining_pence,
+         arrival_article_id, arrival_gift_pence
+       ) VALUES ($1, $2, $3, $4, $5, 'active', $6, $6, $7, $8)
        RETURNING id, nostr_pubkey, username`,
-      [keypair.pubkeyHex, keypair.privkeyEncrypted, input.username, input.displayName, input.email.toLowerCase().trim(), freeAllowancePence]
+      [
+        keypair.pubkeyHex,
+        keypair.privkeyEncrypted,
+        username,
+        input.displayName,
+        email,
+        freeAllowancePence + arrival.giftPence,
+        arrival.articleId,
+        arrival.giftPence,
+      ]
     )
 
     const account = accountRow.rows[0]
@@ -105,7 +140,7 @@ export async function signup(
     })
 
     logger.info(
-      { accountId: account.id, username: input.username },
+      { accountId: account.id, username, arrival: arrival.articleId !== null },
       'Account created'
     )
 

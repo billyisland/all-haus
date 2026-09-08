@@ -18,7 +18,6 @@ function p(
       displayName: null,
       handle: null,
       handleUri: null,
-      avatar: null,
       pubkey: "pk",
       pipStatus: "unknown",
     },

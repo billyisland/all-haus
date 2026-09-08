@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { PageShell } from "../../../components/ui/PageShell";
@@ -100,11 +100,25 @@ export function SourceSurface({ id }: { id: string }) {
       .finally(() => setLoadingMore(false));
   }, [id, cursor, loadingMore]);
 
+  // Not open -> open on the host. Open on a post this card QUOTES -> swing to
+  // the host's own conversation (the quoting card sits above it in the log, so
+  // this click is how the reader gets to it). Open on the host -> close.
   const toggleExpand = useCallback((postId: string) => {
     setExpanded((prev) => {
       const next = new Map(prev);
-      if (next.has(postId)) next.delete(postId);
+      if (next.get(postId) === postId) next.delete(postId);
       else next.set(postId, postId);
+      return next;
+    });
+  }, []);
+
+  // The focal click is a CLOSE, never the toggle above: while a quote expansion
+  // is open the toggle swings to the host, and the focal must still collapse.
+  const collapseExpand = useCallback((postId: string) => {
+    setExpanded((prev) => {
+      if (!prev.has(postId)) return prev;
+      const next = new Map(prev);
+      next.delete(postId);
       return next;
     });
   }, []);
@@ -209,19 +223,10 @@ export function SourceSurface({ id }: { id: string }) {
         // 8px on a comment asserting 8px WAS the feed's gap; it is the card
         // margin measured without the column it lives in.
         <div style={FEED_LOG_STYLE}>
-          {items.map((post) =>
-            expanded.has(post.id) && post.type !== "article" ? (
-              <PostThread
-                key={post.id}
-                rootPostId={expanded.get(post.id) ?? post.id}
-                ctx={CTX}
-                onCollapse={() => toggleExpand(post.id)}
-                onReply={replyFromPost}
-                onOpenReader={openReader}
-              />
-            ) : (
+          {items.map((post) => {
+            const root = expanded.get(post.id);
+            const card = (
               <PostCardInteractive
-                key={post.id}
                 post={post}
                 level="feed"
                 expanded={false}
@@ -233,8 +238,29 @@ export function SourceSurface({ id }: { id: string }) {
                   post.author.pubkey ? () => replyFromPost(post) : undefined
                 }
               />
-            ),
-          )}
+            );
+            if (root === undefined || post.type === "article")
+              return <Fragment key={post.id}>{card}</Fragment>;
+            // A QUOTE expansion keeps the quoting card in the log, directly
+            // above the conversation it opened — in effect the next card up —
+            // so the reader can find it again and open its own conversation
+            // next. Thread seniority is untouched (the thread is still rooted
+            // on the quoted post, no back-link); what survives is FEED context,
+            // not thread residue. A Fragment, not a wrapper, so both stay direct
+            // children of FEED_LOG_STYLE and keep the log's ordinary rhythm.
+            return (
+              <Fragment key={post.id}>
+                {root !== post.id ? card : null}
+                <PostThread
+                  rootPostId={root}
+                  ctx={CTX}
+                  onCollapse={() => collapseExpand(post.id)}
+                  onReply={replyFromPost}
+                  onOpenReader={openReader}
+                />
+              </Fragment>
+            );
+          })}
         </div>
       )}
 

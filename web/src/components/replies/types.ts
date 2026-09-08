@@ -7,7 +7,6 @@ export interface ReplyData {
     id: string
     username: string | null
     displayName: string | null
-    avatar: string | null
     pipStatus: PipStatus
   }
   parentCommentId: string | null

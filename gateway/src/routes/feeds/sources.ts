@@ -147,14 +147,11 @@ interface SourceRow {
   tag_name: string | null;
   account_username: string | null;
   account_display_name: string | null;
-  account_avatar: string | null;
   publication_slug: string | null;
   publication_name: string | null;
-  publication_avatar: string | null;
   external_protocol: string | null;
   external_source_uri: string | null;
   external_display_name: string | null;
-  external_avatar: string | null;
 }
 
 function sourceRowToResponse(row: SourceRow) {
@@ -172,7 +169,6 @@ function sourceRowToResponse(row: SourceRow) {
       label:
         row.account_display_name ?? row.account_username ?? "(deleted account)",
       sublabel: row.account_username ? `@${row.account_username}` : null,
-      avatar: row.account_avatar,
       href: row.account_username ? `/${row.account_username}` : null,
     };
   } else if (row.source_type === "publication") {
@@ -181,7 +177,6 @@ function sourceRowToResponse(row: SourceRow) {
       label:
         row.publication_name ?? row.publication_slug ?? "(deleted publication)",
       sublabel: row.publication_slug ? `/pub/${row.publication_slug}` : null,
-      avatar: row.publication_avatar,
       href: row.publication_slug ? `/pub/${row.publication_slug}` : null,
     };
   } else if (row.source_type === "external_source") {
@@ -192,7 +187,6 @@ function sourceRowToResponse(row: SourceRow) {
         row.external_source_uri ??
         "(deleted source)",
       sublabel: row.external_protocol,
-      avatar: row.external_avatar,
       href: row.external_source_id ? `/source/${row.external_source_id}` : null,
     };
   } else {
@@ -200,7 +194,6 @@ function sourceRowToResponse(row: SourceRow) {
       kind: "tag",
       label: `#${row.tag_name}`,
       sublabel: null,
-      avatar: null,
       href: row.tag_name ? `/tag/${encodeURIComponent(row.tag_name)}` : null,
     };
   }
@@ -506,10 +499,10 @@ async function insertSource(
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id, source_type, weight, sampling_mode, muted_at, created_at,
                  account_id, publication_id, external_source_id, tag_name,
-                 NULL::text AS account_username, NULL::text AS account_display_name, NULL::text AS account_avatar,
-                 NULL::text AS publication_slug, NULL::text AS publication_name, NULL::text AS publication_avatar,
+                 NULL::text AS account_username, NULL::text AS account_display_name,
+                 NULL::text AS publication_slug, NULL::text AS publication_name,
                  NULL::text AS external_protocol, NULL::text AS external_source_uri,
-                 NULL::text AS external_display_name, NULL::text AS external_avatar`,
+                 NULL::text AS external_display_name`,
       [
         feedId,
         sourceType,
@@ -526,10 +519,10 @@ async function insertSource(
       `SELECT fs.id, fs.source_type, fs.weight, fs.sampling_mode, fs.muted_at, fs.created_at,
          fs.exclude_replies,
          fs.account_id, fs.publication_id, fs.external_source_id, fs.tag_name,
-         acc.username AS account_username, acc.display_name AS account_display_name, acc.avatar_blossom_url AS account_avatar,
-         pub.slug AS publication_slug, pub.name AS publication_name, pub.logo_blossom_url AS publication_avatar,
+         acc.username AS account_username, acc.display_name AS account_display_name,
+         pub.slug AS publication_slug, pub.name AS publication_name,
          xs.protocol AS external_protocol, xs.source_uri AS external_source_uri,
-         xs.display_name AS external_display_name, xs.avatar_url AS external_avatar
+         xs.display_name AS external_display_name
        FROM feed_sources fs
        LEFT JOIN accounts acc ON acc.id = fs.account_id
        LEFT JOIN publications pub ON pub.id = fs.publication_id
@@ -695,10 +688,10 @@ export async function loadFeedSources(feedId: string) {
     `SELECT fs.id, fs.source_type, fs.weight, fs.sampling_mode, fs.muted_at, fs.created_at,
        fs.exclude_replies,
        fs.account_id, fs.publication_id, fs.external_source_id, fs.tag_name,
-       acc.username AS account_username, acc.display_name AS account_display_name, acc.avatar_blossom_url AS account_avatar,
-       pub.slug AS publication_slug, pub.name AS publication_name, pub.logo_blossom_url AS publication_avatar,
+       acc.username AS account_username, acc.display_name AS account_display_name,
+       pub.slug AS publication_slug, pub.name AS publication_name,
        xs.protocol AS external_protocol, xs.source_uri AS external_source_uri,
-       xs.display_name AS external_display_name, xs.avatar_url AS external_avatar
+       xs.display_name AS external_display_name
      FROM feed_sources fs
      LEFT JOIN accounts acc ON acc.id = fs.account_id
      LEFT JOIN publications pub ON pub.id = fs.publication_id
@@ -1007,10 +1000,10 @@ export function registerFeedSourcesRoutes(app: FastifyInstance) {
         `SELECT fs.id, fs.source_type, fs.weight, fs.sampling_mode, fs.muted_at, fs.created_at,
            fs.exclude_replies,
            fs.account_id, fs.publication_id, fs.external_source_id, fs.tag_name,
-           acc.username AS account_username, acc.display_name AS account_display_name, acc.avatar_blossom_url AS account_avatar,
-           pub.slug AS publication_slug, pub.name AS publication_name, pub.logo_blossom_url AS publication_avatar,
+           acc.username AS account_username, acc.display_name AS account_display_name,
+           pub.slug AS publication_slug, pub.name AS publication_name,
            xs.protocol AS external_protocol, xs.source_uri AS external_source_uri,
-           xs.display_name AS external_display_name, xs.avatar_url AS external_avatar
+           xs.display_name AS external_display_name
          FROM feed_sources fs
          LEFT JOIN accounts acc ON acc.id = fs.account_id
          LEFT JOIN publications pub ON pub.id = fs.publication_id

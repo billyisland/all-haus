@@ -17,7 +17,7 @@ import { ForallDisc } from './ForallDisc'
 // itself is `ForallDisc` (the ADR-locked geometry lives there); this component
 // owns only the wordmark + their pairing.
 //
-// The wordmark matches the disc's GROUND, not its glyph — ink on the light row,
+// The wordmark matches the disc's GROUND, not its glyph — ink on the light bar,
 // bone on the inverted one — so it reads `useResolvedDark` the same way the disc
 // does. That single boolean is the only reason this is a client component.
 //
@@ -33,10 +33,10 @@ import { ForallDisc } from './ForallDisc'
 // logged-out page and every chromeless tool surface at once. The disc went with
 // it (dark ground, ink-925 glyph a shade off it: a faint outline).
 //
-// So the island belongs HERE rather than on PublicNavRow: the row is global
+// So the island belongs HERE rather than on PublicNavBar: the bar is global
 // chrome and must keep inverting, and it is the two-slug idiom inside the mark
 // — not the row — that needs canonical ground to be read against. Islanded, the
-// dark row gets a light disc with a dark glyph and a light wordmark, which is
+// dark bar gets a light disc with a dark glyph and a light wordmark, which is
 // the photo-negative the workspace disc already renders.
 //
 // The bug is silent by construction: nothing errors, the element is in the DOM
@@ -46,7 +46,8 @@ import { ForallDisc } from './ForallDisc'
 // =============================================================================
 
 interface ForallLockupProps {
-  /** Rendered disc diameter. 40 is the nav-row size; 40 + 2·GRID = NAV_ROW_H. */
+  /** Rendered disc diameter. 40 is the nav-bar size, and it is load-bearing on
+   *  the bar's height (`NAV_BAR_H = NAV_BAR_INSET + 40` — NavBar.tsx). */
   discSize?: number
   /** Wordmark size. 24 with a 40 disc holds §V's disc/cap-height ≈ 2.3. */
   wordmarkSize?: number
@@ -75,8 +76,15 @@ export function ForallLockup({
         flexShrink: 0,
       }}
     >
-      {/* Wordmark set to the LEFT of the disc so the two read as one mark
-          (text · glyph). */}
+      {/* Disc FIRST, wordmark to its right — ∀ · all.haus, the mark before its
+          name. This is the workspace lockup's reading (ForallMenu anchor="row")
+          and it belongs to the LEFT dock: since the top bar became the sitewide
+          rule (2026-08-31) this lockup docks at the bar's left end, where the
+          glyph leads. The bottom-row era set the wordmark first (text · glyph)
+          because the pair docked at the RIGHT end and read inward from the
+          screen edge; that ordering went with the edge it was built for. */}
+      <ForallDisc size={discSize} />
+
       <span
         className="font-sans font-medium leading-none"
         style={{
@@ -87,8 +95,6 @@ export function ForallLockup({
       >
         all.haus
       </span>
-
-      <ForallDisc size={discSize} />
     </Link>
   )
 }

@@ -13,7 +13,7 @@ const ArticleEditor = dynamic(
   {
     ssr: false,
     loading: () => (
-      <div className="mx-auto max-w-article px-4 sm:px-6 pt-16 pb-16 lg:pt-8 text-center">
+      <div className="mx-auto max-w-article px-4 sm:px-6 pt-16 pb-16 text-center">
         <div className="h-8 w-48 mx-auto animate-pulse rounded bg-grey-100" />
         <p className="mt-4 text-sm text-grey-300">Loading editor...</p>
       </div>
@@ -73,7 +73,7 @@ export default function WritePage() {
 
   if (loading || !user) {
     return (
-      <div className="mx-auto max-w-article px-4 sm:px-6 pt-16 pb-16 lg:pt-8 text-center">
+      <div className="mx-auto max-w-article px-4 sm:px-6 pt-16 pb-16 text-center">
         <div className="h-8 w-48 mx-auto animate-pulse rounded bg-grey-100" />
       </div>
     );
@@ -81,7 +81,7 @@ export default function WritePage() {
 
   if (loadError) {
     return (
-      <div className="mx-auto max-w-article px-4 sm:px-6 pt-16 pb-16 lg:pt-8 text-center">
+      <div className="mx-auto max-w-article px-4 sm:px-6 pt-16 pb-16 text-center">
         <p className="text-red-600 mb-4">{loadError}</p>
         <a
           href="/reader?overlay=dashboard"
@@ -95,7 +95,7 @@ export default function WritePage() {
 
   if ((editEventId || draftId) && !editorReady) {
     return (
-      <div className="mx-auto max-w-article px-4 sm:px-6 pt-16 pb-16 lg:pt-8 text-center">
+      <div className="mx-auto max-w-article px-4 sm:px-6 pt-16 pb-16 text-center">
         <div className="h-8 w-48 mx-auto animate-pulse rounded bg-grey-100" />
         <p className="mt-4 text-sm text-grey-300">Loading...</p>
       </div>

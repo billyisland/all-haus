@@ -12,10 +12,10 @@ export default function TraffologyLayout({ children }: { children: React.ReactNo
     { href: '/traffology/overview', label: 'Overview' },
   ]
 
-  // The band clears the fixed PublicNavRow LayoutShell mounts on every
+  // The band clears the fixed PublicNavBar LayoutShell mounts on every
   // non-workspace route — see AdminShell for why PageShell can't own it.
   return (
-    <div style={{ paddingBottom: 'var(--ah-row-band, 0px)' }}>
+    <div style={{ paddingTop: 'var(--ah-bar-band, 0px)' }}>
     <PageShell width="content">
       {/* Header */}
       <div className="mb-6">

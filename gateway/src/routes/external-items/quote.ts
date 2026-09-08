@@ -13,6 +13,7 @@ import {
   type QuoteMedia,
   extractBlueskyViewMedia,
   extractMastodonStatusId,
+  ensureContextFeedItem,
   rowToParentItem,
 } from "../../lib/external-items-shared.js";
 
@@ -102,7 +103,7 @@ export function registerQuoteRoutes(app: FastifyInstance) {
       // Make the quoted post resolvable as a re-root target (best-effort: a
       // failure here only means re-root falls back to a no-op, never a 500).
       if (quote) {
-        await ensureQuoteFeedItem(quote.id).catch(() => {});
+        await ensureContextFeedItem(quote.id).catch(() => {});
       }
 
       const data: QuoteResponse = { quote, partial };
@@ -140,46 +141,6 @@ function mastodonCardToMedia(
     title: card.title || undefined,
     description: card.description || undefined,
   };
-}
-
-// Re-root target enablement: give a quoted post a context-only feed_items row so
-// GET /thread/:postId can resolve it when the reader clicks the quote tile to
-// re-root onto it. The thread projector resolves an external focal via
-// `feed_items WHERE post_id = $1`; a quote inserted into external_items alone
-// (the on-demand fetch + the prefetch worker both write external_items only)
-// has no post_id until the daily feed_items_reconcile backfills it, so re-root
-// would 404 until then. This mirrors reconcile case 3 for a single row, runs at
-// the moment the tile is displayed (the only time re-root is reachable), and is
-// idempotent. The feed query filters is_context_only, so it never surfaces in
-// the timeline. The identity trigger mints post_id from (protocol,
-// source_item_uri) — identical to the host's source_quote_uri derivation — so
-// the minted post_id equals the host Post's `quotes`, which is the re-root id.
-async function ensureQuoteFeedItem(externalItemId: string): Promise<void> {
-  await pool.query(
-    `INSERT INTO feed_items (
-       item_type, external_item_id,
-       author_name, author_avatar,
-       title, content_preview,
-       published_at,
-       source_protocol, source_item_uri, source_id, media,
-       is_reply
-     )
-     SELECT
-       'external', ei.id,
-       NULLIF(ei.author_name, ''),
-       COALESCE(ei.author_avatar_url, xs.avatar_url),
-       ei.title,
-       LEFT(COALESCE(ei.content_text, ei.summary), 200),
-       ei.published_at,
-       ei.protocol::text, ei.source_item_uri, ei.source_id, ei.media,
-       ei.source_reply_uri IS NOT NULL
-     FROM external_items ei
-     JOIN external_sources xs ON xs.id = ei.source_id
-     WHERE ei.id = $1 AND ei.deleted_at IS NULL
-       AND NOT EXISTS (SELECT 1 FROM feed_items fi WHERE fi.external_item_id = ei.id)
-     ON CONFLICT DO NOTHING`,
-    [externalItemId],
-  );
 }
 
 async function fetchQuoteFromSource(

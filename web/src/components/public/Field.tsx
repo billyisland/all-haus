@@ -143,7 +143,7 @@ export function CheckboxField({
 // same solid square slab in both.
 //
 // `.btn-accent` DOES survive, in exactly one place: the waiting-list call to
-// action in PublicNavRow, which sits on the un-islanded bone floor where the
+// action in PublicNavBar, which sits on the un-islanded bone floor where the
 // neutral slugs are the right ones. Crimson is the register's single accent —
 // if a second accent button appears on a page, that page has two primary
 // actions and the page is wrong, not the button.

@@ -44,7 +44,7 @@ export function PublicationEarningsTab({ publicationId }: Props) {
         {articles.length === 0 ? (
           <p className="text-ui-xs text-grey-300">No revenue yet.</p>
         ) : (
-          <div className="overflow-x-auto">
+          <div className="overflow-x-auto ah-scrollbar">
             <table className="w-full text-ui-xs">
               <thead>
                 <tr className="border-b-2 border-grey-200">

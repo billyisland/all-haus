@@ -32,8 +32,8 @@ import type { NormalisedActivityPubItem } from "../adapters/activitypub.js";
 // the published_at ratchet still blocks re-ingest of the same event).
 //
 // Runs the REAL writers against a live Postgres, seeding fixtures inside a
-// transaction that is ALWAYS rolled back. Skipped unless a DB URL is supplied
-// so the no-Postgres CI `test` job stays green. Run locally against dev:
+// transaction that is ALWAYS rolled back. Skipped unless a DB URL is supplied —
+// CI supplies one (it boots Postgres and FAILS on a skip). Run locally against dev:
 //   POSTGRES_PASSWORD=$(grep -E '^POSTGRES_PASSWORD=' ../.env | cut -d= -f2-) \
 //   TEST_DATABASE_URL=postgresql://platformpub:$POSTGRES_PASSWORD@localhost:5432/platformpub \
 //     npx vitest run src/lib/ingest-promotion.test.ts

@@ -160,10 +160,10 @@ export function PublicationSettingsTab({ publicationId, publicationSlug, isOwner
             <label className="label-ui text-grey-400 block mb-3">Logo</label>
             <div className="flex items-center gap-4">
               {logoUrl ? (
-                <img src={logoUrl} alt="" className="h-24 w-24 object-cover flex-shrink-0 bg-grey-100" />
+                <img src={logoUrl} alt="" className="h-24 w-24 rounded-full object-cover flex-shrink-0 bg-grey-100" />
               ) : (
                 <span
-                  className="flex h-24 w-24 items-center justify-center text-2xl font-medium text-grey-300 flex-shrink-0 bg-grey-100 cursor-pointer hover:bg-grey-200/60 transition-colors"
+                  className="flex h-24 w-24 items-center justify-center rounded-full text-2xl font-medium text-grey-300 flex-shrink-0 bg-grey-100 cursor-pointer hover:bg-grey-200/60 transition-colors"
                   onClick={() => fileRef.current?.click()}
                 >
                   {name[0]?.toUpperCase() ?? '?'}

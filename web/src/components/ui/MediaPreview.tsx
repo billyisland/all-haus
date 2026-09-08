@@ -12,7 +12,7 @@ export function MediaPreview({ attachments, onRemove, uploading }: MediaPreviewP
   if (attachments.length === 0 && !uploading) return null
 
   return (
-    <div className="flex gap-2 overflow-x-auto py-2">
+    <div className="flex gap-2 overflow-x-auto ah-scrollbar py-2">
       {attachments.map(a => (
         <div key={a.url} className="relative flex-shrink-0 group">
           {a.type === 'image' ? (

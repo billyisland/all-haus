@@ -483,7 +483,7 @@ function ArticlesTab({ userId, pubkey, inOverlay = false }: { userId: string; pu
   if (items.length === 0) return <div className="py-20 text-center"><p className="text-ui-sm text-grey-600 mb-4">No articles or drafts yet.</p>{inOverlay ? <button type="button" onClick={() => { useDashboardOverlay.getState().close(); useEditorOverlay.getState().open() }} className="btn-text underline underline-offset-4">Write your first article</button> : <Link href="/write" className="btn-text underline underline-offset-4">Write your first article</Link>}</div>
 
   return (
-    <div data-explain="dashboard.articles" className="overflow-x-auto bg-glasshouse-well">
+    <div data-explain="dashboard.articles" className="overflow-x-auto ah-scrollbar bg-glasshouse-well">
       <table className="w-full text-ui-xs">
         <thead><tr className="border-b-2 border-grey-200"><th className="px-4 py-3 text-left label-ui text-grey-400">Title</th><th className="px-4 py-3 text-left label-ui text-grey-400">Status</th><th className="px-4 py-3 text-right label-ui text-grey-400">Reads</th><th className="px-4 py-3 text-right label-ui text-grey-400">Earned</th><th className="px-4 py-3 text-center label-ui text-grey-400">Replies</th><th className="px-4 py-3 text-right label-ui text-grey-400">Actions</th></tr></thead>
         <tbody>{items.map(item => {

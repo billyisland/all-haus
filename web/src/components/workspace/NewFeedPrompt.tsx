@@ -6,13 +6,21 @@ import { useEffect, useRef, useState } from "react";
 // Source-set authoring lives in a later slice; this only captures a name and
 // hands it back to the caller, which posts to /api/v1/feeds.
 
+// Every colour here is in the INVERTING family (`ink`/`white`/`bone`/greys),
+// with the scrim the one deliberate exception: a scrim must DARKEN in both
+// modes, so it stays on the never-inverting `ink-925`. This panel is mounted
+// at the WorkspaceView root with NO light island above it, so its `panelBg`
+// resolves through the `html.dark` inversion — and a never-inverting
+// foreground on top of one (`ink-925` on `white` = 26 26 24 on 30 29 26, a
+// contrast ratio of 1.03:1) is invisible. Foreground and ground must be in the
+// SAME inversion family; see web/CLAUDE.md › Global light/dark mode.
 const TOKENS = {
   scrim: "rgb(var(--ah-ink-925-rgb) / 0.4)",
   panelBg: "var(--ah-white)",
-  panelBorder: "var(--ah-ink-925)",
+  panelBorder: "var(--ah-ink)",
   hintFg: "var(--ah-stone-400)",
   errorFg: "var(--ah-crimson)",
-  primaryBg: "var(--ah-ink-925)",
+  primaryBg: "var(--ah-ink)",
   primaryFg: "var(--ah-bone)",
   primaryDisabled: "var(--ah-grey-300)",
 };

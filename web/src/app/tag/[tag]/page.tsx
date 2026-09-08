@@ -1,6 +1,5 @@
 import type { Metadata } from 'next'
 import { TagBrowser } from './TagBrowser'
-import WorkspacePaneRedirect from '../../../components/layout/WorkspacePaneRedirect'
 import { PublicPage } from '../../../components/public/PublicPage'
 import type { Post } from '../../../lib/post/types'
 
@@ -10,14 +9,25 @@ import type { Post } from '../../../lib/post/types'
 // Fetches the tag's article page from the gateway at request time and passes it
 // to the TagBrowser client component as initial data, so the article list is in
 // the served HTML (SEO + no blank → JS → fetch flash). The endpoint is
-// optionalAuth and viewer-independent (tags are article-only, vote counts are
-// global, bookmark state is per-viewer and hydrates client-side), so the
-// anonymous fetch is safe to cache across viewers via `revalidate`.
+// optionalAuth and viewer-independent (tags are article-only and vote counts
+// are global; the per-viewer bookmark state this note used to cite is gone
+// with the bookmarks feature, migration 189), so the anonymous fetch is safe
+// to cache across viewers via `revalidate`.
 //
-// Logged-in visitors are redirected into the workspace surface overlay
-// (WorkspacePaneRedirect); the overlay's TagBrowser carries no initial data and
-// fetches client-side with the viewer's cookie, so this server fetch only ever
-// serves the logged-out / crawler view. (perf-audit #5 residual.)
+// THIS SERVER FETCH IS ANONYMOUS AND CROSS-VIEWER CACHED (`revalidate: 60`),
+// and it now serves MEMBERS TOO. The sentence that used to stand here —
+// "so this server fetch only ever serves the logged-out / crawler view" —
+// rested on the workspace bounce, which D5 deleted (PAYWALL-ARRIVAL-ADR).
+//
+// Nothing breaks, and the reason is worth stating rather than assuming: the
+// payload is viewer-INDEPENDENT. A tag listing is the same rows for everyone,
+// the route derives nothing from a session, and no cookie is forwarded — so
+// what is cached is a fact about the tag, not about a reader. Contrast
+// /article/[dTag], whose payload does carry two viewer-derived fields and which
+// therefore had to grow a viewer-scoped client read to go with them
+// (ArticleReader). The rule is the same in both: a value derived from the
+// viewer is omitted for an anonymous read, never defaulted — and it may not be
+// served out of a cache shared with other viewers. (perf-audit #5 residual.)
 // =============================================================================
 
 const GATEWAY =
@@ -74,7 +84,6 @@ export default async function TagPage({ params }: { params: { tag: string } }) {
   // logged-out one.
   return (
     <PublicPage>
-      <WorkspacePaneRedirect overlay="surface" params={{ surface: `/tag/${tagName}` }} />
       <TagBrowser
         tagName={tagName}
         initialItems={data?.items}

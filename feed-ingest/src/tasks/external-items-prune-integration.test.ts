@@ -10,8 +10,9 @@ import { EXTERNAL_ITEMS_PRUNE_SQL } from "./external-items-prune.js";
 // interaction with the schema's FK actions. This runs the REAL DELETE text
 // against a live Postgres, fixtures seeded in an always-rolled-back transaction.
 //
-// Three claims, each with its negative control being the pre-M15 query (643fab3),
-// pinned verbatim as BUGGY_DELETE:
+// Three claims. Two of them have a negative control that EXECUTES — the pre-M15
+// query (643fab3) as BUGGY_DELETE. The third's control is a comment and cannot be
+// anything else any more; see the note on BUGGY_DELETE below.
 //   1. WEDGE — citation_edges.source_external_item_id has NO on-delete action, so
 //      deleting a cited item raises a RESTRICT (23503) violation that fails the
 //      WHOLE daily batch — after which nothing is ever pruned again (unbounded
@@ -26,7 +27,7 @@ import { EXTERNAL_ITEMS_PRUNE_SQL } from "./external-items-prune.js";
 // Driven on the running dev stack before writing this: BUGGY threw 23503; FIXED
 // deleted plain+tomb, spared cited+parent.
 //
-// Skipped unless a DB URL is supplied (CI's no-Postgres `test` job stays green).
+// Skipped unless a DB URL is supplied (CI supplies one and fails on a skip).
 //   POSTGRES_PASSWORD=$(grep -E '^POSTGRES_PASSWORD=' ../.env | cut -d= -f2-) \
 //   TEST_DATABASE_URL=postgresql://platformpub:$POSTGRES_PASSWORD@localhost:5432/platformpub \
 //     npx vitest run tests/external-items-prune-integration.test.ts
@@ -39,14 +40,44 @@ const DB_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
 // that inlines a copy of production SQL proves the copy, not the code).
 const FIXED_DELETE = EXTERNAL_ITEMS_PRUNE_SQL;
 
-// The pre-M15 DELETE (643fab3), verbatim — the negative control. Its dead
-// `WHERE FALSE` reply guard, its missing citation_edges guard, and its
-// `deleted_at IS NULL` filter are the three defects M15 closed.
+// The pre-M15 DELETE (643fab3) — the negative control — MINUS ONE CLAUSE, and the
+// removal is the point of this comment.
+//
+// The original carried a fourth conjunct, the dead reply guard:
+//
+//   AND NOT EXISTS (SELECT 1 FROM bookmarks b
+//                     JOIN articles a ON a.nostr_event_id = b.article_id::text
+//                    WHERE FALSE)
+//
+// which was the dead-guard defect of the three M15 closed (the claims above are
+// numbered separately — this is that one, not the wedge): `WHERE FALSE` makes the
+// subselect empty, so `NOT EXISTS` is always TRUE and the guard protected nothing.
+// It was pinned here verbatim to SHOW that, and it never contributed a row either
+// way.
+//
+// Migration 189 dropped `bookmarks` (READING-LOG-AND-LIBRARY-ADR D10 — the two
+// intention lists were one want built twice and mounted never). Postgres resolves
+// a relation at PARSE time regardless of `WHERE FALSE`, so from that migration on
+// the clause raised 42P01 and took BOTH executing controls down with it — a green
+// CI throughout, because this suite is `skipIf(!DB_URL)` and CI supplies neither
+// URL. That is its own tracker item; the lesson here is narrower: a test that pins
+// production SQL verbatim pins its SCHEMA DEPENDENCIES too, and a dropped table
+// breaks the pin however inert the clause was.
+//
+// So the clause is GONE rather than re-pointed at some other surviving table.
+// Re-pointing would keep the shape and lose the meaning: the conjunct was
+// evidence about `bookmarks` specifically, and an inert clause over an unrelated
+// relation proves nothing by executing. The dead guard is now recorded above and
+// nowhere else — it has no live control, and cannot have one, because the table
+// whose guard was dead does not exist.
+//
+// What survives EXECUTES, and it is the two defects that matter: the missing
+// citation_edges guard (the wedge, claim 1) and the `deleted_at IS NULL` filter
+// (the privacy inversion, claim 3).
 const BUGGY_DELETE = `
   DELETE FROM external_items ei
   WHERE ei.created_at < now() - ($1 || ' days')::interval
     AND ei.deleted_at IS NULL
-    AND NOT EXISTS (SELECT 1 FROM bookmarks b JOIN articles a ON a.nostr_event_id = b.article_id::text WHERE FALSE)
     AND NOT EXISTS (SELECT 1 FROM votes v WHERE v.target_nostr_event_id = ei.id::text)
 `;
 

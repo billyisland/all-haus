@@ -248,8 +248,8 @@ services:
       # gateway's note; one value across the deployment). Read here by settlement
       # (accrual apportionment) and the tribute payout cycle.
       TRIBUTES_ENABLED: ${TRIBUTES_ENABLED:-0}
-      # Publications — SUSPENDED by operator directive 2026-08-31 (see the gateway's
-      # note; one value across the deployment). Present here so the flag has ONE
+      # Publications — SUSPENDED by operator directive 2026-08-31 (see the
+      # gateway's note; one value across the deployment). Present here so the flag has ONE
       # value, NOT because the payout cycle reads it: runPublicationPayoutCycle is
       # deliberately ungated and stays live so settled publication reads can still
       # be paid out (gating it would strand that money permanently — env.ts §H1).
@@ -338,14 +338,14 @@ services:
         # so flipping to 1 requires `docker compose build web` (not just up).
         # Gateway twin is PLEDGES_ENABLED. See FIX-PROGRAMME 2026-07-13.
         NEXT_PUBLIC_PLEDGES_ENABLED: ${NEXT_PUBLIC_PLEDGES_ENABLED:-0}
-        # Tribute system + upstream-edges apparatus — SUSPENDED by operator
-        # directive 2026-08-25 (see the gateway env note). Build-time inlined,
+        # Tribute system + upstream-edges apparatus — SUSPENDED 2026-08-25 by
+        # operator directive (see the gateway env note). Build-time inlined,
         # so flipping to 1 requires `docker compose build web`. Gateway twins:
         # TRIBUTES_ENABLED / UPSTREAM_EDGES_ENABLED.
         NEXT_PUBLIC_TRIBUTES_ENABLED: ${NEXT_PUBLIC_TRIBUTES_ENABLED:-0}
         NEXT_PUBLIC_UPSTREAM_EDGES_ENABLED: ${NEXT_PUBLIC_UPSTREAM_EDGES_ENABLED:-0}
-        # Publications — SUSPENDED by operator directive 2026-08-31 (see the
-        # gateway env note). Build-time inlined, so flipping to 1 requires `docker compose
+        # Publications — SUSPENDED 2026-08-31 by operator directive (see the gateway
+        # env note). Build-time inlined, so flipping to 1 requires `docker compose
         # build web`. Gateway twin: PUBLICATIONS_ENABLED.
         NEXT_PUBLIC_PUBLICATIONS_ENABLED: ${NEXT_PUBLIC_PUBLICATIONS_ENABLED:-0}
         # Baked into the Next.js /api rewrite at build time (see web/Dockerfile).

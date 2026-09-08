@@ -1,11 +1,11 @@
 "use client";
 
 // =============================================================================
-// LibraryOverlay — the reader's library (bookmarks + reading history) in a
-// workspace Glasshouse. Mounted once in WorkspaceView; opened from the
-// ForallMenu Library row, or via /reader?overlay=library[&tab=history] (the
-// retired /library route — and the /bookmarks, /history, /reading-history shims
-// before it — redirect here; see the deep-link dispatcher in WorkspaceView).
+// LibraryOverlay — the reader's two logs (Recent reading + the all.haus
+// library) in a workspace Glasshouse. Mounted once in WorkspaceView; opened
+// from the ForallMenu Library row, or via /reader?overlay=library[&tab=…] (the
+// retired /library route — and the /history and /reading-history shims before
+// it — redirect here; see the deep-link dispatcher in WorkspaceView).
 // Wraps LibraryPanel in the canonical frosted overlay so the ForallMenu stays
 // crisp above it.
 // =============================================================================

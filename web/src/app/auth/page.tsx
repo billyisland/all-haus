@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
-import { auth } from '../../lib/api'
+import { auth, signupOffer } from '../../lib/api'
 import { useAuth } from '../../stores/auth'
 import { PublicShell } from '../../components/public/PublicShell'
 import {
@@ -24,12 +24,21 @@ import {
   SLAB,
 } from '../../components/public/palette'
 
-// Closed beta (CLOSED-BETA-ADR Phase 3, D4). `/auth` is login-only: the signup
-// form and the login/signup toggle are gone (account creation is closed
-// server-side — D1). Two edge cases route to the waitlist surface instead of
-// showing a raw error here:
-//   (a) a visitor arriving directly at `/auth?mode=signup`, and
-//   (b) a new Google email the gateway refused (`?error=closed_beta`).
+// `/auth` is login-only, and that is a division of labour rather than a closure
+// now: making an account has its own surface at `/auth/signup`
+// (PAYWALL-ARRIVAL D9, which built the one that never existed).
+//
+//   (a) `?mode=signup` forwards there rather than to the waitlist. The signup
+//       page owns the closed-beta answer, because the server does — it 403s and
+//       the page routes on, so there is one place that decides and no second
+//       copy of the flag here to fall out of step with it.
+//   (b) a new Google email the gateway refused (`?error=closed_beta`) still
+//       goes straight to the waitlist: that refusal has already happened.
+//
+// `?arrival=<dTag>` rides through both the Google button and the magic link, so
+// a MEMBER who meets a paywall logged out lands back on the piece instead of in
+// a workspace they didn't ask for (§11.5). They get no gift and no welcome —
+// both are gated server-side on `arrival_article_id`.
 //
 // REDESIGNED 2026-07-25 onto the public chassis. What went: the black topbar
 // above it (deleted sitewide — see LayoutShell), the `max-w-sm` / `py-28`
@@ -50,11 +59,15 @@ export default function AuthPage() {
 
   const wantsSignup = searchParams.get('mode') === 'signup'
   const initialError = searchParams.get('error')
-  const redirectingToWaitlist = wantsSignup || initialError === 'closed_beta'
+  const arrival = searchParams.get('arrival')
+  const arrivalQs = arrival ? `?arrival=${encodeURIComponent(arrival)}` : ''
+  const redirectingToWaitlist = initialError === 'closed_beta'
+  const leaving = wantsSignup || redirectingToWaitlist
 
   useEffect(() => {
-    if (redirectingToWaitlist) router.replace('/waitlist?from=beta')
-  }, [redirectingToWaitlist, router])
+    if (wantsSignup) router.replace(`/auth/signup${arrivalQs}`)
+    else if (redirectingToWaitlist) router.replace('/waitlist?from=beta')
+  }, [wantsSignup, redirectingToWaitlist, arrivalQs, router])
 
   const [error, setError] = useState<string | null>(
     initialError === 'google_denied'
@@ -66,13 +79,23 @@ export default function AuthPage() {
   const [loading, setLoading] = useState(false)
   const [magicLinkSent, setMagicLinkSent] = useState(false)
   const [email, setEmail] = useState('')
+  // Asked, never assumed: the footer offers whichever way in actually exists,
+  // and defaults to the waiting list when we could not find out — the one
+  // answer that is never a promise we then break.
+  const [canSignUp, setCanSignUp] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    void signupOffer().then((o) => { if (!cancelled) setCanSignUp(o !== null) })
+    return () => { cancelled = true }
+  }, [])
 
   async function handleLogin(e: React.FormEvent) {
     e.preventDefault()
     setLoading(true)
     setError(null)
     try {
-      await auth.login(email)
+      await auth.login(email, arrival ?? undefined)
       setMagicLinkSent(true)
     } catch {
       setError('Something went wrong. Please try again.')
@@ -88,7 +111,7 @@ export default function AuthPage() {
       await auth.devLogin(email)
       const me = await auth.me()
       setUser(me)
-      router.push('/reader')
+      router.push(arrival ? `/article/${encodeURIComponent(arrival)}` : '/reader')
     } catch {
       setError('Dev login failed — is that email in the database?')
     } finally {
@@ -96,8 +119,8 @@ export default function AuthPage() {
     }
   }
 
-  // Redirecting to the waitlist — render nothing so the login form never flashes.
-  if (redirectingToWaitlist) return null
+  // Leaving — render nothing so the login form never flashes.
+  if (leaving) return null
 
   if (magicLinkSent) {
     return (
@@ -143,7 +166,7 @@ export default function AuthPage() {
         {error && <FormError>{error}</FormError>}
 
         <PublicCard>
-          <PublicButton variant="outline" full href="/api/v1/auth/google">
+          <PublicButton variant="outline" full href={`/api/v1/auth/google${arrivalQs}`}>
             <GoogleMark />
             Continue with Google
           </PublicButton>
@@ -174,7 +197,12 @@ export default function AuthPage() {
 
         <PublicCard>
           <PublicBody>
-            New here? <PublicLink href="/waitlist">Join the waiting list</PublicLink>
+            New here?{' '}
+            {canSignUp ? (
+              <PublicLink href={`/auth/signup${arrivalQs}`}>Make an account</PublicLink>
+            ) : (
+              <PublicLink href="/waitlist">Join the waiting list</PublicLink>
+            )}
           </PublicBody>
         </PublicCard>
 

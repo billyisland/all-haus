@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 06iC0Rm84KqaY3xq2886pFV6lyH7XBBOlfftjaEMMlWd6y9AoaYvIfc69vrRkOe
+\restrict RWocryERm9LrsGM0l2qc6Kdvh5Hcja3EIw4pd7mSV1iE8teAKF5dNwwCF6fPphJ
 
 -- Dumped from database version 16.13
 -- Dumped by pg_dump version 16.13
@@ -211,6 +211,36 @@ CREATE TYPE public.report_status AS ENUM (
 
 
 --
+-- Name: article_post_id(uuid); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.article_post_id(p_article_id uuid) RETURNS text
+    LANGUAGE sql STABLE
+    AS $$
+  SELECT COALESCE(
+    (SELECT fi.post_id
+       FROM feed_items fi
+      WHERE fi.article_id = p_article_id AND fi.post_id IS NOT NULL
+      LIMIT 1),
+    (SELECT CASE
+              WHEN ac.nostr_pubkey IS NOT NULL AND a.nostr_d_tag IS NOT NULL
+                THEN feed_items_derive_post_id('nostr', '30023:' || ac.nostr_pubkey || ':' || a.nostr_d_tag)
+              ELSE feed_items_derive_post_id('nostr_article', a.id::text)
+            END
+       FROM articles a JOIN accounts ac ON ac.id = a.writer_id
+      WHERE a.id = p_article_id)
+  );
+$$;
+
+
+--
+-- Name: FUNCTION article_post_id(p_article_id uuid); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.article_post_id(p_article_id uuid) IS 'An article''s feed_items.post_id, read where the row exists and derived only where it does not (READING-LOG-AND-LIBRARY-ADR D7). Never re-derive the naddr coord directly: post_id is minted once and its native branch has a fallback, so a re-derivation can mint an id matching no row.';
+
+
+--
 -- Name: articles_block_publication_when_tributed(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -279,7 +309,7 @@ $$;
 --
 
 CREATE FUNCTION public.external_items_compute_fingerprint(p_canonical_url text, p_content_text text) RETURNS text
-    LANGUAGE plpgsql IMMUTABLE
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
     AS $$
 DECLARE
   normed text;
@@ -301,7 +331,7 @@ $$;
 --
 
 CREATE FUNCTION public.external_items_norm_text(t text) RETURNS text
-    LANGUAGE sql IMMUTABLE
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE
     AS $$
   SELECT btrim(left(
     regexp_replace(                                  -- collapse whitespace
@@ -331,7 +361,7 @@ $$;
 --
 
 CREATE FUNCTION public.feed_items_content_version(p_external_item_id uuid) RETURNS text
-    LANGUAGE plpgsql STABLE
+    LANGUAGE plpgsql STABLE PARALLEL SAFE
     AS $$
 DECLARE
   v_text  TEXT;
@@ -358,7 +388,7 @@ $$;
 --
 
 CREATE FUNCTION public.feed_items_derive_post_id(p_protocol text, p_handle text) RETURNS text
-    LANGUAGE sql IMMUTABLE
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE
     AS $$
   SELECT encode(digest(p_protocol || E'\x1f' || p_handle, 'sha256'), 'hex');
 $$;
@@ -804,6 +834,9 @@ CREATE TABLE public.accounts (
     free_allowance_granted_pence integer DEFAULT 500 NOT NULL,
     onboarded_at timestamp with time zone,
     subscription_welcome_message text,
+    arrival_article_id uuid,
+    arrival_gift_pence integer DEFAULT 0 NOT NULL,
+    reading_log_enabled boolean DEFAULT true NOT NULL,
     CONSTRAINT accounts_annual_discount_pct_check CHECK (((annual_discount_pct >= 0) AND (annual_discount_pct <= 30))),
     CONSTRAINT accounts_hosting_type_check CHECK ((hosting_type = ANY (ARRAY['hosted'::text, 'self_hosted'::text]))),
     CONSTRAINT accounts_subscription_welcome_message_length CHECK (((subscription_welcome_message IS NULL) OR (char_length(subscription_welcome_message) <= 2000)))
@@ -829,6 +862,27 @@ COMMENT ON COLUMN public.accounts.onboarded_at IS 'When the first-session welcom
 --
 
 COMMENT ON COLUMN public.accounts.subscription_welcome_message IS 'Writer-composed plain-text welcome, sent to a reader on subscribing. NULL = never set, send the default template. Escaped at send time; never store HTML.';
+
+
+--
+-- Name: COLUMN accounts.arrival_article_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.accounts.arrival_article_id IS 'The paywalled article this account was created from (PAYWALL-ARRIVAL-ADR D2/§11.2). NULL for every account that arrived any other way, which is what distinguishes an arrival signup from a member signing in at the same gate. ON DELETE SET NULL — deleting the piece must not delete the reader.';
+
+
+--
+-- Name: COLUMN accounts.arrival_gift_pence; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.accounts.arrival_gift_pence IS 'How much of free_allowance_granted_pence was the arrival gift — the price of arrival_article_id, looked up server-side at grant time. A historical fact like the grant itself: never re-derived as granted minus the current dial, which restates history the moment the dial is retuned. 0 for a non-arrival account, and for an arrival above the cap that was given nothing.';
+
+
+--
+-- Name: COLUMN accounts.reading_log_enabled; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.accounts.reading_log_enabled IS 'D1 stop-logging switch for Recent reading. Account state, not a per-device key: a member who switched it off on their laptop has switched it off. Default true.';
 
 
 --
@@ -1005,17 +1059,6 @@ CREATE TABLE public.blocks (
     blocker_id uuid NOT NULL,
     blocked_id uuid NOT NULL,
     blocked_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
---
--- Name: bookmarks; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.bookmarks (
-    user_id uuid NOT NULL,
-    article_id uuid NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -1446,18 +1489,6 @@ CREATE TABLE public.feed_items (
 
 
 --
--- Name: feed_saves; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.feed_saves (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    feed_id uuid NOT NULL,
-    feed_item_id uuid NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
---
 -- Name: feed_scores; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1514,7 +1545,7 @@ CREATE TABLE public.feeds (
     cloned_from_feed_id uuid,
     from_formula_id uuid,
     origin_label text,
-    CONSTRAINT feeds_name_length CHECK (((char_length(name) >= 1) AND (char_length(name) <= 80)))
+    CONSTRAINT feeds_name_length CHECK ((char_length(name) <= 80))
 );
 
 
@@ -2238,16 +2269,48 @@ COMMENT ON COLUMN public.read_events.publication_payout_id IS 'The publication p
 
 
 --
+-- Name: reading_log; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.reading_log (
+    user_id uuid NOT NULL,
+    post_id text NOT NULL,
+    opened_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE reading_log; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.reading_log IS 'Recent reading (READING-LOG-AND-LIBRARY-ADR): every piece opened in a reader, native or external, on the reading_log_retention_days window. Readable by its owner alone — never a writer, never the owner dashboard, never a third-party export.';
+
+
+--
+-- Name: COLUMN reading_log.post_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.reading_log.post_id IS 'feed_items.post_id. NO FK, and it is not an omission: feed_items.post_id has no unique constraint so nothing can reference it (same reason as repost_edges.target_post_id). Rendering tolerates a post_id that resolves to nothing.';
+
+
+--
 -- Name: reading_positions; Type: TABLE; Schema: public; Owner: -
 --
 
 CREATE TABLE public.reading_positions (
     user_id uuid NOT NULL,
-    article_id uuid NOT NULL,
     scroll_ratio real NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    post_id text NOT NULL,
     CONSTRAINT reading_positions_scroll_ratio_check CHECK (((scroll_ratio >= (0)::double precision) AND (scroll_ratio <= (1)::double precision)))
 );
+
+
+--
+-- Name: COLUMN reading_positions.post_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.reading_positions.post_id IS 'feed_items.post_id — same key as reading_log, and no FK for the same reason. An external post has no articles row, which is why this column replaced article_id.';
 
 
 --
@@ -3165,14 +3228,6 @@ ALTER TABLE ONLY public.blocks
 
 
 --
--- Name: bookmarks bookmarks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.bookmarks
-    ADD CONSTRAINT bookmarks_pkey PRIMARY KEY (user_id, article_id);
-
-
---
 -- Name: citation_edges citation_edges_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3394,22 +3449,6 @@ ALTER TABLE ONLY public.feed_import_exclusions
 
 ALTER TABLE ONLY public.feed_items
     ADD CONSTRAINT feed_items_pkey PRIMARY KEY (id);
-
-
---
--- Name: feed_saves feed_saves_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.feed_saves
-    ADD CONSTRAINT feed_saves_pkey PRIMARY KEY (id);
-
-
---
--- Name: feed_saves feed_saves_unique; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.feed_saves
-    ADD CONSTRAINT feed_saves_unique UNIQUE (feed_id, feed_item_id);
 
 
 --
@@ -3773,11 +3812,19 @@ ALTER TABLE ONLY public.read_events
 
 
 --
+-- Name: reading_log reading_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.reading_log
+    ADD CONSTRAINT reading_log_pkey PRIMARY KEY (user_id, post_id);
+
+
+--
 -- Name: reading_positions reading_positions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.reading_positions
-    ADD CONSTRAINT reading_positions_pkey PRIMARY KEY (user_id, article_id);
+    ADD CONSTRAINT reading_positions_pkey PRIMARY KEY (user_id, post_id);
 
 
 --
@@ -4226,13 +4273,6 @@ CREATE INDEX atproto_oauth_pending_states_expires_at_idx ON public.atproto_oauth
 
 
 --
--- Name: feed_saves_feed_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX feed_saves_feed_idx ON public.feed_saves USING btree (feed_id, created_at DESC, id DESC);
-
-
---
 -- Name: feed_sources_account_uniq; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -4398,13 +4438,6 @@ CREATE UNIQUE INDEX idx_articles_unique_live ON public.articles USING btree (wri
 --
 
 CREATE INDEX idx_articles_writer_id ON public.articles USING btree (writer_id);
-
-
---
--- Name: idx_bookmarks_user; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_bookmarks_user ON public.bookmarks USING btree (user_id, created_at DESC);
 
 
 --
@@ -5290,6 +5323,27 @@ CREATE INDEX idx_read_events_writer_id ON public.read_events USING btree (writer
 
 
 --
+-- Name: idx_reading_log_sweep; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_reading_log_sweep ON public.reading_log USING btree (opened_at);
+
+
+--
+-- Name: idx_reading_log_user; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_reading_log_user ON public.reading_log USING btree (user_id, opened_at DESC);
+
+
+--
+-- Name: idx_reading_positions_sweep; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_reading_positions_sweep ON public.reading_positions USING btree (updated_at);
+
+
+--
 -- Name: idx_reading_positions_user; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6116,6 +6170,14 @@ CREATE TRIGGER trust_polls_touch_updated_at BEFORE UPDATE ON public.trust_polls 
 
 
 --
+-- Name: accounts accounts_arrival_article_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.accounts
+    ADD CONSTRAINT accounts_arrival_article_id_fkey FOREIGN KEY (arrival_article_id) REFERENCES public.articles(id) ON DELETE SET NULL;
+
+
+--
 -- Name: allocated_draws allocated_draws_settlement_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6209,22 +6271,6 @@ ALTER TABLE ONLY public.blocks
 
 ALTER TABLE ONLY public.blocks
     ADD CONSTRAINT blocks_blocker_id_fkey FOREIGN KEY (blocker_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
-
-
---
--- Name: bookmarks bookmarks_article_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.bookmarks
-    ADD CONSTRAINT bookmarks_article_id_fkey FOREIGN KEY (article_id) REFERENCES public.articles(id) ON DELETE CASCADE;
-
-
---
--- Name: bookmarks bookmarks_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.bookmarks
-    ADD CONSTRAINT bookmarks_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
 
 
 --
@@ -6593,22 +6639,6 @@ ALTER TABLE ONLY public.feed_items
 
 ALTER TABLE ONLY public.feed_items
     ADD CONSTRAINT feed_items_source_id_fkey FOREIGN KEY (source_id) REFERENCES public.external_sources(id) ON DELETE CASCADE;
-
-
---
--- Name: feed_saves feed_saves_feed_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.feed_saves
-    ADD CONSTRAINT feed_saves_feed_id_fkey FOREIGN KEY (feed_id) REFERENCES public.feeds(id) ON DELETE CASCADE;
-
-
---
--- Name: feed_saves feed_saves_feed_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.feed_saves
-    ADD CONSTRAINT feed_saves_feed_item_id_fkey FOREIGN KEY (feed_item_id) REFERENCES public.feed_items(id) ON DELETE CASCADE;
 
 
 --
@@ -7204,11 +7234,11 @@ ALTER TABLE ONLY public.read_events
 
 
 --
--- Name: reading_positions reading_positions_article_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: reading_log reading_log_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.reading_positions
-    ADD CONSTRAINT reading_positions_article_id_fkey FOREIGN KEY (article_id) REFERENCES public.articles(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.reading_log
+    ADD CONSTRAINT reading_log_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
 
 
 --
@@ -7799,8 +7829,7 @@ ALTER TABLE ONLY traffology.writer_baselines
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 06iC0Rm84KqaY3xq2886pFV6lyH7XBBOlfftjaEMMlWd6y9AoaYvIfc69vrRkOe
-
+\unrestrict RWocryERm9LrsGM0l2qc6Kdvh5Hcja3EIw4pd7mSV1iE8teAKF5dNwwCF6fPphJ
 
 
 --
@@ -7992,4 +8021,9 @@ INSERT INTO public._migrations (filename) VALUES
     ('182_network_presences_show_on_profile.sql'),
     ('183_external_authors_tier_c.sql'),
     ('184_feed_items_author_name_nullable.sql'),
-    ('185_feed_formulas_live.sql');
+    ('185_feed_formulas_live.sql'),
+    ('186_reclassify_member_formulas.sql'),
+    ('187_parallel_safe_functions.sql'),
+    ('188_accounts_arrival.sql'),
+    ('189_reading_log.sql'),
+    ('190_feeds_name_optional.sql');

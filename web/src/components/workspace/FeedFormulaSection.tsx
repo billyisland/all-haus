@@ -6,6 +6,11 @@ import {
   type FeedLinkStatus,
 } from "../../lib/api/formulas";
 import { apiErrorMessage } from "../../lib/api/client";
+import {
+  CONFIRM_MS,
+  copyPendingOrReveal,
+  pendingClipboardWriter,
+} from "../../hooks/useCopyLink";
 
 // =============================================================================
 // FeedFormulaSection — the FeedComposer's share control
@@ -40,19 +45,27 @@ import { apiErrorMessage } from "../../lib/api/client";
 //      line does not exist.
 //   3. **The fallback**, when the clipboard refuses. A button that says
 //      "copied" without copying is the worst outcome available here, so a
-//      rejected `writeText` reveals the URL to be copied by hand instead.
+//      rejected write reveals the URL to be copied by hand instead.
+//
+// THE COPY RIDES THE GESTURE, NOT THE ROUND TRIP (§0u.5). The URL does not
+// exist until the mint returns, and awaiting it spends Safari's transient user
+// activation — so the clipboard is handed the PENDING value synchronously and
+// the discipline lives in `copyPendingOrReveal`. This control used to inline
+// its own `writeText`-after-await, which was both the WebKit failure and an
+// untested third copy of a mutation-tested rule that had already drifted.
 //
 // WHAT THE STATUS READ IS NOW FOR. It no longer gates the render — the button
 // paints immediately, so there is no flash of nothing — it only answers "is a
 // link already out there", which decides Stop and the caveat. Everything else
 // comes back on the mint response, which carries the live projection.
 //
-// It renders on the composer's fixed-light Glasshouse pane, so fixed neutral
-// tokens are correct here, exactly as in FeedSyncSection.
+// It renders on the composer's Glasshouse pane, so neutral tokens are correct
+// here, exactly as in FeedSyncSection — and, exactly as there, that pane is
+// mode-neutral rather than fixed light, so the tokens must be inverting slugs.
 // =============================================================================
 
 const T = {
-  fg: "var(--ah-ink-925)",
+  fg: "var(--ah-ink)",
   hintFg: "var(--ah-grey-600)",
   fieldBg: "var(--ah-white)",
   errorFg: "var(--ah-crimson)",
@@ -167,32 +180,52 @@ export function FeedFormulaSection({
     setBusy(true);
     setError(null);
     setRevealed(null);
+    // Started, not awaited. Everything up to the first `await` below runs
+    // inside the click handler, which is what keeps the gesture alive for the
+    // clipboard — see copyPendingOrReveal.
+    //
+    // Idempotent server-side (L2): mints on the first press, returns the same
+    // link on every later one. Nothing here needs to know which it was, which
+    // is the whole reason this is one button.
+    const minting = formulasApi.mint(feedId);
     try {
-      // Idempotent server-side (L2): mints on the first press, returns the same
-      // link on every later one. Nothing here needs to know which it was, which
-      // is the whole reason this is one button.
-      const link = await formulasApi.mint(feedId);
-      const url = absoluteUrl(link.url);
+      const outcome = await copyPendingOrReveal(
+        minting.then((l) => absoluteUrl(l.url)),
+        {
+          writePending: pendingClipboardWriter(),
+          writeText: (t) => navigator.clipboard.writeText(t),
+        },
+      );
+      const link = await minting;
       setStatus((prev) =>
         prev
-          ? { ...prev, link, excludedCount: link.excludedCount, refusal: link.refusal }
+          ? {
+              ...prev,
+              link,
+              excludedCount: link.excludedCount,
+              refusal: link.refusal,
+            }
           : {
               link,
               sourceCount: link.sourceCount,
               excludedCount: link.excludedCount,
               refusal: link.refusal,
-              maxSources: 0,
+              // The link's OWN cap, never a fabricated zero (§0u.6). This
+              // branch runs when the initial status GET blipped — a tolerated
+              // case — and the caveat it feeds reads "trim it to N", so a
+              // stand-in 0 turned a recoverable blip into instructions nobody
+              // can follow.
+              maxSources: link.maxSources,
             },
       );
       report.current?.(true);
-      try {
-        await navigator.clipboard.writeText(url);
+      if (outcome.ok) {
         setCopied(true);
-        setTimeout(() => setCopied(false), 2400);
-      } catch {
+        setTimeout(() => setCopied(false), CONFIRM_MS);
+      } else {
         // Saying "copied" without copying is the worst outcome available here,
         // so the link is revealed to be taken by hand instead.
-        setRevealed(url);
+        setRevealed(outcome.url);
       }
     } catch (err) {
       setError(apiErrorMessage(err) ?? "Couldn’t make a link for this feed.");

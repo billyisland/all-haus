@@ -4,10 +4,10 @@ import type { Metadata } from 'next'
 import { renderMarkdown } from '../../../lib/markdown'
 import { ArticleReader } from '../../../components/article/ArticleReader'
 import { TraffologyMeta } from '../../../components/traffology/TraffologyMeta'
-import WorkspacePaneRedirect from '../../../components/layout/WorkspacePaneRedirect'
 import { PublicPage } from '../../../components/public/PublicPage'
 import { traffologyEnabled, publicationsEnabled } from '../../../lib/featureFlags'
 import type { ArticleMetadata } from '../../../lib/api'
+import { ReadingScrollbar } from '../../../components/layout/ReadingScrollbar'
 
 // Publications suspended 2026-08-31 (lib/featureFlags.ts). A publication
 // article is still reachable at its PERSONAL /article/:dTag URL — that route is
@@ -32,6 +32,19 @@ function visiblePublication(article: ArticleMetadata) {
 
 const GATEWAY = process.env.GATEWAY_INTERNAL_URL ?? process.env.GATEWAY_URL ?? 'http://localhost:3000'
 
+// ANONYMOUS, AND CROSS-VIEWER CACHED — which since D5 deleted the workspace
+// bounce (PAYWALL-ARRIVAL-ADR) is what a MEMBER gets too, not only a crawler.
+//
+// No cookie is forwarded, so the gateway answers with the anonymous projection.
+// That is the correct behaviour and not an accident: the route OMITS its two
+// viewer-derived fields (`writerSpendThisMonthPence`, `nudgeShownThisMonth`)
+// when there is no session rather than defaulting them, and a cache shared
+// between viewers is the last place a per-viewer figure may live.
+//
+// The consequence is that those two fields are absent for everybody here, so
+// ArticleReader re-reads them client-side with the viewer's own cookie. Do NOT
+// "fix" this by forwarding the session into this fetch: that would put one
+// reader's spend in a cache the next reader is served from.
 async function getArticle(dTag: string): Promise<ArticleMetadata | null> {
   const res = await fetch(`${GATEWAY}/api/v1/articles/${dTag}`, {
     next: { revalidate: 60 },
@@ -99,11 +112,23 @@ export default async function ArticlePage({ params }: { params: { dTag: string }
   // `ground={false}`: ArticleReader's root is `min-h-screen bg-white` — it is
   // the reading surface and owns both its ground and its height. PublicPage
   // contributes only the nav row's bottom band.
+  //
+  // `barGround` names that white for the fixed nav bar, which otherwise stays
+  // on bone and draws its own bottom edge as a griege seam across the top of
+  // every shared article — the bar is built to have no divider, and the ground
+  // is the whole of the join. See PublicPage.
   return (
-    <PublicPage ground={false}>
-    <WorkspacePaneRedirect overlay="reader" params={{ article: params.dTag }} />
+    <PublicPage ground={false} barGround="var(--ah-white)">
+    {/* A reading surface keeps its scroll marker (globals.css). This page
+        scrolls the DOCUMENT, so the opt-in goes on the root rather than on a
+        container. */}
+    <ReadingScrollbar />
     {traffologyOn && <TraffologyMeta articleId={article.id} />}
     <ArticleReader
+      // The unified key, straight off the article payload — resolved
+      // server-side by `article_post_id()` (READING-LOG-AND-LIBRARY-ADR D8).
+      // No `scrollRef`: this is a page, so the document scrolls.
+      postId={article.postId}
       article={{
         id: article.nostrEventId,
         pubkey: article.writer.pubkey,

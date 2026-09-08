@@ -572,7 +572,33 @@ async function mintLinkForFeed(
   }
 }
 
-function linkToResponse(link: LinkRow, projection: FeedProjection | null) {
+function linkToResponse(
+  link: LinkRow,
+  projection: FeedProjection | null,
+  maxSources: number,
+) {
+  // A WITHDRAWN LINK CARRIES ITS OWN SENTENCE AND NOTHING ELSE, and that is a
+  // property of the RESPONSE rather than of any one page (§0u.1). The join in
+  // LINK_SELECT is live by design, so every field it projects tracks the feed's
+  // edits AFTER the author pressed Stop: an author who withdrew a link and then
+  // renamed the feed to something private was having the new name served to
+  // anyone still holding the dead token. The `/f` page happens not to render
+  // these fields on the revoked branch — but "happens not to" is not a privacy
+  // guarantee, and the API is what a client actually reads.
+  //
+  // Derived from the row rather than passed in, so a caller cannot forget it.
+  // The two workspace reads and /my/formulas all filter `revoked_at IS NULL`
+  // and are unaffected; the public token route is the one that can see a
+  // revoked row, which is exactly the one this is for.
+  //
+  // The AUTHOR stays. It is the link's own author, not the feed's composition,
+  // and the withdrawn sentence names them ("X has taken this link down") — the
+  // page would lose its subject without it.
+  const revoked = link.revoked_at !== null;
+  // Computed off the ROW, before the strip: a revoked link whose feed is also
+  // gone is still gone, and deriving this from the redacted name would make
+  // every revoked link claim its feed had been deleted.
+  const gone = link.source_feed_id === null || link.feed_name === null;
   return {
     id: link.id,
     token: link.token,
@@ -580,9 +606,11 @@ function linkToResponse(link: LinkRow, projection: FeedProjection | null) {
     createdAt: link.created_at.toISOString(),
     // Live, not stamped: L1's own posture settles it — an author renaming the
     // feed they have shared is the same act as adding a source to it. What a
-    // recipient ALREADY holds keeps the name it had at redeem (L6).
-    name: link.feed_name,
-    appearance: link.feed_appearance ?? {},
+    // recipient ALREADY holds keeps the name it had at redeem (L6). Live only
+    // while the link is: withdrawal ends the projection, it does not keep it
+    // current.
+    name: revoked ? null : link.feed_name,
+    appearance: revoked ? {} : (link.feed_appearance ?? {}),
     // D7 — attribution travels, adoption counts do not. There is no add count
     // here, public or private: an adoption metric on a curatorial object is an
     // engagement surface by another name.
@@ -599,13 +627,19 @@ function linkToResponse(link: LinkRow, projection: FeedProjection | null) {
     isDefaultSeed: link.is_default_seed,
     // L7 — the feed this points at has been deleted or merged away. A state,
     // not a missing row.
-    gone: link.source_feed_id === null || link.feed_name === null,
+    gone,
     sourceCount: projection?.sources.length ?? 0,
     // Named out loud, never silently omitted: an author who shares a feed with
     // three email sources must be able to see that three did not travel, or
     // they believe they shared their whole feed (D5, count now live — L8).
     excludedCount: projection?.excludedCount ?? 0,
     refusal: projection?.refusal ?? null,
+    // The cap the refusal is measured against, on the link itself (§0u.6). It
+    // was only ever on the STATUS read, so a composer whose status GET blipped
+    // had nothing to interpolate and fabricated a zero — rendering "trim it to
+    // 0" over a feed with a real cap. A dial the server holds is never a number
+    // the client should have to guess.
+    maxSources,
     sources: (projection?.sources ?? []).map(frozenSourceToResponse),
   };
 }
@@ -617,6 +651,7 @@ function linkToResponse(link: LinkRow, projection: FeedProjection | null) {
 export interface RedeemFailure {
   position: number;
   label: string;
+  /** `unresolvable` | `unreachable` | `invalid` | `suspended` | `error`. */
   reason: string;
 }
 
@@ -711,6 +746,24 @@ export async function populateFeedFromSources(
   for (let i = 0; i < sources.length; i++) {
     const s = sources[i];
     const label = s.displayName ?? s.tagValue;
+    // A SUSPENDED PROTOCOL IS SKIPPED AND COUNTED, NEVER LEFT TO FAIL AS
+    // "error" (§0u.2). `freezeSource` drops a publication while publications
+    // are dark, but that runs at CUT time — and a seed frozen before the
+    // 2026-08-31 suspension still holds its publication rows, which this replay
+    // was handing to `addSource` ungated. It threw TARGET_NOT_FOUND, filed
+    // under the catch-all `error` arm below, and the only witness was
+    // seedStarterFeeds' logger.error — at every signup, on the one path whose
+    // refusals have nowhere to report (ADR §6). So the exclusion is stated
+    // where the replay is, in the same words the cut uses, with a reason of its
+    // own so the Default-seed panel can say it out loud.
+    //
+    // Read at replay rather than at freeze because that is what makes the flag
+    // reversible: reinstating publications restores these rows with no data
+    // change and no re-cut.
+    if (s.sourceType === "publication" && !publicationsEnabled()) {
+      failed.push({ position: i, label, reason: "suspended" });
+      continue;
+    }
     try {
       const input = await resolveFormulaSource(s);
       if (!input) {
@@ -897,7 +950,7 @@ export function registerFeedFormulaRoutes(app: FastifyInstance) {
       const projection = await freezeFeedSources(pool, id, cap);
       const link = await loadLiveLinkForFeed(pool, id);
       return reply.send({
-        link: link ? linkToResponse(link, projection) : null,
+        link: link ? linkToResponse(link, projection, cap) : null,
         sourceCount: projection.sources.length,
         excludedCount: projection.excludedCount,
         refusal: projection.refusal,
@@ -928,11 +981,8 @@ export function registerFeedFormulaRoutes(app: FastifyInstance) {
       if (!feed) return reply.status(404).send({ error: "Feed not found" });
 
       const link = await mintLinkForFeed(id, ownerId);
-      const projection = await freezeFeedSources(
-        pool,
-        id,
-        await formulaMaxSources(),
-      );
+      const cap = await formulaMaxSources();
+      const projection = await freezeFeedSources(pool, id, cap);
       logger.info(
         {
           ownerId,
@@ -943,7 +993,7 @@ export function registerFeedFormulaRoutes(app: FastifyInstance) {
         },
         "Feed share link served",
       );
-      return reply.send({ link: linkToResponse(link, projection) });
+      return reply.send({ link: linkToResponse(link, projection, cap) });
     },
   );
 }
@@ -979,6 +1029,7 @@ export async function formulaPublicRoutes(app: FastifyInstance) {
             r.source_feed_id
               ? await freezeFeedSources(pool, r.source_feed_id, cap)
               : null,
+            cap,
           ),
         })),
       ),
@@ -1012,16 +1063,14 @@ export async function formulaPublicRoutes(app: FastifyInstance) {
       // own sentence and nothing else: projecting the composition of a feed the
       // author has withdrawn would publish exactly what they took down.
       const projectable = f.revoked_at === null && f.source_feed_id !== null;
+      const cap = await formulaMaxSources();
       return reply.send({
         formula: linkToResponse(
           f,
           projectable
-            ? await freezeFeedSources(
-                pool,
-                f.source_feed_id!,
-                await formulaMaxSources(),
-              )
+            ? await freezeFeedSources(pool, f.source_feed_id!, cap)
             : null,
+          cap,
         ),
       });
     },

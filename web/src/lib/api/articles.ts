@@ -1,7 +1,17 @@
 import { request } from "./client";
+import type { Post } from "../post/types";
 
 export interface ArticleMetadata {
   id: string;
+  /**
+   * The unified key (READING-LOG-AND-LIBRARY-ADR D8) — `feed_items.post_id`,
+   * resolved server-side by the article-metadata query. It is what names this
+   * piece to `/reading-log` and `/reading-positions`, both of which take a
+   * post_id and nothing else so that native and external readers speak one key.
+   * Never derive one client-side: post_id is minted once and its native branch
+   * has a fallback, so a derivation can name no row at all.
+   */
+  postId: string;
   nostrEventId: string;
   dTag: string;
   title: string;
@@ -33,6 +43,31 @@ export interface ArticleMetadata {
   } | null;
 }
 
+// The paywall arrival landing (PAYWALL-ARRIVAL-ADR §3, D4, §11.4).
+//
+// `arrival: false` is the answer for everyone who did not create their account
+// from THIS piece — which is every member signing in at the same gate, and
+// every ordinary reload by anyone else. There is no client-side test that could
+// stand in for it: the discriminator is `accounts.arrival_article_id`, stamped
+// at account creation, and a page view knows nothing about how its viewer's
+// account came to exist.
+//
+// `unlocked` is the server saying it performed the gate pass, which it does
+// only when the read costs nothing (at or below the cap, deliverable, no card).
+// When it is false the piece is simply still gated and the reader meets the
+// ordinary button — so the modal must not promise otherwise.
+export interface ArrivalResponse {
+  arrival: boolean;
+  unlocked?: boolean;
+  /** The ordinary welcome gift as it stood FOR THIS READER — the dial at the
+   *  moment they were granted it, not the live one, which is a different number
+   *  the day an operator retunes (migration 169's rule, migration 188's twin). */
+  welcomeGiftPence?: number;
+  arrivalGiftPence?: number;
+  pricePence?: number | null;
+  gatePass?: GatePassResponse;
+}
+
 interface GatePassResponse {
   readEventId: string;
   allowanceJustExhausted?: boolean;
@@ -48,6 +83,15 @@ export const articles = {
 
   gatePass: (nostrEventId: string) =>
     request<GatePassResponse>(`/articles/${nostrEventId}/gate-pass`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+
+  // Keyed on the D-TAG, not the nostr event id, because the thing being tested
+  // is "is this the URL this account was created from" and the d-tag is what
+  // that URL contains.
+  arrival: (dTag: string) =>
+    request<ArrivalResponse>(`/articles/${dTag}/arrival`, {
       method: "POST",
       body: JSON.stringify({}),
     }),
@@ -155,45 +199,6 @@ export const myArticles = {
 };
 
 // =============================================================================
-// Bookmarks
-// =============================================================================
-
-export interface BookmarkedArticle {
-  id: string;
-  nostr_event_id: string;
-  nostr_d_tag: string;
-  title: string;
-  slug: string;
-  summary: string | null;
-  word_count: number | null;
-  access_mode: string;
-  price_pence: number | null;
-  published_at: string;
-  author_username: string;
-  author_display_name: string | null;
-  author_pubkey: string;
-  author_avatar: string | null;
-  bookmarked_at: string;
-}
-
-export const bookmarks = {
-  add: (nostrEventId: string) =>
-    request<{ ok: boolean }>(`/bookmarks/${nostrEventId}`, { method: "POST" }),
-
-  remove: (nostrEventId: string) =>
-    request<{ ok: boolean }>(`/bookmarks/${nostrEventId}`, {
-      method: "DELETE",
-    }),
-
-  list: (limit = 20, offset = 0) =>
-    request<{ articles: BookmarkedArticle[]; hasMore: boolean }>(
-      `/bookmarks?limit=${limit}&offset=${offset}`,
-    ),
-
-  ids: () => request<{ eventIds: string[] }>("/bookmarks/ids"),
-};
-
-// =============================================================================
 // Tags
 // =============================================================================
 
@@ -224,12 +229,20 @@ export const tags = {
 };
 
 // =============================================================================
-// Reading History
+// The all.haus library — what the reader ACQUIRED (D2)
+//
+// Every piece a `read_event` exists for, gifted and subscription reads
+// included: the test is *acquired*, not *charged*. Its twin is the reading log
+// below, which records attention rather than possession — neither is a filter
+// of the other.
+//
+// Replaces `readingHistory`, whose route (`/my/reading-history`) answered 500
+// for every caller from the day it was written and so had never returned a row.
 // =============================================================================
 
-export interface ReadingHistoryItem {
+export interface LibraryItem {
   articleId: string;
-  readAt: string;
+  acquiredAt: string;
   title: string | null;
   slug: string | null;
   dTag: string | null;
@@ -242,16 +255,61 @@ export interface ReadingHistoryItem {
   };
 }
 
-export const readingHistory = {
+export const library = {
   list: (limit = 50, offset = 0) =>
-    request<{ items: ReadingHistoryItem[] }>(
-      `/my/reading-history?limit=${limit}&offset=${offset}`,
+    request<{ items: LibraryItem[] }>(
+      `/my/library?limit=${limit}&offset=${offset}`,
     ),
 };
 
 // =============================================================================
-// Reading positions (per-article scroll resumption)
+// Recent reading — what the reader OPENED (D1/D3/D5)
+//
+// Every piece opened in a reader, all.haus or not, paid or not, on a rolling
+// window. One row per piece at its latest open, so returning to something moves
+// it up the list rather than filling the list with it.
+//
+// `record` is FIRE-AND-FORGET by contract and swallows its own failure here as
+// well as at the call site: a failed write loses a row, and a write that could
+// fail an open would cost the reader the piece. It is called on reader MOUNT,
+// never on unlock — see hooks/useReadingLog.ts, the log's one writer.
 // =============================================================================
+
+export const readingLog = {
+  record: (postId: string) =>
+    request<{ ok: boolean; logged: boolean }>("/reading-log", {
+      method: "POST",
+      body: JSON.stringify({ postId }),
+    }).catch(() => ({ ok: false, logged: false })),
+
+  // `hasMore` comes from the SERVER, off the log itself. The page's own length
+  // cannot answer it: a row whose piece no longer resolves is skipped by the
+  // join, so a full page can arrive short and "shorter than asked for" does not
+  // mean "the end".
+  list: (limit = 50, offset = 0) =>
+    request<{ items: ReadingLogEntry[]; hasMore: boolean }>(
+      `/reading-log?limit=${limit}&offset=${offset}`,
+    ),
+
+  clear: () =>
+    request<{ ok: boolean; deleted: number }>("/reading-log", {
+      method: "DELETE",
+    }),
+};
+
+// =============================================================================
+// Reading positions (per-piece scroll resumption)
+//
+// Keyed on post_id since migration 189 (D8): an external post has no `articles`
+// row, so the old nostr-event key meant resume worked on native pieces and not
+// external ones.
+// =============================================================================
+
+/** One row of Recent reading: when it was opened, and the card it renders as. */
+export interface ReadingLogEntry {
+  openedAt: string;
+  post: Post;
+}
 
 export interface ReadingPosition {
   scrollRatio: number;
@@ -259,29 +317,36 @@ export interface ReadingPosition {
 }
 
 export const readingPositions = {
-  get: (nostrEventId: string) =>
+  get: (postId: string) =>
     request<{ position: ReadingPosition | null }>(
-      `/reading-positions/${nostrEventId}`,
+      `/reading-positions/${postId}`,
     ),
 
-  upsert: (nostrEventId: string, scrollRatio: number) =>
-    request<{ ok: boolean }>(`/reading-positions/${nostrEventId}`, {
+  upsert: (postId: string, scrollRatio: number) =>
+    request<{ ok: boolean }>(`/reading-positions/${postId}`, {
       method: "PUT",
       body: JSON.stringify({ scrollRatio }),
     }),
 };
 
-export const readingPreferences = {
-  get: () => request<{ alwaysOpenAtTop: boolean }>("/me/reading-preferences"),
+export interface ReadingPrefs {
+  alwaysOpenAtTop: boolean;
+  /** D1's stop-logging switch for Recent reading. */
+  readingLogEnabled: boolean;
+}
 
-  update: (alwaysOpenAtTop: boolean) =>
-    request<{ ok: boolean; alwaysOpenAtTop: boolean }>(
-      "/me/reading-preferences",
-      {
-        method: "PUT",
-        body: JSON.stringify({ alwaysOpenAtTop }),
-      },
-    ),
+export const readingPreferences = {
+  get: () => request<ReadingPrefs>("/me/reading-preferences"),
+
+  // Both dials go in one call because they share a settings section and a row.
+  // `readingLogEnabled` is optional at the route: omitting it leaves the column
+  // alone, so a caller that knows only about resume cannot switch a member's
+  // logging back on by touching the other toggle.
+  update: (prefs: { alwaysOpenAtTop: boolean; readingLogEnabled?: boolean }) =>
+    request<{ ok: true } & ReadingPrefs>("/me/reading-preferences", {
+      method: "PUT",
+      body: JSON.stringify(prefs),
+    }),
 };
 
 export const privacyPreferences = {

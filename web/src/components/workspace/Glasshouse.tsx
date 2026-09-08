@@ -55,7 +55,7 @@ import { useLightbox } from "../../stores/lightbox";
 import { useBackGuard } from "../../lib/backGuard";
 import { isDragSurface } from "../../lib/dragSurface";
 import { MOBILE_BAR_H } from "./MobileWorkspace";
-import { NAV_BAR_H } from "./NavBar";
+import { NAV_BAR_H, NAV_BAR_BAND } from "./NavBar";
 
 // Gutter between the pane and the viewport edge. (Not a lattice value — the
 // shared drag/resize lattice is GRID = 8, grid.ts.)
@@ -141,6 +141,16 @@ function writeSize(key: string, size: { w: number; h: number }) {
     /* ignore */
   }
 }
+/** Forget a stretched size, so the pane falls back to the default width and
+ *  fill/content height. A drag begun in the default view uses this: the
+ *  arrangement it replaces has to go whole. */
+function clearSize(key: string) {
+  try {
+    localStorage.removeItem(sizeStoreKey(key));
+  } catch {
+    /* ignore */
+  }
+}
 
 // Placement of the pane: a draggable, grid-snapped, viewport-clamped position
 // that persists per overlay.
@@ -167,7 +177,7 @@ function writeSize(key: string, size: { w: number; h: number }) {
 // never changes: the chrome is z-58, above the pane (z-56), so a pane that
 // ignored it would slide underneath something opaque. Applied unconditionally
 // on the desktop path: a member always lands in the workspace (HomeRedirect /
-// WorkspacePaneRedirect), so a desktop pane over a bar-less standalone page is
+// ?overlay= on /reader), so a desktop pane over a bar-less standalone page is
 // only ever a transient pre-redirect frame.
 //
 // TOP-EDGE CHROME RESERVES DIFFERENTLY FROM BOTTOM-EDGE CHROME, and this is the
@@ -190,9 +200,21 @@ const widthFor = (maxWidth: number, vw: number) =>
 const minXFor = () => 0;
 const maxXFor = (maxWidth: number, vw: number) =>
   Math.max(0, vw - widthFor(maxWidth, vw));
-// The pane's y has a FLOOR (the bar's inner edge) and a ceiling that keeps at
-// least 120px of the pane — its draggable top + chrome — on-screen.
-const minYFor = (coverNavChrome = false) => barFor(coverNavChrome);
+// The pane's y has a FLOOR and a ceiling that keeps at least 120px of the pane
+// — its draggable top + chrome — on-screen. THE FLOOR IS THE BAR'S OPTICAL
+// BAND, NOT ITS TRUE EDGE (`NAV_BAR_BAND`, 2026-09-06): a pane may come no
+// closer to the bar than a vessel does. The bar's bottom edge at `NAV_BAR_H` is
+// invisible by construction — band and floor are one bone — and the disc's
+// off-centre placement is licensed by that. A pane dragged flush to
+// `NAV_BAR_H` traced that edge with its own top, the one line the whole bar is
+// built on nobody seeing; and it was also the case that kept the Explain
+// pane-mode scrim at `inset: 0` (a cut at the band would have left the pane's
+// top 8px undimmed), which drew the same edge for every pane-mode Explain,
+// dragged or not. With the floor at the band both artefacts are gone and the
+// three dimming layers cut at one line (web/CLAUDE.md › *A dimming layer must
+// not draw an edge*).
+const minYFor = (coverNavChrome = false) =>
+  coverNavChrome ? 0 : NAV_BAR_BAND;
 const maxYFor = (vh: number, coverNavChrome = false) =>
   Math.max(minYFor(coverNavChrome), vh - 120);
 // The default opening y: clear of the bar with a gutter under it. In the row
@@ -262,10 +284,14 @@ function usePanePlacement(
   // `pos`/`size`) and the DEFAULT placement (snapped-centre, default width,
   // fill/content height) — the pane-scoped mirror of the workspace floor's `\`
   // (which is inert while a pane is open). It is a transient, NON-DESTRUCTIVE
-  // view: `pos`/`size` stay in state, so a second `\` restores the custom
-  // arrangement, while a drag/resize commits a new custom one and clears it.
-  // Resets to false each time the pane opens (the hook remounts), so a member
-  // always lands on their saved arrangement first.
+  // view while it is only a view: `pos`/`size` stay in state, so a second `\`
+  // restores the custom arrangement verbatim. ADJUSTING THE PANE IN THE DEFAULT
+  // VIEW IS WHAT MAKES IT DESTRUCTIVE, and it replaces the custom arrangement
+  // WHOLE rather than editing one axis of it (see startDrag / startResize) — a
+  // member who has toggled to the default is starting from there, so a drag must
+  // not restore the old stretched size and a stretch must not restore the old
+  // spot. Resets to false each time the pane opens (the hook remounts), so a
+  // member always lands on their saved arrangement first.
   const [showDefault, setShowDefault] = useState(false);
   const toggleDefault = useCallback(() => setShowDefault((v) => !v), []);
 
@@ -313,12 +339,28 @@ function usePanePlacement(
       : pos;
     const offX = e.clientX - base.x;
     const offY = e.clientY - base.y;
+    // AN ADJUSTMENT MADE IN THE DEFAULT VIEW STARTS FROM SCRATCH THERE. The
+    // gesture doesn't edit the custom arrangement, it REPLACES it: the default
+    // placement plus this one edit. For a drag that means dropping the stretched
+    // size along with the position, or the pane would take the new spot and then
+    // snap back to a size the member has just toggled away from — the custom
+    // arrangement reappearing halfway, which is exactly what `\` was pressed to
+    // leave. (Resize does the mirror below: it pins the default POSITION.) The
+    // floor's `\` has always worked this way — `materializeIfRegimented` stamps
+    // the whole parade before applying the drop (WorkspaceView §V).
+    const fromDefault = showDefault;
+    // A press that never moved is not an adjustment and commits NOTHING — the
+    // pane twin of the floor's `dropIsNoop` / the vessel's `unchanged` guard.
+    // It matters more now that a from-default commit discards the stored size:
+    // a stray click on the pane must not be what destroys it.
+    let moved = false;
     // Suppress text selection while the window rides the cursor (whole-pane drag
     // can start on a margin and sweep over prose). Restored on gesture teardown.
     const prevUserSelect = document.body.style.userSelect;
     document.body.style.userSelect = "none";
     const onUp = (ev: PointerEvent) => {
       gestureCleanupRef.current?.();
+      if (!moved) return;
       const dropped = {
         x: clampN(snap(ev.clientX - offX), minXFor(), maxXFor(maxWidth, vw)),
         y: clampN(snap(ev.clientY - offY), minYFor(coverNavChrome), maxYFor(vh, coverNavChrome)),
@@ -327,7 +369,11 @@ function usePanePlacement(
       // Batched with setPos, so the pane never flashes the old custom spot.
       setShowDefault(false);
       setPos(dropped);
-      if (persistKey) writePos(persistKey, dropped);
+      if (fromDefault) setSize(null);
+      if (persistKey) {
+        writePos(persistKey, dropped);
+        if (fromDefault) clearSize(persistKey);
+      }
     };
     const onMove = (ev: PointerEvent) => {
       // Button released outside the window: no pointerup ever reaches us, so
@@ -337,7 +383,11 @@ function usePanePlacement(
         onUp(ev);
         return;
       }
+      moved = true;
       setShowDefault(false);
+      // Live, not just on release: the pane keeps the default's width and
+      // fill-height for the whole gesture, so nothing flashes back mid-drag.
+      if (fromDefault) setSize(null);
       setPos({
         x: clampN(ev.clientX - offX, minXFor(), maxXFor(maxWidth, vw)),
         y: clampN(ev.clientY - offY, minYFor(coverNavChrome), maxYFor(vh, coverNavChrome)),
@@ -372,8 +422,13 @@ function usePanePlacement(
       w: snap(clampN(startW + (ev.clientX - startX), MIN_W, maxW)),
       h: snap(clampN(startH + (ev.clientY - startY), MIN_H, maxH)),
     });
+    // As in the drag: a press on the grip that never moved commits nothing, so a
+    // bare click can't freeze a fill-height pane to a number or pin the default
+    // view as the new custom arrangement.
+    let moved = false;
     const onUp = (ev: PointerEvent) => {
       gestureCleanupRef.current?.();
+      if (!moved) return;
       const next = resolve(ev);
       // A resize commits a new custom arrangement; leave the default view. If the
       // pane was showing default at a non-custom position, also pin that position
@@ -391,6 +446,7 @@ function usePanePlacement(
         onUp(ev);
         return;
       }
+      moved = true;
       if (showDefault) setPos({ x: baseX, y: baseY });
       setShowDefault(false);
       setSize(resolve(ev));
@@ -754,13 +810,43 @@ export function Glasshouse({
 
   return (
     <>
-      {/* Frosted scrim — full viewport, click to close. `.gh-scrim` (globals.css)
-          blurs AND desaturates + washes the backdrop toward the mode's neutral
-          ground, so the fixed parchment pane always meets the same field whatever
-          per-feed scheme is behind (GLASSHOUSE-AND-PALETTE-ADR §III.1 — separation
-          is the scrim's job, identity is the pane's). z-[55] sits above the
-          workspace (so it blurs) but below the ForallMenu (z-60). */}
-      <div className="fixed inset-0 z-[55] gh-scrim" onClick={onClose} />
+      {/* Frosted scrim — click to close. `.gh-scrim` (globals.css) blurs AND
+          desaturates + washes the backdrop toward the mode's neutral ground, so
+          the fixed parchment pane always meets the same field whatever per-feed
+          scheme is behind (GLASSHOUSE-AND-PALETTE-ADR §III.1 — separation is the
+          scrim's job, identity is the pane's). z-[55] sits above the workspace
+          (so it blurs) but below the ForallMenu (z-60).
+
+          IT STARTS AT THE BAR'S OPTICAL EDGE, NOT THE VIEWPORT'S TOP, and the
+          number is `NAV_BAR_BAND`, the same line both Explain scrims and the
+          pane's own y floor take — the rule is *a dimming layer must not draw
+          an edge the design depends on not having* (web/CLAUDE.md), and this
+          is the sweep that section says had not been done. Two separate
+          artefacts came off
+          `inset: 0`, both of them right under the bar and both invisible in a
+          diff. The bar is opaque `bone` at z-58, so its own 48px was never
+          being dimmed anyway; what WAS being dimmed is the floor's 8px top
+          buffer beneath it, which put the band's true bottom edge on screen —
+          the same seam, and the same falsified premise, as one surface over.
+          And a backdrop filter samples across its own box, so the blur dragged
+          the white page ground behind the bar down over the join as a soft pale
+          ramp: a coarse greyscale gradient hanging under the bar for ~14px,
+          which is exactly the width of the gutter between the bar and a pane at
+          its default y. Clipping the scrim to the band ends both.
+
+          Nothing is lost by the cut — the opaque bar already ate every click
+          in that strip, and this scrim sits at z-55, UNDER the pane, so it
+          never dims a pane at all. (The Explain pane-mode scrim, which sits
+          ABOVE the pane, once kept `inset: 0` so a pane dragged flush to the
+          bar stayed dimmed to its top; the pane's y floor is now the band
+          itself, so that exception is gone too.) Full viewport when
+          there is no bar standing: the mobile sheet, and the reader, which
+          un-mounts the bar (`coverNavChrome`). */}
+      <div
+        className="fixed inset-x-0 bottom-0 z-[55] gh-scrim"
+        style={{ top: isMobile || coverNavChrome ? 0 : NAV_BAR_BAND }}
+        onClick={onClose}
+      />
 
       {/* Pane wrapper — click outside the pane closes. */}
       <div className="fixed inset-0 z-[56]" onClick={onClose}>

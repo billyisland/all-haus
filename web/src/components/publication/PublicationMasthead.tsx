@@ -7,11 +7,11 @@ import { PubFollowButton } from './PubFollowButton'
 //
 // IT REPLACED A SECOND CHASSIS. These routes used to mount their own
 // `PublicationNav` + `PublicationFooter` from `pub/[slug]/layout.tsx`, which
-// stacked a nav bar on top of the sitewide `PublicNavRow` that `LayoutShell`
-// already mounts for every non-workspace route — two chromes on one page, and
-// the layout never cleared `--ah-row-band`, so the fixed row sat over the
-// footer. Both are gone: the publication now sits in the public register like
-// every other logged-out surface, and its identity is carried HERE, by its own
+// stacked a nav bar on top of the sitewide nav chrome (now `PublicNavBar`) that
+// `LayoutShell` already mounts for every non-workspace route — two chromes on
+// one page, and the layout never cleared the reserved band, so the fixed chrome
+// sat over the footer. Both are gone: the publication now sits in the public
+// register like every other logged-out surface, and its identity is carried HERE, by its own
 // cover and name, rather than by a bar that imitated the site's.
 //
 // THE COVER IS FULL-BLEED AND THE REST IS MEASURED. A cover image is the one

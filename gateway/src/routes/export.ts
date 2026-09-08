@@ -24,6 +24,29 @@ import logger from '@platform-pub/shared/lib/logger.js'
 //                   to get the raw 32-byte key, then use algorithm to decrypt)
 //   receiptWhitelist — per-article list of reader Nostr pubkeys who have paid
 //                   (another host can honour these readers without re-charging)
+//   reading       — the caller's OWN reading log and saved positions
+//                   (READING-LOG-AND-LIBRARY-ADR §6). This route is misnamed for
+//                   that half and the name is the older thing: it is not only an
+//                   author migration bundle, it is the one place a member gets
+//                   their own data back. §6 is explicit that the log belongs
+//                   here — the export is the reader's data delivered TO the
+//                   reader, not a publishing surface, and it already carries
+//                   their `read_events` and their nsec. Withholding the log
+//                   would be withholding a member's own reading from them,
+//                   which is what an earlier draft of that line did.
+//
+//                   D1's privacy posture is satisfied rather than breached:
+//                   every row here is scoped to `req.session.sub` like the rest
+//                   of the route, and the log must still never reach the owner
+//                   dashboard, a writer-facing analytic, or any export a THIRD
+//                   PARTY receives.
+//
+//                   Rows are exported RAW — `post_id` and timestamps, with no
+//                   join to `feed_items`. A resolved title would be prettier and
+//                   would also make the export a set of live pointers rather
+//                   than a record of what happened (D7): a piece deleted since
+//                   it was read would silently vanish from the member's own
+//                   history at exactly the moment they asked for a copy of it.
 //
 // The Nostr events themselves (profile kind 0, follow list kind 3, articles
 // kind 30023) are published to the relay and can be fetched by the client
@@ -186,6 +209,37 @@ export async function exportRoutes(app: FastifyInstance) {
       return reply.status(502).send({ error: 'Failed to retrieve account key' })
     }
 
+    // The reader half. Scoped to the caller like everything else here, and
+    // capped: an unbounded export is a way to ask the database for an
+    // arbitrarily large response, and the log is windowed by the retention
+    // sweep anyway (`reading_log_retention_days`), so the cap is a backstop
+    // rather than a policy. If it is ever hit the export says so rather than
+    // silently shipping a truncated history as a complete one.
+    const READING_EXPORT_CAP = 10000
+    const readingLogRow = await pool.query<{
+      post_id: string
+      opened_at: Date
+    }>(
+      `SELECT post_id, opened_at
+         FROM reading_log
+        WHERE user_id = $1
+        ORDER BY opened_at DESC
+        LIMIT $2`,
+      [writerId, READING_EXPORT_CAP]
+    )
+    const readingPositionsRow = await pool.query<{
+      post_id: string
+      scroll_ratio: string | number
+      updated_at: Date
+    }>(
+      `SELECT post_id, scroll_ratio, updated_at
+         FROM reading_positions
+        WHERE user_id = $1
+        ORDER BY updated_at DESC
+        LIMIT $2`,
+      [writerId, READING_EXPORT_CAP]
+    )
+
     const contentKeysByArticleId = new Map(contentKeys.map(k => [k.articleId, k]))
 
     // Build articles list with key info merged in
@@ -212,8 +266,13 @@ export async function exportRoutes(app: FastifyInstance) {
     })
 
     logger.info(
-      { writerId, articleCount: articles.length, keyCount: contentKeys.length },
-      'Author migration export'
+      {
+        writerId,
+        articleCount: articles.length,
+        keyCount: contentKeys.length,
+        readingLogEntries: readingLogRow.rows.length,
+      },
+      'Account export'
     )
 
     return reply.status(200).send({
@@ -227,12 +286,35 @@ export async function exportRoutes(app: FastifyInstance) {
         displayName: account.display_name,
       },
       articles,
+      // The reader's own two logs (§6). `post_id` is the unified key spanning
+      // both id-spaces, so one list covers native and external alike.
+      reading: {
+        log: readingLogRow.rows.map(r => ({
+          postId: r.post_id,
+          openedAt: r.opened_at.toISOString(),
+        })),
+        positions: readingPositionsRow.rows.map(r => ({
+          postId: r.post_id,
+          scrollRatio: Number(r.scroll_ratio),
+          updatedAt: r.updated_at.toISOString(),
+        })),
+        // Said in the payload rather than left to be inferred from a round
+        // number: a capped history that reads as a complete one is the same
+        // failure class as a truncated alert payload.
+        truncated:
+          readingLogRow.rows.length === READING_EXPORT_CAP ||
+          readingPositionsRow.rows.length === READING_EXPORT_CAP,
+        retentionNote:
+          'Recent reading is kept for a limited window and swept; this is what remains, not everything ever opened.',
+      },
       // Summary counts for quick validation
       summary: {
         totalArticles: articles.length,
         paywallArticles: articles.filter(a => a.isPaywalled).length,
         contentKeysExported: contentKeys.length,
         uniqueReaders: new Set(articles.flatMap(a => a.readerPubkeys)).size,
+        readingLogEntries: readingLogRow.rows.length,
+        readingPositions: readingPositionsRow.rows.length,
       },
     })
   })

@@ -54,7 +54,7 @@ export async function sourcesRoutes(app: FastifyInstance) {
 
       try {
         const { rows: sourceRows } = await pool.query(
-          `SELECT id, protocol, source_uri, display_name, avatar_url, description
+          `SELECT id, protocol, source_uri, display_name, description
            FROM external_sources
            WHERE id = $1 AND is_active = TRUE`,
           [id],
@@ -85,7 +85,6 @@ export async function sourcesRoutes(app: FastifyInstance) {
           protocol: s.protocol,
           sourceUri: s.source_uri,
           displayName: s.display_name,
-          avatarUrl: s.avatar_url,
           description: s.description,
           followTarget: {
             type: "source" as const,

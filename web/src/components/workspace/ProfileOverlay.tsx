@@ -17,7 +17,7 @@ import { usePathname } from "next/navigation";
 import { useProfile } from "../../stores/profileOverlay";
 import { Glasshouse } from "./Glasshouse";
 import { NativeProfilePanel } from "../profile/NativeProfilePanel";
-import { profilePalette } from "../profile/ProfileChrome";
+import { PROFILE_PANE_WIDTH, profilePalette } from "../profile/ProfileChrome";
 import { VESSEL_WALL } from "./tokens";
 import { useResolvedDark } from "../../stores/colorScheme";
 import { AuthorProfileView } from "../../app/author/[authorId]/AuthorProfileView";
@@ -73,7 +73,9 @@ export function ProfileOverlay() {
       onClose={close}
       onSupersede={dismiss}
       selfHistory
-      maxWidth={860}
+      // One home with the standalone pages' column, so the two registers of one
+      // surface cannot drift in width (`PROFILE_PANE_WIDTH`).
+      maxWidth={PROFILE_PANE_WIDTH}
       ariaLabel="Profile"
       persistKey="profile"
       frameColor={palette.walls}

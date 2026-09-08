@@ -12,7 +12,6 @@ interface MemberShare {
   accountId: string
   username: string
   displayName: string
-  avatarBlossomUrl: string | null
   role: string
   contributorType: string
   isOwner: boolean
@@ -150,7 +149,7 @@ export function PayrollTab({ publicationId }: Props) {
       {articleShares.length > 0 && (
         <div className="bg-glasshouse-well px-6 py-5">
           <p className="label-ui text-grey-400 mb-4">Per-article overrides</p>
-          <div className="overflow-x-auto">
+          <div className="overflow-x-auto ah-scrollbar">
             <table className="w-full text-ui-xs">
               <thead>
                 <tr className="border-b-2 border-grey-200">

@@ -13,7 +13,8 @@ import {
   type HoverTarget,
 } from "../../stores/explain";
 import { useExplainRegistry } from "./ExplainProvider";
-import { NAV_BAR_H } from "./NavBar";
+import { NAV_BAR_H, NAV_BAR_BAND } from "./NavBar";
+import { GRID } from "../../lib/workspace/grid";
 import {
   type ExplainKind,
   explainCardCopy,
@@ -32,7 +33,8 @@ import { useGlasshousePresence } from "../../stores/glasshouse";
 //     No pinned sequence bubble, no leader — the element-anchored placement
 //     scattered bubbles across the screen and the perpetually-dimmed pinned
 //     bubble read as half-triggered noise (2026-07-15 live review).
-//   - First-run (dormant) keeps the pinned stepping bubble: element-anchored
+//   - First-run (launched from the welcome sheet's last step; only its D6
+//     AUTO-entry is dormant) keeps the pinned stepping bubble: element-anchored
 //     placement (right → left → below → above), the 2px crimson leader with a
 //     4px dot at the target end, live `getBoundingClientRect` measurement
 //     re-run on a ResizeObserver (floor container + the pinned target's own
@@ -69,7 +71,14 @@ import { useGlasshousePresence } from "../../stores/glasshouse";
 const CHROME_ATTR = "data-explain-chrome";
 
 const BUBBLE_WIDTH = 300; // fixed width → predictable placement; height adapts
-const GAP = 14; // target edge → bubble gap
+// Target edge → bubble gap, and the length of the crimson leader that spans it.
+// WAS 14 (2026-09-04): the bubbles read as cramped against the things they
+// explain — the leader too short to register as a line, so the bubble looked
+// stuck to its subject rather than pointing at it. Now 3·GRID, which also puts
+// it back on the lattice everything else in the workspace lives on; 14 was the
+// outlier. Widening this makes a side less likely to `fit` and flip, which is
+// the thing to check if a beat starts choosing a different side.
+const GAP = 3 * GRID;
 const MARGIN = 10; // viewport margin the bubble keeps clear
 const ENTER_MS = 200; // opacity / leader-draw enter duration
 const CURSOR_GAP_X = 18; // cursor → hover-bubble offset (flips to keep on-screen)
@@ -492,7 +501,56 @@ export function ExplainOverlay() {
           2026-07-16). Floor mode sits at z-50 (under any Glasshouse); pane
           mode rises to z-57 — above the pane (z-56) it annotates, still under
           the nav row (z-58) and the ForallMenu (z-60). Pointer leaving the viewport clears the hover
-          so no stale bubble lingers. */}
+          so no stale bubble lingers.
+
+          IN BOTH MODES IT STARTS AT THE BAR'S OPTICAL EDGE, NOT THE
+          VIEWPORT'S TOP — `NAV_BAR_BAND` (floor mode since 2026-09-04, pane
+          mode since 2026-09-06), and the number is `NAV_BAR_H + GRID` rather
+          than `NAV_BAR_H`. The nav bar is opaque `bone` at z-58, so it already
+          paints over the scrim for its own 48px; what an `inset: 0` scrim
+          dims is the FLOOR'S OWN TOP BUFFER beneath it — the 8px margin
+          `layoutColumns` starts every column past. Bone above, dimmed bone
+          below, and the seam lands at 48.
+
+          THAT SEAM DRAWS A LINE THE WHOLE BAR IS BUILT ON NOT EXISTING.
+          `NavBar`'s geometry is deliberate and derived: the disc is NOT centred
+          in the band — it sits at `INSET` with its bottom flush to the band's
+          bottom edge, so the floor's buffer supplies the matching gap below and
+          the two optical gaps come out 8 and 8. That construction is licensed
+          by one stated premise — the band's bottom edge is invisible, because
+          `FLOOR` and the bar's ground are both `var(--ah-bone)`. A scrim at
+          `inset: 0` falsifies it, and the first thing anyone sees in Explain is
+          a 48px band with a 40px disc jammed against its bottom. The bar is not
+          wrong; its correctness was conditional on an invisibility this
+          component was removing.
+
+          So the undimmed strip is 0..56 — exactly the bar the eye already
+          reads, since 56 is the first vessel's top. Nothing moves in the
+          workspace's normal state; a centred disc and a taller band were both
+          considered and are worse (the floor's GRID lands in the lower gap
+          whatever the band does, so they buy 8-above/16-below — the thing
+          reversed on 2026-08-25).
+
+          PANE MODE KEPT `inset: 0` FOR TWO DAYS, AND THAT WAS THE BREAK. The
+          reasoning was that a pane's minimum y was `NAV_BAR_H`, so a pane
+          dragged flush to the bar would have had its top 8px undimmed by a
+          scrim cut at the band. True — but the cost was paid on EVERY
+          pane-mode Explain, dragged or not: this layer sits UNDER the bar
+          (z-57 < 58) and over the frost (z-55, itself cut at the band), so
+          `inset: 0` here dimmed the 8px strip between the two and nothing else
+          — a third tone between the bar's bone and the frost, i.e. the bar's
+          true edge at 48 AND the frost's at 56, measured 240 → 206 → 200 down a
+          column beside the pane. The exception was removed at its root rather
+          than here: the pane's y floor is now the band itself
+          (`Glasshouse.minYFor`), so no pane can occupy the strip and there is
+          nothing above 56 for this scrim to leave undimmed. One line, three
+          dimming layers, no cases.
+
+          The cost is that a click on bare bar ground no longer dismisses.
+          Its occupants live above the scrim and keep their own click jobs
+          anyway, so this only affects the empty stretch between them — and
+          beat 4 points AT the bar, so freezing it under a dismiss target was
+          never quite right. */}
       <div
         {...{ [CHROME_ATTR]: "" }}
         onPointerMove={handlePointerMove}
@@ -501,7 +559,10 @@ export function ExplainOverlay() {
         onClick={handleClick}
         style={{
           position: "fixed",
-          inset: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          top: NAV_BAR_BAND,
           zIndex: paneMode ? 57 : 50,
           background: "rgb(var(--ah-true-black-rgb) / 0.14)",
           cursor: "default",
@@ -697,15 +758,18 @@ function placeBubble(rect: DOMRect | null, size: { w: number; h: number }): Plac
 // Leader endpoints: from the target's facing-edge midpoint to the bubble's
 // near-edge midpoint. The dot sits at the target end (x1, y1).
 //
-// THE LEADER MAY CROSS THE BAR; THE BUBBLE MAY NOT. Check this if the first-run
-// tour is ever revived (its controller has been dormant since 2026-07-15, so
-// none of this renders today). Beat 4 is the only beat anchored on bar chrome —
-// the ∀ disc, at the top-left — and with `placeBubble` fenced at TOP_FENCE its
-// body now lands below the bar whichever side wins. The LEADER still crosses:
-// the stub from the disc down to the bar's inner edge paints under z-58. That
-// is the same trade the bottom row and the left rail each made, and is left as
-// it was — a leader is a 2px line to a target the reader can see, not the copy
-// they have to read.
+// THE LEADER MAY CROSS THE BAR; THE BUBBLE MAY NOT. This is live, not
+// hypothetical: only the D6 AUTO-entry is dormant, and the tour itself is
+// reached every first session from the welcome sheet's last step
+// (`FirstRunLauncher`, WorkspaceView). Beat 4 is the only beat anchored on bar
+// chrome — the ∀ disc, at the top-left — and with `placeBubble` fenced at
+// TOP_FENCE its body lands below the bar whichever side wins (driven on screen
+// 2026-09-01: beats 3 and 4 both clamp to exactly TOP_FENCE, at 1600/1280/1100/
+// 800 wide, with no bubble intersecting anything painted above it). The
+// LEADER still crosses: the stub from the disc down to the bar's inner edge
+// paints under z-58. That is the same trade the bottom row and the left rail
+// each made, and is left as it was — a leader is a 2px line to a target the
+// reader can see, not the copy they have to read.
 function leaderPoints(
   side: Side,
   rect: DOMRect,

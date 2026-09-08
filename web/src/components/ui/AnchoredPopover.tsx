@@ -25,6 +25,29 @@
 //
 // It re-measures on scroll and resize rather than assuming: the anchor sits in
 // a sticky bar inside a scroller, and the host pane is draggable.
+//
+// IT PORTALS, SO IT HAS TO MANAGE FOCUS ITSELF. This is the one cost of leaving
+// the pane, and it is easy to miss because everything else about the panel looks
+// right. An `absolute` panel sat NEXT IN DOM ORDER after its trigger, so Tab from
+// the trigger walked straight into it and the browser did the work. Portalled to
+// `document.body` the panel is elsewhere in the document entirely: Tab from the
+// trigger goes to the next control in the BAR, and a keyboard reader who opens
+// the report form cannot reach the form. So the panel takes a `role`, focus MOVES
+// into it on open, and focus RETURNS to the trigger on dismiss — the last of
+// those being the part that is invisible when you test with a mouse, and the part
+// that decides whether Escape leaves you where you were or at the top of the
+// document.
+//
+// The role is the CALLER'S to state, because only the caller knows what it built:
+// `ReportButton` opens a form (`dialog`, and a dialog needs a name, hence
+// `ariaLabel`), `ShareButton` opens a list of actions (`menu`). It defaults to
+// `dialog` — the safer of the two, since `menu` makes a screen reader promise
+// arrow-key navigation this primitive does not implement.
+//
+// GROUND AND LIFT ARE ONE DECISION, taken by the `over` prop — see its doc
+// comment. A popover over a READING SURFACE cannot be glasshouse: that token
+// and `white` are the same value in light mode, so the panel is white on white
+// and reads as pale nothing however good its shadow.
 // =============================================================================
 
 import {
@@ -43,6 +66,9 @@ import { useEscapeShield } from "../../hooks/useEscapeShield";
 const OFFSET = 4;
 /** Keep the panel this far off the viewport edges when clamping. */
 const VIEWPORT_MARGIN = 8;
+/** First stop for focus when the panel opens. */
+const FOCUSABLE =
+  'a[href],button:not([disabled]),input:not([disabled]):not([type="hidden"]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 
 export function AnchoredPopover({
   anchorRef,
@@ -50,6 +76,9 @@ export function AnchoredPopover({
   onDismiss,
   align = "end",
   width,
+  over = "scrim",
+  role = "dialog",
+  ariaLabel,
   className = "",
   children,
 }: {
@@ -65,6 +94,45 @@ export function AnchoredPopover({
    *  viewport, so alignment is a preference and never a guarantee. */
   align?: "start" | "end";
   width: number;
+  /**
+   * WHAT THIS POPOVER IS FLOATING OVER. One prop, because ground and lift are
+   * one decision (web/CLAUDE.md › *Floating material*), and answering half of
+   * it is what leaves a panel looking like a hole in the page.
+   *
+   * `scrim` (default) — over a frosted scrim, the bone floor, anything with a
+   * colour step already between the panel and its ground. `bg-glasshouse`, the
+   * top of the elevation ladder, and `shadow-lg` to finish a separation the
+   * step has already made.
+   *
+   * `paper` — over a READING SURFACE. `--ah-white` and `--ah-glasshouse` are
+   * BOTH 255 in light mode, so there is no step to make and no rung above
+   * glasshouse to climb to: a glasshouse panel there is white-on-white and
+   * reads as pale nothing however good its shadow. So the panel goes DOWN the
+   * ladder instead, to `grey-100` — the registry's own soft panel fill — and
+   * takes `.ah-lift` (the house's lifted-paper figure) rather than `shadow-lg`.
+   *
+   * `grey-100` is the one token that works in both directions, which is why it
+   * and not `glasshouse-well` or `bone`: light `#F2F1ED` sits below white, and
+   * dark `42 41 37` sits ABOVE the reading surface's `30 29 26` — a bigger step
+   * than glasshouse's own 35. The two tokens that read correctly in light
+   * (`glasshouse-well` 26, `bone` 20) both invert to DARKER than the surface,
+   * which paints the panel as a hole.
+   *
+   * It is a prop and not a `className` because neither half can be overridden
+   * from outside: two background utilities of equal specificity are settled by
+   * stylesheet order rather than class order, and `.ah-lift` sits in
+   * `@layer components` where the `shadow-lg` utility beats it outright.
+   */
+  over?: "scrim" | "paper";
+  /**
+   * What the panel IS, for a screen reader. `dialog` (the default) suits a form
+   * or a panel of controls; `menu` suits a list of actions — but only say `menu`
+   * if arrow-key navigation is genuinely there, since the role promises it.
+   * Whatever the trigger's `aria-haspopup` says, this should agree with it.
+   */
+  role?: "dialog" | "menu";
+  /** The accessible name. A `dialog` without one is announced as just "dialog". */
+  ariaLabel?: string;
   className?: string;
   children: ReactNode;
 }) {
@@ -135,6 +203,49 @@ export function AnchoredPopover({
     };
   }, [open, measure]);
 
+  // FOCUS IN ON OPEN, FOCUS BACK ON CLOSE.
+  //
+  // In: the first focusable thing in the panel, or the panel itself (it carries
+  // `tabIndex={-1}` for exactly this) when there is nothing to focus — a report
+  // receipt is prose with no control in it, and leaving focus behind on the
+  // trigger there would announce nothing at all.
+  //
+  // Back: to whatever had focus when the panel opened, which is the trigger in
+  // every current caller but is captured rather than assumed. It is skipped when
+  // focus has already MOVED somewhere else of the user's own accord — dragging
+  // focus back from wherever they went would be worse than doing nothing — and
+  // guarded on the node still being in the document, since a popover can outlive
+  // a trigger that re-rendered under it.
+  //
+  // IT KEYS ON `pos`, NOT ON `open`, AND THAT IS THE WHOLE OF IT WORKING. The
+  // panel renders `visibility: hidden` until it has been measured (one pre-paint
+  // frame, so it never paints at 0,0 and jumps) — and a `visibility: hidden`
+  // element CANNOT TAKE FOCUS. Keyed on `open` alone this ran against the hidden
+  // frame, every `.focus()` was a no-op, and the panel came up with focus still
+  // on the trigger: a change that looks right in the code, ships the role and the
+  // label correctly, and does nothing at all. Found by driving it, which is the
+  // only way it could have been found. `measured` is a boolean rather than `pos`
+  // itself so a scroll — which mints a new `pos` object every frame — does not
+  // re-run it and yank focus back.
+  const restoreRef = useRef<HTMLElement | null>(null);
+  const measured = pos !== null;
+  useEffect(() => {
+    if (!open || !measured) return;
+    restoreRef.current = (document.activeElement as HTMLElement) ?? null;
+    const panel = panelRef.current;
+    if (!panel) return;
+    const first = panel.querySelector<HTMLElement>(FOCUSABLE);
+    (first ?? panel).focus({ preventScroll: true });
+    return () => {
+      const back = restoreRef.current;
+      restoreRef.current = null;
+      if (!back || !back.isConnected) return;
+      const active = document.activeElement;
+      if (active && active !== document.body && !panel.contains(active)) return;
+      back.focus({ preventScroll: true });
+    };
+  }, [open, measured]);
+
   // Escape via the shared shield, so it closes this menu and not the host
   // Glasshouse under it (web/CLAUDE.md › Escape on a popover over a Glasshouse).
   useEscapeShield(open, onDismiss);
@@ -159,7 +270,10 @@ export function AnchoredPopover({
   return createPortal(
     <div
       ref={panelRef}
-      className={`bg-glasshouse shadow-lg ${className}`}
+      role={role}
+      aria-label={ariaLabel}
+      tabIndex={-1}
+      className={`${over === "paper" ? "bg-grey-100 ah-lift" : "bg-glasshouse shadow-lg"} focus:outline-none ${className}`}
       style={{
         position: "fixed",
         left: pos?.left ?? 0,

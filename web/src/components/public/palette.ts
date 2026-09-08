@@ -1,5 +1,6 @@
 'use client'
 
+import { createContext, useContext } from 'react'
 import { paletteFor, type VesselPalette } from '../workspace/tokens'
 import { useResolvedDark } from '../../stores/colorScheme'
 
@@ -19,11 +20,30 @@ import { useResolvedDark } from '../../stores/colorScheme'
 // let html.dark invert BASIC_DARK's explicit values a second time. Anything
 // rendering public chrome OUTSIDE a PublicVessel (the nav row) sits on the
 // plain `--ah-bone` floor and wants the un-islanded neutral slugs, so it does
-// not carry the island — see PublicNavRow.
+// not carry the island — see PublicNavBar.
 // =============================================================================
 
+// THE OVERLAY REGISTER'S SEAM (2026-09-04). `/about` renders twice — as the
+// public page and inside the workspace's AboutOverlay — and the two registers
+// resolve `basic` DIFFERENTLY, which is why this is a context and not a second
+// implementation of the cards. On the page the vessel is islanded, so `basic`
+// is BASIC_LIGHT/BASIC_DARK and the explicit dark values are what render. In a
+// Glasshouse there is no island (a scheme palette must be islanded and the
+// global one must not — ProfileChrome's PALETTE note), so the pane hands down
+// `globalContentPalette(dark)`: BASIC_LIGHT, whose slug refs invert under
+// html.dark, with the never-inverting stone tones corrected. Left to resolve
+// `basic` itself un-islanded, a card's `cardStandfirst` (stone-600) would sit
+// dark-on-dark — the exact bug globalContentPalette exists to fix.
+//
+// Provide it ONLY where the public primitives render outside a PublicVessel.
+// Everything else takes the default and is unchanged.
+const PublicPaletteContext = createContext<VesselPalette | null>(null)
+export const PublicPaletteProvider = PublicPaletteContext.Provider
+
 export function usePublicPalette(): VesselPalette {
-  return paletteFor('basic', useResolvedDark())
+  const override = useContext(PublicPaletteContext)
+  const own = paletteFor('basic', useResolvedDark())
+  return override ?? own
 }
 
 /** Side-wall thickness. The workspace vessel's wall (Vessel.tsx). */
@@ -63,21 +83,10 @@ export const SLAB = 4
 // If bone at 4px reads hot in dark once you see it, the fallback is
 // `cardStandfirst` (stone-300, 180 178 169) — but that would also lighten the
 // light mode, so change it here rather than at the call sites, and look at both.
-//
-// `scrollThumb` is separate because the scrollbar is chrome, not a control: it
-// should be present without being an element. `cardMeta` (stone-400, 138 136
-// 128) is outside DARK_SLUGS, so it is the same value in both modes and reads
-// as a quiet grey against both the white and the ink-900 interior.
 // =============================================================================
 
 /** The line colour for anything inside a card: field underlines, outline
  *  borders, dividers, slab tracks. NEVER `palette.walls` — see above. */
 export function controlLine(p: VesselPalette): string {
   return p.cardTitle
-}
-
-/** The vessel scrollbar thumb. Consumed as `--ah-scroll-thumb` by
- *  `.ah-vessel-scroll` in globals.css. */
-export function scrollThumb(p: VesselPalette): string {
-  return p.cardMeta
 }

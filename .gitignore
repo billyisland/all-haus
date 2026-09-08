@@ -63,3 +63,7 @@ certs/
 
 # LibreOffice/OpenOffice lock files (a doc open in an editor)
 .~lock.*#
+
+# Editor swap files
+*.swp
+*.swo

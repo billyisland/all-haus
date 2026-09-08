@@ -29,7 +29,7 @@ import {
 //      exact epistemic mistake §8.16 IS. So it runs against real Postgres, in a
 //      rolled-back transaction, through the task's own exported SQL.
 //
-// Skipped unless a DB URL is supplied (CI's no-Postgres `test` job stays green).
+// Skipped unless a DB URL is supplied (CI supplies one and fails on a skip).
 //   POSTGRES_PASSWORD=$(grep -E '^POSTGRES_PASSWORD=' ../.env | cut -d= -f2-) \
 //   TEST_DATABASE_URL=postgresql://platformpub:$POSTGRES_PASSWORD@localhost:5432/platformpub \
 //     npx vitest run src/tasks/feed-ingest-rss-conditional.test.ts

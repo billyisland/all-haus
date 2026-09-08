@@ -11,7 +11,7 @@
     "shared": {}
   },
   "ignoreExportsUsedInFile": true,
-  "ignoreBinaries": ["tsc", "next", "vitest", "tsx"],
+  "ignoreBinaries": ["tsc", "next", "vitest", "tsx", "graphile-worker"],
   "ignoreDependencies": [
     "@atproto/oauth-client-node",
     "pino",

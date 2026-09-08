@@ -100,12 +100,28 @@ export function SeedFormulaPanel() {
           <div className="space-y-3">
             <div className="space-y-1">
               <p className="text-ui-sm text-black">
+                {/* No fallback needed here and that is deliberate: a DESIGNATED
+                    FORMULA always has a name. `feed_formulas_name_check` is 1..80
+                    and the route refuses to cut an untitled feed into a seed
+                    (400 `seed_feed_unnamed`), the operator's `name` override
+                    being the way through. The list of FEEDS to cut from, below,
+                    is the opposite case — see its note. */}
                 {designated.name} — {designated.sourceCount} source
                 {designated.sourceCount === 1 ? '' : 's'}
                 {designated.excludedCount > 0 && (
                   <span className="text-grey-600"> ({designated.excludedCount} not shareable)</span>
                 )}
               </p>
+              {designated.suspendedSourceCount > 0 && (
+                <p className="text-ui-xs text-crimson max-w-article">
+                  {designated.suspendedSourceCount === 1
+                    ? 'One source in this seed points at a suspended system'
+                    : `${designated.suspendedSourceCount} sources in this seed point at a suspended system`}{' '}
+                  and {designated.suspendedSourceCount === 1 ? 'is' : 'are'} skipped at every
+                  signup. Re-cut the seed from a feed without them, or reinstate the system — the
+                  rows travel again the moment it comes back.
+                </p>
+              )}
               {!designated.authorIsSelf && (
                 <p className="text-ui-xs text-crimson max-w-article">
                   Authored by {designated.authorName}. Their account can no longer be deleted while
@@ -153,9 +169,16 @@ export function SeedFormulaPanel() {
             aria-label="Feed to cut into a new seed formula"
           >
             <option value="">Cut one of my feeds into a new seed formula…</option>
+            {/* A FEED's name is optional (migration 190 dropped the floor) and the
+                create schema is `z.string().trim().default("")`, so an untitled
+                feed is `""` and never null — `??` would walk straight past it and
+                this option would read " — 3 source(s)" with nothing in front of
+                it. Same rule the workspace already follows everywhere; this list
+                and the public share page were the two places that had not caught
+                up. */}
             {feeds.map((f) => (
               <option key={f.id} value={f.id}>
-                {f.name} — {f.sourceCount} source(s)
+                {f.name.trim() || 'Unnamed feed'} — {f.sourceCount} source(s)
               </option>
             ))}
           </select>

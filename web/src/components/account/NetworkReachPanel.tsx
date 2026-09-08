@@ -212,8 +212,8 @@ export function NetworkReachPanel() {
                 <p className="text-ui-sm text-black">Nostr</p>
                 <p className="text-ui-xs text-grey-600 mt-1 leading-relaxed">
                   {discoveryEnabled
-                    ? 'Public. Your profile and where to read you are published to the Nostr network, so anyone on Nostr can find and follow you.'
-                    : 'Your account is a Nostr identity, kept inside all.haus. Turn on discovery to publish it to the public Nostr network.'}
+                    ? "Public. You've allowed all.haus to publish your profile and where to read you to the Nostr network, so people anywhere on Nostr can find and follow you."
+                    : 'Your account is a Nostr identity, not published beyond all.haus. Turn on discovery to publish your profile to the public Nostr network.'}
                 </p>
               </div>
               <div className="flex shrink-0">

@@ -74,10 +74,10 @@ export function ProfileSection() {
             <label className="block label-ui text-grey-600 mb-3">Photo</label>
             <div className="flex items-center gap-4">
               {avatar ? (
-                <img src={avatar} alt="" className="h-16 w-16  object-cover flex-shrink-0" />
+                <img src={avatar} alt="" className="h-16 w-16 rounded-full object-cover flex-shrink-0" />
               ) : (
                 <span
-                  className="flex h-16 w-16 items-center justify-center  text-xl font-medium text-black flex-shrink-0"
+                  className="flex h-16 w-16 items-center justify-center rounded-full text-xl font-medium text-black flex-shrink-0"
                   style={{ background: 'linear-gradient(135deg, var(--ah-blush), var(--ah-blush-deep))' }}
                 >
                   {initial}

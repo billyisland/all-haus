@@ -17,12 +17,14 @@ import { timeAgo } from "../../lib/format";
 // "+N to add · M to remove" with sample names, and Apply hands the plan to the
 // same background engine the initial import used (progress polled here).
 // Removals mirror remote unfollows only — local removals are exclusion-guarded
-// server-side and never resurrected. Renders on the composer's fixed-light
-// Glasshouse pane, so fixed neutral tokens (not a feed palette) are correct.
+// server-side and never resurrected. Renders on the composer's Glasshouse
+// pane, so neutral tokens (not a feed palette) are correct. That pane is
+// mode-neutral, NOT fixed light: its tokens invert under `html.dark`, so every
+// colour here must be an inverting slug (`ink`, never `ink-925`).
 // =============================================================================
 
 const T = {
-  fg: "var(--ah-ink-925)",
+  fg: "var(--ah-ink)",
   hintFg: "var(--ah-grey-600)",
   fieldBg: "var(--ah-white)",
   errorFg: "var(--ah-crimson)",

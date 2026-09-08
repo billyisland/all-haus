@@ -1,7 +1,7 @@
 import { UUID_RE } from "../lib/uuid.js";
 import type { FastifyInstance } from "fastify";
 import { pool } from "@platform-pub/shared/db/client.js";
-import { requireAuth } from "../middleware/auth.js";
+import { optionalAuth } from "../middleware/auth.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 import { FEED_SELECT, FEED_JOINS, parseCursor } from "../lib/feed-sql.js";
 import {
@@ -9,6 +9,7 @@ import {
   POST_JOINS,
   feedItemToPost,
   commentToPost,
+  nostrTargetPostId,
 } from "../lib/post-mapper.js";
 import {
   type AuthorCardResponse,
@@ -23,6 +24,7 @@ import {
   hydrateAuthorTimeline,
 } from "../lib/author-timeline-hydration.js";
 import { encodeTsIdCursor } from "../lib/cursor.js";
+import { resolveLockedRoots } from "../lib/root-locked.js";
 
 // =============================================================================
 // Constructed author profile — UNIVERSAL-POST-ADR Phase 4 (§4.4, §9, §VI.3)
@@ -179,9 +181,17 @@ export async function loadAuthorLinkSource(
 // `sourceName`/`sourceDescription` fill the hover modal's existing tier-C
 // branch (AuthorModal.tsx), which the legacy item-keyed /author-card route was
 // the only producer of; the `type="author"` hover never calls that route.
+interface TierCSourceRow {
+  source_id: string;
+  source_uri: string;
+  display_name: string | null;
+  description: string | null;
+  sub_id: string | null;
+}
+
 async function resolveTierCAuthor(
   xa: ExternalAuthorRow,
-  viewerId: string,
+  viewerId: string | null,
 ): Promise<AuthorCardResponse> {
   const base: AuthorCardResponse = {
     tier: "C",
@@ -191,21 +201,35 @@ async function resolveTierCAuthor(
   };
   if (!xa.source_id) return base;
 
-  const { rows } = await pool.query<{
-    source_id: string;
-    source_uri: string;
-    display_name: string | null;
-    description: string | null;
-    sub_id: string | null;
-  }>(
-    `SELECT es.id AS source_id, es.source_uri, es.display_name, es.description,
-            sub.id AS sub_id
-       FROM external_sources es
-       LEFT JOIN external_subscriptions sub
-         ON sub.source_id = es.id AND sub.subscriber_id = $1
-      WHERE es.id = $2`,
-    [viewerId, xa.source_id],
-  );
+  // THE VIEWER'S HALF OF THIS QUERY IS NOT RUN FOR AN ANONYMOUS READER, and the
+  // join is dropped rather than passed a NULL subscriber id.
+  //
+  // The two halves are different KINDS of fact and the statement has to say so.
+  // The source's own columns are public and are returned to anybody; the
+  // subscription join is a relationship, and a stranger has none — not "false",
+  // none. Handing `$1 = NULL` to the LEFT JOIN produced the right OUTPUT (it
+  // answers `sub_id = NULL` and the `followTarget` below is omitted anyway), and
+  // getting the right answer from a query about a relationship that cannot exist
+  // is the shape the widening invariant names: the anonymous test cannot see the
+  // difference here, because both versions return the same JSON. So it is the
+  // SQL that has to differ, which is also the only thing a test could assert on.
+  const { rows } = viewerId
+    ? await pool.query<TierCSourceRow>(
+        `SELECT es.id AS source_id, es.source_uri, es.display_name, es.description,
+                sub.id AS sub_id
+           FROM external_sources es
+           LEFT JOIN external_subscriptions sub
+             ON sub.source_id = es.id AND sub.subscriber_id = $1
+          WHERE es.id = $2`,
+        [viewerId, xa.source_id],
+      )
+    : await pool.query<TierCSourceRow>(
+        `SELECT es.id AS source_id, es.source_uri, es.display_name, es.description,
+                NULL::uuid AS sub_id
+           FROM external_sources es
+          WHERE es.id = $1`,
+        [xa.source_id],
+      );
   const src = rows[0];
   if (!src) return base;
 
@@ -218,14 +242,21 @@ async function resolveTierCAuthor(
     // viewer's subscription row) when following, else the sourceUri the
     // subscribe path keys on; `sourceId` lets the client resolve per-feed
     // membership for the feed-derived Follow.
-    followTarget: {
-      type: "source",
-      id: src.sub_id ?? src.source_uri,
-      isFollowing: src.sub_id !== null,
-      protocol: xa.protocol,
-      sourceUri: src.source_uri,
-      sourceId: src.source_id,
-    },
+    //
+    // The source's own fields above are public facts and are returned to
+    // anybody; the follow target is not one, so an anonymous reader gets none —
+    // a `sub_id = NULL` reading as "not following" is a claim about somebody who
+    // has no account. The query above no longer even asks it for them.
+    followTarget: viewerId
+      ? {
+          type: "source",
+          id: src.sub_id ?? src.source_uri,
+          isFollowing: src.sub_id !== null,
+          protocol: xa.protocol,
+          sourceUri: src.source_uri,
+          sourceId: src.source_id,
+        }
+      : undefined,
   };
 }
 
@@ -235,7 +266,7 @@ async function resolveTierCAuthor(
 // activitypub Mastodon-REST host fallback.
 async function resolveExternalAuthorById(
   xa: ExternalAuthorRow,
-  viewerId: string,
+  viewerId: string | null,
 ): Promise<AuthorCardResponse> {
   if (xa.tier === "C") return resolveTierCAuthor(xa, viewerId);
 
@@ -267,10 +298,21 @@ async function resolveExternalAuthorById(
   // URI / pubkey — the exact value the subscribe API expects as sourceUri).
   const followUri = authorFollowUri(xa);
   let followTarget: AuthorCardResponse["followTarget"];
+  // An anonymous reader (2026-09-02) gets neither of the two viewer-derived
+  // fields, and neither of their queries runs: `followTarget` states a
+  // relationship they do not have, and `linkedSources` is BY CONSTRUCTION a
+  // per-viewer set (their own assertions ∪ global detections − their own
+  // tombstones). Global detections alone would be a defensible third answer,
+  // and it is deliberately not the one taken here: they are automated guesses
+  // that this person's accounts are the same person, and publishing them to
+  // anybody with the URL is a disclosure decision, not a side effect of opening
+  // a page up. The identity row states its tier in words for exactly that
+  // reason; widening who can read it belongs with the consent question
+  // (`show_on_profile`, D7), not with a 401.
   // The author's backing source — `source_a_id` for any cross-source identity
   // link (set alongside followTarget below; both read the same source lookup).
   let linkSourceId: string | null = null;
-  if (followUri) {
+  if (followUri && viewerId) {
     // `id` is the unfollow handle — the viewer's subscription-row id, since
     // DELETE /feeds/:id keys on external_subscriptions.id. Emit it when
     // subscribed so "FOLLOWING" → unsubscribe deletes the right row; when not
@@ -316,7 +358,7 @@ async function resolveExternalAuthorById(
   // link (unlink ⇒ tombstone) from the viewer's own (unlink ⇒ delete). Only
   // computable once source_a exists; empty otherwise.
   let linkedSources: AuthorCardResponse["linkedSources"];
-  if (linkSourceId) {
+  if (linkSourceId && viewerId) {
     const { rows: linkRows } = await pool.query<{
       link_id: string;
       source_id: string;
@@ -509,15 +551,32 @@ async function resolveExternalAuthorById(
 
 export async function authorRoutes(app: FastifyInstance) {
   // GET /author/:authorId/profile — hover modal + profile header.
+  //
+  // optionalAuth, not requireAuth (2026-09-02). `/author/:id` is one of the two
+  // standalone profile pages — a share/SEO surface whose whole reason to exist
+  // is that a stranger can open it — and gated it 401'd, which
+  // `AuthorProfileView` rendered as "Something went wrong loading this
+  // profile.": an OUTAGE sentence for a permissions state, blaming the platform
+  // for a door it had locked. Exact sibling of the widening `/author/:id/posts`
+  // and `/author/:id/replies` took, and for the same reason.
+  //
+  // It is NOT the same one-line change, because unlike those two this route
+  // genuinely reads the viewer. The rule applied to both resolvers: a fact about
+  // the SUBJECT is public and unchanged; a fact about the VIEWER'S RELATIONSHIP
+  // to them (`followTarget`) or about the VIEWER'S OWN identity-link set
+  // (`linkedSources`) is OMITTED for an anonymous reader rather than defaulted —
+  // their queries do not run. A defaulted `isFollowing: false` would be a claim
+  // about a relationship that cannot exist, rendered as a Follow button that
+  // cannot work.
   app.get<{ Params: { authorId: string } }>(
     "/author/:authorId/profile",
     {
-      preHandler: requireAuth,
+      preHandler: optionalAuth,
       config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
     },
     async (req, reply) => {
       const { authorId } = req.params;
-      const viewerId = req.session!.sub;
+      const viewerId = req.session?.sub ?? null;
       if (!UUID_RE.test(authorId)) {
         return reply.status(400).send({ error: "Invalid author id" });
       }
@@ -549,7 +608,19 @@ export async function authorRoutes(app: FastifyInstance) {
   }>(
     "/author/:authorId/posts",
     {
-      preHandler: requireAuth,
+      // optionalAuth, not requireAuth: /[username] is the primary cold-traffic
+      // landing surface (writers.ts' own header says so), and this is where its
+      // article log comes from — gated, a logged-out visitor was shown a
+      // writer's profile over the words "No articles yet". Safe to widen
+      // because the query is VIEWER-INDEPENDENT: FEED_SELECT/POST_SELECT and
+      // their joins take no viewer param, so an anonymous read returns exactly
+      // what a logged-in stranger's does. Nor does it widen the paywall — an
+      // article row carries `content_free`/`summary` (the free portion), never
+      // the vaulted body, which only /gate-pass ever hands out. The sibling
+      // /profile route was left gated here BECAUSE it reads req.session.sub —
+      // widened 2026-09-02 by making the viewer nullable and omitting the two
+      // fields derived from it, rather than by ignoring that it reads one.
+      preHandler: optionalAuth,
       config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
     },
     async (req, reply) => {
@@ -664,7 +735,10 @@ export async function authorRoutes(app: FastifyInstance) {
   }>(
     "/author/:authorId/replies",
     {
-      preHandler: requireAuth,
+      // optionalAuth for the same reason as /posts above, and on the same
+      // proof: the comments query is keyed on the author alone and carries no
+      // viewer term.
+      preHandler: optionalAuth,
       config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
     },
     async (req, reply) => {
@@ -692,8 +766,8 @@ export async function authorRoutes(app: FastifyInstance) {
           ? [authorId, limit, cursor.ts, cursor.id]
           : [authorId, limit];
 
-        // root_post_id is the comment's root THING (derived from its
-        // target_event_id) — commentToPost's rootPostId fallback for inReplyTo.
+        // root_post_id is the comment's root THING — commentToPost's rootPostId
+        // fallback for inReplyTo. RESOLVED, not derived: see the column below.
         const result = await pool.query<any>(
           `
           SELECT c.id,
@@ -701,7 +775,24 @@ export async function authorRoutes(app: FastifyInstance) {
                  c.nostr_event_id,
                  c.parent_comment_id,
                  feed_items_derive_post_id('nostr', p.nostr_event_id) AS parent_post_id,
-                 feed_items_derive_post_id('nostr', c.target_event_id) AS root_post_id,
+                 -- The conversation's ROOT, resolved through the one home
+                 -- (post-mapper's nostrTargetPostId -> article_post_id) rather
+                 -- than derived here. This column used to be a bare
+                 -- feed_items_derive_post_id('nostr', c.target_event_id), which
+                 -- is right for a NOTE root and wrong for an ARTICLE one: an
+                 -- article's post_id comes off its naddr coord, so the derived
+                 -- value was a different string for the same piece and matched
+                 -- no row anywhere. It reached commentToPost as every
+                 -- article-rooted comment's inReplyTo -- a plausible 64-hex id
+                 -- pointing at nothing, which is why nothing ever complained.
+                 -- ARTICLE-HEADED-CONVERSATIONS-ADR §7, closed 2026-09-05.
+                 ${nostrTargetPostId("c.target_event_id")} AS root_post_id,
+                 -- The root's own event id, carried for the access resolution
+                 -- below. Note that root_post_id is still the GROUPING key and
+                 -- target_event_id is still the JOIN key: they now agree about
+                 -- which piece they name, but only the event id joins to
+                 -- the articles table, which is what resolveLockedRoots needs.
+                 c.target_event_id,
                  c.content,
                  EXTRACT(EPOCH FROM c.published_at)::bigint AS published_at_epoch,
                  -- Fractional epoch for the cursor only (M13); published_at_epoch
@@ -711,7 +802,6 @@ export async function authorRoutes(app: FastifyInstance) {
                  c.author_id,
                  acc.display_name AS acc_display_name,
                  acc.username AS acc_username,
-                 acc.avatar_blossom_url AS acc_avatar,
                  acc.nostr_pubkey AS nostr_pubkey,
                  tl.pip_status AS pip_status,
                  vt.upvote_count AS vt_up, vt.downvote_count AS vt_down
@@ -729,8 +819,35 @@ export async function authorRoutes(app: FastifyInstance) {
           params,
         );
 
+        // ARTICLE-HEADED-CONVERSATIONS-ADR D3/D5, item 8. The log is public and
+        // stays public; what it gains is a per-comment answer to "is the piece
+        // this hangs off locked TO THIS VIEWER", which the card needs in order
+        // to decide whether to draw reply/quote/vote (D6). Until now the route
+        // disclosed every comment on every paywalled article with no signal at
+        // all — accidentally, which is what this makes deliberate.
+        //
+        // SET-BASED, NEVER PER COMMENT: `checkArticleAccess` is 1-3 sequential
+        // round-trips and this route pages at MAX_LIMIT = 50, so a call per row
+        // would be ~150 sequential queries on an anonymous-reachable route.
+        // `resolveLockedRoots` does the page in two reads, and in ONE for an
+        // anonymous viewer, who can read none of them by definition. Its header
+        // carries the join key and why the resolution is a separate query
+        // rather than a join onto the read above.
+        const rootEventIds = [
+          ...new Set(result.rows.map((r) => r.target_event_id as string)),
+        ];
+        const lockedRoots = await resolveLockedRoots(
+          req.session?.sub ?? null,
+          rootEventIds,
+        );
+
         const items = result.rows.map((c) =>
-          commentToPost(c, c.root_post_id, new Set<string>()),
+          commentToPost(
+            c,
+            c.root_post_id,
+            new Set<string>(),
+            lockedRoots.has(c.target_event_id),
+          ),
         );
         const lastRow =
           result.rows.length === limit

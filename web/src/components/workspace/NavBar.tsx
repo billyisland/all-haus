@@ -1,5 +1,7 @@
 "use client";
 
+import { GRID } from "../../lib/workspace/grid";
+
 // =============================================================================
 // NavBar — the fixed desktop workspace toolbar (WORKSPACE-COLUMN-LAYOUT-ADR
 // §VI, as re-oriented 2026-08-25).
@@ -86,6 +88,20 @@ export const NAV_BAR_INSET = 8;
  *  centre line (`NAV_BAR_INSET` down from the top), not the band's — see the
  *  muster's `paddingTop`. */
 export const NAV_BAR_H = NAV_BAR_INSET + 40;
+
+/** The band the EYE reads as the bar: `NAV_BAR_H` plus the floor's own GRID
+ *  top buffer beneath it (`deriveGeometry` starts every column one GRID down).
+ *  The bar's true bottom edge at `NAV_BAR_H` is invisible by construction —
+ *  band and floor are both `bone` — and the whole of the geometry above is
+ *  licensed by that invisibility, so NOTHING may draw an edge there: no dimming
+ *  layer starts above this line (`.gh-scrim`, both Explain scrims,
+ *  `--ah-bar-band`), and no pane's y may come above it (`Glasshouse.minYFor` —
+ *  a pane flush at `NAV_BAR_H` traces the true edge with its own top). This is
+ *  the ONE home for the number; every consumer imports it rather than adding
+ *  `NAV_BAR_H + GRID` itself, so the two Explain modes and the frost cannot
+ *  drift apart again (web/CLAUDE.md › *A dimming layer must not draw an
+ *  edge*). */
+export const NAV_BAR_BAND = NAV_BAR_H + GRID;
 
 export function NavBar() {
   return (

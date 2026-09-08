@@ -198,11 +198,10 @@ export function LandingVessel({
       }
     >
       <div className="ah-landing-frame ah-landing-frame-inner" style={frame}>
-        {/* The scrolling card column — the one moving part. `.scroll-silent`
-            hides the native scrollbar (whose track would draw a banned vertical
-            rule); wheel / touch / keyboard scroll are unaffected. */}
+        {/* The scrolling card column — the one moving part. It scrolls with no
+            marker, which is now the sitewide default rather than this column's
+            own opt-out (globals.css); wheel / touch / keyboard are unaffected. */}
         <div
-          className="scroll-silent"
           style={{
             flex: 1,
             minHeight: 0,

@@ -93,7 +93,7 @@ export function AccountLedger({ initialIncludeFreeReads = false }: { initialIncl
         </div>
       ) : (
         <>
-          <div className="overflow-x-auto bg-glasshouse-well">
+          <div className="overflow-x-auto ah-scrollbar bg-glasshouse-well">
             <table className="w-full text-ui-xs">
               <thead>
                 <tr className="border-b-2 border-grey-200/50">

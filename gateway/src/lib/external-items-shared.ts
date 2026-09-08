@@ -1,3 +1,5 @@
+import { pool } from "@platform-pub/shared/db/client.js";
+
 // Shared helpers, constants and row/interface types for the external-items
 // route modules (engagement / parent / quote / thread / interactions) and the
 // background thread-hydration lib (external-hydration.ts). Anything used across
@@ -227,4 +229,61 @@ export function extractMastodonStatusId(uri: string): string | null {
   } catch {
     return null;
   }
+}
+
+// -----------------------------------------------------------------------------
+// Context rows must be dual-written, or they are unreachable until 05:00.
+//
+// The on-demand context fetchers (parent / quote / thread) each write an
+// `is_context_only` row to external_items so the tile can be rendered, and the
+// row is invisible in feeds by design. But the thread projector resolves an
+// external focal through `feed_items WHERE post_id = $1`, and post_id is minted
+// by the identity trigger ON feed_items — so a context row with no feed_items
+// twin cannot be re-rooted onto. `GET /thread/:postId` 404s on a post the reader
+// is looking at, until the nightly `feed_items_reconcile` mints the missing row
+// (case 2) and the tile silently starts working the next morning.
+//
+// This is the mechanism behind §8.13's third symptom, "external_items grew by 71
+// in ten minutes while feed_items gained none" — a real asymmetry, but not the
+// dual-write divergence it was filed as: the four ingest writers dual-write in
+// one transaction and are 1:1 by construction (0 orphans in 166,754 rows, and
+// ten days of exactly equal daily arrivals). It is these routes, and only these.
+//
+// The SQL is `feed_items_reconcile`'s own INSERT (RECONCILE_EXTERNAL_INSERT_SQL)
+// narrowed to one row. Keeping them identical is not tidiness: a repair pass
+// that disagrees with its primary writer reports drift every night and repairs
+// a row the writer puts straight back, so `NULLIF(author_name, '')` and the
+// avatar's source fallback must stay spelled exactly as they are there.
+//
+// Idempotent (the NOT EXISTS plus ON CONFLICT DO NOTHING), so every fetcher can
+// call it unconditionally on the row it just upserted.
+//
+// The SQL is exported so the test runs this module's own text rather than a
+// copy of it — the same reason feed-items-reconcile.ts exports its two.
+export const CONTEXT_FEED_ITEM_INSERT_SQL = `
+    INSERT INTO feed_items (
+       item_type, external_item_id,
+       author_name, author_avatar,
+       title, content_preview,
+       published_at,
+       source_protocol, source_item_uri, source_id, media,
+       is_reply
+     )
+     SELECT
+       'external', ei.id,
+       NULLIF(ei.author_name, ''),
+       COALESCE(ei.author_avatar_url, xs.avatar_url),
+       ei.title,
+       LEFT(COALESCE(ei.content_text, ei.summary), 200),
+       ei.published_at,
+       ei.protocol::text, ei.source_item_uri, ei.source_id, ei.media,
+       ei.source_reply_uri IS NOT NULL
+     FROM external_items ei
+     JOIN external_sources xs ON xs.id = ei.source_id
+     WHERE ei.id = $1 AND ei.deleted_at IS NULL
+       AND NOT EXISTS (SELECT 1 FROM feed_items fi WHERE fi.external_item_id = ei.id)
+     ON CONFLICT DO NOTHING`;
+
+export async function ensureContextFeedItem(externalItemId: string): Promise<void> {
+  await pool.query(CONTEXT_FEED_ITEM_INSERT_SQL, [externalItemId]);
 }

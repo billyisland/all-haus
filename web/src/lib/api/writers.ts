@@ -13,6 +13,14 @@ export interface WriterProfile {
   showCommissionButton: boolean
   articleCount: number
   hasPaywalledArticle: boolean
+  // The profile's button row shows a view's button only when that view has
+  // something in it, so it needs every count BEFORE it paints — derived from
+  // the logs' own fetches, two buttons would appear a beat after load and move
+  // the selected view under the reader. Optional because a stale gateway sends
+  // neither; the row treats absent as "unknown, so offer it" rather than as
+  // zero, which would hide a log that is actually there.
+  noteCount?: number
+  replyCount?: number
   followerCount: number
   followingCount: number
   // The `verified` tier of the profile's identity row (PROFILE-PANE-REDESIGN-

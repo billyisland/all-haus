@@ -19,6 +19,7 @@ export const ADVISORY_LOCKS = {
   TRIBUTES: 100006, // Tribute lifecycle sweep (30d reminder + 60d lapse)
   FOLLOW_IMPORT: 100007, // Follow-graph import sweep (FOLLOW-GRAPH-IMPORT-ADR §6.1)
   WAITLIST_DIGEST: 100008, // Waitlist operator digest (CLOSED-BETA-ADR §XI, D8.2)
+  READING_LOG: 100009, // Recent-reading retention sweep (READING-LOG-AND-LIBRARY-ADR D5)
 
   // feed-ingest
   JETSTREAM: 0x4a455453, // "JETS" in ASCII; session-scoped leader election
