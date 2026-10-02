@@ -12,7 +12,13 @@ export const externalItems = {
       body: JSON.stringify({ linkedAccountId }),
     }),
   reply: (itemId: string, linkedAccountId: string, content: string) =>
-    request<{ noteId: string; nostrEventId: string }>(
+    // `crossPost: 'not_sent'` — the reply is published HERE but was never
+    // queued for the network it answers (CROSS-NETWORK-ROUNDTRIP-ADR A7).
+    request<{
+      noteId: string;
+      nostrEventId: string;
+      crossPost?: "queued" | "not_sent";
+    }>(
       `/external-items/${itemId}/reply`,
       {
         method: "POST",

@@ -7,6 +7,20 @@ import { wrapKeyForReader } from "../lib/nip44.js";
 import { pool } from "@platform-pub/shared/db/client.js";
 import { zodValidationError } from "@platform-pub/shared/lib/validation.js";
 import logger from "@platform-pub/shared/lib/logger.js";
+// The per-route budgets, and the reason each route needs its own — one home,
+// shared with src/index.ts's registration (MIRROR-AUDIT §2.13).
+import {
+  readerKeyLimit,
+  writerPublishLimit,
+  writerReadLimit,
+  writerExportLimit,
+} from "../lib/rate-limit.js";
+import {
+  BINDING_HEADER,
+  keyServiceSubject,
+  verifyInternalRequest,
+} from "@platform-pub/shared/lib/internal-binding.js";
+import { rawBodyOf } from "../lib/raw-body.js";
 
 // =============================================================================
 // Key Service Routes
@@ -20,6 +34,27 @@ import logger from "@platform-pub/shared/lib/logger.js";
 // x-reader-pubkey / x-writer-id), so every route must prove the caller IS the
 // gateway: the plugin-scope preHandler below requires x-internal-secret to
 // match INTERNAL_SECRET. Fail-closed — no secret configured means no access.
+//
+// AND, since S16, a per-request BINDING on top of that bearer (MIRROR-AUDIT §3
+// *Security*). The secret alone says only "somebody holds it", and what it was
+// buying here is every content key on the platform: the vault write, the paying
+// reader's key issue, the author's own paywalled body, and an export of every
+// vault key one writer holds. One captured request off the plaintext compose
+// network yielded the credential and with it every other request.
+//
+// THE SUBJECT IS IN THE HEADERS ON THIS SERVICE, and that is the whole reason
+// the shared tuple grew a `subject` term. key-custody names its signer in the
+// body, so hashing the body already covers a retarget. Here `POST
+// /articles/:id/key` carries `{}` and takes its reader from `x-reader-id`, and
+// `GET /writers/export-keys` has no body at all — so path-plus-body-hash would
+// not have noticed a captured request pointed at a different reader or a
+// different writer by editing one header. The guard therefore re-reads those
+// headers off the request it actually got and puts them in the tuple, in the
+// order gateway/src/lib/key-service-client.ts fixes.
+//
+// `GET /auth-check` stays on the bare secret, deliberately: it is the shared
+// boot-time parity probe, reaching it IS the proof, and a 401 there exits the
+// gateway. Binding it would make one probe three.
 // =============================================================================
 
 function constantTimeEqual(a: string, b: string): boolean {
@@ -31,16 +66,39 @@ function constantTimeEqual(a: string, b: string): boolean {
   return timingSafeEqual(ab, bb);
 }
 
+/**
+ * The identity headers this service acts on, in the fixed order the sender uses
+ * (`keyServiceSubject`, in shared). Read off the
+ * request, never off the binding — a binding that supplied its own subject would
+ * be asserting the thing it is meant to prove.
+ *
+ * A missing header is the empty string rather than a skipped term, so no two
+ * different identity sets can spell the same tuple.
+ */
+function subjectOf(req: {
+  headers: Record<string, string | string[] | undefined>;
+}): string[] {
+  const one = (name: string): string => {
+    const v = req.headers[name];
+    const s = Array.isArray(v) ? v[0] : v;
+    return typeof s === "string" ? s : "";
+  };
+  // The ORDER is `shared`'s, not ours — one spelling of the tuple, imported by
+  // the sender too. Two copies would disagree silently.
+  return keyServiceSubject({
+    readerId: one("x-reader-id"),
+    readerPubkey: one("x-reader-pubkey"),
+    writerId: one("x-writer-id"),
+    writerPubkey: one("x-writer-pubkey"),
+  });
+}
+
 const PublishVaultSchema = z.object({
   articleId: z.string().uuid(),
   paywallBody: z.string().min(1),
   pricePence: z.number().int().positive(),
   gatePositionPct: z.number().int().min(1).max(99),
   nostrDTag: z.string().min(1),
-});
-
-const UpdateVaultEventIdSchema = z.object({
-  vaultNostrEventId: z.string().length(64), // hex Nostr event ID
 });
 
 export async function keyRoutes(app: FastifyInstance) {
@@ -59,6 +117,29 @@ export async function keyRoutes(app: FastifyInstance) {
     ) {
       return reply.status(401).send({ error: "Unauthorized" });
     }
+
+    // The parity probe is bearer-only. See the header.
+    if (req.routeOptions?.url === "/api/v1/auth-check") return;
+
+    const verdict = verifyInternalRequest(
+      expected,
+      req.headers[BINDING_HEADER],
+      {
+        method: req.method,
+        path: req.url,
+        rawBody: rawBodyOf(req),
+        subject: subjectOf(req),
+      },
+    );
+    if (!verdict.ok) {
+      // The REASON is logged and never returned: the caller learns 401 and
+      // nothing about which half it got wrong.
+      logger.warn(
+        { path: req.url, reason: verdict.reason },
+        "Rejected unbound key-service request",
+      );
+      return reply.status(401).send({ error: "Unauthorized" });
+    }
   });
 
   // ---------------------------------------------------------------------------
@@ -72,7 +153,14 @@ export async function keyRoutes(app: FastifyInstance) {
   // Spec: gateway/src/lib/internal-parity.ts.
   // ---------------------------------------------------------------------------
 
-  app.get("/auth-check", async (_req, reply) => {
+  // Exempt from rate limiting, deliberately. A 429 here is classified
+  // "unreachable" by `classifyParityStatus` (gateway/src/lib/internal-parity.ts
+  // names 200/401/403/404 and defaults the rest to ambiguous), so it is
+  // correctly not fatal — but it leaves key-service reading "never confirmed",
+  // which is the third state the probe exists to keep distinct from "fine",
+  // degraded by an unrelated burst of publishing. Rate-limiting a liveness
+  // probe is the wrong shape whichever bucket it lands in.
+  app.get("/auth-check", { config: { rateLimit: false } }, async (_req, reply) => {
     return reply.status(200).send({ ok: true });
   });
 
@@ -85,6 +173,7 @@ export async function keyRoutes(app: FastifyInstance) {
 
   app.post<{ Params: { nostrEventId: string } }>(
     "/articles/:nostrEventId/vault",
+    { config: writerPublishLimit },
     async (req, reply) => {
       const writerId = req.headers["x-writer-id"];
       if (!writerId || typeof writerId !== "string") {
@@ -135,54 +224,18 @@ export async function keyRoutes(app: FastifyInstance) {
   );
 
   // ---------------------------------------------------------------------------
-  // PATCH /articles/:nostrEventId/vault
-  // After the caller signs and publishes the vault event to the relay,
-  // they report the final Nostr event ID back so we can store the reference.
-  // ---------------------------------------------------------------------------
-
-  app.patch<{ Params: { nostrEventId: string } }>(
-    "/articles/:nostrEventId/vault",
-    async (req, reply) => {
-      const writerId = req.headers["x-writer-id"];
-      if (!writerId || typeof writerId !== "string") {
-        return reply.status(401).send({ error: "Missing x-writer-id" });
-      }
-
-      const parsed = UpdateVaultEventIdSchema.safeParse(req.body);
-      if (!parsed.success) {
-        return reply.status(400).send(zodValidationError(parsed.error));
-      }
-
-      const { rows } = await pool.query<{ id: string }>(
-        `SELECT id FROM articles WHERE nostr_event_id = $1 AND writer_id = $2`,
-        [req.params.nostrEventId, writerId],
-      );
-
-      if (rows.length === 0) {
-        return reply
-          .status(403)
-          .send({ error: "Article not found or not owned by writer" });
-      }
-
-      await vaultService.updateVaultEventId(
-        rows[0].id,
-        parsed.data.vaultNostrEventId,
-      );
-      return reply.status(200).send({ ok: true });
-    },
-  );
-
-  // ---------------------------------------------------------------------------
   // POST /articles/:nostrEventId/key
   // Called by the web client when a reader passes a gate.
   // Verifies payment, issues the NIP-44 encrypted content key.
   //
   // Rate-limited: 10 requests per reader per minute — prevents key-fishing.
-  // (The rate limit plugin is registered on the app instance at startup.)
+  // (`readerKeyLimit` above; the plugin is registered non-global at startup, so
+  // this budget is this route's alone and is no longer spent by writer traffic.)
   // ---------------------------------------------------------------------------
 
   app.post<{ Params: { nostrEventId: string } }>(
     "/articles/:nostrEventId/key",
+    { config: readerKeyLimit },
     async (req, reply) => {
       const readerId = req.headers["x-reader-id"];
       const readerPubkey = req.headers["x-reader-pubkey"];
@@ -242,7 +295,7 @@ export async function keyRoutes(app: FastifyInstance) {
   // Requires x-writer-id and x-writer-pubkey headers (injected by gateway).
   // ---------------------------------------------------------------------------
 
-  app.get("/writers/export-keys", async (req, reply) => {
+  app.get("/writers/export-keys", { config: writerExportLimit }, async (req, reply) => {
     const writerId = req.headers["x-writer-id"];
     const writerPubkey = req.headers["x-writer-pubkey"];
 
@@ -273,21 +326,37 @@ export async function keyRoutes(app: FastifyInstance) {
         [writerId],
       );
 
-      const keys = rows.map((row) => {
-        const contentKeyBytes = decryptContentKey(row.content_key_enc);
-        const encryptedKey = wrapKeyForReader(contentKeyBytes, writerPubkey);
-        return {
-          articleId: row.article_id,
-          nostrEventId: row.nostr_event_id,
-          dTag: row.nostr_d_tag,
-          title: row.title,
-          algorithm: row.algorithm,
-          encryptedKey, // NIP-44 wrapped to writer's own pubkey
-        };
-      });
+      // One undecryptable row is a fact about that article, not about the
+      // export: it is skipped and NAMED beside the keys that did open, never
+      // allowed to fail the writer's every other key (the partial-outcome rule).
+      const keys = [];
+      const skipped: string[] = [];
+      for (const row of rows) {
+        try {
+          const contentKeyBytes = decryptContentKey(row.content_key_enc);
+          const encryptedKey = wrapKeyForReader(contentKeyBytes, writerPubkey);
+          keys.push({
+            articleId: row.article_id,
+            nostrEventId: row.nostr_event_id,
+            dTag: row.nostr_d_tag,
+            title: row.title,
+            algorithm: row.algorithm,
+            encryptedKey, // NIP-44 wrapped to writer's own pubkey
+          });
+        } catch (err) {
+          logger.error(
+            { err, writerId, articleId: row.article_id },
+            "Writer key export: key could not be opened; skipped",
+          );
+          skipped.push(row.article_id);
+        }
+      }
 
-      logger.info({ writerId, count: keys.length }, "Writer key export");
-      return reply.status(200).send({ keys });
+      logger.info(
+        { writerId, count: keys.length, skipped: skipped.length },
+        "Writer key export",
+      );
+      return reply.status(200).send({ keys, skipped });
     } catch (err) {
       logger.error({ err, writerId }, "Writer key export failed");
       return reply.status(500).send({ error: "Key export failed" });
@@ -303,6 +372,7 @@ export async function keyRoutes(app: FastifyInstance) {
 
   app.get<{ Params: { articleId: string } }>(
     "/articles/:articleId/paywall-content",
+    { config: writerReadLimit },
     async (req, reply) => {
       const writerId = req.headers["x-writer-id"];
       if (!writerId || typeof writerId !== "string") {

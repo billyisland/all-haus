@@ -1,23 +1,30 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import pg from "pg";
-import {
-  feedAlphaCte,
-  proofBlendScoreSql,
-  resonanceRankingEnabled,
-} from "../src/lib/feed-rank.js";
+import { feedAlphaCte } from "../src/lib/feed-rank.js";
+import { proofTermSql } from "../src/lib/source-selection.js";
 
 // =============================================================================
-// D6 read-time proof blend — integration test
-// (SOCIAL-PROOF-RESONANCE-ADR D6, sequencing step 5)
+// The TOP criterion — integration test
+// (SOCIAL-PROOF-RESONANCE-ADR D6, as spent since migration 202)
 //
-// Exercises the REAL SQL builders (lib/feed-rank.ts — the same strings
-// feeds/items.ts splices into its `scored` CTE) against a live Postgres, with
-// every fixture seeded inside a transaction that is ALWAYS rolled back.
+// Exercises the REAL SQL builder (`proofTermSql` — the same string
+// lib/source-selection.ts orders each source's window by) against a live
+// Postgres, with every fixture seeded inside a transaction that is ALWAYS
+// rolled back.
+//
+// WHAT CHANGED, because this file used to test something larger. The proof term
+// was a whole feed's ORDER BY, divided by an age decay and multiplied by the
+// source's weight, behind RESONANCE_RANKING_ENABLED. It is now the ordering
+// INSIDE one source's own posts, from which the top `throughput` fraction is
+// kept — so the decay, the weight multiplier, the `asOf` pinning and the brake
+// are all gone (see the module header). What remains is the part that decides
+// which of a source's posts are its best, and the boundary cases the expression
+// exists to handle: absence and clamping.
 //
 // Ranking is the thing dedup taught us to be paranoid about: an ordering bug is
-// silent — the feed still renders, just wrong — so the assertions here are on
-// ORDER and on the boundary cases the expression exists to handle (absence,
-// clamping, alpha selection), not on "the query returns rows".
+// silent — the feed still renders, just wrong — so the assertions are on ORDER,
+// not on "the query returns rows". Selection itself is tested next door in
+// source-selection.test.ts.
 //
 // Skipped unless a DB URL is supplied — CI supplies one (it boots Postgres and FAILS on a skip). Run locally against the dev DB:
 //   TEST_DATABASE_URL=postgresql://platformpub:PASSWORD@localhost:5432/platformpub \
@@ -26,32 +33,27 @@ import {
 
 const DB_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
 
-// Params mirror the host query's layout: $1 fi_id[], then the four blend
-// params in the order items.ts pushes them. (α became a single constant param
-// when the reach source kind — the only explore-surface discriminator — was
-// retired, migration 177/§9.16; feedAlphaCte now just binds it.)
+// Params mirror the host's layout: $1 fi_id[], then α and the floor. (α became
+// a single constant param when the reach source kind — the only explore-surface
+// discriminator — was retired, migration 177/§9.16; feedAlphaCte now just binds
+// it.)
 const P_ALPHA = 2;
-const P_GRAVITY = 3;
-const P_FLOOR = 4;
-const P_ASOF = 5;
+const P_FLOOR = 3;
 
-// The host's `scored` CTE, reduced to just the ranking expression. `matched` is
-// stubbed with a flat weight of 1 so weight never confounds the proof term;
-// there is a dedicated weight test below that varies it.
-function rankSql(weight = "1::float8"): string {
+// The ordering source-selection.ts takes inside one source's window, isolated.
+// The tiebreak is the real one: published_at DESC, which is what turns a tie at
+// the floor into recency order rather than an arbitrary uuid sort.
+function rankSql(): string {
   return `
-    WITH ${feedAlphaCte(P_ALPHA).trim()},
-    matched AS (
-      SELECT id AS fi_id, ${weight} AS weight FROM feed_items WHERE id = ANY($1::uuid[])
-    )
-    SELECT fi.id AS fi_id, ${proofBlendScoreSql(P_GRAVITY, P_FLOOR, P_ASOF)} AS effective_score
+    WITH ${feedAlphaCte(P_ALPHA).trim()}
+    SELECT fi.id AS fi_id, ${proofTermSql(P_FLOOR)} AS criterion
     FROM feed_items fi
-    JOIN matched m ON m.fi_id = fi.id
-    ORDER BY effective_score DESC, fi.id DESC
+    WHERE fi.id = ANY($1::uuid[])
+    ORDER BY criterion DESC, fi.published_at DESC, fi.id DESC
   `;
 }
 
-describe.skipIf(!DB_URL)("D6 read-time proof blend (step 5)", () => {
+describe.skipIf(!DB_URL)("the TOP criterion (D6 proof term)", () => {
   let client: pg.Client;
   // One pinned asOf per test: cross-call score comparisons (alpha/weight)
   // rely on both evaluations seeing identical ages, which SQL now() used to
@@ -124,42 +126,16 @@ describe.skipIf(!DB_URL)("D6 read-time proof blend (step 5)", () => {
 
   async function rank(
     ids: string[],
-    opts: { alpha?: number; gravity?: number; floor?: number; weight?: string; asOf?: number } = {},
+    opts: { alpha?: number; floor?: number } = {},
   ): Promise<{ id: string; score: number }[]> {
-    const { rows } = await client.query<{ fi_id: string; effective_score: string }>(
-      rankSql(opts.weight),
-      [
-        ids,
-        opts.alpha ?? 0.8,
-        opts.gravity ?? 1.5,
-        opts.floor ?? 0.05,
-        opts.asOf ?? testAsOf,
-      ],
+    const { rows } = await client.query<{ fi_id: string; criterion: string }>(
+      rankSql(),
+      [ids, opts.alpha ?? 0.8, opts.floor ?? 0.05],
     );
-    return rows.map((r) => ({ id: r.fi_id, score: Number(r.effective_score) }));
+    return rows.map((r) => ({ id: r.fi_id, score: Number(r.criterion) }));
   }
 
-  // --- the brake ------------------------------------------------------------
-
-  it("is off unless RESONANCE_RANKING_ENABLED is explicitly truthy", () => {
-    const prev = process.env.RESONANCE_RANKING_ENABLED;
-    try {
-      delete process.env.RESONANCE_RANKING_ENABLED;
-      expect(resonanceRankingEnabled()).toBe(false);
-      process.env.RESONANCE_RANKING_ENABLED = "0";
-      expect(resonanceRankingEnabled()).toBe(false);
-      // A common near-miss: "false" must not read as on.
-      process.env.RESONANCE_RANKING_ENABLED = "false";
-      expect(resonanceRankingEnabled()).toBe(false);
-      process.env.RESONANCE_RANKING_ENABLED = "1";
-      expect(resonanceRankingEnabled()).toBe(true);
-      process.env.RESONANCE_RANKING_ENABLED = "true";
-      expect(resonanceRankingEnabled()).toBe(true);
-    } finally {
-      if (prev === undefined) delete process.env.RESONANCE_RANKING_ENABLED;
-      else process.env.RESONANCE_RANKING_ENABLED = prev;
-    }
-  });
+  // --- the dials -----------------------------------------------------------
 
   it("has every dial it reads seeded in platform_config, not hard-coded", async () => {
     // The blend must be tunable by UPDATE, never by deploy (CLAUDE.md tuning-dial
@@ -200,30 +176,59 @@ describe.skipIf(!DB_URL)("D6 read-time proof blend (step 5)", () => {
     expect(order.map((r) => r.id)).toEqual([strong, weak]);
   });
 
-  it("ranks fresher above older at equal proof (gravity term is live)", async () => {
+  it("breaks an equal-proof tie on recency, not on the uuid", async () => {
+    // There is no age decay in the criterion any more, so two equally resonant
+    // posts score IDENTICALLY — and inside a window bounded by recency that is
+    // right. What orders them is the tiebreak, and without it the ORDER BY
+    // falls through to the uuid: a source's cut would then include an arbitrary
+    // half of its tied posts and reshuffle between pages.
     const fresh = await item({ resonance: 2, ambientPctl: 0.5, ageHours: 1 });
     const old = await item({ resonance: 2, ambientPctl: 0.5, ageHours: 72 });
     const order = await rank([fresh, old]);
     expect(order.map((r) => r.id)).toEqual([fresh, old]);
-    // And the decay is real, not a rounding artefact.
-    expect(order[0].score).toBeGreaterThan(order[1].score * 5);
+    expect(order[0].score).toBe(order[1].score);
   });
 
   // --- absence (the correction to D6-as-drafted) ----------------------------
 
   it("orders NULL-resonance items by recency instead of collapsing them", async () => {
-    // This is the whole reason the floor exists. With proof_term = 0 exactly,
-    // every one of these scores 0 and the ORDER BY falls through to the uuid
-    // tiebreak — i.e. arbitrary order. Assert real recency ordering.
+    // This is the whole reason the floor exists, and it is what makes a source
+    // with NO engagement signal — rss, email, external nostr while its counts
+    // flag is dark — behave: every item ties at the floor and the recency
+    // tiebreak orders them, so "the top 60%" of such a source is its most
+    // recent 60%, in order. Without the floor the tie is at 0 and the sort
+    // falls through to the uuid: an arbitrary 60%, reshuffling between pages.
     const fresh = await item({ resonance: null, ambientPctl: null, ageHours: 1 });
     const mid = await item({ resonance: null, ambientPctl: null, ageHours: 24 });
     const old = await item({ resonance: null, ambientPctl: null, ageHours: 200 });
     const order = await rank([old, fresh, mid]);
     expect(order.map((r) => r.id)).toEqual([fresh, mid, old]);
-    // Every score strictly positive and strictly decreasing — no ties to break.
-    expect(order[0].score).toBeGreaterThan(order[1].score);
-    expect(order[1].score).toBeGreaterThan(order[2].score);
+    // They all sit ON the floor — positive, and equal — so it is the recency
+    // tiebreak doing the ordering. A floor of 0 would make them equal too, and
+    // equally ordered by the uuid; positive-and-equal is what says the floor is
+    // carrying them rather than nothing being there.
+    expect(order[0].score).toBe(order[1].score);
+    expect(order[1].score).toBe(order[2].score);
     expect(order[2].score).toBeGreaterThan(0);
+  });
+
+  it("treats proof BELOW the floor as indistinguishable from silence", async () => {
+    // What the floor actually decides, now that an explicit published_at
+    // tiebreak (not the floor) is what stops silent items falling through to a
+    // uuid sort. Below it we do not claim to be able to tell posts apart, so
+    // recency does — which is the difference between "a post with one stray
+    // like outranks everything silent forever" and "it takes its place in
+    // time". Removing the GREATEST makes this red and nothing else: the
+    // trivial-proof item then outranks both silent ones regardless of age.
+    const trivial = await item({ resonance: 0, ambientPctl: 0.01, ageHours: 40 });
+    const silentFresh = await item({ resonance: null, ambientPctl: null, ageHours: 1 });
+    const silentOld = await item({ resonance: null, ambientPctl: null, ageHours: 90 });
+
+    const order = await rank([trivial, silentFresh, silentOld]);
+    expect(order.map((r) => r.id)).toEqual([silentFresh, trivial, silentOld]);
+    // All three sit ON the floor — equal, and positive.
+    expect(order[0].score).toBe(order[1].score);
+    expect(order[1].score).toBe(order[2].score);
   });
 
   it("keeps a silent item below a resonant item of the same age", async () => {
@@ -284,56 +289,6 @@ describe.skipIf(!DB_URL)("D6 read-time proof blend (step 5)", () => {
     expect(at04).toBeCloseTo(at08 * 3, 10);
   });
 
-  // --- pinned as-of (§0i.2 — time-shifted pagination) -----------------------
-
-  it("scores are exact at a pinned asOf, so the page-1 boundary item never re-qualifies", async () => {
-    // The keyset filter is a strict (score, id) <. Page 2 re-evaluates every
-    // item's score, so exactness at the SAME asOf is what excludes the page-1
-    // boundary item. With now() instead, the boundary item's score has decayed
-    // below the cursor score by page 2 and re-qualifies — the duplicate bug.
-    const a = await item({ resonance: 2, ambientPctl: 0.5, ageHours: 1 });
-    const b = await item({ resonance: 2, ambientPctl: 0.5, ageHours: 2 });
-    const asOf = Date.now() / 1000;
-
-    const page1 = await rank([a, b], { asOf });
-    const boundary = page1[0]; // pretend LIMIT 1: cursor = (boundary.score, boundary.id)
-
-    // Re-evaluated at the pinned asOf, the boundary item reproduces its score
-    // EXACTLY — the strict `<` therefore excludes it from page 2.
-    const again = await rank([a, b], { asOf });
-    const reScore = again.find((r) => r.id === boundary.id)!.score;
-    expect(reScore).toBe(boundary.score);
-
-    // The bug class this pins out: an hour later, an UNpinned evaluation gives
-    // the boundary item a strictly lower score than the cursor carries — it
-    // would re-qualify under `<` and duplicate.
-    const shifted = await rank([a, b], { asOf: asOf + 3600 });
-    const decayed = shifted.find((r) => r.id === boundary.id)!.score;
-    expect(decayed).toBeLessThan(boundary.score);
-  });
-
-  // --- weight ---------------------------------------------------------------
-
-  it("still multiplies by the per-item source weight", async () => {
-    const a = await item({ resonance: 2, ambientPctl: 0.5, ageHours: 5 });
-    const base = (await rank([a]))[0].score;
-    const doubled = (await rank([a], { weight: "2::float8" }))[0].score;
-    expect(doubled).toBeCloseTo(base * 2, 10);
-  });
-
-  it("lets a loud silent source outrank a quiet resonant one (weight is a real dial)", async () => {
-    // Guards the composition: proof must not become an override that makes the
-    // volume control decorative.
-    const silent = await item({ resonance: null, ambientPctl: null, ageHours: 5 });
-    const resonant = await item({ resonance: 4, ambientPctl: 1, ageHours: 5 });
-    const equal = await rank([silent, resonant]);
-    expect(equal.map((r) => r.id)).toEqual([resonant, silent]);
-    // With a floor of 0.05 vs proof 1.0, weight 25x flips it.
-    const weighted = await rank([silent, resonant], {
-      weight: `(CASE WHEN id = '${silent}'::uuid THEN 25 ELSE 1 END)::float8`,
-    });
-    expect(weighted[0].id).toBe(silent);
-  });
 });
 
 function randHex(): string {

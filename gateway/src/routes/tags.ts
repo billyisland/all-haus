@@ -1,4 +1,3 @@
-import { UUID_RE } from "../lib/uuid.js";
 import type { FastifyInstance } from 'fastify'
 import { pool, withTransaction } from '@platform-pub/shared/db/client.js'
 import { requireAuth, optionalAuth } from '../middleware/auth.js'
@@ -6,6 +5,9 @@ import logger from '@platform-pub/shared/lib/logger.js'
 import { FEED_SELECT, FEED_JOINS, parseCursor } from '../lib/feed-sql.js'
 import { POST_SELECT, POST_JOINS, feedItemToPost } from '../lib/post-mapper.js'
 import { encodeTsIdCursor } from "../lib/cursor.js";
+import { parseLimit, parseOffset, isUuid } from '../lib/request-inputs.js'
+import { z } from 'zod'
+import { zodValidationError } from '@platform-pub/shared/lib/validation.js'
 
 // =============================================================================
 // Tag Routes
@@ -20,6 +22,17 @@ import { encodeTsIdCursor } from "../lib/cursor.js";
 const TAG_RE = /^[a-z0-9][a-z0-9-]{0,48}[a-z0-9]?$/
 const DEFAULT_LIMIT = 20
 const MAX_LIMIT = 50
+
+// The body was read as `req.body as { tags: string[] }` and checked only with
+// `Array.isArray(tags) || tags.length > 5`, which says nothing about the
+// ELEMENTS: `{"tags":[1]}` reaches `t.toLowerCase()` and throws, and so does
+// `{"tags":[{}]}` — a 500 out of a cast the route wrote itself. The per-tag
+// length cap is generous on purpose: the normaliser strips everything outside
+// [a-z0-9-] and TAG_RE filters what survives, so this only bounds what is
+// worth normalising at all.
+const SetTagsSchema = z.object({
+  tags: z.array(z.string().max(100)).max(5),
+})
 
 export async function tagRoutes(app: FastifyInstance) {
 
@@ -59,8 +72,8 @@ export async function tagRoutes(app: FastifyInstance) {
     { preHandler: optionalAuth },
     async (req, reply) => {
       const tagName = req.params.name.toLowerCase()
-      const limit = Math.min(parseInt(req.query.limit ?? '20', 10) || 20, 50)
-      const offset = parseInt(req.query.offset ?? '0', 10) || 0
+      const limit = parseLimit(req.query.limit, 20, 50)
+      const offset = parseOffset(req.query.offset)
 
       const { rows: tagRows } = await pool.query<{ id: string }>(
         'SELECT id FROM tags WHERE name = $1',
@@ -122,10 +135,7 @@ export async function tagRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const tagName = req.params.name.toLowerCase()
       const cursor = parseCursor(req.query.cursor)
-      const limit = Math.min(
-        parseInt(req.query.limit ?? String(DEFAULT_LIMIT), 10) || DEFAULT_LIMIT,
-        MAX_LIMIT
-      )
+      const limit = parseLimit(req.query.limit, DEFAULT_LIMIT, MAX_LIMIT)
 
       try {
         const { rows: tagRows } = await pool.query<{ id: string }>(
@@ -194,7 +204,7 @@ export async function tagRoutes(app: FastifyInstance) {
         })
       } catch (err) {
         logger.error({ err, tag: tagName }, 'Tag posts fetch failed')
-        return reply.status(500).send({ error: 'Tag posts fetch failed' })
+        return reply.status(500).send({ error: "Couldn't load posts for this tag. Please try again." })
       }
     }
   )
@@ -207,8 +217,8 @@ export async function tagRoutes(app: FastifyInstance) {
     '/articles/:articleId/tags',
     async (req, reply) => {
       const { articleId } = req.params
-      if (!articleId.match(UUID_RE)) {
-        return reply.status(400).send({ error: 'Invalid article ID' })
+      if (!isUuid(articleId)) {
+        return reply.status(404).send({ error: "We couldn't find that article." })
       }
 
       const { rows } = await pool.query<{ name: string }>(
@@ -228,20 +238,20 @@ export async function tagRoutes(app: FastifyInstance) {
   //   Body: { tags: string[] }  (max 5, normalised lowercase, hyphens ok)
   // ---------------------------------------------------------------------------
 
-  app.put<{ Params: { articleId: string }; Body: { tags: string[] } }>(
+  app.put<{ Params: { articleId: string }; Body: unknown }>(
     '/articles/:articleId/tags',
     { preHandler: requireAuth },
     async (req, reply) => {
       const writerId = req.session!.sub
       const { articleId } = req.params
-      const { tags } = req.body as { tags: string[] }
-
-      if (!articleId.match(UUID_RE)) {
-        return reply.status(400).send({ error: 'Invalid article ID' })
+      const parsed = SetTagsSchema.safeParse(req.body)
+      if (!parsed.success) {
+        return reply.status(400).send(zodValidationError(parsed.error))
       }
+      const { tags } = parsed.data
 
-      if (!Array.isArray(tags) || tags.length > 5) {
-        return reply.status(400).send({ error: 'Maximum 5 tags allowed' })
+      if (!isUuid(articleId)) {
+        return reply.status(404).send({ error: "We couldn't find that article." })
       }
 
       const normalised = tags
@@ -255,7 +265,7 @@ export async function tagRoutes(app: FastifyInstance) {
         [articleId, writerId]
       )
       if (artRows.length === 0) {
-        return reply.status(404).send({ error: 'Article not found' })
+        return reply.status(404).send({ error: "We couldn't find that article." })
       }
 
       await withTransaction(async (client) => {

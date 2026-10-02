@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { failureSentence } from "../../lib/api/client";
 
 // NewFeedPrompt — slice 3, minimal naming dialog for ∀ → New feed.
 // Source-set authoring lives in a later slice; this only captures a name and
@@ -13,7 +14,8 @@ import { useEffect, useRef, useState } from "react";
 // resolves through the `html.dark` inversion — and a never-inverting
 // foreground on top of one (`ink-925` on `white` = 26 26 24 on 30 29 26, a
 // contrast ratio of 1.03:1) is invisible. Foreground and ground must be in the
-// SAME inversion family; see web/CLAUDE.md › Global light/dark mode.
+// SAME inversion family; see `.claude/rules/web-theme.md` › Global light/dark
+// mode.
 const TOKENS = {
   scrim: "rgb(var(--ah-ink-925-rgb) / 0.4)",
   panelBg: "var(--ah-white)",
@@ -69,7 +71,7 @@ export function NewFeedPrompt({ open, onClose, onCreate }: NewFeedPromptProps) {
     try {
       await onCreate(trimmed);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create feed.");
+      setError(failureSentence(err, "Couldn’t create the channel. Please try again."));
       setSubmitting(false);
     }
   }
@@ -84,7 +86,7 @@ export function NewFeedPrompt({ open, onClose, onCreate }: NewFeedPromptProps) {
       onMouseDown={onScrimClick}
       role="dialog"
       aria-modal="true"
-      aria-label="New feed"
+      aria-label="New channel"
       style={{
         position: "fixed",
         inset: 0,
@@ -140,8 +142,8 @@ export function NewFeedPrompt({ open, onClose, onCreate }: NewFeedPromptProps) {
           className="font-mono text-mono-xs"
           style={{ color: TOKENS.hintFg, marginBottom: 16 }}
         >
-          A numeral is assigned automatically. Add a name to help you remember
-          what this feed is for.
+          Every channel gets a number automatically. A name is optional, but it
+          helps you remember what the channel is for.
         </div>
 
         <div
@@ -195,7 +197,7 @@ export function NewFeedPrompt({ open, onClose, onCreate }: NewFeedPromptProps) {
                 cursor: canSubmit ? "pointer" : "default",
               }}
             >
-              {submitting ? "Creating…" : "Create feed"}
+              {submitting ? "Creating…" : "Create channel"}
             </button>
           </div>
         </div>

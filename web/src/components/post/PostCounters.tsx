@@ -4,6 +4,7 @@ import React from "react";
 import type { Post } from "../../lib/post/types";
 import type { VesselPalette } from "../workspace/tokens";
 import type { PostInteractions } from "../../hooks/usePostInteractions";
+import { linkAccountToAct } from "../../content/conversation";
 
 // =============================================================================
 // PostCounters — the ORIGIN platform's like/reply/repost tallies (external only).
@@ -51,6 +52,7 @@ export function PostCounters({
         hideLike={hideLike}
         hideReply={hideReply}
         hideRepost={hideRepost}
+        protocol={proto}
       />
     );
   }
@@ -82,6 +84,7 @@ function InteractiveRow({
   hideLike,
   hideReply,
   hideRepost,
+  protocol,
 }: {
   counts: { like: number; reply: number; repost: number };
   palette: VesselPalette;
@@ -89,6 +92,7 @@ function InteractiveRow({
   hideLike: boolean;
   hideReply: boolean;
   hideRepost: boolean;
+  protocol: string;
 }) {
   const { liked, reposted, onLike, onRepost, onToggleReply, likeDisabled, repostDisabled, replyDisabled } =
     interactions;
@@ -116,7 +120,7 @@ function InteractiveRow({
             cursor: onLike && !liked ? "pointer" : "default",
             color: liked ? palette.crimson : palette.cardMeta,
           }}
-          title={likeDisabled ? "Connect account to interact" : liked ? "Liked" : "Like"}
+          title={likeDisabled ? linkAccountToAct(protocol, "like") : liked ? "Liked" : "Like"}
         >
           <svg width="12" height="12" viewBox="0 0 24 24" fill={liked ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
@@ -137,7 +141,7 @@ function InteractiveRow({
             cursor: onToggleReply ? "pointer" : "default",
             color: palette.cardMeta,
           }}
-          title={replyDisabled ? "Connect account to interact" : "Reply"}
+          title={replyDisabled ? linkAccountToAct(protocol, "reply") : "Reply"}
         >
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
@@ -158,7 +162,7 @@ function InteractiveRow({
             cursor: onRepost && !reposted ? "pointer" : "default",
             color: reposted ? palette.crimson : palette.cardMeta,
           }}
-          title={repostDisabled ? "Connect account to interact" : reposted ? "Reposted" : "Repost"}
+          title={repostDisabled ? linkAccountToAct(protocol, "repost") : reposted ? "Reposted" : "Repost"}
         >
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <polyline points="17 1 21 5 17 9" />

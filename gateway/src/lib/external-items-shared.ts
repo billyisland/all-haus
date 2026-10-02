@@ -1,4 +1,6 @@
 import { pool } from "@platform-pub/shared/db/client.js";
+import { httpUrlOrNull } from "@platform-pub/shared/lib/sanitize.js";
+import type { AtprotoReplyRefs } from "@platform-pub/shared/lib/atproto-reply-refs.js";
 
 // Shared helpers, constants and row/interface types for the external-items
 // route modules (engagement / parent / quote / thread / interactions) and the
@@ -94,7 +96,7 @@ export interface BlueskyThreadViewPost {
     record: {
       text?: string;
       createdAt?: string;
-      reply?: { parent: { uri: string }; root: { uri: string } };
+      reply?: AtprotoReplyRefs;
     };
     // Hydrated view embed (#view) — carries full CDN media URLs. Only read when
     // building the rich focus node (extractBlueskyViewMedia).
@@ -152,13 +154,17 @@ export function extractBlueskyViewMedia(embed: unknown): QuoteMedia[] {
           });
       }
     } else if (t.startsWith("app.bsky.embed.external") && v.external?.uri) {
-      out.push({
-        type: "link",
-        url: v.external.uri,
-        thumbnail: v.external.thumb,
-        title: v.external.title || undefined,
-        description: v.external.description || undefined,
-      });
+      // The preview target is rendered as an `href`; refuse a non-http(s)
+      // scheme here rather than storing it (see httpUrlOrNull's header).
+      const uri = httpUrlOrNull(v.external.uri);
+      if (uri)
+        out.push({
+          type: "link",
+          url: uri,
+          thumbnail: v.external.thumb,
+          title: v.external.title || undefined,
+          description: v.external.description || undefined,
+        });
     } else if (t.startsWith("app.bsky.embed.video") && v.playlist) {
       out.push({ type: "video", url: v.playlist, thumbnail: v.thumbnail });
     }
@@ -220,16 +226,7 @@ export function rowToParentItem(row: any): ParentItem {
   };
 }
 
-export function extractMastodonStatusId(uri: string): string | null {
-  try {
-    const parts = new URL(uri).pathname.split("/").filter(Boolean);
-    const last = parts[parts.length - 1];
-    if (last && /^\d+$/.test(last)) return last;
-    return null;
-  } catch {
-    return null;
-  }
-}
+export { extractMastodonStatusId } from "@platform-pub/shared/lib/mastodon-api.js";
 
 // -----------------------------------------------------------------------------
 // Context rows must be dual-written, or they are unreachable until 05:00.
@@ -258,6 +255,11 @@ export function extractMastodonStatusId(uri: string): string | null {
 // Idempotent (the NOT EXISTS plus ON CONFLICT DO NOTHING), so every fetcher can
 // call it unconditionally on the row it just upserted.
 //
+// CONTEXT_INTERACTION_MERGE_SQL — the merge every context write assigns to
+// interaction_data — lives in shared/src/lib/context-persist.ts beside the
+// writer that exercises it, and is re-exported here for the route sites.
+export { CONTEXT_INTERACTION_MERGE_SQL } from "@platform-pub/shared/lib/context-persist.js";
+
 // The SQL is exported so the test runs this module's own text rather than a
 // copy of it — the same reason feed-items-reconcile.ts exports its two.
 export const CONTEXT_FEED_ITEM_INSERT_SQL = `

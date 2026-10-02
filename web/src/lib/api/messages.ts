@@ -1,8 +1,11 @@
 import { request } from './client'
 
+/** One inbox row, as `GET /messages` sends it (`listInbox`): a time, never a
+ *  preview — a preview would be one decrypt per row. */
 export interface Conversation {
   id: string
-  lastMessage: { content: string; senderUsername: string; createdAt: string } | null
+  lastMessageAt: string | null
+  createdAt: string
   unreadCount: number
   members: { id: string; username: string; displayName: string | null; avatar: string | null }[]
 }

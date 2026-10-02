@@ -2,7 +2,8 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
 import { requireAuth, optionalAuth } from "../../middleware/auth.js";
-import { publicationsEnabled } from "@platform-pub/shared/lib/env.js";
+import { requireWriter } from "../../lib/writer-gate.js";
+import { publicationsEnabled, internalSecret } from "@platform-pub/shared/lib/env.js";
 import { matchDriveForPublish, queueDriveFulfilment } from "../drives.js";
 import { sendPublishNotifications } from "@platform-pub/shared/lib/publish-emails.js";
 import { slugify } from "@platform-pub/shared/lib/slug.js";
@@ -10,6 +11,12 @@ import { zodValidationError } from "@platform-pub/shared/lib/validation.js";
 import { truncatePreview } from "@platform-pub/shared/lib/text.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 import { KEY_SERVICE_URL } from "./shared.js";
+import { keyServiceHeaders } from "../../lib/key-service-client.js";
+import { rekeyArticleEvent } from "../../lib/article-event-rekey.js";
+import {
+  writerTermsOutstanding,
+  WRITER_TERMS_REQUIRED,
+} from "../../lib/terms-gate.js";
 
 // =============================================================================
 // Article publishing + public reads
@@ -18,6 +25,15 @@ import { KEY_SERVICE_URL } from "./shared.js";
 // GET  /articles/:dTag                      — Fetch article metadata by d-tag
 // GET  /articles/by-event/:nostrEventId     — Fetch article by Nostr event ID
 // =============================================================================
+
+/** Thrown inside the index transaction when the d-tag is live under another
+ *  writer (CA-B4); the route answers 409 and nothing was written. */
+class DTagTakenError extends Error {
+  constructor() {
+    super("d-tag already live under another writer");
+    this.name = "DTagTakenError";
+  }
+}
 
 const IndexArticleSchema = z
   .object({
@@ -78,7 +94,12 @@ export async function articlePublishRoutes(app: FastifyInstance) {
   // Creates the app-layer index row used for feed assembly, search, billing.
   // ---------------------------------------------------------------------------
 
-  app.post("/articles", { preHandler: requireAuth }, async (req, reply) => {
+  // `requireWriter` BEFORE the Writer Agreement question below, and for every
+  // piece rather than the paywalled ones: asking a reader to accept the
+  // agreement for an act they cannot perform is a button that cannot do its
+  // job (READER-WRITER-SPLIT-ADR §2). The web's first writer call is the
+  // kind-30023 signature (`routes/signing.ts`), which asks the same question.
+  app.post("/articles", { preHandler: [requireAuth, requireWriter] }, async (req, reply) => {
     const parsed = IndexArticleSchema.safeParse(req.body);
     if (!parsed.success) {
       return reply.status(400).send(zodValidationError(parsed.error));
@@ -86,6 +107,25 @@ export async function articlePublishRoutes(app: FastifyInstance) {
 
     const writerId = req.session!.sub;
     const data = parsed.data;
+
+    // THE WRITER AGREEMENT IS WHAT PAID ACCESS IS SOLD UNDER (A3), so the
+    // first paywalled publish is where it is accepted — before Connect
+    // onboarding, because the code sells access long before a payout exists.
+    //
+    // Refused here rather than in the three publish-side validators beside it:
+    // those three are in lockstep about PRICE AND GATE POSITION, and neither
+    // the editor nor the key service can know what version an account has
+    // accepted. A free publish is untouched — it is not a sale.
+    //
+    // Paired with the throw in `publishPersonalArticle`, which covers the
+    // scheduler's path; this route is only the web's.
+    if (data.accessMode === "paywalled" && (await writerTermsOutstanding(writerId))) {
+      return reply.status(403).send({
+        error: WRITER_TERMS_REQUIRED,
+        message:
+          "Before publishing paid access, please accept the all.haus Writer Agreement.",
+      });
+    }
 
     const slug = slugify(data.title, 120);
 
@@ -95,7 +135,39 @@ export async function articlePublishRoutes(app: FastifyInstance) {
     try {
       const isGated = data.accessMode === "paywalled";
 
-      const { articleId, isNew, driveId } = await withTransaction(async (client) => {
+      const { articleId, isNew, driveId, rekeyed } = await withTransaction(async (client) => {
+        // THE OLD EVENT ID, READ BEFORE THE UPSERT OVERWRITES IT (§2.8).
+        // A NIP-23 edit signs a NEW event, and this upsert writes its id over
+        // the old one — orphaning every comment, vote, tally, engagement row and
+        // report that points at the piece. `xmax = 0` below only says AFTERWARDS
+        // whether a row existed, which is too late to have kept the value, so
+        // the read has to happen here. `FOR UPDATE` because the re-key and the
+        // rewrite must be one indivisible move: a concurrent publish of the same
+        // d-tag would otherwise interleave and re-key onto the loser's id.
+        const priorRow = await client.query<{ nostr_event_id: string }>(
+          `SELECT nostr_event_id FROM articles
+            WHERE writer_id = $1 AND nostr_d_tag = $2 AND deleted_at IS NULL
+            FOR UPDATE`,
+          [writerId, data.dTag],
+        );
+        const priorEventId = priorRow.rows[0]?.nostr_event_id ?? null;
+
+        // A D-TAG LIVE UNDER ANOTHER WRITER IS REFUSED (CA-B4). The unique
+        // index is per writer, and GET /articles/:dTag addresses by d-tag
+        // alone, so a chosen collision would put one writer's piece at
+        // another's address. The d-tag is client-minted (slug + base36 time),
+        // so an honest collision is improbable and a chosen one is the case.
+        // Thrown inside the transaction so nothing below it is written.
+        if (!priorEventId) {
+          const { rows: held } = await client.query(
+            `SELECT 1 FROM articles
+              WHERE nostr_d_tag = $1 AND writer_id <> $2 AND deleted_at IS NULL
+              LIMIT 1`,
+            [data.dTag, writerId],
+          );
+          if (held.length > 0) throw new DTagTakenError();
+        }
+
         const result = await client.query<{ id: string; is_new: boolean }>(
           `INSERT INTO articles (
              writer_id, nostr_event_id, nostr_d_tag, title, slug, summary,
@@ -137,6 +209,14 @@ export async function articlePublishRoutes(app: FastifyInstance) {
         );
 
         const artId = result.rows[0].id;
+
+        // Carry the conversation across the edit. Guarded on the PRIOR row
+        // rather than on `is_new`: nothing to move when there was no row, and a
+        // stray match on an empty old id would capture another article's
+        // conversation.
+        const rekeyed = priorEventId
+          ? await rekeyArticleEvent(client, priorEventId, data.nostrEventId)
+          : {};
 
         // Dual-write: upsert feed_items row in same transaction
         const {
@@ -199,11 +279,15 @@ export async function articlePublishRoutes(app: FastifyInstance) {
           data.draftId ?? null,
         );
 
-        return { articleId: artId, isNew: result.rows[0].is_new, driveId: matchedDriveId };
+        return { articleId: artId, isNew: result.rows[0].is_new, driveId: matchedDriveId, rekeyed };
       });
 
       logger.info(
-        { articleId, writerId, nostrEventId: data.nostrEventId, isNew },
+        // `rekeyed` is what an edit carried across with it — empty on a first
+        // publish and on an edit of a piece nobody has engaged with. Logged
+        // because it is otherwise invisible: the failure it replaces was a
+        // conversation quietly ceasing to exist.
+        { articleId, writerId, nostrEventId: data.nostrEventId, isNew, rekeyed },
         "Article indexed",
       );
 
@@ -230,8 +314,15 @@ export async function articlePublishRoutes(app: FastifyInstance) {
 
       return reply.status(201).send({ articleId, isNew });
     } catch (err) {
+      if (err instanceof DTagTakenError) {
+        logger.warn({ writerId, dTag: data.dTag }, "Article refused: d-tag live under another writer");
+        return reply.status(409).send({
+          error: "d_tag_taken",
+          message: "That address already belongs to another writer's piece.",
+        });
+      }
       logger.error({ err, writerId }, "Article indexing failed");
-      return reply.status(500).send({ error: "Indexing failed" });
+      return reply.status(500).send({ error: "Couldn't publish that. Please try again." });
     }
   });
 
@@ -275,8 +366,9 @@ export async function articlePublishRoutes(app: FastifyInstance) {
         publication_name: string | null;
         publication_status: string | null;
         publication_subscription_price_pence: number | null;
+        deleted_at: Date | null;
       }>(
-        `SELECT a.id, article_post_id(a.id) AS post_id,
+        `SELECT a.id, article_post_id(a.id) AS post_id, a.deleted_at,
                 a.writer_id, a.nostr_event_id, a.nostr_d_tag,
                 a.title, a.slug, a.summary, a.content_free, a.word_count,
                 a.access_mode, a.price_pence, a.gate_position_pct,
@@ -294,41 +386,70 @@ export async function articlePublishRoutes(app: FastifyInstance) {
          FROM articles a
          JOIN accounts w ON w.id = a.writer_id
          LEFT JOIN publications p ON p.id = a.publication_id
-         WHERE a.nostr_d_tag = $1 AND a.published_at IS NOT NULL AND a.deleted_at IS NULL`,
+         WHERE a.nostr_d_tag = $1 AND a.published_at IS NOT NULL
+         -- THE LIVE ROW FIRST (CA-B4, 2026-09-29). idx_articles_unique_live is
+         -- partial on deleted_at IS NULL, so a withdrawn row and its live
+         -- re-publish coexist under one d-tag, and an unordered rows[0] served
+         -- whichever the planner found -- a public 404 for a live piece. The
+         -- withdrawn arm below stays: it is reached only when no live row exists.
+         ORDER BY (a.deleted_at IS NULL) DESC, a.published_at DESC
+         LIMIT 1`,
         [dTag],
       );
 
       if (rows.length === 0) {
-        return reply.status(404).send({ error: "Article not found" });
+        return reply.status(404).send({ error: "We couldn't find that article." });
       }
 
       const r = rows[0];
 
+      // A WITHDRAWN PIECE IS STILL THE READER'S WHO PAID FOR IT (Writer 3.4,
+      // Writer 13.3; §0z item 18). Withdrawal — the writer's delete, their
+      // closure, or a moderation rung — sets `deleted_at`, and this route
+      // answered 404 to everyone, so the promise that readers keep what they
+      // paid for was made by the text and kept by nothing. It is 404 to the
+      // world (the page's server fetch is anonymous and cached across
+      // viewers, so this is the answer the public and the crawlers get) and
+      // the piece to a session that holds an `article_unlocks` row — the one
+      // record that says this reader bought THIS piece; a live subscription is
+      // access to what is on sale, and a withdrawn piece is not.
+      if (r.deleted_at !== null) {
+        const viewer = req.session?.sub;
+        const unlocked = viewer
+          ? await pool.query(
+              `SELECT 1 FROM article_unlocks WHERE reader_id = $1 AND article_id = $2`,
+              [viewer, r.id],
+            )
+          : { rows: [] };
+        if (unlocked.rows.length === 0) {
+          return reply.status(404).send({ error: "We couldn't find that article." });
+        }
+      }
+
       // If authenticated reader viewing a paywalled article, include their
-      // monthly spend on this writer (for the subscription nudge)
+      // monthly spend on this writer (for the gate's "a subscription is £X/mo"
+      // note). The spend→subscription CONVERSION this once fed, and the
+      // one-shot nudge log with it, were deleted 2026-09-29 (CA-I6): the route
+      // was a documented money pump kept dark behind a do-not-flip flag, and
+      // the gate's copy promised a conversion nothing performed.
       let writerSpendThisMonthPence: number | null = null;
-      let nudgeShownThisMonth = false;
       const readerId = req.session?.sub;
       if (
         readerId &&
         r.access_mode === "paywalled" &&
         readerId !== r.writer_id
       ) {
+        // What the reader has actually PAID this writer this month. The gift
+        // rule: a free-allowance penny is charged to nobody, so it is not spend
+        // and must not inflate the "you would save by subscribing" nudge.
         const spendResult = await pool.query<{ total: string }>(
-          `SELECT COALESCE(SUM(amount_pence), 0) AS total
+          `SELECT COALESCE(SUM(chargeable_pence), 0) AS total
            FROM read_events
            WHERE reader_id = $1 AND writer_id = $2
              AND read_at >= date_trunc('month', now())`,
           [readerId, r.writer_id],
         );
         writerSpendThisMonthPence = parseInt(spendResult.rows[0].total, 10);
-
-        const nudgeResult = await pool.query<{ reader_id: string }>(
-          `SELECT reader_id FROM subscription_nudge_log
-           WHERE reader_id = $1 AND writer_id = $2 AND month = date_trunc('month', now())::date`,
-          [readerId, r.writer_id],
-        );
-        nudgeShownThisMonth = nudgeResult.rows.length > 0;
       }
 
       return reply.status(200).send({
@@ -362,7 +483,9 @@ export async function articlePublishRoutes(app: FastifyInstance) {
         coverImageUrl: r.cover_image_url,
         publishedAt: r.published_at?.toISOString() ?? null,
         writerSpendThisMonthPence,
-        nudgeShownThisMonth,
+        // True only on the unlocked-reader answer above; the reader says why
+        // the piece looks the way it does.
+        withdrawn: r.deleted_at !== null,
         writer: {
           id: r.writer_id,
           username: r.writer_username,
@@ -425,7 +548,7 @@ export async function articlePublishRoutes(app: FastifyInstance) {
       );
 
       if (rows.length === 0) {
-        return reply.status(404).send({ error: "Article not found" });
+        return reply.status(404).send({ error: "We couldn't find that article." });
       }
 
       const r = rows[0];
@@ -433,15 +556,15 @@ export async function articlePublishRoutes(app: FastifyInstance) {
 
       if (r.writer_id === userId && r.access_mode === "paywalled") {
         try {
-          const res = await fetch(
-            `${KEY_SERVICE_URL}/api/v1/articles/${r.id}/paywall-content`,
-            {
-              headers: {
-                "x-writer-id": userId,
-                "X-Internal-Secret": process.env.INTERNAL_SECRET ?? "",
-              },
-            },
-          );
+          const ksPath = `/api/v1/articles/${r.id}/paywall-content`;
+          const res = await fetch(`${KEY_SERVICE_URL}${ksPath}`, {
+            headers: keyServiceHeaders({
+              method: "GET",
+              path: ksPath,
+              identity: { writerId: userId },
+            }),
+            signal: AbortSignal.timeout(15_000),
+          });
           if (res.ok) {
             const body = (await res.json()) as { content?: string };
             contentPaywall = body.content ?? null;

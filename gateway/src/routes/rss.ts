@@ -1,6 +1,10 @@
 import type { FastifyInstance } from "fastify";
 import { pool } from "@platform-pub/shared/db/client.js";
 import { requirePublicationsEnabled } from "../middleware/publication-auth.js";
+import { requireEnv } from "@platform-pub/shared/lib/env.js";
+import { marked } from "marked";
+import { sanitizeContent } from "@platform-pub/shared/lib/sanitize.js";
+import { stripHtmlTags } from "../lib/external-items-shared.js";
 
 // =============================================================================
 // RSS Feed Routes
@@ -19,7 +23,29 @@ import { requirePublicationsEnabled } from "../middleware/publication-auth.js";
 // Feed format: RSS 2.0 (broader client support than Atom)
 // =============================================================================
 
-const SITE_URL = process.env.APP_URL ?? "https://all.haus";
+// THE BODY IS MARKDOWN, AND A FEED READER IS NOT A MARKDOWN RENDERER (CA-B5,
+// 2026-09-29). `content_free` is what the editor's markdown serialiser wrote
+// and what the NIP-23 event carries; `content:encoded` put it in raw, so every
+// feed reader showed asterisks and brackets, and `description` ran a tag
+// strip over text that had no tags. It is rendered here through `marked` and
+// then through the shared sanitiser — the same allow-list every other HTML
+// body on the site passes — so a feed reader gets the piece as the article
+// page shows it and nothing the sanitiser refuses reaches a third-party
+// renderer. The description is the rendered text, tags stripped.
+//
+// A PUBLICATION PIECE HIDDEN FROM THE PROFILE IS HIDDEN FROM THE WRITER'S
+// FEED TOO: `show_on_writer_profile` is the same clause the profile counts
+// carry (`writers.ts`). Moot while publications are suspended; kept in
+// lockstep so it is true the day they are not.
+function renderBody(markdown: string): string {
+  return sanitizeContent(marked.parse(markdown, { async: false }));
+}
+
+// The gateway refuses to boot without APP_URL (`index.ts`), so this is read at
+// call time, never with a fallback — a fallback here is a second spelling of a
+// value that already has one home, and a module constant would freeze whatever
+// the importing process had set at import.
+const siteUrl = () => requireEnv("APP_URL");
 
 export async function rssRoutes(app: FastifyInstance) {
   // ---------------------------------------------------------------------------
@@ -57,14 +83,15 @@ export async function rssRoutes(app: FastifyInstance) {
         `SELECT nostr_d_tag, title, summary, content_free, published_at
          FROM articles
          WHERE writer_id = $1 AND published_at IS NOT NULL AND deleted_at IS NULL
+           AND (publication_id IS NULL OR show_on_writer_profile = TRUE)
          ORDER BY published_at DESC
          LIMIT 20`,
         [writer.id],
       );
 
       const displayName = writer.display_name ?? username;
-      const feedUrl = `${SITE_URL}/rss/${username}`;
-      const writerUrl = `${SITE_URL}/${username}`;
+      const feedUrl = `${siteUrl()}/rss/${username}`;
+      const writerUrl = `${siteUrl()}/${username}`;
 
       const xml = buildRssFeed({
         title: `${displayName} — all.haus`,
@@ -73,10 +100,10 @@ export async function rssRoutes(app: FastifyInstance) {
         feedUrl,
         items: articles.map((a) => ({
           title: a.title,
-          link: `${SITE_URL}/article/${a.nostr_d_tag}`,
+          link: `${siteUrl()}/article/${a.nostr_d_tag}`,
           description:
-            a.summary ?? truncate(stripHtml(a.content_free ?? ""), 300),
-          content: a.content_free ?? "",
+            a.summary ?? truncate(stripHtmlTags(renderBody(a.content_free ?? "")), 300),
+          content: renderBody(a.content_free ?? ""),
           pubDate: a.published_at,
         })),
       });
@@ -135,18 +162,18 @@ export async function rssRoutes(app: FastifyInstance) {
         [pub.id],
       );
 
-      const pubUrl = `${SITE_URL}/pub/${slug}`;
+      const pubUrl = `${siteUrl()}/pub/${slug}`;
       const xml = buildRssFeed({
         title: `${pub.name}`,
         description: pub.tagline ?? `Articles from ${pub.name}`,
         link: pubUrl,
-        feedUrl: `${SITE_URL}/api/v1/pub/${slug}/rss`,
+        feedUrl: `${siteUrl()}/api/v1/pub/${slug}/rss`,
         items: articles.map((a) => ({
           title: a.title,
-          link: `${SITE_URL}/pub/${slug}/${a.nostr_d_tag}`,
+          link: `${siteUrl()}/pub/${slug}/${a.nostr_d_tag}`,
           description:
-            a.summary ?? truncate(stripHtml(a.content_free ?? ""), 300),
-          content: a.content_free ?? "",
+            a.summary ?? truncate(stripHtmlTags(renderBody(a.content_free ?? "")), 300),
+          content: renderBody(a.content_free ?? ""),
           pubDate: a.published_at,
           author: a.writer_display_name ?? a.writer_username,
         })),
@@ -185,14 +212,14 @@ export async function rssRoutes(app: FastifyInstance) {
     const xml = buildRssFeed({
       title: "all.haus — recent articles",
       description: "Recent articles from writers on all.haus",
-      link: SITE_URL,
-      feedUrl: `${SITE_URL}/rss`,
+      link: siteUrl(),
+      feedUrl: `${siteUrl()}/rss`,
       items: articles.map((a) => ({
         title: a.title,
-        link: `${SITE_URL}/article/${a.nostr_d_tag}`,
+        link: `${siteUrl()}/article/${a.nostr_d_tag}`,
         description:
-          a.summary ?? truncate(stripHtml(a.content_free ?? ""), 300),
-        content: a.content_free ?? "",
+          a.summary ?? truncate(stripHtmlTags(renderBody(a.content_free ?? "")), 300),
+        content: renderBody(a.content_free ?? ""),
         pubDate: a.published_at,
         author: a.writer_display_name ?? a.writer_username,
       })),
@@ -266,10 +293,6 @@ function escapeXml(str: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;");
-}
-
-function stripHtml(html: string): string {
-  return html.replace(/<[^>]*>/g, "").trim();
 }
 
 function truncate(text: string, max: number): string {

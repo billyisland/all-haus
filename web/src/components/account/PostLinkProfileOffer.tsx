@@ -25,6 +25,7 @@ import {
   useLinkedAccounts,
   invalidateLinkedAccounts,
 } from '../../hooks/useLinkedAccounts'
+import { failureSentence } from '../../lib/api/client'
 
 const PROTOCOL: Record<'bluesky' | 'mastodon', LinkedAccount['protocol']> = {
   bluesky: 'atproto',
@@ -71,7 +72,7 @@ export function PostLinkProfileOffer({
       invalidateLinkedAccounts()
       setDone(true)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update')
+      setError(failureSentence(err, 'Couldn’t save that change. Please try again.'))
     } finally {
       setBusy(false)
     }
@@ -98,10 +99,11 @@ export function PostLinkProfileOffer({
           the profile, which is a different act from letting us post through it
           (that consent is `Default on`, and it was not asked for here). */}
       <p className="text-ui-xs text-grey-600 leading-relaxed">
-        It joins the &ldquo;also known as&rdquo; row as a{' '}
-        <span className="label-ui">VERIFIED</span> identity — you proved it, so
-        anyone reading your profile can see it is yours. Public, including to
-        logged-out visitors. Separate from cross-posting, and reversible.
+        It joins the &ldquo;Also known as&rdquo; row on your profile, marked{' '}
+        <span className="label-ui">VERIFIED</span> because you&rsquo;ve proved
+        it&rsquo;s yours. Anyone can see it, including people who aren&rsquo;t
+        logged in. It&rsquo;s separate from cross-posting, and you can turn it
+        off at any time.
       </p>
       {error && <p className="text-ui-xs text-red-600">{error}</p>}
       <div className="flex gap-3">

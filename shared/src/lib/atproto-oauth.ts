@@ -14,8 +14,10 @@ import logger from './logger.js'
 // Session bookkeeping (NodeSavedSession: TokenSet + DPoP key per DID) lives in
 // `atproto_oauth_sessions`, AES-256-GCM encrypted with LINKED_ACCOUNT_KEY_HEX.
 // State bookkeeping (PKCE verifier + DPoP key between authorize/callback) lives
-// in-memory — only the gateway runs that half of the dance and the flow is
-// short-lived (~10 minutes).
+// in `atproto_oauth_pending_states` (`DbStateStore` below, same encryption),
+// because the callback may land on a different gateway process than the one
+// that issued the authorize URL; rows expire after 45min and the feed-ingest
+// cron `atproto_oauth_states_prune` deletes expired ones every 5 minutes.
 //
 // Dev mode (ATPROTO_CLIENT_BASE_URL unset or localhost): use the loopback
 // client_id encoding (`http://localhost?...`) so no JWKS endpoint is required.
@@ -43,9 +45,20 @@ class DbSessionStore implements NodeSavedSessionStore {
   async set(did: string, session: NodeSavedSession): Promise<void> {
     const enc = encryptJson(session)
     await pool.query(
-      `INSERT INTO atproto_oauth_sessions (did, session_data_enc, updated_at)
-       VALUES ($1, $2, now())
-       ON CONFLICT (did) DO UPDATE SET session_data_enc = EXCLUDED.session_data_enc, updated_at = now()`,
+      // `account_id` (migration 194) is what makes a stored credential
+      // attributable. The store only ever knows the DID, so it fills the
+      // column from the presence that carries it — and COALESCEs on conflict
+      // rather than assigning, so a refresh that runs before the presence
+      // exists can never blank an attribution already made.
+      `INSERT INTO atproto_oauth_sessions (did, session_data_enc, account_id, updated_at)
+       VALUES ($1, $2,
+               (SELECT account_id FROM network_presences
+                 WHERE protocol = 'atproto' AND external_id = $1),
+               now())
+       ON CONFLICT (did) DO UPDATE SET
+         session_data_enc = EXCLUDED.session_data_enc,
+         account_id = COALESCE(atproto_oauth_sessions.account_id, EXCLUDED.account_id),
+         updated_at = now()`,
       [did, enc]
     )
   }

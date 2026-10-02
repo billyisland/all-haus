@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { pool } from '@platform-pub/shared/db/client.js'
 import { requireAuth } from '../../middleware/auth.js'
+import { requireWriter } from '../../lib/writer-gate.js'
 import logger from '@platform-pub/shared/lib/logger.js'
 import { zodValidationError } from '@platform-pub/shared/lib/validation.js'
 
@@ -18,7 +19,7 @@ const PriceSchema = z.object({
 export async function subscriptionSettingsRoutes(app: FastifyInstance) {
   app.patch(
     '/settings/subscription-price',
-    { preHandler: requireAuth },
+    { preHandler: [requireAuth, requireWriter] },
     async (req, reply) => {
       const parsed = PriceSchema.safeParse(req.body)
       if (!parsed.success) {
@@ -91,7 +92,7 @@ export async function subscriptionSettingsRoutes(app: FastifyInstance) {
 
   app.patch(
     '/settings/subscription-welcome',
-    { preHandler: requireAuth },
+    { preHandler: [requireAuth, requireWriter] },
     async (req, reply) => {
       const parsed = WelcomeSchema.safeParse(req.body)
       if (!parsed.success) {

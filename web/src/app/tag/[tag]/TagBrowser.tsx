@@ -13,9 +13,7 @@ import {
 } from "../../../components/workspace/tokens";
 import { tagPosts } from "../../../lib/api/post";
 import type { Post } from "../../../lib/post/types";
-import { quotePreviewContent } from "../../../lib/post/quote-preview";
 import { useReader } from "../../../stores/reader";
-import { useCompose } from "../../../stores/compose";
 import { useColorScheme } from "../../../stores/colorScheme";
 
 // =============================================================================
@@ -117,16 +115,6 @@ export function TagBrowser({
     [inOverlay, openNative, router],
   );
 
-  const replyFromPost = useCallback((p: Post) => {
-    if (!p.author.pubkey) return;
-    useCompose.getState().open("reply", {
-      eventId: p.version ?? p.id,
-      eventKind: p.type === "article" ? 30023 : 1,
-      authorPubkey: p.author.pubkey,
-      previewContent: quotePreviewContent(p),
-    });
-  }, []);
-
   return (
     <div className="mx-auto max-w-feed px-4 sm:px-6 py-12">
       <h1 className="font-mono text-2xl uppercase tracking-[0.02em] text-black">
@@ -145,7 +133,7 @@ export function TagBrowser({
       ) : items.length === 0 ? (
         <div className="py-20 text-center">
           <p className="text-ui-sm text-grey-600">
-            #{tagName} — No articles yet.
+            No articles tagged #{tagName} yet.
           </p>
         </div>
       ) : (
@@ -162,9 +150,6 @@ export function TagBrowser({
               level="feed"
               ctx={CTX}
               onOpenReader={openReader}
-              onReply={
-                post.author.pubkey ? () => replyFromPost(post) : undefined
-              }
             />
           ))}
 

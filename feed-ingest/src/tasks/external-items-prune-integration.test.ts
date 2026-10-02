@@ -117,13 +117,18 @@ describe.skipIf(!DB_URL)("external_items_prune — reference guards + wedge (M15
     );
     articleId = a.id;
 
-    // Four items, all older than any retention window.
+    // Four items, all older than any retention window — and last SERVED that
+    // long ago too: the home-membership trigger stamps now(), so age it.
     const OLD = `now() - interval '200 days'`;
     const item = async (label: string): Promise<string> => {
       const { rows: [r] } = await client.query<{ id: string }>(
         `INSERT INTO external_items (source_id, protocol, tier, source_item_uri, published_at, fetched_at, created_at)
          VALUES ($1,'nostr_external','tier2',$2, ${OLD}, ${OLD}, ${OLD}) RETURNING id`,
         [sourceId, `uri://${tag}/${label}`],
+      );
+      await client.query(
+        `UPDATE external_item_sources SET last_seen_at = ${OLD} WHERE external_item_id = $1`,
+        [r.id],
       );
       return r.id;
     };
@@ -210,6 +215,78 @@ describe.skipIf(!DB_URL)("external_items_prune — reference guards + wedge (M15
     // deleted_at filter, not some other difference.
     expect(after).not.toContain("cited");
     expect(rowCount).toBeGreaterThan(0);
+  });
+
+  it("an item a notification names is spared (migration 236 CASCADEs, so pruning it would delete the notification)", async () => {
+    const { rows: [n] } = await client.query<{ id: string }>(
+      `INSERT INTO external_items (source_id, protocol, tier, source_item_uri, published_at, fetched_at, created_at)
+       VALUES ($1,'nostr_external','tier2',$2, now() - interval '200 days', now() - interval '200 days', now() - interval '200 days')
+       RETURNING id`,
+      [sourceId, `uri://notified-${uniq()}/notified`],
+    );
+    await client.query(
+      `UPDATE external_item_sources SET last_seen_at = now() - interval '200 days' WHERE external_item_id = $1`,
+      [n.id],
+    );
+    const { rows: [who] } = await client.query<{ id: string }>(
+      `INSERT INTO accounts (nostr_pubkey) VALUES ($1) RETURNING id`,
+      [uniq().padEnd(64, "1")],
+    );
+    await client.query(
+      `INSERT INTO notifications (recipient_id, type, external_item_id) VALUES ($1, 'external_mention', $2)`,
+      [who.id, n.id],
+    );
+    await runFixedToCompletion();
+    expect(await survivors()).toEqual(["cited", "notified", "parent"]);
+  });
+
+  // CA-G10b. An item still SERVED by its source is kept however long ago we
+  // first inserted it; keyed on insert time it was pruned and re-inserted as a
+  // new row by the next poll.
+  it("keeps an item a source served recently, however old its row is", async () => {
+    const { rows: [r] } = await client.query<{ id: string }>(
+      `INSERT INTO external_items (source_id, protocol, tier, source_item_uri, published_at, fetched_at, created_at)
+       VALUES ($1,'nostr_external','tier2',$2, now() - interval '400 days', now() - interval '200 days', now() - interval '200 days')
+       RETURNING id`,
+      [sourceId, `uri://evergreen-${uniq()}/evergreen`],
+    );
+    await client.query(
+      `UPDATE external_item_sources SET last_seen_at = now() - interval '1 day' WHERE external_item_id = $1`,
+      [r.id],
+    );
+    await runFixedToCompletion();
+    expect(await survivors()).toEqual(["cited", "evergreen", "parent"]);
+  });
+
+  // CA-C4. The stamp is per SOURCE: a shared item whose home source stopped
+  // serving it long ago is kept while ANOTHER source still serves it.
+  it("keeps a shared item while any source still serves it", async () => {
+    const { rows: [other] } = await client.query<{ id: string }>(
+      `INSERT INTO external_sources (protocol, source_uri) VALUES ('nostr_external', $1) RETURNING id`,
+      [`src://other-${uniq()}`],
+    );
+    await client.query(
+      `INSERT INTO external_item_sources (external_item_id, source_id, last_seen_at)
+       VALUES ($1, $2, now() - interval '1 day')`,
+      [ids.plain, other.id],
+    );
+    await runFixedToCompletion();
+    expect(await survivors()).toEqual(["cited", "parent", "plain"]);
+  });
+
+  it("a context row (no membership — nothing served it) ages on its insert date", async () => {
+    await client.query(
+      `INSERT INTO external_items (source_id, protocol, tier, source_item_uri, published_at, fetched_at, created_at, is_context_only)
+       VALUES ($1,'nostr_external','tier2',$2, now() - interval '200 days', now() - interval '200 days', now() - interval '200 days', TRUE)`,
+      [sourceId, `uri://ctx-${uniq()}/ctx`],
+    );
+    await client.query(
+      `INSERT INTO external_items (source_id, protocol, tier, source_item_uri, published_at, fetched_at, created_at, is_context_only)
+       VALUES ($1,'nostr_external','tier2',$2, now() - interval '200 days', now() - interval '200 days', now() - interval '1 day', TRUE)`,
+      [sourceId, `uri://ctx-${uniq()}/ctxfresh`],
+    );
+    await runFixedToCompletion();
+    expect(await survivors()).toEqual(["cited", "ctxfresh", "parent"]);
   });
 
   it("a cited item whose citation is later removed becomes prunable (guard is live, not sticky)", async () => {

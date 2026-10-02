@@ -12,8 +12,18 @@ import { verifyEvent } from "nostr-tools";
 import { pool } from "@platform-pub/shared/db/client.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 import { safeFetch } from "@platform-pub/shared/lib/http-client.js";
+import {
+  blueskyInteractionData,
+  type AtprotoReplyRefs,
+} from "@platform-pub/shared/lib/atproto-reply-refs.js";
 import { sanitizeContent } from "@platform-pub/shared/lib/sanitize.js";
 import { mergeNostrRelayUrls } from "@platform-pub/shared/lib/nip65.js";
+import {
+  mastodonRefFromActorUri,
+  readMastodonAccount,
+  readMastodonAccountStatuses,
+} from "@platform-pub/shared/lib/mastodon-api.js";
+import { authoritativeId } from "@platform-pub/shared/lib/activitypub-origin.js";
 import {
   fetchNostrWriteRelays,
   relayCandidates,
@@ -25,7 +35,10 @@ import {
   type RawNostrEvent,
   type NostrProfile,
 } from "./nostr-thread.js";
-import { persistHydratedThreadNodes } from "./external-hydration.js";
+import {
+  ensureShadowSource,
+  persistHydratedThreadNodes,
+} from "@platform-pub/shared/lib/context-persist.js";
 import {
   APPVIEW,
   CACHE_MAX_ENTRIES,
@@ -89,47 +102,10 @@ function stampGuard(authorId: string): void {
   }
 }
 
-interface Queryable {
-  query: (
-    text: string,
-    values?: unknown[],
-  ) => Promise<{ rows: any[]; rowCount: number | null }>;
-}
-
-// §3.2 — where an unfollowed author's rows live. external_items.source_id is
-// NOT NULL and an unfollowed author often has no source row, so hydration
-// upserts a SHADOW source: is_active = FALSE (the poll scheduler never fetches
-// it), keyed on the same (protocol, source_uri) identity the subscribe path
-// uses — so a later real subscribe lands on this exact row and reactivates it
-// (addSource clears is_active/orphaned_at on both its paths). No
-// external_subscriptions row is written: this is a storage anchor, not a
-// follow — the feed-derived-subscriptions invariant is untouched. The GC then
-// treats it as an orphan (deactivate no-op, 90-day cull) — profile-hydrated
-// history is a self-refreshing cache, not an archive.
-//
-// ON CONFLICT DO NOTHING RETURNING returns no row on conflict, hence the
-// two-step. Never touches is_active on an existing row — a real subscribed
-// source must not be flipped, and a previously shadowed row stays shadowed.
-export async function ensureShadowSource(
-  protocol: string,
-  sourceUri: string,
-  db: Queryable = pool,
-): Promise<{ id: string; relay_urls: string[] | null } | null> {
-  const ins = await db.query(
-    `INSERT INTO external_sources (protocol, source_uri, is_active)
-     VALUES ($1::external_protocol, $2, FALSE)
-     ON CONFLICT (protocol, source_uri) DO NOTHING
-     RETURNING id, relay_urls`,
-    [protocol, sourceUri],
-  );
-  if (ins.rows[0]) return ins.rows[0];
-  const sel = await db.query(
-    `SELECT id, relay_urls FROM external_sources
-      WHERE protocol = $1::external_protocol AND source_uri = $2`,
-    [protocol, sourceUri],
-  );
-  return sel.rows[0] ?? null;
-}
+// ensureShadowSource — the §3.2 storage anchor for an unfollowed author —
+// lives in shared/src/lib/context-persist.ts (the notification poller anchors
+// on it too) and is re-exported here.
+export { ensureShadowSource };
 
 export interface AuthorTimelineTarget {
   authorId: string; // external_authors.id — the TTL-guard key
@@ -238,7 +214,7 @@ interface AtprotoFeedViewPost {
       $type?: string;
       text?: string;
       createdAt?: string;
-      reply?: { parent: { uri: string } };
+      reply?: AtprotoReplyRefs;
     };
     embed?: unknown;
     likeCount?: number;
@@ -278,7 +254,7 @@ export function extractAtprotoTimelineNodes(
       contentText: post.record?.text ?? null,
       contentHtml: null,
       media: extractBlueskyViewMedia(post.embed),
-      interactionData: { uri: post.uri, cid: post.cid },
+      interactionData: blueskyInteractionData(post),
       likeCount: post.likeCount ?? 0,
       replyCount: post.replyCount ?? 0,
       repostCount: post.repostCount ?? 0,
@@ -350,25 +326,26 @@ interface MastodonTimelineStatus {
   reblogs_count?: number;
 }
 
-// The handle segment of a fediverse actor URI (/@name or /users/name).
-export function actorHandleFromUri(actorUri: string): string | null {
-  const m = actorUri.match(/\/@([^/]+)/) ?? actorUri.match(/\/users\/([^/]+)/);
-  return m?.[1] ?? null;
-}
-
 // Map a Mastodon-REST statuses page into hydrated nodes. Pure (exported for
 // tests): replies and reblogs are skipped (a timeline warm, not a thread
 // walk — reblogged content belongs to its own author); statuses are keyed on
 // the federated `uri` (the id-space ingest uses), and author_uri is pinned to
 // the profile's stable_handle (see AuthorTimelineTarget).
+//
+// AND A STATUS MAY CLAIM ITS ID ONLY ON THE ORIGIN THAT SERVED THE PAGE
+// (CA-A10, 2026-09-29): `apiOrigin` is the instance asked, and a status whose
+// federated `uri` names another host is skipped — never keyed on its web url
+// instead. The author is already pinned to `stableHandle`, which passed the
+// same check when the target was resolved.
 export function extractMastodonTimelineNodes(
   statuses: MastodonTimelineStatus[],
   stableHandle: string,
+  apiOrigin: string,
 ) {
   const out = [];
   const seen = new Set<string>();
   for (const s of statuses) {
-    const uri = s.uri || s.url;
+    const uri = authoritativeId(s.uri, apiOrigin);
     if (!uri || seen.has(uri)) continue;
     if (s.in_reply_to_id != null) continue;
     if (s.reblog) continue;
@@ -409,31 +386,31 @@ async function hydrateActivityPubTimeline(
 
   // Mastodon REST (the profile header's established fallback): resolve the
   // account id from the actor handle, then one public statuses page.
-  const host = new URL(actor).hostname;
-  const handle = actorHandleFromUri(actor);
-  if (!handle) return;
-  const lookup = await safeFetch(
-    `https://${host}/api/v1/accounts/lookup?acct=${encodeURIComponent(handle)}`,
-    { headers: { Accept: "application/json" }, timeout: NEIGHBOURHOOD_FETCH_TIMEOUT_MS },
-  );
+  const apiOrigin = `https://${new URL(actor).hostname}`;
+  const ref = mastodonRefFromActorUri(actor);
+  if (!ref) return;
+  const opts = { timeout: NEIGHBOURHOOD_FETCH_TIMEOUT_MS };
+  const lookup = await readMastodonAccount(apiOrigin, ref, opts);
   // Same transient/definitive split as the atproto fetch above (§0k.2).
   if (lookup.status === 429 || lookup.status >= 500)
     throw new Error(`mastodon account lookup failed: ${lookup.status}`);
   if (!lookup.ok) return;
-  const account = JSON.parse(lookup.text) as { id?: string };
-  if (!account.id || !/^[A-Za-z0-9_-]+$/.test(account.id)) return;
+  const account = lookup.body as { id?: string } | null;
+  if (!account?.id || !/^[A-Za-z0-9_-]+$/.test(account.id)) return;
 
-  const res = await safeFetch(
-    `https://${host}/api/v1/accounts/${account.id}/statuses?limit=${TIMELINE_AP_LIMIT}&exclude_replies=true&exclude_reblogs=true`,
-    { headers: { Accept: "application/json" }, timeout: NEIGHBOURHOOD_FETCH_TIMEOUT_MS },
+  const res = await readMastodonAccountStatuses(
+    apiOrigin,
+    account.id,
+    { limit: TIMELINE_AP_LIMIT, excludeReplies: true, excludeReblogs: true },
+    opts,
   );
   if (res.status === 429 || res.status >= 500)
     throw new Error(`mastodon statuses fetch failed: ${res.status}`);
   if (!res.ok) return;
-  const statuses = JSON.parse(res.text) as MastodonTimelineStatus[];
+  const statuses = res.body as MastodonTimelineStatus[];
   if (!Array.isArray(statuses)) return;
 
-  const nodes = extractMastodonTimelineNodes(statuses, target.stableHandle);
+  const nodes = extractMastodonTimelineNodes(statuses, target.stableHandle, apiOrigin);
   await persistHydratedThreadNodes(source.id, "activitypub", nodes, {
     profileHydrated: true,
   });

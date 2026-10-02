@@ -10,6 +10,10 @@ import {
 } from "@platform-pub/shared/lib/subscription-period.js";
 import { logSubscriptionCharge } from "./shared.js";
 import { requirePublicationsEnabled } from "../../middleware/publication-auth.js";
+import {
+  readerTermsOutstanding,
+  READER_TERMS_REQUIRED,
+} from "../../lib/terms-gate.js";
 
 // =============================================================================
 // Publication subscriptions
@@ -39,9 +43,21 @@ export async function subscriptionPublicationRoutes(app: FastifyInstance) {
         // would be uncollectible. 402 mirrors the gate-pass shape.
         const cardRow = await client.query<{
           stripe_customer_id: string | null;
-        }>(`SELECT stripe_customer_id FROM accounts WHERE id = $1`, [readerId]);
+          card_action_required_at: Date | null;
+        }>(
+          `SELECT stripe_customer_id, card_action_required_at FROM accounts WHERE id = $1`,
+          [readerId],
+        );
         if (!cardRow.rows[0]?.stripe_customer_id) {
           return reply.status(402).send({ error: "card_required" });
+        }
+        // And the same pause as the writer route (Reader Terms 6.1): a card on
+        // file is not a card that works. Kept in step deliberately — these two
+        // routes have carried the same collection gate since it was written,
+        // and a paused reader who could still subscribe via a publication would
+        // be paused nowhere.
+        if (cardRow.rows[0].card_action_required_at) {
+          return reply.status(402).send({ error: "card_action_required" });
         }
 
         const { rows: pubs } = await client.query<{
@@ -74,6 +90,24 @@ export async function subscriptionPublicationRoutes(app: FastifyInstance) {
           [readerId, publicationId],
         );
 
+        // Hoisted out of the re-activate branch so the terms gate can sit
+        // after it: a reader who is already subscribed is refused here, and is
+        // never sent to accept a text for a sale that will not happen.
+        if (existing.rows.length > 0 && existing.rows[0].status === "active") {
+          return reply.status(409).send({ error: "Already subscribed" });
+        }
+
+        // Same gate as the writer route, in the same place: after every path
+        // on which no sale happens and before the first write. The Reader
+        // Terms are what the tab runs on, and a pre-text card-holder has never
+        // been shown them (§0z item 5; A3).
+        if (await readerTermsOutstanding(readerId, client)) {
+          return reply.status(403).send({
+            error: READER_TERMS_REQUIRED,
+            message: "Before subscribing, please accept the all.haus Reader Terms.",
+          });
+        }
+
         const now = new Date();
         // Calendar periods anchored on today, for both the re-activate and the
         // create branch below (a re-activation starts a fresh run) — §1.5.
@@ -83,9 +117,6 @@ export async function subscriptionPublicationRoutes(app: FastifyInstance) {
 
         if (existing.rows.length > 0) {
           const sub = existing.rows[0];
-          if (sub.status === "active") {
-            return reply.status(409).send({ error: "Already subscribed" });
-          }
 
           await client.query(
             `UPDATE subscriptions
@@ -129,10 +160,14 @@ export async function subscriptionPublicationRoutes(app: FastifyInstance) {
             signedEvent: reactivateEvent,
           });
 
+          // BINDS THE PUBLICATION (migration 198). Without it, one reader
+          // subscribing to two of a manager's publications was ONE
+          // notification — so the second publication's revenue arrived
+          // unannounced.
           pool
             .query(
-              `INSERT INTO notifications (recipient_id, actor_id, type)
-               SELECT pm.account_id, $1, 'pub_new_subscriber'
+              `INSERT INTO notifications (recipient_id, actor_id, type, publication_id)
+               SELECT pm.account_id, $1, 'pub_new_subscriber', $2
                FROM publication_members pm
                WHERE pm.publication_id = $2 AND pm.can_manage_finances = TRUE
                  AND pm.removed_at IS NULL
@@ -200,8 +235,8 @@ export async function subscriptionPublicationRoutes(app: FastifyInstance) {
 
         pool
           .query(
-            `INSERT INTO notifications (recipient_id, actor_id, type)
-             SELECT pm.account_id, $1, 'pub_new_subscriber'
+            `INSERT INTO notifications (recipient_id, actor_id, type, publication_id)
+             SELECT pm.account_id, $1, 'pub_new_subscriber', $2
              FROM publication_members pm
              WHERE pm.publication_id = $2 AND pm.can_manage_finances = TRUE
                AND pm.removed_at IS NULL

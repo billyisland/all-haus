@@ -1,6 +1,7 @@
 import { WebSocket } from 'ws'
 import logger from '@platform-pub/shared/lib/logger.js'
 import { pinnedWebSocketOptions } from '@platform-pub/shared/lib/http-client.js'
+import { TerminalDeliveryError, isTerminalDeliveryError } from '../lib/outbound-errors.js'
 
 // =============================================================================
 // External Nostr outbound adapter
@@ -23,6 +24,35 @@ export interface NostrSignedEvent {
 }
 
 const RELAY_TIMEOUT_MS = 5_000
+
+// =============================================================================
+// NIP-01 gives `OK: false` a machine-readable prefix, and the three answers it
+// can carry are genuinely different facts — which is why every rejection used
+// to cost the row all ten of its attempts (audit §3, relay-publish):
+//
+//   duplicate:   the relay ALREADY HAS the event. That is delivery, not
+//                failure — an event id is a hash of its content, so there is
+//                nothing a retry could add. Treated as success.
+//   terminal     `invalid:` (malformed / bad signature / out of the accepted
+//                created_at window), `blocked:` (this pubkey may not write),
+//                `restricted:` (this relay wants auth or payment). A refusal
+//                the same bytes will get again in an hour.
+//   transient    `rate-limited:`, `pow:`, `error:`, an unprefixed message, a
+//                timeout, a socket error. Retry.
+//
+// Unprefixed defaults to transient: relays in the wild often answer with bare
+// prose, and the safe direction for an unrecognised answer is to try again.
+// =============================================================================
+const TERMINAL_OK_PREFIXES = ['invalid:', 'blocked:', 'restricted:']
+
+export function isDuplicateRejection(message: string): boolean {
+  return message.trim().toLowerCase().startsWith('duplicate:')
+}
+
+export function isTerminalRejection(message: string): boolean {
+  const m = message.trim().toLowerCase()
+  return TERMINAL_OK_PREFIXES.some(p => m.startsWith(p))
+}
 
 export interface RelayPublishResult {
   eventId: string
@@ -48,20 +78,32 @@ export async function publishNostrToRelaysDetailed(
 
   const succeeded: string[] = []
   const failed: string[] = []
+  const reasons: string[] = []
+  // A total failure is only TERMINAL if every relay refused deterministically.
+  // One timeout among the refusals makes the whole attempt ambiguous — that
+  // relay may yet accept, and a re-publish of the same signed event is
+  // idempotent by event id, so retrying costs nothing but a round trip.
+  let allTerminal = true
   for (let i = 0; i < results.length; i++) {
     const r = results[i]
     if (r.status === 'fulfilled') {
       succeeded.push(relayUrls[i])
     } else {
       failed.push(relayUrls[i])
+      const msg = r.reason?.message ?? String(r.reason)
+      reasons.push(`${relayUrls[i]}: ${msg}`)
+      if (!isTerminalDeliveryError(r.reason)) allTerminal = false
       logger.warn(
-        { relayUrl: relayUrls[i], eventId: event.id, err: r.reason?.message ?? String(r.reason) },
+        { relayUrl: relayUrls[i], eventId: event.id, err: msg, terminal: isTerminalDeliveryError(r.reason) },
         'Outbound Nostr relay publish failed'
       )
     }
   }
 
-  if (succeeded.length === 0) throw new Error('All relays rejected or timed out')
+  if (succeeded.length === 0) {
+    const detail = `All relays rejected or timed out (${reasons.join('; ')})`
+    throw allTerminal ? new TerminalDeliveryError(detail) : new Error(detail)
+  }
   if (failed.length > 0) {
     logger.warn(
       { eventId: event.id, succeeded: succeeded.length, total: relayUrls.length },
@@ -115,8 +157,12 @@ async function publishOne(relayUrl: string, event: NostrSignedEvent): Promise<vo
         if (type === 'OK') {
           clearTimeout(timeout)
           ws.close()
-          if (success) resolve()
-          else reject(new Error(`Relay rejected event: ${message}`))
+          if (success) return resolve()
+          const reason = typeof message === 'string' ? message : String(message ?? '')
+          // The relay already holds this exact event — delivered.
+          if (isDuplicateRejection(reason)) return resolve()
+          const err = `Relay rejected event: ${reason}`
+          reject(isTerminalRejection(reason) ? new TerminalDeliveryError(err) : new Error(err))
         }
       } catch { /* ignore non-OK frames */ }
     })

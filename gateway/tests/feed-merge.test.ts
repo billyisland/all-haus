@@ -20,7 +20,7 @@ import Fastify from "fastify";
 //
 //   - happy path      → sources moved, leftovers cleared, saves copied, and
 //                       the SOURCE feed (never the target) deleted.
-//   - not owned       → 403, and nothing is written.
+//   - not owned       → 404, exactly as absent, and nothing is written.
 //   - absent          → 404, and nothing is written.
 //   - self-merge      → 400 before the transaction opens at all.
 // =============================================================================
@@ -139,12 +139,16 @@ describe("feed merge", () => {
     expect(read?.sql).toContain("FOR UPDATE");
   });
 
-  it("403s on a feed owned by someone else, and writes nothing", async () => {
+  it("answers a feed owned by someone else exactly as an absent one, and writes nothing (CA-D6)", async () => {
     feedRows = [feed(TARGET), feed(SOURCE, STRANGER)];
+    const notOwned = await merge();
 
-    const res = await merge();
+    feedRows = [feed(TARGET)];
+    const absent = await merge();
 
-    expect(res.statusCode).toBe(403);
+    // A 403 here told the caller which of somebody else's feed ids exist.
+    expect(notOwned.statusCode).toBe(404);
+    expect(notOwned.json()).toEqual(absent.json());
     expect(wrote()).toBe(false);
   });
 

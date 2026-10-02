@@ -15,12 +15,11 @@ import { describe, it, expect, beforeAll } from 'vitest'
 //      slice-3 feeds.ts both registered GET /feeds at /api/v1, which
 //      tsc happily accepted.
 //
-// The test mirrors the route registration block in `src/index.ts`. When
-// adding a new route module to index.ts, mirror it here too — drift
-// between the two is the test's main maintenance hazard, and the
-// deliberate duplication is the price of running this without booting
-// the full gateway (env validation, plugin chain, listen, graceful
-// shutdown handlers).
+// It registers through `registerRoutes` (`src/register-routes.ts`), the
+// same function `index.ts` calls, so it runs the real route table without
+// booting the full gateway (env validation, plugin chain, listen, graceful
+// shutdown handlers). Until D1 it carried a hand-kept mirror of that table,
+// which had drifted to about two thirds of it.
 //
 // Plugins (sensible / cookie / cors / multipart / rate-limit) are not
 // registered here. Route-level `config.rateLimit` becomes inert without
@@ -55,84 +54,14 @@ describe('gateway boot', () => {
     // module-scope requireEnv() / new Stripe() / Zod schema construction.
     const Fastify = (await import('fastify')).default
 
-    const { authRoutes } = await import('../src/routes/auth.js')
-    const { googleAuthRoutes } = await import('../src/routes/google-auth.js')
-    const { signingRoutes } = await import('../src/routes/signing.js')
-    const { writerRoutes } = await import('../src/routes/writers.js')
-    const { articleRoutes } = await import('../src/routes/articles/index.js')
-    const { noteRoutes } = await import('../src/routes/notes.js')
-    const { draftRoutes } = await import('../src/routes/drafts.js')
-    const { replyRoutes } = await import('../src/routes/replies.js')
-    const { mediaRoutes } = await import('../src/routes/media.js')
-    const { followRoutes } = await import('../src/routes/follows.js')
-    const { moderationRoutes } = await import('../src/routes/moderation.js')
-    const { searchRoutes } = await import('../src/routes/search.js')
-    const { rssRoutes } = await import('../src/routes/rss.js')
-    const { subscriptionRoutes } = await import('../src/routes/subscriptions/index.js')
-    const { unsubscribeRoutes } = await import('../src/routes/unsubscribe.js')
-    const { myAccountRoutes } = await import('../src/routes/my-account.js')
-    const { receiptRoutes } = await import('../src/routes/receipts.js')
-    const { exportRoutes } = await import('../src/routes/export.js')
-    const { notificationRoutes } = await import('../src/routes/notifications.js')
-    const { voteRoutes } = await import('../src/routes/votes.js')
-    const { libraryRoutes } = await import('../src/routes/library.js')
-    const { readingLogRoutes } = await import('../src/routes/reading-log.js')
-    const { giftLinkRoutes } = await import('../src/routes/gift-links.js')
-    const { subscriptionOfferRoutes } = await import('../src/routes/subscription-offers.js')
-    const { messageRoutes } = await import('../src/routes/messages.js')
-    const { socialRoutes } = await import('../src/routes/social.js')
-    const { publicationRoutes } = await import('../src/routes/publications/index.js')
-    const { driveRoutes } = await import('../src/routes/drives.js')
-    const { traffologyRoutes } = await import('../src/routes/traffology.js')
-    const { tagRoutes } = await import('../src/routes/tags.js')
-    const { resolveRoutes } = await import('../src/routes/resolve.js')
-    const { externalFeedsRoutes } = await import('../src/routes/external-feeds.js')
-    const { linkedAccountsRoutes } = await import('../src/routes/linked-accounts.js')
-    const { trustRoutes } = await import('../src/routes/trust.js')
-    const { readingPositionRoutes } = await import('../src/routes/reading-positions.js')
-    const followImportRoutes = (await import('../src/routes/follow-imports.js')).default
-    const { feedsRoutes } = await import('../src/routes/feeds/index.js')
+    const { registerRoutes } = await import('../src/register-routes.js')
 
     const app = Fastify({ logger: false })
 
-    // Prefixes mirror src/index.ts. Keep these in sync.
-    await app.register(authRoutes, { prefix: '/api/v1' })
-    await app.register(googleAuthRoutes, { prefix: '/api/v1' })
-    await app.register(signingRoutes, { prefix: '/api/v1' })
-    await app.register(writerRoutes, { prefix: '/api/v1' })
-    await app.register(articleRoutes, { prefix: '/api/v1' })
-    await app.register(noteRoutes, { prefix: '/api/v1' })
-    await app.register(draftRoutes, { prefix: '/api/v1' })
-    await app.register(replyRoutes, { prefix: '/api/v1' })
-    await app.register(mediaRoutes, { prefix: '/api/v1' })
-    await app.register(followRoutes, { prefix: '/api/v1' })
-    await app.register(moderationRoutes, { prefix: '/api/v1' })
-    await app.register(searchRoutes, { prefix: '/api/v1' })
-    await app.register(rssRoutes)
-    await app.register(subscriptionRoutes, { prefix: '/api/v1' })
-    await app.register(unsubscribeRoutes, { prefix: '/api/v1' })
-    await app.register(myAccountRoutes, { prefix: '/api/v1' })
-    await app.register(receiptRoutes, { prefix: '/api/v1' })
-    await app.register(exportRoutes, { prefix: '/api/v1' })
-    await app.register(notificationRoutes, { prefix: '/api/v1' })
-    await app.register(voteRoutes, { prefix: '/api/v1' })
-    await app.register(libraryRoutes, { prefix: '/api/v1' })
-    await app.register(readingLogRoutes, { prefix: '/api/v1' })
-    await app.register(giftLinkRoutes, { prefix: '/api/v1' })
-    await app.register(subscriptionOfferRoutes, { prefix: '/api/v1' })
-    await app.register(messageRoutes, { prefix: '/api/v1' })
-    await app.register(socialRoutes, { prefix: '/api/v1' })
-    await app.register(publicationRoutes, { prefix: '/api/v1' })
-    await app.register(driveRoutes, { prefix: '/api/v1' })
-    await app.register(traffologyRoutes, { prefix: '/api/v1' })
-    await app.register(tagRoutes, { prefix: '/api/v1' })
-    await app.register(resolveRoutes, { prefix: '/api/v1' })
-    await app.register(externalFeedsRoutes, { prefix: '/api/v1' })
-    await app.register(linkedAccountsRoutes, { prefix: '/api/v1' })
-    await app.register(trustRoutes, { prefix: '/api/v1' })
-    await app.register(readingPositionRoutes, { prefix: '/api/v1' })
-    await app.register(followImportRoutes, { prefix: '/api/v1' })
-    await app.register(feedsRoutes, { prefix: '/api/v1/workspace' })
+    // The gateway's own registration function, not a mirror of it: since D1
+    // (READER-WRITER-SPLIT-ADR §4.6) the route table is one exported function,
+    // so this test can no longer drift from what `index.ts` registers.
+    await registerRoutes(app)
 
     // ready() flushes pending plugin registration and surfaces any deferred
     // errors. If a future plugin registers async work, this is where it

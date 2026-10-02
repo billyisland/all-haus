@@ -9,6 +9,10 @@ import {
   type ExternalItemRow,
   extractMastodonStatusId,
 } from "../../lib/external-items-shared.js";
+import {
+  readMastodonStatus,
+} from "@platform-pub/shared/lib/mastodon-api.js";
+import { isUuid } from "../../lib/request-inputs.js";
 
 interface EngagementResponse {
   likeCount: number;
@@ -34,6 +38,9 @@ export function registerEngagementRoutes(app: FastifyInstance) {
     { preHandler: requireAuth },
     async (req, reply) => {
       const { id } = req.params;
+      if (!isUuid(id)) {
+        return reply.status(404).send({ error: "We couldn't find that post." });
+      }
 
       const cached = engagementCache.get(id);
       if (cached && cached.expiresAt > Date.now()) {
@@ -47,7 +54,7 @@ export function registerEngagementRoutes(app: FastifyInstance) {
       );
 
       if (rows.length === 0) {
-        return reply.status(404).send({ error: "Item not found" });
+        return reply.status(404).send({ error: "We couldn't find that post." });
       }
 
       const item = rows[0];
@@ -165,13 +172,11 @@ async function fetchMastodonEngagement(uri: string): Promise<{
 
   try {
     const host = new URL(uri).hostname;
-    const res = await safeFetch(`https://${host}/api/v1/statuses/${statusId}`, {
-      headers: { Accept: "application/json" },
-    });
+    const res = await readMastodonStatus(`https://${host}`, statusId);
 
     if (!res.ok) return null;
 
-    const status = JSON.parse(res.text) as {
+    const status = res.body as {
       favourites_count?: number;
       replies_count?: number;
       reblogs_count?: number;

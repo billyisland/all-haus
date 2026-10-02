@@ -35,13 +35,13 @@ describe("embed enhancement via renderMarkdown", () => {
       "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
     );
     expect(result).toContain("<iframe");
-    expect(result).toContain("youtube.com/embed/dQw4w9WgXcQ");
+    expect(result).toContain("youtube-nocookie.com/embed/dQw4w9WgXcQ");
   });
 
   it("replaces standalone youtu.be short URLs with iframes", async () => {
     const result = await renderMarkdown("https://youtu.be/dQw4w9WgXcQ");
     expect(result).toContain("<iframe");
-    expect(result).toContain("youtube.com/embed/dQw4w9WgXcQ");
+    expect(result).toContain("youtube-nocookie.com/embed/dQw4w9WgXcQ");
   });
 
   it("does not replace non-embeddable URLs", async () => {

@@ -13,12 +13,18 @@
 
 export const PREVIEW_LIMIT = 200;
 
+// The five HTML metacharacters, and all five deliberately: `'` matters the
+// moment a caller interpolates into a single-quoted attribute, and a helper
+// that is correct only for the contexts its current callers happen to use is
+// one somebody widens without re-reading. (atproto.ts used to bolt the
+// apostrophe on afterwards at one call site; that compensation is gone.)
 export function escapeHtml(str: string): string {
   return str
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 export function truncatePreview(

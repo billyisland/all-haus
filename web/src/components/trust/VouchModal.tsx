@@ -134,7 +134,7 @@ export function VouchModal({
       }
       onVouched();
     } catch (err: any) {
-      setError(err?.body?.error ?? "Failed to submit vouch");
+      setError(err?.body?.error ?? "Couldn’t send your vouch. Please try again.");
     } finally {
       setSubmitting(false);
     }
@@ -179,7 +179,7 @@ export function VouchModal({
               disabled={submitting}
               className="btn py-1.5 px-4 text-ui-xs disabled:opacity-50"
             >
-              {submitting ? "..." : "Vouch anyway"}
+              {submitting ? "…" : "Vouch anyway"}
             </button>
             <button
               onClick={() => {
@@ -302,7 +302,7 @@ export function VouchModal({
             disabled={submitting || selected.size === 0}
             className="btn py-1.5 px-4 text-ui-xs disabled:opacity-50"
           >
-            {submitting ? "..." : `Vouch (${selected.size})`}
+            {submitting ? "…" : `Vouch (${selected.size})`}
           </button>
         </div>
       </div>

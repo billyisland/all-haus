@@ -78,13 +78,14 @@ export function PostLinkImportOffer({
         <>
           <p className="text-ui-sm text-black">
             {follows !== null && follows > 0
-              ? `Import the ${follows} accounts you follow on ${net.label} as a new feed?`
-              : `Import the accounts you follow on ${net.label} as a new feed?`}
+              ? `Import the ${follows} accounts you follow on ${net.label} as a new channel?`
+              : `Import the accounts you follow on ${net.label} as a new channel?`}
           </p>
           <p className="text-ui-xs text-grey-600 leading-relaxed">
-            It lands as an ordinary feed — retune, redistribute, or delete it
-            with the usual tools. One-way: nothing changes on {net.label}. You
-            can also do this later from &ldquo;Reach other networks&rdquo;.
+            It arrives as its own channel on all.haus, where you can change its
+            sources, split it across multiple channels or harmlessly delete it,
+            all without affecting the original account on {net.label}. You can
+            also do this later from &ldquo;Reach other networks&rdquo;.
           </p>
           <div className="flex gap-3">
             <button

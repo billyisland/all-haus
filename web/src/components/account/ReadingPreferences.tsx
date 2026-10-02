@@ -2,6 +2,12 @@
 
 import { useEffect, useState } from 'react'
 import { readingPreferences, readingLog } from '../../lib/api'
+import {
+  READING_LOG_TITLE, readingWindowPhrase, readingLogSentence,
+  READING_CLEAR_TITLE, READING_CLEAR_BEFORE, READING_CLEAR_NOTHING, readingClearedSentence,
+  READING_CLEAR_BUTTON, READING_CLEAR_CONFIRM, READING_CLEARING, READING_CLEAR_FAILED,
+  SETTINGS_CANCEL,
+} from '../../content/settings'
 
 // =============================================================================
 // Settings › Reading — the two account-level reading dials, plus the log's
@@ -28,27 +34,46 @@ export function ReadingPreferences() {
   const [clearing, setClearing] = useState(false)
   const [confirmClear, setConfirmClear] = useState(false)
   const [cleared, setCleared] = useState<number | null>(null)
+  const [retentionDays, setRetentionDays] = useState<number | null>(null)
+  const [loadFailed, setLoadFailed] = useState(false)
+  const [writeError, setWriteError] = useState<string | null>(null)
 
-  useEffect(() => {
+  // A FAILED READ ASSERTS NOTHING (walkthrough A10, same shape as Settings ›
+  // Networks). This used to fall to the server's defaults on the theory that a
+  // write corrects a wrong guess — but each setter early-returns when the
+  // pressed value equals the one on screen, so a guess that happened to equal
+  // the member's wish made their press a no-op: logging really off, guessed
+  // On, press On, nothing. Unknown stays unknown, says so, and offers a retry.
+  function load() {
+    setLoadFailed(false)
     readingPreferences.get()
       .then(res => {
         setAlwaysOpenAtTop(res.alwaysOpenAtTop)
         setLogEnabled(res.readingLogEnabled)
+        setRetentionDays(res.retentionDays ?? null)
       })
-      .catch(() => {
-        // Unknown, not "off" — but the controls need a value to render, and the
-        // server's own defaults are resume-on / logging-on, so failing to those
-        // shows the member what they most likely have. A write from here reads
-        // its own result back, so a wrong guess corrects itself on first use.
-        setAlwaysOpenAtTop(false)
-        setLogEnabled(true)
-      })
-  }, [])
+      .catch(() => setLoadFailed(true))
+  }
+
+  useEffect(() => { load() }, [])
+
+  const unread = loadFailed ? (
+    <>
+      Couldn&rsquo;t load this setting.{' '}
+      <button onClick={load} className="btn-text">Retry</button>
+    </>
+  ) : null
+
+  const SAVE_FAILED = "Couldn’t save that change, so the setting is as it was. Please try again."
+
+  // The window, named from the dial (walkthrough A11) — see readingWindowPhrase.
+  const windowPhrase = readingWindowPhrase(retentionDays)
 
   async function setTop(value: boolean) {
     if (alwaysOpenAtTop === value) return
     const previous = alwaysOpenAtTop
     setAlwaysOpenAtTop(value)
+    setWriteError(null)
     try {
       // `readingLogEnabled` is deliberately OMITTED, not sent as its current
       // value: the route leaves an omitted field alone, so a stale local copy
@@ -57,6 +82,7 @@ export function ReadingPreferences() {
       await readingPreferences.update({ alwaysOpenAtTop: value })
     } catch {
       setAlwaysOpenAtTop(previous)
+      setWriteError(SAVE_FAILED)
     }
   }
 
@@ -64,27 +90,36 @@ export function ReadingPreferences() {
     if (logEnabled === value) return
     const previous = logEnabled
     setLogEnabled(value)
+    setWriteError(null)
     try {
+      // `alwaysOpenAtTop` is OMITTED for exactly the reason `setTop` above
+      // states about this field: the route leaves an omitted field alone, so a
+      // stale local copy cannot be written back over a change made elsewhere.
+      // Sending it was worse than stale — `?? false` turned "not loaded yet"
+      // and "the fetch failed" into a positive write of OFF, so a member who
+      // toggled logging before the preferences call returned silently switched
+      // their own resume setting off.
       const res = await readingPreferences.update({
-        alwaysOpenAtTop: alwaysOpenAtTop ?? false,
         readingLogEnabled: value,
       })
       setLogEnabled(res.readingLogEnabled)
     } catch {
       setLogEnabled(previous)
+      setWriteError(SAVE_FAILED)
     }
   }
 
   async function clear() {
     setClearing(true)
+    setWriteError(null)
     try {
       const res = await readingLog.clear()
       setCleared(res.deleted)
       setConfirmClear(false)
     } catch {
-      // Leave the confirm open — saying nothing here would look exactly like
-      // a clear that worked, on the one control whose whole job is to be
-      // believed.
+      // Leave the confirm open AND say so — a failure that only left the
+      // confirm standing looked like a press that had not registered.
+      setWriteError(READING_CLEAR_FAILED)
     } finally {
       setClearing(false)
     }
@@ -96,7 +131,9 @@ export function ReadingPreferences() {
         <div className="pr-6">
           <p className="text-ui-sm text-black">Always open articles at the top</p>
           <p className="text-ui-xs text-grey-600 mt-1 leading-relaxed">
-            By default, articles you&apos;ve started reading reopen where you left off. Turn this on to always start from the beginning.
+            {alwaysOpenAtTop === null && unread
+              ? unread
+              : <>By default, articles you&apos;ve started reading reopen where you left off. Turn this on to always start from the beginning.</>}
           </p>
         </div>
         <div className="flex shrink-0">
@@ -123,9 +160,11 @@ export function ReadingPreferences() {
 
       <div className="flex items-center justify-between py-1">
         <div className="pr-6">
-          <p className="text-ui-sm text-black">Keep a record of what you read</p>
+          <p className="text-ui-sm text-black">{READING_LOG_TITLE}</p>
           <p className="text-ui-xs text-grey-600 mt-1 leading-relaxed">
-            Recent reading lists everything you open in a reader for a week, then forgets it. Nobody else can see it — not the writers you read, not us.
+            {logEnabled === null && unread
+              ? unread
+              : readingLogSentence(windowPhrase)}
           </p>
         </div>
         <div className="flex shrink-0">
@@ -155,13 +194,13 @@ export function ReadingPreferences() {
           member who has just turned it off is exactly who wants this. */}
       <div className="flex items-center justify-between py-1">
         <div className="pr-6">
-          <p className="text-ui-sm text-black">Clear Recent reading</p>
+          <p className="text-ui-sm text-black">{READING_CLEAR_TITLE}</p>
           <p className="text-ui-xs text-grey-600 mt-1 leading-relaxed">
             {cleared === null
-              ? 'Empties the list now. It cannot be undone, and it does not affect your library.'
+              ? READING_CLEAR_BEFORE
               : cleared === 0
-                ? 'There was nothing to clear.'
-                : `Cleared ${cleared} ${cleared === 1 ? 'piece' : 'pieces'}.`}
+                ? READING_CLEAR_NOTHING
+                : readingClearedSentence(cleared)}
           </p>
         </div>
         <div className="flex shrink-0 gap-2">
@@ -172,14 +211,14 @@ export function ReadingPreferences() {
                 className="btn-text-muted"
                 disabled={clearing}
               >
-                Cancel
+                {SETTINGS_CANCEL}
               </button>
               <button
                 onClick={() => void clear()}
                 className="btn-text-danger"
                 disabled={clearing}
               >
-                {clearing ? 'Clearing…' : 'Clear it'}
+                {clearing ? READING_CLEARING : READING_CLEAR_CONFIRM}
               </button>
             </>
           ) : (
@@ -187,11 +226,12 @@ export function ReadingPreferences() {
               onClick={() => { setCleared(null); setConfirmClear(true) }}
               className="btn-text-danger"
             >
-              Clear
+              {READING_CLEAR_BUTTON}
             </button>
           )}
         </div>
       </div>
+      {writeError && <p className="text-ui-xs text-crimson">{writeError}</p>}
     </div>
   )
 }

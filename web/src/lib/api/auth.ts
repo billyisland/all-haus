@@ -12,6 +12,22 @@ import { request, ApiError } from './client'
 interface SignupInput {
   email: string
   displayName: string
+  /**
+   * `YYYY-MM-DD`, assembled by `DateOfBirthField` from three boxes. It is NOT
+   * a native `<input type="date">` value: that control draws itself in the
+   * browser's locale order and cannot be made British, so the one field on
+   * the site whose value is never shown back to the member was being asked
+   * for in an order they could not determine. The platform sells
+   * paid access and carries direct messages, and both rest on the member being
+   * an adult (L6.1). It is a DECLARATION, not a verification — the gateway
+   * refuses a date under 18 and records nothing, and the value of the record
+   * is that we asked on a dated occasion.
+   *
+   * NO CLIENT-SIDE AGE ARITHMETIC ANYWHERE. `shared/src/lib/age.ts` is the one
+   * home and the route parses with it; a second copy here would be a second
+   * rule to keep in step, and this is the half nobody would test.
+   */
+  dateOfBirth: string
   arrivalDTag?: string
 }
 
@@ -42,6 +58,14 @@ export interface MeResponse {
   stripeConnectKycComplete: boolean
   freeAllowanceRemainingPence: number
   defaultArticlePricePence: number | null
+  // The writer's own subscription pricing, so the dashboard's Pricing tab can
+  // open showing what they actually have. Without them the form opened empty
+  // and Save wrote its placeholders over the real figures.
+  subscriptionPricePence: number
+  annualDiscountPct: number
+  // The tab-settlement threshold dial, so copy that names it cannot drift from
+  // what the platform actually does (`tab_settlement_threshold_pence`).
+  tabSettlementThresholdPence: number
   isAdmin: boolean
   usernameChangedAt: string | null
   /**
@@ -57,6 +81,64 @@ export interface MeResponse {
    * once, not once per browser.
    */
   onboardedAt: string | null
+  /**
+   * May this member publish articles and sell access (READER-WRITER-SPLIT-ADR,
+   * migration 271)? The column the gateway's writer gate reads, so the web
+   * offers no writing control a press would only see refused. First read by
+   * the first-run tour's ∀ beat (WORKSPACE-QUEUE-ADR §XI.6), which must not
+   * promise a reader writing.
+   *
+   * Pinned against the gateway by `web/tests/me-can-write-wire.test.ts`.
+   */
+  canWrite: boolean
+  /**
+   * A reader's application to write, while it waits (READER-WRITER-SPLIT-ADR
+   * §11): `{ appliedAt }`, else null. Never set for a writer. Read by the one
+   * "Apply to write" surface (`WriterAccessPanel`), which shows "Application
+   * sent" rather than offering the press again.
+   *
+   * Pinned against the gateway by `web/tests/me-can-write-wire.test.ts`.
+   */
+  writerApplication: { appliedAt: string } | null
+  /**
+   * When this member declared a date of birth (migration 212, L6.1). NULL ⇒
+   * never asked or never answered, and that is the whole of what `AgeGate`
+   * reads. On the account rather than in `localStorage`, for `onboardedAt`'s
+   * reason: a device key asks the same person on every browser.
+   *
+   * THE DATE ITSELF DELIBERATELY DOES NOT RIDE THE PAYLOAD. No surface needs
+   * it, and a value on the session payload is a value on every page.
+   *
+   * Pinned against the gateway by `web/tests/me-age-wire.test.ts`.
+   */
+  ageDeclaredAt: string | null
+  /**
+   * Which legal text this member has accepted, and which one is current.
+   *
+   * BOTH SIDES RIDE THE PAYLOAD rather than the web carrying a second copy of
+   * the version constants: a duplicated version is a value to flip in lockstep,
+   * and the half-lit state is a member re-prompted forever by a client that
+   * thinks a newer text exists. `isCurrent` is the server's own comparison —
+   * the web never compares `version` against `current` itself, because only
+   * the server knows that the text sub-version is ignored.
+   *
+   * Pinned against the gateway by `web/tests/me-terms-wire.test.ts`: a
+   * hand-written response interface is a claim about a server that nothing
+   * checks.
+   */
+  terms: {
+    reader: TermsState
+    writer: TermsState
+  }
+}
+
+export interface TermsState {
+  acceptedAt: string | null
+  version: string | null
+  /** The version this server is currently offering — what an acceptance sends back. */
+  current: string
+  /** Has this member accepted the current text? Major-only, computed server-side. */
+  isCurrent: boolean
 }
 
 export const auth = {
@@ -64,6 +146,16 @@ export const auth = {
     request<SignupResult>('/auth/signup', {
       method: 'POST',
       body: JSON.stringify(input),
+    }),
+
+  // The other two doors to `accounts.date_of_birth`: a member who arrived
+  // through Google (the OAuth callback has no form) and every member who was
+  // already here. One route for both, because from the web's side they are the
+  // same fact — `ageDeclaredAt === null`.
+  declareAge: (dateOfBirth: string) =>
+    request<{ ok: true; recorded: boolean }>('/auth/declare-age', {
+      method: 'POST',
+      body: JSON.stringify({ dateOfBirth }),
     }),
 
   login: (email: string, arrivalDTag?: string) =>
@@ -97,6 +189,12 @@ export const auth = {
   markOnboarded: () =>
     request<{ ok: boolean }>('/auth/onboarded', { method: 'POST' }),
 
+  // A reader asks to write (READER-WRITER-SPLIT-ADR §8): one press, nothing
+  // asked, idempotent — a second press answers the first `appliedAt`. A writer
+  // is refused 409 `already_writer`.
+  applyToWrite: () =>
+    request<{ appliedAt: string }>('/writer-applications', { method: 'POST' }),
+
   connectStripe: () =>
     request<{ stripeConnectUrl: string }>('/auth/upgrade-writer', { method: 'POST' }),
 
@@ -106,10 +204,34 @@ export const auth = {
     request<{ clientSecret: string }>('/auth/setup-intent', { method: 'POST' }),
 
   // Finalise card setup from a succeeded SetupIntent (server verifies status). S2.
-  connectCard: (setupIntentId: string) =>
+  //
+  // The Reader Terms version is REQUIRED, because registering a card IS
+  // accepting them (A3) and the two facts are written in one statement. It
+  // comes from `/auth/me`'s `terms.reader.current`, never a literal here — a
+  // version typed into the client is a second copy of a constant that moves
+  // with the text.
+  connectCard: (setupIntentId: string, readerTermsVersion: string) =>
     request<{ ok: boolean; hasPaymentMethod: boolean }>('/auth/connect-card', {
       method: 'POST',
-      body: JSON.stringify({ setupIntentId }),
+      body: JSON.stringify({ setupIntentId, readerTermsVersion }),
+    }),
+
+  // Reader Terms 2.4. Detaches every card at Stripe and clears the customer id,
+  // which is what pauses paid reading; the tab is deliberately untouched, so
+  // `hasPaymentMethod: false` never means "your debt is gone".
+  removeCard: () =>
+    request<{ ok: boolean; hasPaymentMethod: boolean; detached: number; failed: number }>(
+      '/auth/payment-method',
+      { method: 'DELETE' },
+    ),
+
+  // Record acceptance of a legal text. The version is the one the server said
+  // was current (`terms.<kind>.current`); a stale one is REFUSED, never
+  // coerced, so the caller re-reads `/auth/me` and asks again.
+  acceptTerms: (kind: 'reader' | 'writer', version: string) =>
+    request<{ ok: boolean; kind: string; version: string }>('/auth/accept-terms', {
+      method: 'POST',
+      body: JSON.stringify({ kind, version }),
     }),
 
   updateProfile: (data: { displayName?: string; bio?: string; avatar?: string | null }) =>
@@ -137,6 +259,13 @@ export const auth = {
     request<{ ok: boolean }>('/auth/verify-email-change', {
       method: 'POST',
       body: JSON.stringify({ token }),
+    }),
+
+  // No session needed: the holder is the member a stolen session locked out.
+  undoEmailChange: (change: string, token: string) =>
+    request<{ ok: boolean }>('/auth/undo-email-change', {
+      method: 'POST',
+      body: JSON.stringify({ change, token }),
     }),
 
   changeUsername: (newUsername: string) =>

@@ -2,6 +2,7 @@
 
 import { useState, type ReactNode } from 'react'
 import { usePublicPalette, controlLine, SLAB } from './palette'
+import { DOB_LABEL, DOB_DAY, DOB_MONTH, DOB_YEAR, DOB_HINT } from '../../content/auth'
 
 // =============================================================================
 // Public form primitives.
@@ -32,6 +33,17 @@ interface TextFieldProps {
   placeholder?: string
   required?: boolean
   autoComplete?: string
+  /** A fixed width in px; without it the field fills its row. */
+  width?: number
+  maxLength?: number
+  /**
+   * Digits only: `text` + `inputMode="numeric"`, never `type="number"` — a
+   * spinner on a year is nonsense, and a number field silently changes its
+   * value on a stray scroll wheel over a focused box. Non-digits are dropped
+   * as they are typed.
+   */
+  numeric?: boolean
+  describedBy?: string
 }
 
 export function TextField({
@@ -43,6 +55,10 @@ export function TextField({
   placeholder,
   required,
   autoComplete,
+  width,
+  maxLength,
+  numeric,
+  describedBy,
 }: TextFieldProps) {
   const palette = usePublicPalette()
   const [focused, setFocused] = useState(false)
@@ -58,16 +74,22 @@ export function TextField({
       </label>
       <input
         id={id}
-        type={type}
+        type={numeric ? 'text' : type}
+        inputMode={numeric ? 'numeric' : undefined}
         value={value}
         required={required}
         autoComplete={autoComplete}
+        aria-describedby={describedBy}
+        maxLength={maxLength}
         placeholder={placeholder}
-        onChange={(e) => onChange(e.target.value)}
+        onChange={(e) =>
+          onChange(numeric ? e.target.value.replace(/\D/g, '') : e.target.value)
+        }
         onFocus={() => setFocused(true)}
         onBlur={() => setFocused(false)}
-        className="w-full font-mono focus:outline-none"
+        className={`${width === undefined ? 'w-full ' : ''}font-mono focus:outline-none`}
         style={{
+          width,
           background: palette.cardBg,
           color: palette.cardTitle,
           fontSize: 16,
@@ -84,51 +106,227 @@ export function TextField({
   )
 }
 
-// ─── Checkbox ───────────────────────────────────────────────────────────────
+// ─── Date of birth ──────────────────────────────────────────────────────────
 //
-// Square by construction (no radius) and painted with `accentColor` so the tick
-// takes the vessel's crimson rather than the browser's blue. The whole row is
-// the label, so the hit target is the sentence, not the 16px box.
+// THREE BOXES, BECAUSE A NATIVE DATE PICKER CANNOT BE MADE BRITISH.
+//
+// `<input type="date">` draws its own value and its own placeholder in the
+// order the BROWSER's locale dictates, and nothing in our markup can change
+// that. Probed in Chromium against an en-US browser locale: `lang="en-GB"` on
+// the input and `lang="en-GB"` on `<html>` are BOTH ignored, and the field
+// renders `mm/dd/yyyy`. On a site whose every other date is British that is
+// not a cosmetic mismatch — the reader is being asked for the one value they
+// cannot check afterwards (it is never shown back to them; see the wire test)
+// in an order they have no way to determine. A member who reads 03/05 as
+// 3 May declares a birthday two months out and nothing anywhere disagrees.
+//
+// So for the DATE OF BIRTH the widget goes. Three labelled boxes say which
+// number is which in every locale there is, and they are also simply the
+// better control for this value: nobody wants to page a calendar back forty
+// years, and the browser's own autofill has real tokens for the three parts
+// (`bday-day`/`bday-month`/`bday-year`). This is the GOV.UK date-input
+// pattern, adopted for the same reason they adopted it.
+//
+// ELSEWHERE THE WIDGET STAYS. A schedule picker or an expiry is a date next
+// Tuesday, where a calendar is the right control and the ambiguity is fixed
+// by STATING the chosen value beside it — `formatDateInputEcho` in
+// `lib/format.ts`. Two different problems, two different answers; do not
+// "unify" them.
+//
+// IT ASSEMBLES, IT DOES NOT JUDGE. The component emits `YYYY-MM-DD` once all
+// three boxes hold something and `''` until then, and that is the whole of
+// its cleverness. It does not check the month is under 13, that the day
+// exists in it, or that the year is plausible — `shared/src/lib/age.ts` is
+// the ONE home for that rule and the route parses with it, so a second copy
+// here would be a second rule to keep in step and the half nobody tests.
+// A year typed as `78` pads to `0078` and comes back refused with "a day, a
+// month and a four-digit year" (the calendar arm, not the plausibility one —
+// `age.ts` says why), which is the server's own sentence and is a better thing
+// to read than a button that will not light up.
+//
+// Each box is a `numeric` `TextField` at a fixed width.
+//
+// The three parts are LOCAL STATE and the assembled value goes out through
+// `onChange`; there is no `value` prop, because a parent holding `''` for an
+// incomplete date could not say which box was still empty. Nothing resets
+// this field today — if something ever needs to, give it a `key`.
 
-interface CheckboxFieldProps {
-  id: string
-  checked: boolean
-  onChange: (checked: boolean) => void
-  children: ReactNode
+interface DateOfBirthFieldProps {
+  /** Ids are derived from this — the three boxes and the hint. */
+  idPrefix: string
+  label?: string
+  /** `YYYY-MM-DD` once all three boxes are filled, `''` before that. */
+  onChange: (value: string) => void
+  required?: boolean
 }
 
-export function CheckboxField({
-  id,
-  checked,
+export function DateOfBirthField({
+  idPrefix,
+  label = DOB_LABEL,
   onChange,
-  children,
-}: CheckboxFieldProps) {
+  required,
+}: DateOfBirthFieldProps) {
   const palette = usePublicPalette()
+  const [day, setDay] = useState('')
+  const [month, setMonth] = useState('')
+  const [year, setYear] = useState('')
+  const hintId = `${idPrefix}-hint`
+
+  function emit(d: string, m: string, y: string) {
+    onChange(
+      d === '' || m === '' || y === ''
+        ? ''
+        : `${y.padStart(4, '0')}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`,
+    )
+  }
 
   return (
-    <label
-      htmlFor={id}
-      className="flex items-start gap-3 cursor-pointer select-none"
+    // `minInlineSize: 'auto'` — a fieldset's UA default is `min-content`,
+    // which stops the row shrinking on a narrow phone. `border: none` because
+    // the UA default is a groove, which the no-single-pixel rule refuses.
+    <fieldset
+      style={{
+        border: 'none',
+        padding: 0,
+        margin: 0,
+        minInlineSize: 'auto',
+      }}
     >
-      <input
-        id={id}
-        type="checkbox"
-        checked={checked}
-        onChange={(e) => onChange(e.target.checked)}
-        className="mt-[3px] h-4 w-4 shrink-0 cursor-pointer"
-        style={{ accentColor: palette.crimson, borderRadius: 0 }}
-      />
-      <span
-        className="font-mono"
-        style={{
-          fontSize: 15,
-          lineHeight: 1.5,
-          color: palette.cardStandfirst,
-        }}
+      <legend
+        className="label-ui"
+        style={{ color: palette.cardMeta, marginBottom: 8, padding: 0 }}
       >
-        {children}
-      </span>
-    </label>
+        {label}
+      </legend>
+      <div style={{ display: 'flex', gap: 12 }}>
+        <TextField
+          id={`${idPrefix}-day`}
+          label={DOB_DAY}
+          value={day}
+          onChange={(v) => {
+            setDay(v)
+            emit(v, month, year)
+          }}
+          width={76}
+          numeric
+          maxLength={2}
+          autoComplete="bday-day"
+          describedBy={hintId}
+          required={required}
+        />
+        <TextField
+          id={`${idPrefix}-month`}
+          label={DOB_MONTH}
+          value={month}
+          onChange={(v) => {
+            setMonth(v)
+            emit(day, v, year)
+          }}
+          width={76}
+          numeric
+          maxLength={2}
+          autoComplete="bday-month"
+          describedBy={hintId}
+          required={required}
+        />
+        <TextField
+          id={`${idPrefix}-year`}
+          label={DOB_YEAR}
+          value={year}
+          onChange={(v) => {
+            setYear(v)
+            emit(day, month, v)
+          }}
+          width={104}
+          numeric
+          maxLength={4}
+          autoComplete="bday-year"
+          describedBy={hintId}
+          required={required}
+        />
+      </div>
+      <p
+        id={hintId}
+        className="text-mono-xs"
+        style={{ color: palette.cardMeta, margin: '10px 0 0' }}
+      >
+        {DOB_HINT}
+      </p>
+    </fieldset>
+  )
+}
+
+// ─── Multi-line field ───────────────────────────────────────────────────────
+//
+// The same card-with-a-slab construction as `TextField`, for the one public
+// surface that asks for a paragraph rather than a value: the appeal (D7 §5).
+// A second component rather than a `multiline` prop on the first, because the
+// element differs (`textarea`, which takes no `type` and needs a `rows`) and a
+// prop that swaps the rendered tag is the shape that accumulates branches.
+//
+// `resize: vertical` and not `none`: this is somebody arguing that we got a
+// decision about them wrong, and a box they cannot make bigger is a small
+// discourtesy in exactly the place we can least afford one.
+
+interface TextAreaFieldProps {
+  id: string
+  label: string
+  value: string
+  onChange: (value: string) => void
+  placeholder?: string
+  required?: boolean
+  rows?: number
+  maxLength?: number
+}
+
+export function TextAreaField({
+  id,
+  label,
+  value,
+  onChange,
+  placeholder,
+  required,
+  rows = 6,
+  maxLength,
+}: TextAreaFieldProps) {
+  const palette = usePublicPalette()
+  const [focused, setFocused] = useState(false)
+
+  return (
+    <div>
+      <label
+        htmlFor={id}
+        className="label-ui block"
+        style={{ color: palette.cardMeta, marginBottom: 8 }}
+      >
+        {label}
+      </label>
+      <textarea
+        id={id}
+        value={value}
+        rows={rows}
+        required={required}
+        maxLength={maxLength}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
+        className="w-full font-mono focus:outline-none"
+        style={{
+          background: palette.cardBg,
+          color: palette.cardTitle,
+          fontSize: 16,
+          padding: '13px 14px',
+          border: 'none',
+          borderRadius: 0,
+          resize: 'vertical',
+          borderBottom: `${SLAB}px solid ${
+            focused ? palette.crimson : controlLine(palette)
+          }`,
+          transition: 'border-color 0.15s ease',
+        }}
+      />
+    </div>
   )
 }
 
@@ -228,22 +426,54 @@ export function PublicButton({
 // The retired register underlined these at `underline-offset-4`. Kept — an
 // underline is not a rule, the invariant does not reach it, and a bare colour
 // change is a weak affordance in a mono paragraph.
+//
+// IT TAKES AN `onClick` INSTEAD OF AN `href`, AND THAT IS A SEAM, NOT A SECOND
+// COMPONENT. Some inline register actions are acts rather than navigations —
+// the age gate's Sign out. The obvious shortcut is `.btn-text`, and it is
+// wrong TWICE over on a public surface: it is 13px SANS, so it changes voice
+// in the middle of a mono `PublicBody` sentence and reads a size smaller; and
+// it is hard-coded to the neutral slugs, which inside a `PublicVessel`'s light
+// island renders near-black on a near-black card in dark mode — invisible, and
+// invisible only in one mode, which is how it survives being looked at. Both
+// were found by rendering the gate (`gate-dark.png`), not by reading it. Same
+// family as the `IndeterminateSlab` track warning above.
+//
+// It inherits its type from the paragraph it sits in, by saying nothing about
+// type at all — which is the whole point of putting it here rather than
+// rolling one at the call site.
 
 export function PublicLink({
   href,
+  onClick,
   children,
 }: {
-  href: string
+  href?: string
+  onClick?: () => void
   children: ReactNode
 }) {
   const palette = usePublicPalette()
+  const className =
+    'underline underline-offset-4 hover:opacity-70 transition-opacity'
+  const style = { color: palette.cardTitle }
+
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        className={className}
+        // `font: inherit` and not a size: the point is that it takes the voice
+        // of the sentence around it. A `<button>` otherwise resets to the UA's
+        // own font and shrinks mid-paragraph.
+        style={{ ...style, font: 'inherit', background: 'none', border: 'none', padding: 0, cursor: 'pointer' }}
+      >
+        {children}
+      </button>
+    )
+  }
 
   return (
-    <a
-      href={href}
-      className="underline underline-offset-4 hover:opacity-70 transition-opacity"
-      style={{ color: palette.cardTitle }}
-    >
+    <a href={href} className={className} style={style}>
       {children}
     </a>
   )

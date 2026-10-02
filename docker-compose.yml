@@ -45,7 +45,21 @@ services:
   # strfry — Nostr relay
   # ---------------------------------------------------------------------------
   strfry:
-    image: dockurr/strfry:latest
+    # PINNED (MIRROR-AUDIT §3 *Security*, S16). This was `:latest`, which meant
+    # the relay holding every article this platform has ever published could be
+    # replaced by whatever that tag pointed at on the day somebody happened to
+    # run `docker compose pull` — with no diff, no review and no way afterwards
+    # to say what had been running. The tag is here to be read and the digest is
+    # what is enforced (a tag can be re-pushed over; a digest cannot), and the
+    # two were verified to be the same image as the one already live: the pull
+    # of `1.1.0` resolved to this digest and to the identical image id as the
+    # `latest` the running container came from, so this pin CHANGES NOTHING
+    # about what runs, which is the point.
+    #
+    # Upgrading is now a commit: bump both halves together, having read what
+    # changed. The other two third-party images here are pinned the same way
+    # (postgres:16-alpine, blossom-server:6.2.0).
+    image: dockurr/strfry:1.1.0@sha256:545555da5dd2c2b502f2c0d159f4dc4996d0e488e3bf25905ce881722d63d2c5
     restart: unless-stopped
     ulimits:
       nofile:
@@ -61,6 +75,9 @@ services:
       - "127.0.0.1:4848:7777"
     volumes:
       - ./relay/strfry.conf:/etc/strfry.conf:ro
+      # The write policy strfry.conf names. Mounted read-only; the executable
+      # bit comes from the file in git, and strfry execs it directly.
+      - ./relay/write-policy.py:/etc/strfry-write-policy.py:ro
       - strfry_data:/app/strfry-db
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7777"]
@@ -102,6 +119,26 @@ services:
       APP_URL: https://all.haus
       MEDIA_DIR: /app/media
       PUBLIC_MEDIA_URL: https://all.haus/media
+      # A FULL AUTHENTICATION BYPASS, off unless deliberately armed. Pinned here
+      # rather than left to gateway/.env because `environment:` OVERRIDES
+      # `env_file:` — so production is off whatever that file says, which is the
+      # whole point: the predecessor was armed by NODE_ENV=development alone, and
+      # gateway/.env.example ships exactly that line. A local stack sets
+      # DEV_LOGIN_ENABLED=1 in the ROOT .env. See DEPLOYMENT.md.
+      DEV_LOGIN_ENABLED: ${DEV_LOGIN_ENABLED:-0}
+      # ActivityPub HTTP Signatures — the instance actor's private key.
+      # Base64 of a PKCS#8 PEM; `npx tsx scripts/gen-ap-instance-key.ts` makes
+      # one. UNSET IS A CAPABILITY THIS PLATFORM DOES NOT HAVE, not a fault:
+      # both services read the fediverse exactly as they did before signing
+      # existed (unsigned ActivityPub, with the Mastodon client-API fallback
+      # for secure-mode instances), and the actor route answers 503 saying so.
+      # SET AND MALFORMED kills the boot on purpose — a fallback is for an
+      # absent value and never for a malformed one, and a broken key would
+      # present as the fediverse refusing us, which is the symptom this exists
+      # to end. Both services need the SAME value: the gateway signs the
+      # resolver's reads, feed-ingest signs the polls, and one key is what the
+      # one published actor document attests.
+      AP_INSTANCE_PRIVATE_KEY_B64: ${AP_INSTANCE_PRIVATE_KEY_B64:-}
       LINKED_ACCOUNT_KEY_HEX: ${LINKED_ACCOUNT_KEY_HEX}
       ATPROTO_CLIENT_BASE_URL: ${ATPROTO_CLIENT_BASE_URL:-https://all.haus}
       ATPROTO_PRIVATE_JWK: ${ATPROTO_PRIVATE_JWK}
@@ -178,6 +215,29 @@ services:
       # gated (gating it would strand writer money — see env.ts). ONE value here
       # and on the payment service. Web twin is the build-time NEXT_PUBLIC_* below.
       PUBLICATIONS_ENABLED: ${PUBLICATIONS_ENABLED:-0}
+      # Trust graph (parked). Off ⇒ every trust route (/trust/*, /vouches*,
+      # /my/vouches) 404s, and feed-ingest schedules none of the three trust
+      # crons. ONE value here and on feed-ingest. Web twin:
+      # NEXT_PUBLIC_TRUST_ENABLED (build arg).
+      TRUST_SYSTEM_ENABLED: ${TRUST_SYSTEM_ENABLED:-0}
+      # Nostr reaction/reply counts on external cards. ONE value here and on
+      # feed-ingest, both from the root .env: feed-ingest decides whether the
+      # counts exist, this side whether a new nostr source is promised them.
+      NOSTR_ENGAGEMENT_COUNTS_ENABLED: ${NOSTR_ENGAGEMENT_COUNTS_ENABLED:-0}
+      # Traffology (writer analytics, parked). Off ⇒ every /traffology/* route
+      # 404s. Web twin: NEXT_PUBLIC_TRAFFOLOGY_ENABLED (build arg). Turning it
+      # on lights an empty surface: nothing runs the ingest or the worker until
+      # DEPLOYMENT.md › "Traffology (parked)" is followed (CA-I1).
+      TRAFFOLOGY_ENABLED: ${TRAFFOLOGY_ENABLED:-0}
+      # Priced DMs — SUSPENDED 2026-09-15. Default 0. Gateway only: the four
+      # /settings/dm-pricing routes 404 while it is off, which is the whole of
+      # the entry to `dm_pricing`, and the Network page's fee panel reads that
+      # 404 and renders nothing. NO web twin — flipping this needs a gateway
+      # restart, not a `docker compose build web`.
+      # DO NOT SET THIS TO 1 until a charge-and-unblock path exists on message
+      # send: this parks an UNFINISHED feature, not a complete one, so turning
+      # it on re-exposes a fee control that charges nobody (shared/src/lib/env.ts).
+      DM_PRICING_ENABLED: ${DM_PRICING_ENABLED:-0}
       # Stripe funds segregation — see the payment service for the full note.
       # Present here so the flag has ONE value across the deployment, not because
       # the gateway uses it today: its only Stripe client (auth.ts) drives Connect
@@ -193,20 +253,13 @@ services:
       # crons write feed_items.resonance* either way, so flipping needs no
       # backfill and is instantly reversible in BOTH directions. No web twin.
       # Default flipped to 1 while the beta is closed: the gate was per-protocol
-      # band-3 re-measurement on prod volume, and with one real reader that
+      # band-3 re-measurement on prod volume, and at closed-beta volume that
       # measurement IS the operator browsing real ingested posts. Safe to lead
       # with because the band gates are platform_config dials
       # (resonance_band{1,2,3}_min), so a wrong distribution is an UPDATE, not a
       # deploy. Set RESONANCE_GLYPH_ENABLED=0 in the root .env to douse it.
       # REVISIT THE DEFAULT THE DAY THE BETA OPENS (CONSOLIDATED-TODO §9.12).
       RESONANCE_GLYPH_ENABLED: ${RESONANCE_GLYPH_ENABLED:-1}
-      # D6 read-time proof blend (step 5). Off = 'scored' feeds rank on the
-      # cron-baked fi.score exactly as before; on = every item in a scored feed,
-      # native and external alike, ranks by one commensurable expression built
-      # from feed_items.resonance/ambient_pctl. Independent of the glyph brake
-      # above on purpose — ranking on resonance and displaying the band are
-      # separate claims, so the explore A/B can run with the glyph still dark.
-      RESONANCE_RANKING_ENABLED: ${RESONANCE_RANKING_ENABLED:-0}
       PLATFORM_RELAY_WS_URL: ws://strfry:7777
       PUBLIC_RELAY_URL: ${PUBLIC_RELAY_URL:-wss://all.haus/relay}
       PUBLIC_FANOUT_RELAY_URLS: ${PUBLIC_FANOUT_RELAY_URLS:-}
@@ -234,6 +287,17 @@ services:
       DATABASE_URL: postgresql://platformpub:${POSTGRES_PASSWORD}@postgres:5432/platformpub
       PLATFORM_RELAY_WS_URL: ws://strfry:7777
       DB_POOL_MAX: 10
+      # Where the settlement receipt's link points (Reader Terms 5.2). Pinned
+      # here, as on the gateway and feed-ingest, so it cannot be a localhost in
+      # production because somebody's .env said so.
+      APP_URL: https://all.haus
+      # THIS SERVICE SENDS EMAIL NOW, and it did not before 2026-09-17: a
+      # confirmed settlement emails the reader an itemised receipt. The provider
+      # and its token live in payment-service/.env beside the gateway's own copy
+      # (DEPLOYMENT.md › The reader's receipt for a charge). Unset, shared's
+      # email.ts falls back to `console` and every receipt is written to THIS
+      # service's log with one WARN — nothing breaks and nobody is told, which is
+      # the 2026 outbound-email outage one service across.
       # Stripe funds segregation / allocated funds (FUNDS-SEGREGATION-INTEGRATION.md).
       # Ships dark: flag off ⇒ settlement PaymentIntents carry no allocated_funds,
       # the allocation-sync sweep is a no-op, and each payout is one aggregate
@@ -320,8 +384,19 @@ services:
       APP_URL: https://all.haus
       PLATFORM_RELAY_WS_URL: ws://strfry:7777
       DB_POOL_MAX: 10
+      # The same key the gateway holds — see its block above for why unset is a
+      # capability and malformed is a boot failure.
+      AP_INSTANCE_PRIVATE_KEY_B64: ${AP_INSTANCE_PRIVATE_KEY_B64:-}
       ATPROTO_CLIENT_BASE_URL: ${ATPROTO_CLIENT_BASE_URL:-https://all.haus}
       ATPROTO_PRIVATE_JWK: ${ATPROTO_PRIVATE_JWK}
+      # Trust graph (parked) — ONE value here and on the gateway.
+      TRUST_SYSTEM_ENABLED: ${TRUST_SYSTEM_ENABLED:-0}
+      # feed-ingest has no env_file and its image carries no .env, so a flag
+      # not listed here CANNOT reach it — setting it anywhere else does nothing
+      # (CA-F1). Nostr engagement counts: ONE value here and on the gateway.
+      NOSTR_ENGAGEMENT_COUNTS_ENABLED: ${NOSTR_ENGAGEMENT_COUNTS_ENABLED:-0}
+      # Cross-source identity-link detection (Slice 8 P3), feed-ingest only.
+      IDENTITY_LINK_DETECT_ENABLED: ${IDENTITY_LINK_DETECT_ENABLED:-0}
 
   # ---------------------------------------------------------------------------
   # Web client (Next.js)
@@ -331,8 +406,6 @@ services:
       context: .
       dockerfile: web/Dockerfile
       args:
-        NEXT_PUBLIC_RELAY_URL: wss://all.haus/relay
-        NEXT_PUBLIC_GATEWAY_URL: ""
         NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY:-}
         # Pledge drives + commissioning (parked 2026-07-13). Build-time inlined,
         # so flipping to 1 requires `docker compose build web` (not just up).
@@ -348,6 +421,15 @@ services:
         # env note). Build-time inlined, so flipping to 1 requires `docker compose
         # build web`. Gateway twin: PUBLICATIONS_ENABLED.
         NEXT_PUBLIC_PUBLICATIONS_ENABLED: ${NEXT_PUBLIC_PUBLICATIONS_ENABLED:-0}
+        # Trust graph (parked) and traffology. Both are read by
+        # web/src/lib/featureFlags.ts and had NO build arg and no Dockerfile
+        # ARG, so they were inlined as `undefined` on every build: the code
+        # read them, nothing could set them, and no operator action turned
+        # either surface on. Gateway twins: TRUST_SYSTEM_ENABLED /
+        # TRAFFOLOGY_ENABLED (both 404 their routes while off).
+        # Build-time inlined, so flipping to 1 needs `docker compose build web`.
+        NEXT_PUBLIC_TRUST_ENABLED: ${NEXT_PUBLIC_TRUST_ENABLED:-0}
+        NEXT_PUBLIC_TRAFFOLOGY_ENABLED: ${NEXT_PUBLIC_TRAFFOLOGY_ENABLED:-0}
         # Baked into the Next.js /api rewrite at build time (see web/Dockerfile).
         # Must be the in-cluster gateway address the web server proxies to, else
         # the proxy falls back to localhost:3000 and every API call ECONNRESETs.

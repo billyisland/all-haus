@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict RWocryERm9LrsGM0l2qc6Kdvh5Hcja3EIw4pd7mSV1iE8teAKF5dNwwCF6fPphJ
+\restrict Gq80UVf0Iq5PehM3vYeiHc4ohcroSVZ9kAgzmZJ3C6iW1wzYZT14yUM8brrJ8ku
 
 -- Dumped from database version 16.13
 -- Dumped by pg_dump version 16.13
@@ -194,7 +194,15 @@ CREATE TYPE public.report_category AS ENUM (
     'illegal_content',
     'harassment',
     'spam',
-    'other'
+    'other',
+    'terrorism',
+    'csam',
+    'grooming',
+    'fraud',
+    'hate',
+    'intimate_image_abuse',
+    'cyberflashing',
+    'self_harm_promotion'
 );
 
 
@@ -206,7 +214,8 @@ CREATE TYPE public.report_status AS ENUM (
     'open',
     'under_review',
     'resolved_removed',
-    'resolved_no_action'
+    'resolved_no_action',
+    'resolved_actioned'
 );
 
 
@@ -266,22 +275,16 @@ $$;
 
 
 --
--- Name: articles_derive_size_tier(); Type: FUNCTION; Schema: public; Owner: -
+-- Name: config_audit_append_only(); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION public.articles_derive_size_tier() RETURNS trigger
+CREATE FUNCTION public.config_audit_append_only() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  IF NEW.size_tier IS NULL THEN
-    NEW.size_tier := CASE
-      WHEN NEW.word_count IS NULL       THEN 'standard'
-      WHEN NEW.word_count >= 3000       THEN 'lead'
-      WHEN NEW.word_count <  1000       THEN 'brief'
-      ELSE 'standard'
-    END;
-  END IF;
-  RETURN NEW;
+  RAISE EXCEPTION
+    'config_audit is append-only: % is not permitted (record a new row instead)',
+    TG_OP;
 END;
 $$;
 
@@ -323,6 +326,24 @@ BEGIN
   END IF;
   RETURN 'h:' || encode(digest(normed, 'sha256'), 'hex');
 END;
+$$;
+
+
+--
+-- Name: external_items_home_membership(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.external_items_home_membership() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF NEW.is_context_only IS NOT TRUE THEN
+    INSERT INTO public.external_item_sources (external_item_id, source_id)
+    VALUES (NEW.id, NEW.source_id)
+    ON CONFLICT (source_id, external_item_id) DO NOTHING;
+  END IF;
+  RETURN NULL;
+END
 $$;
 
 
@@ -427,6 +448,13 @@ BEGIN
       END IF;
     ELSIF NEW.note_id IS NOT NULL THEN
       NEW.post_id := feed_items_derive_post_id('nostr', coalesce(NEW.nostr_event_id, NEW.note_id::text));
+    ELSIF NEW.comment_id IS NOT NULL THEN
+      -- A native reply. THE SAME DERIVATION THE PROJECTORS ALREADY USE:
+      -- post-thread.ts and author.ts have always addressed a comment as
+      -- feed_items_derive_post_id('nostr', comments.nostr_event_id), so the
+      -- row minted here carries the id those surfaces already hand out. Any
+      -- other spelling would give one reply two addresses.
+      NEW.post_id := feed_items_derive_post_id('nostr', coalesce(NEW.nostr_event_id, NEW.comment_id::text));
     ELSIF NEW.external_item_id IS NOT NULL THEN
       NEW.post_id := feed_items_derive_post_id(coalesce(NEW.source_protocol, 'unknown'),
                                                coalesce(NEW.source_item_uri, NEW.external_item_id::text));
@@ -462,7 +490,7 @@ BEGIN
      AND NEW.source_protocol  IS NOT DISTINCT FROM OLD.source_protocol
      AND NEW.external_item_id IS NOT DISTINCT FROM OLD.external_item_id THEN
     NULL;  -- biddability inputs unchanged; fall through (author block still mint-once-guarded)
-  ELSIF NEW.item_type IN ('article', 'note') THEN
+  ELSIF NEW.item_type IN ('article', 'note', 'comment') THEN
     NEW.biddability_tier := 'A';
   ELSIF NEW.source_protocol IN ('nostr_external', 'atproto') THEN
     NEW.biddability_tier := 'A';
@@ -550,8 +578,9 @@ BEGIN
   -- rows; best-effort (NULL if the parent isn't ingested yet — feed_items_author_refresh
   -- fills it later). INSERT-only so the cron's maintenance UPDATEs are never clobbered.
   -- Mirrors the read-path subqueries this replaces: native -> parent note author's
-  -- display_name; external -> parent item's author_handle (constrained on protocol so
-  -- the lookup hits the UNIQUE(protocol, source_item_uri) composite).
+  -- display_name; native REPLY -> the parent comment's author, else the
+  -- conversation root's; external -> parent item's author_handle (constrained on
+  -- protocol so the lookup hits the UNIQUE(protocol, source_item_uri) composite).
   IF TG_OP = 'INSERT' AND NEW.is_reply THEN
     IF NEW.note_id IS NOT NULL THEN
       SELECT acc_p.display_name INTO NEW.reply_to_author
@@ -559,6 +588,22 @@ BEGIN
       JOIN notes n_p ON n_p.nostr_event_id = n.reply_to_event_id
       JOIN accounts acc_p ON acc_p.id = n_p.author_id
       WHERE n.id = NEW.note_id
+      LIMIT 1;
+    ELSIF NEW.comment_id IS NOT NULL THEN
+      -- A native reply is addressed to the CONVERSATION and nested under a
+      -- remark, so its parent is the parent comment's author where there is
+      -- one and the root's author otherwise -- the same two-step
+      -- POST /replies uses to decide who to notify. Best-effort like the
+      -- arms beside it; NULL is "we do not know", never "nobody".
+      SELECT COALESCE(acc_p.display_name, acc_r.display_name)
+        INTO NEW.reply_to_author
+      FROM comments c
+      LEFT JOIN comments c_p ON c_p.id = c.parent_comment_id
+      LEFT JOIN accounts acc_p ON acc_p.id = c_p.author_id
+      LEFT JOIN articles art_r ON art_r.nostr_event_id = c.target_event_id
+      LEFT JOIN notes n_r ON n_r.nostr_event_id = c.target_event_id
+      LEFT JOIN accounts acc_r ON acc_r.id = COALESCE(art_r.writer_id, n_r.author_id)
+      WHERE c.id = NEW.comment_id
       LIMIT 1;
     ELSIF NEW.external_item_id IS NOT NULL THEN
       SELECT ei_p.author_handle INTO NEW.reply_to_author
@@ -605,6 +650,20 @@ $$;
 
 
 --
+-- Name: key_access_log_append_only(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.key_access_log_append_only() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  RAISE EXCEPTION
+    'key_access_log is append-only: % is not permitted', TG_OP;
+END;
+$$;
+
+
+--
 -- Name: ledger_entries_append_only(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -615,6 +674,43 @@ BEGIN
   RAISE EXCEPTION
     'ledger_entries is append-only: % is not permitted (post a reversing entry instead)',
     TG_OP;
+END;
+$$;
+
+
+--
+-- Name: network_presences_claim(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.network_presences_claim() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  -- Release what the old row held. Only this account's claim: a row some
+  -- other account claimed (a relink moved it) is not ours to clear.
+  IF TG_OP IN ('UPDATE', 'DELETE')
+     AND OLD.stable_handle IS NOT NULL
+     AND OLD.protocol IN ('atproto', 'activitypub') THEN
+    UPDATE external_authors
+       SET account_id = NULL
+     WHERE protocol = OLD.protocol
+       AND stable_handle = OLD.stable_handle
+       AND account_id = OLD.account_id;
+  END IF;
+
+  IF TG_OP IN ('INSERT', 'UPDATE')
+     AND NEW.stable_handle IS NOT NULL
+     AND NEW.lifecycle_state = 'active'
+     AND NEW.protocol IN ('atproto', 'activitypub') THEN
+    INSERT INTO external_authors (protocol, stable_handle, tier, account_id)
+    VALUES (NEW.protocol, NEW.stable_handle,
+            CASE NEW.protocol WHEN 'atproto' THEN 'A' ELSE 'B' END,
+            NEW.account_id)
+    ON CONFLICT (protocol, stable_handle) DO UPDATE
+      SET account_id = EXCLUDED.account_id;
+  END IF;
+
+  RETURN NULL;
 END;
 $$;
 
@@ -793,6 +889,33 @@ ALTER SEQUENCE public._migrations_id_seq OWNED BY public._migrations.id;
 
 
 --
+-- Name: account_email_changes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.account_email_changes (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    account_id uuid NOT NULL,
+    old_email text,
+    new_email text NOT NULL,
+    changed_at timestamp with time zone DEFAULT now() NOT NULL,
+    undone_at timestamp with time zone
+);
+
+
+--
+-- Name: account_key_exports; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.account_key_exports (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    account_id uuid NOT NULL,
+    exported_at timestamp with time zone DEFAULT now() NOT NULL,
+    ip text,
+    user_agent text
+);
+
+
+--
 -- Name: accounts; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -837,9 +960,33 @@ CREATE TABLE public.accounts (
     arrival_article_id uuid,
     arrival_gift_pence integer DEFAULT 0 NOT NULL,
     reading_log_enabled boolean DEFAULT true NOT NULL,
+    discoverable_by_email boolean DEFAULT false NOT NULL,
+    reader_terms_accepted_at timestamp with time zone,
+    reader_terms_version text,
+    writer_terms_accepted_at timestamp with time zone,
+    writer_terms_version text,
+    payout_threshold_pence integer,
+    payout_cadence text DEFAULT 'daily'::text NOT NULL,
+    unpayable_since timestamp with time zone,
+    unpayable_notice_sent_at timestamp with time zone,
+    paid_access_withdrawn_at timestamp with time zone,
+    date_of_birth date,
+    age_declared_at timestamp with time zone,
+    suspended_until timestamp with time zone,
+    discovery_attempted_at timestamp with time zone,
+    provisioned_by_admit boolean DEFAULT false NOT NULL,
+    writer_admitted_at timestamp with time zone,
+    writer_admitted_by uuid,
+    CONSTRAINT accounts_age_declaration_adult CHECK (((date_of_birth IS NULL) OR ((date_of_birth + '18 years'::interval) <= (age_declared_at AT TIME ZONE 'UTC'::text)))),
+    CONSTRAINT accounts_age_declaration_pair CHECK (((date_of_birth IS NULL) = (age_declared_at IS NULL))),
     CONSTRAINT accounts_annual_discount_pct_check CHECK (((annual_discount_pct >= 0) AND (annual_discount_pct <= 30))),
     CONSTRAINT accounts_hosting_type_check CHECK ((hosting_type = ANY (ARRAY['hosted'::text, 'self_hosted'::text]))),
-    CONSTRAINT accounts_subscription_welcome_message_length CHECK (((subscription_welcome_message IS NULL) OR (char_length(subscription_welcome_message) <= 2000)))
+    CONSTRAINT accounts_payout_cadence_check CHECK ((payout_cadence = ANY (ARRAY['daily'::text, 'weekly'::text, 'monthly'::text]))),
+    CONSTRAINT accounts_payout_threshold_positive CHECK (((payout_threshold_pence IS NULL) OR (payout_threshold_pence > 0))),
+    CONSTRAINT accounts_reader_terms_pair_chk CHECK (((reader_terms_accepted_at IS NULL) = (reader_terms_version IS NULL))),
+    CONSTRAINT accounts_subscription_welcome_message_length CHECK (((subscription_welcome_message IS NULL) OR (char_length(subscription_welcome_message) <= 2000))),
+    CONSTRAINT accounts_unpayable_sequence CHECK ((((unpayable_notice_sent_at IS NULL) OR (unpayable_since IS NOT NULL)) AND ((paid_access_withdrawn_at IS NULL) OR (unpayable_notice_sent_at IS NOT NULL)))),
+    CONSTRAINT accounts_writer_terms_pair_chk CHECK (((writer_terms_accepted_at IS NULL) = (writer_terms_version IS NULL)))
 );
 
 
@@ -854,7 +1001,7 @@ COMMENT ON COLUMN public.accounts.free_allowance_granted_pence IS 'What this rea
 -- Name: COLUMN accounts.onboarded_at; Type: COMMENT; Schema: public; Owner: -
 --
 
-COMMENT ON COLUMN public.accounts.onboarded_at IS 'When the first-session welcome was offered and answered (completed or dismissed). NULL = never offered. Records that the offer was made, never that the profile was filled in.';
+COMMENT ON COLUMN public.accounts.onboarded_at IS 'When this member was first shown the workspace''s first-run introduction, stamped the moment it OPENS — being shown it is an answer, as completing, dismissing or walking away from it are. NULL = never shown. This is the MEMBER-level half of a two-part gate and must stay: the per-device key (workspace:firstrun_seen:) is the other half, and without this one a member who was introduced on one device is introduced again on every other. Records that the introduction happened, never that a profile was filled in. Read today by the Explain tour''s auto-entry (FirstRunController); it outlived the five-step Welcome sheet it was built for, which was deleted 2026-09-04.';
 
 
 --
@@ -883,6 +1030,83 @@ COMMENT ON COLUMN public.accounts.arrival_gift_pence IS 'How much of free_allowa
 --
 
 COMMENT ON COLUMN public.accounts.reading_log_enabled IS 'D1 stop-logging switch for Recent reading. Account state, not a per-device key: a member who switched it off on their laptop has switched it off. Default true.';
+
+
+--
+-- Name: COLUMN accounts.discoverable_by_email; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.accounts.discoverable_by_email IS 'Opt-in: may POST /resolve confirm that this account owns a given email address, and name it? Default false — the login address is not a published identifier.';
+
+
+--
+-- Name: COLUMN accounts.reader_terms_accepted_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.accounts.reader_terms_accepted_at IS 'When this member accepted the Reader Terms version named beside it. NULL = never accepted; the pair is CHECK-tied.';
+
+
+--
+-- Name: COLUMN accounts.reader_terms_version; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.accounts.reader_terms_version IS 'The Reader Terms version this member accepted, as minted by shared/src/lib/terms-versions.ts. Compared on its major part only.';
+
+
+--
+-- Name: COLUMN accounts.writer_terms_accepted_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.accounts.writer_terms_accepted_at IS 'When this member accepted the Writer Agreement version named beside it. NULL = never accepted; the pair is CHECK-tied.';
+
+
+--
+-- Name: COLUMN accounts.writer_terms_version; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.accounts.writer_terms_version IS 'The Writer Agreement version this member accepted, as minted by shared/src/lib/terms-versions.ts. Compared on its major part only.';
+
+
+--
+-- Name: COLUMN accounts.date_of_birth; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.accounts.date_of_birth IS 'Self-declared date of birth (L6.1). NULL = never asked or never answered, which is what the age gate reads. A declaration, not a verification.';
+
+
+--
+-- Name: COLUMN accounts.age_declared_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.accounts.age_declared_at IS 'When the declaration above was made. Paired with date_of_birth by accounts_age_declaration_pair; the adult CHECK is evaluated against THIS instant, not against now().';
+
+
+--
+-- Name: COLUMN accounts.suspended_until; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.accounts.suspended_until IS 'The 7-day rung of the D7 SS5 ladder. Written only by moderation.ts, which stays the one moderation writer of accounts.status; read by the suspension-expiry sweep and by reinstate.';
+
+
+--
+-- Name: COLUMN accounts.provisioned_by_admit; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.accounts.provisioned_by_admit IS 'TRUE when the waitlist Admit action CREATED this account (not when it linked an existing one). Written once by provisionAccount, never cleared. With age_declared_at IS NULL it means "admitted, has not arrived": seeded into other members'' feeds but named to nobody (RESHAPE-PLAN-2026-10 §A.2.6).';
+
+
+--
+-- Name: COLUMN accounts.writer_admitted_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.accounts.writer_admitted_at IS 'When this account was admitted as a WRITER (may publish articles and sell access). NULL = reader. Set by the D1 backfill (migration 271) or the writer-access grant; never cleared (READER-WRITER-SPLIT-ADR).';
+
+
+--
+-- Name: COLUMN accounts.writer_admitted_by; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.accounts.writer_admitted_by IS 'The admin who granted writer access. NULL for the migration-271 backfill.';
 
 
 --
@@ -982,7 +1206,6 @@ CREATE TABLE public.articles (
     writer_id uuid NOT NULL,
     nostr_event_id text NOT NULL,
     nostr_d_tag text NOT NULL,
-    nostr_kind integer DEFAULT 30023 NOT NULL,
     title text NOT NULL,
     slug text NOT NULL,
     summary text,
@@ -1004,12 +1227,10 @@ CREATE TABLE public.articles (
     publication_article_status text,
     show_on_writer_profile boolean DEFAULT true NOT NULL,
     email_sent_at timestamp with time zone,
-    size_tier text,
     cover_image_url text,
     CONSTRAINT access_mode_price CHECK (((access_mode = 'public'::text) OR ((access_mode = 'paywalled'::text) AND (price_pence IS NOT NULL)) OR (access_mode = 'invitation_only'::text))),
     CONSTRAINT articles_gate_position_pct_check CHECK (((gate_position_pct >= 1) AND (gate_position_pct <= 99))),
-    CONSTRAINT articles_publication_article_status_check CHECK ((publication_article_status = ANY (ARRAY['submitted'::text, 'approved'::text, 'published'::text, 'unpublished'::text]))),
-    CONSTRAINT articles_size_tier_check CHECK (((size_tier IS NULL) OR (size_tier = ANY (ARRAY['lead'::text, 'standard'::text, 'brief'::text]))))
+    CONSTRAINT articles_publication_article_status_check CHECK ((publication_article_status = ANY (ARRAY['submitted'::text, 'approved'::text, 'published'::text, 'unpublished'::text])))
 );
 
 
@@ -1033,7 +1254,8 @@ CREATE TABLE public.atproto_oauth_sessions (
     did text NOT NULL,
     session_data_enc text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    account_id uuid
 );
 
 
@@ -1103,6 +1325,23 @@ CREATE TABLE public.comments (
     published_at timestamp with time zone DEFAULT now() NOT NULL,
     deleted_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: config_audit; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.config_audit (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    actor_account_id uuid NOT NULL,
+    key text NOT NULL,
+    subject_account_id uuid,
+    old_value text,
+    new_value text,
+    reason text NOT NULL,
+    changed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT config_audit_reason_present CHECK ((reason ~ '[^[:space:]]'::text))
 );
 
 
@@ -1244,7 +1483,6 @@ CREATE TABLE public.external_authors (
     handle text,
     handle_uri text,
     avatar text,
-    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
     last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
     bio text,
     website text,
@@ -1275,6 +1513,17 @@ CREATE TABLE public.external_identity_links (
 
 
 --
+-- Name: external_item_sources; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.external_item_sources (
+    external_item_id uuid NOT NULL,
+    source_id uuid NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: external_items; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1297,7 +1546,6 @@ CREATE TABLE public.external_items (
     source_reply_uri text,
     source_quote_uri text,
     is_repost boolean DEFAULT false NOT NULL,
-    original_item_uri text,
     interaction_data jsonb DEFAULT '{}'::jsonb,
     published_at timestamp with time zone NOT NULL,
     fetched_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -1338,8 +1586,17 @@ CREATE TABLE public.external_sources (
     orphaned_at timestamp with time zone,
     metadata_updated_at timestamp with time zone,
     ingest_address text,
-    handle text
+    handle text,
+    signed_fetch_refused_at timestamp with time zone,
+    fetch_enqueued_at timestamp with time zone
 );
+
+
+--
+-- Name: COLUMN external_sources.signed_fetch_refused_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.external_sources.signed_fetch_refused_at IS 'When this source was last refused a read for want of an HTTP Signature the instance would accept (401/403 surviving both a signed retry and the client-API fallback). NULL means readable. Written only by the ingest task; cleared by the next poll that is not a refusal. Counted on /admin/overview.';
 
 
 --
@@ -1383,14 +1640,15 @@ CREATE TABLE public.feed_formula_sources (
     protocol public.external_protocol,
     display_name text,
     avatar_url text,
-    weight numeric DEFAULT 4.0 NOT NULL,
-    sampling_mode text DEFAULT 'chronological'::text NOT NULL,
+    throughput numeric DEFAULT 1.0 NOT NULL,
+    sampling_mode text DEFAULT 'scored'::text NOT NULL,
     exclude_replies boolean DEFAULT false NOT NULL,
     CONSTRAINT feed_formula_sources_protocol_matches_type CHECK (((source_type = 'external_source'::text) = (protocol IS NOT NULL))),
-    CONSTRAINT feed_formula_sources_sampling_mode_check CHECK ((sampling_mode = ANY (ARRAY['chronological'::text, 'scored'::text, 'random'::text]))),
+    CONSTRAINT feed_formula_sources_sampling_mode_check CHECK ((sampling_mode = ANY (ARRAY['scored'::text, 'random'::text]))),
     CONSTRAINT feed_formula_sources_source_type_check CHECK ((source_type = ANY (ARRAY['account'::text, 'publication'::text, 'external_source'::text, 'tag'::text]))),
     CONSTRAINT feed_formula_sources_tag_kind_check CHECK ((tag_kind = ANY (ARRAY['p'::text, 't'::text, 'r'::text, 'a'::text]))),
-    CONSTRAINT feed_formula_sources_tag_matches_type CHECK (((source_type = 'tag'::text) = (tag_kind = 't'::text)))
+    CONSTRAINT feed_formula_sources_tag_matches_type CHECK (((source_type = 'tag'::text) = (tag_kind = 't'::text))),
+    CONSTRAINT feed_formula_sources_throughput_range CHECK (((throughput > (0)::numeric) AND (throughput <= (1)::numeric)))
 );
 
 
@@ -1482,10 +1740,18 @@ CREATE TABLE public.feed_items (
     resonance numeric,
     resonance_band smallint,
     ambient_pctl numeric,
-    CONSTRAINT exactly_one_source CHECK ((((((article_id IS NOT NULL))::integer + ((note_id IS NOT NULL))::integer) + ((external_item_id IS NOT NULL))::integer) = 1)),
+    comment_id uuid,
+    CONSTRAINT exactly_one_source CHECK (((((((article_id IS NOT NULL))::integer + ((note_id IS NOT NULL))::integer) + ((external_item_id IS NOT NULL))::integer) + ((comment_id IS NOT NULL))::integer) = 1)),
     CONSTRAINT feed_items_biddability_tier_check CHECK ((biddability_tier = ANY (ARRAY['A'::text, 'B'::text, 'C'::text, 'D'::text]))),
-    CONSTRAINT feed_items_item_type_check CHECK ((item_type = ANY (ARRAY['article'::text, 'note'::text, 'external'::text])))
+    CONSTRAINT feed_items_item_type_check CHECK ((item_type = ANY (ARRAY['article'::text, 'note'::text, 'external'::text, 'comment'::text])))
 );
+
+
+--
+-- Name: COLUMN feed_items.comment_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.feed_items.comment_id IS 'The kind-1111 native reply this row projects (comments.id). Mutually exclusive with article_id/note_id/external_item_id (exactly_one_source). ON DELETE CASCADE mirrors note_id: erase-account hard-deletes comments and the card must go with them.';
 
 
 --
@@ -1517,15 +1783,16 @@ CREATE TABLE public.feed_sources (
     publication_id uuid,
     external_source_id uuid,
     tag_name text,
-    weight numeric DEFAULT 4.0 NOT NULL,
-    sampling_mode text DEFAULT 'chronological'::text NOT NULL,
+    throughput numeric DEFAULT 1.0 NOT NULL,
+    sampling_mode text DEFAULT 'scored'::text NOT NULL,
     muted_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     exclude_replies boolean DEFAULT false NOT NULL,
-    CONSTRAINT feed_sources_sampling_mode_check CHECK ((sampling_mode = ANY (ARRAY['chronological'::text, 'scored'::text, 'random'::text]))),
+    CONSTRAINT feed_sources_sampling_mode_check CHECK ((sampling_mode = ANY (ARRAY['scored'::text, 'random'::text]))),
     CONSTRAINT feed_sources_source_type_check CHECK ((source_type = ANY (ARRAY['account'::text, 'publication'::text, 'external_source'::text, 'tag'::text]))),
     CONSTRAINT feed_sources_tag_name_length CHECK (((tag_name IS NULL) OR ((char_length(tag_name) >= 1) AND (char_length(tag_name) <= 64)))),
-    CONSTRAINT feed_sources_target_matches_type CHECK ((((source_type = 'account'::text) AND (account_id IS NOT NULL) AND (publication_id IS NULL) AND (external_source_id IS NULL) AND (tag_name IS NULL)) OR ((source_type = 'publication'::text) AND (publication_id IS NOT NULL) AND (account_id IS NULL) AND (external_source_id IS NULL) AND (tag_name IS NULL)) OR ((source_type = 'external_source'::text) AND (external_source_id IS NOT NULL) AND (account_id IS NULL) AND (publication_id IS NULL) AND (tag_name IS NULL)) OR ((source_type = 'tag'::text) AND (tag_name IS NOT NULL) AND (account_id IS NULL) AND (publication_id IS NULL) AND (external_source_id IS NULL))))
+    CONSTRAINT feed_sources_target_matches_type CHECK ((((source_type = 'account'::text) AND (account_id IS NOT NULL) AND (publication_id IS NULL) AND (external_source_id IS NULL) AND (tag_name IS NULL)) OR ((source_type = 'publication'::text) AND (publication_id IS NOT NULL) AND (account_id IS NULL) AND (external_source_id IS NULL) AND (tag_name IS NULL)) OR ((source_type = 'external_source'::text) AND (external_source_id IS NOT NULL) AND (account_id IS NULL) AND (publication_id IS NULL) AND (tag_name IS NULL)) OR ((source_type = 'tag'::text) AND (tag_name IS NOT NULL) AND (account_id IS NULL) AND (publication_id IS NULL) AND (external_source_id IS NULL)))),
+    CONSTRAINT feed_sources_throughput_range CHECK (((throughput > (0)::numeric) AND (throughput <= (1)::numeric)))
 );
 
 
@@ -1545,8 +1812,16 @@ CREATE TABLE public.feeds (
     cloned_from_feed_id uuid,
     from_formula_id uuid,
     origin_label text,
+    seen_baseline_at timestamp with time zone,
     CONSTRAINT feeds_name_length CHECK ((char_length(name) <= 80))
 );
+
+
+--
+-- Name: COLUMN feeds.seen_baseline_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.feeds.seen_baseline_at IS 'When the owner last looked at this feed (dwelt on it). A window post whose feed_items.created_at is above it is "new". NULL = never looked. Moved only forward, never past now(), by POST /workspace/feeds/:id/seen (WORKSPACE-QUEUE-ADR §IV).';
 
 
 --
@@ -1607,6 +1882,20 @@ CREATE TABLE public.gift_links (
 
 
 --
+-- Name: key_access_log; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.key_access_log (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    account_id uuid NOT NULL,
+    purpose text NOT NULL,
+    actor_account_id uuid NOT NULL,
+    accessed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT key_access_log_purpose_known CHECK ((purpose = ANY (ARRAY['dm_decrypt'::text, 'paywall_unwrap'::text])))
+);
+
+
+--
 -- Name: ledger_entries; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1619,20 +1908,9 @@ CREATE TABLE public.ledger_entries (
     trigger_type text NOT NULL,
     ref_table text NOT NULL,
     ref_id uuid NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ledger_entries_trigger_type_check CHECK ((trigger_type = ANY (ARRAY['read_accrual'::text, 'tab_settlement'::text, 'writer_payout'::text, 'publication_split'::text, 'vote_charge'::text, 'pledge_fulfil'::text, 'subscription_credit'::text, 'subscription_charge'::text, 'subscription_earning'::text, 'opening_balance'::text, 'dispute_stake'::text, 'dispute_stake_refund'::text, 'tribute_payout'::text, 'tab_settlement_reversal'::text, 'writer_payout_reversal'::text, 'tribute_payout_reversal'::text, 'writer_accrual'::text, 'writer_accrual_reversal'::text, 'tribute_carve'::text, 'tribute_carve_reversal'::text, 'vat'::text, 'credit_quarantine'::text, 'credit_release'::text, 'credit_refund'::text])))
 );
-
-
---
--- Name: ledger_platform_tax; Type: VIEW; Schema: public; Owner: -
---
-
-CREATE VIEW public.ledger_platform_tax AS
- SELECT account_id,
-    ((- sum(amount_pence)))::bigint AS tax_paid_pence
-   FROM public.ledger_entries
-  WHERE ((trigger_type = 'vote_charge'::text) AND (counterparty_id IS NULL))
-  GROUP BY account_id;
 
 
 --
@@ -1711,8 +1989,27 @@ CREATE VIEW public.ledger_reader_balance AS
  SELECT account_id,
     ((- sum(amount_pence)))::bigint AS balance_pence
    FROM public.ledger_entries
-  WHERE (trigger_type = ANY (ARRAY['read_accrual'::text, 'vote_charge'::text, 'pledge_fulfil'::text, 'tab_settlement'::text, 'subscription_credit'::text, 'subscription_charge'::text, 'opening_balance'::text, 'dispute_stake'::text, 'dispute_stake_refund'::text, 'tab_settlement_reversal'::text]))
+  WHERE (trigger_type = ANY (ARRAY['read_accrual'::text, 'vote_charge'::text, 'pledge_fulfil'::text, 'tab_settlement'::text, 'subscription_credit'::text, 'subscription_charge'::text, 'opening_balance'::text, 'dispute_stake'::text, 'dispute_stake_refund'::text, 'tab_settlement_reversal'::text, 'credit_quarantine'::text, 'credit_release'::text]))
   GROUP BY account_id;
+
+
+--
+-- Name: ledger_reader_refunds; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.ledger_reader_refunds AS
+ SELECT account_id,
+    (sum(amount_pence))::bigint AS refunded_pence
+   FROM public.ledger_entries
+  WHERE (trigger_type = 'credit_refund'::text)
+  GROUP BY account_id;
+
+
+--
+-- Name: VIEW ledger_reader_refunds; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON VIEW public.ledger_reader_refunds IS 'Money actually sent back to readers for over-collections (Reader Terms 4.3). Disjoint from ledger_reader_balance: a refund moves no reading_tabs column, so counting it there would break the balance == -SUM(ledger) anchor and halt every payout. Reconciled against reader_credits by reader_credit_refund_parity.';
 
 
 --
@@ -1749,7 +2046,9 @@ CREATE TABLE public.magic_links (
     token_hash text NOT NULL,
     expires_at timestamp with time zone NOT NULL,
     used_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    purpose text DEFAULT 'login'::text NOT NULL,
+    CONSTRAINT magic_links_purpose_check CHECK ((purpose = ANY (ARRAY['login'::text, 'key_export'::text, 'appeal'::text, 'email_change_undo'::text])))
 );
 
 
@@ -1782,8 +2081,74 @@ CREATE TABLE public.moderation_reports (
     status public.report_status DEFAULT 'open'::public.report_status NOT NULL,
     reviewed_by uuid,
     reviewed_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    target_post_id text,
+    target_conversation_id uuid,
+    target_profile_id uuid,
+    snapshot jsonb,
+    priority text,
+    triaged_at timestamp with time zone,
+    reason text,
+    reasoning text,
+    action text,
+    subject_account_id uuid,
+    appeal_deadline timestamp with time zone,
+    appealed_at timestamp with time zone,
+    appeal_text text,
+    appeal_outcome text,
+    appeal_reasoning text,
+    appeal_decided_at timestamp with time zone,
+    priority_raised_at timestamp with time zone,
+    priority_raised_by uuid,
+    priority_raise_reason text,
+    CONSTRAINT moderation_reports_action_check CHECK (((action IS NULL) OR (action = ANY (ARRAY['warn'::text, 'remove_content'::text, 'suspend_7d'::text, 'suspend'::text, 'terminate'::text, 'no_action'::text])))),
+    CONSTRAINT moderation_reports_appeal_decided_check CHECK (((appeal_decided_at IS NULL) OR ((appealed_at IS NOT NULL) AND (appeal_outcome IS NOT NULL) AND (appeal_reasoning IS NOT NULL)))),
+    CONSTRAINT moderation_reports_appeal_outcome_check CHECK (((appeal_outcome IS NULL) OR (appeal_outcome = ANY (ARRAY['upheld'::text, 'reversed'::text])))),
+    CONSTRAINT moderation_reports_priority_check CHECK (((priority IS NULL) OR (priority = ANY (ARRAY['P0'::text, 'P1'::text, 'P2'::text])))),
+    CONSTRAINT moderation_reports_priority_raise_whole CHECK (((priority_raised_at IS NULL) = (priority_raise_reason IS NULL)))
 );
+
+
+--
+-- Name: COLUMN moderation_reports.target_post_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.moderation_reports.target_post_id IS 'feed_items.post_id - the one identity spanning native and external items. No FK: post_id carries no unique constraint (same reason as reading_log.post_id).';
+
+
+--
+-- Name: COLUMN moderation_reports.snapshot; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.moderation_reports.snapshot IS 'The content as reported, captured at FILING (D7 SS8). Resolving a report deletes what it points at, so the pointer stops resolving exactly when the record starts mattering. A reported conversation snapshots its ids only: decrypting a DM thread is a reviewer act, audited through key_access_log (D7 SS4).';
+
+
+--
+-- Name: COLUMN moderation_reports.reasoning; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.moderation_reports.reasoning IS 'The one-line judgement, mandatory even for an obvious call (D7 SS8). Distinct from `reason`, which is the sentence the MEMBER is sent.';
+
+
+--
+-- Name: COLUMN moderation_reports.subject_account_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.moderation_reports.subject_account_id IS 'Who the action landed on, stamped at resolution from the rows the removal matched. The appeal route authorises on this: target_account_id is null on every content report, so it cannot answer "is this member the subject".';
+
+
+--
+-- Name: COLUMN moderation_reports.priority_raised_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.moderation_reports.priority_raised_at IS 'When a reviewer raised the priority above what the category derived (§0z item 8). NULL: never raised.';
+
+
+--
+-- Name: COLUMN moderation_reports.priority_raise_reason; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.moderation_reports.priority_raise_reason IS 'Why the priority was raised — the judgement that made 9.3''s 24h apply. Required with priority_raised_at.';
 
 
 --
@@ -1818,9 +2183,49 @@ CREATE TABLE public.network_presences (
     provenance text DEFAULT 'linked'::text NOT NULL,
     lifecycle_state text DEFAULT 'active'::text NOT NULL,
     show_on_profile boolean DEFAULT false NOT NULL,
+    notifications_cursor text,
+    notifications_attempted_at timestamp with time zone,
+    notifications_polled_at timestamp with time zone,
+    notifications_poll_error text,
+    stable_handle text,
     CONSTRAINT network_presences_lifecycle_state_check CHECK ((lifecycle_state = ANY (ARRAY['provisioning'::text, 'active'::text, 'suspended'::text, 'deprovisioned'::text]))),
     CONSTRAINT network_presences_provenance_check CHECK ((provenance = ANY (ARRAY['linked'::text, 'assisted'::text, 'concierge'::text])))
 );
+
+
+--
+-- Name: COLUMN network_presences.notifications_cursor; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.network_presences.notifications_cursor IS 'How far linked_notifications_poll has read this presence''s notifications on the remote network: the newest Bluesky indexedAt, or the newest Mastodon notification id, it has CONSIDERED. NULL until the first poll, which starts from a bounded backfill window rather than the account''s whole history.';
+
+
+--
+-- Name: COLUMN network_presences.notifications_attempted_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.network_presences.notifications_attempted_at IS 'When linked_notifications_poll last CLAIMED this presence, success or not; the due check reads it, so a failing presence is retried once per interval, not once per tick.';
+
+
+--
+-- Name: COLUMN network_presences.notifications_polled_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.network_presences.notifications_polled_at IS 'When linked_notifications_poll last SUCCEEDED for this presence — never stamped by a failure. /admin/overview counts active presences whose poll is older than linked_notifications_stale_intervals polls as DOWN, and a presence that has never been polled counts from its created_at.';
+
+
+--
+-- Name: COLUMN network_presences.notifications_poll_error; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.network_presences.notifications_poll_error IS 'The last failed notification poll''s message, for the operator; NULL after a success.';
+
+
+--
+-- Name: COLUMN network_presences.stable_handle; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.network_presences.stable_handle IS 'The identity this presence proves, spelled as external_authors.stable_handle spells it: the DID (atproto) or the ActivityPub actor URI (activitypub). NULL until known; activitypub presences linked before migration 237 are filled by presence_sources_sync. Trigger network_presences_claim keeps external_authors.account_id in step with it (CROSS-NETWORK-ROUNDTRIP-ADR D1).';
 
 
 --
@@ -1879,8 +2284,18 @@ CREATE TABLE public.notifications (
     note_id uuid,
     conversation_id uuid,
     drive_id uuid,
-    offer_id uuid
+    offer_id uuid,
+    publication_id uuid,
+    parent_comment_id uuid,
+    external_item_id uuid
 );
+
+
+--
+-- Name: COLUMN notifications.conversation_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.notifications.conversation_id IS 'DEAD AS OF 2026-09-10: no insert anywhere writes this column, and it is deliberately NOT in idx_notifications_dedup. It exists for a new_message notification type that has no producer — the merged Messages inbox shows conversations directly with its own unread count, so a notification row would restate the same fact on the same surface. Binding it means DECIDING that DMs produce notification rows (an operator call); if that decision is taken, bind it at the insert AND add it to the dedup index in the same change, or two messages in different conversations will collapse into one notification.';
 
 
 --
@@ -1895,6 +2310,27 @@ COMMENT ON COLUMN public.notifications.drive_id IS 'The pledge drive this notifi
 --
 
 COMMENT ON COLUMN public.notifications.offer_id IS 'The subscription offer this notification is about (grant-mode gifts). Part of idx_notifications_dedup, so two offers to the same reader from the same writer are two notifications rather than one.';
+
+
+--
+-- Name: COLUMN notifications.publication_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.notifications.publication_id IS 'The publication this notification is about (pub_invite_received, pub_member_joined, pub_member_left, pub_new_subscriber, pub_article_submitted, pub_article_published). Part of idx_notifications_dedup, so two publications acting on the same person are two notifications rather than one. ON DELETE SET NULL, not CASCADE — the notification still reads sensibly without the publication, exactly as drive_id does.';
+
+
+--
+-- Name: COLUMN notifications.parent_comment_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.notifications.parent_comment_id IS 'The comment that was REPLIED TO, on a new_reply notification whose recipient is that comment''s author (2026-09-18). Distinct from comment_id, which on the same row is the NEW reply — the thing the panel renders and focus_post_id opens. Bound iff the recipient is being told because the reply was to a remark of theirs; NULL on the root author''s row and on every other type, and that absence is what the label branches on ("replied to your comment" vs "replied to <title>"). Deliberately NOT in idx_notifications_dedup: comment_id is already one row per reply per recipient, so no pair of notifications can differ in this column alone, and the pair one reply does produce is separated by recipient_id. ON DELETE SET NULL, not CASCADE like comment_id — the parent going away does not take the reply, so the notification survives and degrades to the root''s sentence.';
+
+
+--
+-- Name: COLUMN notifications.external_item_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.notifications.external_item_id IS 'The external post (Bluesky/Mastodon) an external_reply / external_mention / external_quote notification is about (CROSS-NETWORK-ROUNDTRIP-ADR C3), written by feed-ingest linked_notifications_poll. actor_id is NULL on these rows, so idx_notifications_dedup cannot collapse them; idx_notifications_external_item does, one row per (recipient, type, item) whether read or not. ON DELETE CASCADE is a backstop: the external_items reapers spare a row this column names.';
 
 
 --
@@ -2021,6 +2457,39 @@ COMMENT ON COLUMN public.payouts_halted_accounts.reason IS 'The specifics behind
 --
 
 COMMENT ON COLUMN public.payouts_halted_accounts.created_at IS 'When this account was first halted. First-writer-wins, so it is the FIRST detection and not the most recent one — which is what makes it a sound input to the payout_halt_escalation_hours bound. A halt that is never cleared is indistinguishable from a policy of not paying.';
+
+
+--
+-- Name: platform_blocks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.platform_blocks (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    kind text NOT NULL,
+    protocol public.external_protocol NOT NULL,
+    target_key text NOT NULL,
+    reason text NOT NULL,
+    blocked_by uuid,
+    blocked_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT platform_blocks_kind_check CHECK ((kind = ANY (ARRAY['source'::text, 'npub'::text]))),
+    CONSTRAINT platform_blocks_npub_protocol_check CHECK (((kind <> 'npub'::text) OR (protocol = 'nostr_external'::public.external_protocol))),
+    CONSTRAINT platform_blocks_reason_check CHECK (((char_length(btrim(reason)) >= 1) AND (char_length(btrim(reason)) <= 1000))),
+    CONSTRAINT platform_blocks_target_key_check CHECK (((char_length(target_key) >= 1) AND (char_length(target_key) <= 2048)))
+);
+
+
+--
+-- Name: TABLE platform_blocks; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.platform_blocks IS 'Operator-level refusals: a source we will not ingest, an external identity we will not carry (D7 SS5/SS7). Not a suspension - it holds no account id on the target side. Keyed by PORTABLE identity (protocol, source_uri) / hex pubkey, never by an external_sources row id, because that row is created and GCd by ordinary use.';
+
+
+--
+-- Name: COLUMN platform_blocks.target_key; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.platform_blocks.target_key IS 'kind=source: external_sources.source_uri, in its canonical stored form. kind=npub: the 64-char lowercase hex pubkey, which is what external_authors.stable_handle and a nostr_external source_uri both hold.';
 
 
 --
@@ -2230,13 +2699,15 @@ CREATE TABLE public.read_events (
     on_free_allowance boolean DEFAULT false NOT NULL,
     read_at timestamp with time zone DEFAULT now() NOT NULL,
     state_updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    via_subscription_id uuid,
     is_subscription_read boolean DEFAULT false NOT NULL,
     publication_id uuid,
     allowance_consumed_pence integer DEFAULT 0 NOT NULL,
     chargeable_pence integer GENERATED ALWAYS AS ((amount_pence - allowance_consumed_pence)) STORED,
     payout_transfer_id uuid,
-    publication_payout_id uuid
+    publication_payout_id uuid,
+    fee_bps smallint,
+    CONSTRAINT read_events_allowance_bounds CHECK (((allowance_consumed_pence >= 0) AND (allowance_consumed_pence <= amount_pence))),
+    CONSTRAINT read_events_fee_bps_range CHECK (((fee_bps IS NULL) OR ((fee_bps >= 0) AND (fee_bps <= 10000))))
 );
 
 
@@ -2266,6 +2737,45 @@ COMMENT ON COLUMN public.read_events.payout_transfer_id IS 'Which payout_transfe
 --
 
 COMMENT ON COLUMN public.read_events.publication_payout_id IS 'The publication payout that claimed this read. The publication twin of writer_payout_id: the two cycles are exact complements, and a read is claimed by exactly one of them. Never reuse writer_payout_id for a publication payout — its FK points at writer_payouts and the UPDATE raises 23503 (migration 168).';
+
+
+--
+-- Name: reader_credits; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.reader_credits (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    reader_id uuid NOT NULL,
+    amount_pence bigint NOT NULL,
+    status text DEFAULT 'pending_refund'::text NOT NULL,
+    quarantine_ledger_entry_id uuid NOT NULL,
+    release_ledger_entry_id uuid,
+    source_ref_table text NOT NULL,
+    source_ref_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    resolved_at timestamp with time zone,
+    refund_attempt smallint DEFAULT 0 NOT NULL,
+    refund_reserved_at timestamp with time zone,
+    refund_charge_id text,
+    stripe_refund_id text,
+    refund_reason text,
+    refund_actor_id uuid,
+    refund_failure_reason text,
+    refund_ledger_entry_id uuid,
+    CONSTRAINT reader_credits_amount_pence_check CHECK ((amount_pence > 0)),
+    CONSTRAINT reader_credits_refund_evidence CHECK (((status IS DISTINCT FROM 'refunded'::text) OR ((stripe_refund_id IS NOT NULL) AND (refund_charge_id IS NOT NULL) AND (refund_reason IS NOT NULL) AND (refund_ledger_entry_id IS NOT NULL)))),
+    CONSTRAINT reader_credits_refund_reason_nonblank CHECK (((refund_reason IS NULL) OR (length(btrim(refund_reason)) > 0))),
+    CONSTRAINT reader_credits_refund_reservation CHECK (((refund_reserved_at IS NULL) OR ((refund_reason IS NOT NULL) AND (refund_actor_id IS NOT NULL) AND (refund_charge_id IS NOT NULL)))),
+    CONSTRAINT reader_credits_resolution_shape CHECK ((((NOT (status IS DISTINCT FROM 'pending_refund'::text)) AND (resolved_at IS NULL)) OR ((status IS DISTINCT FROM 'pending_refund'::text) AND (resolved_at IS NOT NULL)))),
+    CONSTRAINT reader_credits_status_check CHECK ((status = ANY (ARRAY['pending_refund'::text, 'released'::text, 'refunded'::text])))
+);
+
+
+--
+-- Name: TABLE reader_credits; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.reader_credits IS 'Money the platform over-collected and owes a reader back. Moved out of reading_tabs the moment it would have made a balance negative, so no reading tab is ever in credit and no credit is ever spendable against future reads (Reader Terms 4.2/4.3). Resolution is an outward refund; runbook docs/runbooks/reader-tab-credit.md.';
 
 
 --
@@ -2346,7 +2856,7 @@ CREATE TABLE public.relay_outbox (
     last_attempt_at timestamp with time zone,
     last_error text,
     sent_at timestamp with time zone,
-    CONSTRAINT relay_outbox_entity_type_check CHECK ((entity_type = ANY (ARRAY['article'::text, 'article_deletion'::text, 'note'::text, 'note_deletion'::text, 'subscription'::text, 'receipt'::text, 'drive'::text, 'drive_deletion'::text, 'signing_passthrough'::text, 'conversation_pulse'::text, 'account_deletion'::text, 'profile'::text, 'follow_list'::text, 'relay_list'::text]))),
+    CONSTRAINT relay_outbox_entity_type_check CHECK ((entity_type = ANY (ARRAY['article'::text, 'article_deletion'::text, 'note'::text, 'note_deletion'::text, 'subscription'::text, 'receipt'::text, 'drive'::text, 'drive_deletion'::text, 'signing_passthrough'::text, 'conversation_pulse'::text, 'account_deletion'::text, 'profile'::text, 'follow_list'::text, 'relay_list'::text, 'citation'::text, 'dispute'::text]))),
     CONSTRAINT relay_outbox_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'sent'::text, 'failed'::text, 'abandoned'::text])))
 );
 
@@ -2428,20 +2938,6 @@ COMMENT ON COLUMN public.subscription_events.tab_settlement_id IS 'The settlemen
 
 
 --
--- Name: subscription_nudge_log; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.subscription_nudge_log (
-    reader_id uuid NOT NULL,
-    writer_id uuid NOT NULL,
-    month date NOT NULL,
-    shown_at timestamp with time zone DEFAULT now() NOT NULL,
-    converted boolean DEFAULT false NOT NULL,
-    publication_id uuid
-);
-
-
---
 -- Name: subscription_offers; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -2459,6 +2955,8 @@ CREATE TABLE public.subscription_offers (
     expires_at timestamp with time zone,
     revoked_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    is_comp boolean DEFAULT false NOT NULL,
+    CONSTRAINT subscription_offers_comp_shape CHECK (((NOT is_comp) OR ((mode = 'grant'::text) AND (discount_pct = 100) AND (recipient_id IS NOT NULL) AND (NOT (max_redemptions IS DISTINCT FROM 1))))),
     CONSTRAINT subscription_offers_discount_pct_check CHECK (((discount_pct >= 0) AND (discount_pct <= 100))),
     CONSTRAINT subscription_offers_mode_check CHECK ((mode = ANY (ARRAY['code'::text, 'grant'::text])))
 );
@@ -2528,8 +3026,9 @@ CREATE TABLE public.tab_settlements (
     tax_point timestamp with time zone,
     allocated_pence integer,
     allocation_synced_at timestamp with time zone,
+    receipt_email text,
     CONSTRAINT tab_settlements_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'completed'::text, 'failed'::text]))),
-    CONSTRAINT tab_settlements_trigger_type_check CHECK ((trigger_type = ANY (ARRAY['threshold'::text, 'monthly_fallback'::text])))
+    CONSTRAINT tab_settlements_trigger_type_check CHECK ((trigger_type = ANY (ARRAY['threshold'::text, 'monthly_fallback'::text, 'reader_requested'::text, 'account_closure'::text, 'tab_ceiling'::text])))
 );
 
 
@@ -2538,6 +3037,13 @@ CREATE TABLE public.tab_settlements (
 --
 
 COMMENT ON COLUMN public.tab_settlements.allocated_pence IS 'What Stripe reports locked in allocated state for this charge (pending + available), read back by the allocation-sync sweep. NULL = not known to be drawable; never assumed (migration 165).';
+
+
+--
+-- Name: COLUMN tab_settlements.receipt_email; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.tab_settlements.receipt_email IS 'The reader''s email at reserve time — where the receipt is sent on confirm, so a closure charge still reaches the person who left (migration 227).';
 
 
 --
@@ -2690,7 +3196,7 @@ CREATE TABLE public.vault_keys (
     article_id uuid NOT NULL,
     nostr_article_event_id text NOT NULL,
     content_key_enc text NOT NULL,
-    algorithm text DEFAULT 'aes-256-gcm'::text NOT NULL,
+    algorithm text DEFAULT 'xchacha20poly1305'::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     rotated_at timestamp with time zone,
     ciphertext text
@@ -2740,9 +3246,6 @@ CREATE TABLE public.votes (
     target_author_id uuid NOT NULL,
     direction text NOT NULL,
     sequence_number integer NOT NULL,
-    cost_pence bigint DEFAULT 0 NOT NULL,
-    tab_id uuid,
-    on_free_allowance boolean DEFAULT false NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT votes_direction_check CHECK ((direction = ANY (ARRAY['up'::text, 'down'::text])))
 );
@@ -2782,8 +3285,36 @@ CREATE TABLE public.waitlist (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     admitted_at timestamp with time zone,
     admitted_account_id uuid,
-    invited_at timestamp with time zone
+    invited_at timestamp with time zone,
+    invite_failed_at timestamp with time zone
 );
+
+
+--
+-- Name: COLUMN waitlist.invite_failed_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.waitlist.invite_failed_at IS 'The last invitation send that FAILED, cleared by the next good one. Tells a failed send apart from a row deliberately not yet invited (RESHAPE-PLAN-2026-10 §A.2.2).';
+
+
+--
+-- Name: writer_applications; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.writer_applications (
+    account_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    admitted_at timestamp with time zone,
+    admitted_by uuid,
+    CONSTRAINT writer_applications_admitted_by_needs_at CHECK (((admitted_by IS NULL) OR (admitted_at IS NOT NULL)))
+);
+
+
+--
+-- Name: TABLE writer_applications; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.writer_applications IS 'A reader asking to be admitted as a writer (READER-WRITER-SPLIT-ADR §8). One row per account; the grant itself is accounts.writer_admitted_at.';
 
 
 --
@@ -2814,25 +3345,6 @@ CREATE TABLE traffology.half_day_buckets (
     bucket_start timestamp with time zone NOT NULL,
     is_day boolean NOT NULL,
     reader_count integer DEFAULT 0 NOT NULL
-);
-
-
---
--- Name: nostr_events; Type: TABLE; Schema: traffology; Owner: -
---
-
-CREATE TABLE traffology.nostr_events (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    event_id text NOT NULL,
-    piece_id uuid NOT NULL,
-    event_kind integer NOT NULL,
-    author_npub text NOT NULL,
-    author_display_name text,
-    parent_event_id text,
-    relay text NOT NULL,
-    event_created_at timestamp with time zone NOT NULL,
-    attributed_sessions integer DEFAULT 0 NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -2893,29 +3405,6 @@ CREATE TABLE traffology.pieces (
     tags text[] DEFAULT '{}'::text[] NOT NULL,
     published_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
---
--- Name: public_mentions; Type: TABLE; Schema: traffology; Owner: -
---
-
-CREATE TABLE traffology.public_mentions (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    piece_id uuid NOT NULL,
-    platform text NOT NULL,
-    post_url text NOT NULL,
-    author_handle text NOT NULL,
-    author_display_name text,
-    post_text text,
-    posted_at timestamp with time zone NOT NULL,
-    engagement_count integer DEFAULT 0 NOT NULL,
-    comment_count integer,
-    attributed_sessions integer DEFAULT 0 NOT NULL,
-    attribution_confidence text DEFAULT 'found'::text NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT public_mentions_attribution_confidence_check CHECK ((attribution_confidence = ANY (ARRAY['direct'::text, 'inferred'::text, 'found'::text]))),
-    CONSTRAINT public_mentions_platform_check CHECK ((platform = ANY (ARRAY['bluesky'::text, 'mastodon'::text, 'reddit'::text, 'hackernews'::text, 'twitter'::text, 'other'::text])))
 );
 
 
@@ -3057,6 +3546,22 @@ ALTER TABLE ONLY public._migrations
 
 ALTER TABLE ONLY public._migrations
     ADD CONSTRAINT _migrations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: account_email_changes account_email_changes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.account_email_changes
+    ADD CONSTRAINT account_email_changes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: account_key_exports account_key_exports_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.account_key_exports
+    ADD CONSTRAINT account_key_exports_pkey PRIMARY KEY (id);
 
 
 --
@@ -3252,6 +3757,14 @@ ALTER TABLE ONLY public.comments
 
 
 --
+-- Name: config_audit config_audit_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.config_audit
+    ADD CONSTRAINT config_audit_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: content_key_issuances content_key_issuances_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3361,6 +3874,14 @@ ALTER TABLE ONLY public.external_authors
 
 ALTER TABLE ONLY public.external_identity_links
     ADD CONSTRAINT external_identity_links_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: external_item_sources external_item_sources_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.external_item_sources
+    ADD CONSTRAINT external_item_sources_pkey PRIMARY KEY (source_id, external_item_id);
 
 
 --
@@ -3508,6 +4029,14 @@ ALTER TABLE ONLY public.gift_links
 
 
 --
+-- Name: key_access_log key_access_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.key_access_log
+    ADD CONSTRAINT key_access_log_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: ledger_entries ledger_entries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3641,6 +4170,14 @@ ALTER TABLE ONLY public.payout_transfers
 
 ALTER TABLE ONLY public.payouts_halted_accounts
     ADD CONSTRAINT payouts_halted_accounts_pkey PRIMARY KEY (account_id);
+
+
+--
+-- Name: platform_blocks platform_blocks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_blocks
+    ADD CONSTRAINT platform_blocks_pkey PRIMARY KEY (id);
 
 
 --
@@ -3812,6 +4349,46 @@ ALTER TABLE ONLY public.read_events
 
 
 --
+-- Name: reader_credits reader_credits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.reader_credits
+    ADD CONSTRAINT reader_credits_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: reader_credits reader_credits_quarantine_ledger_entry_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.reader_credits
+    ADD CONSTRAINT reader_credits_quarantine_ledger_entry_id_key UNIQUE (quarantine_ledger_entry_id);
+
+
+--
+-- Name: reader_credits reader_credits_refund_ledger_entry_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.reader_credits
+    ADD CONSTRAINT reader_credits_refund_ledger_entry_id_key UNIQUE (refund_ledger_entry_id);
+
+
+--
+-- Name: reader_credits reader_credits_release_ledger_entry_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.reader_credits
+    ADD CONSTRAINT reader_credits_release_ledger_entry_id_key UNIQUE (release_ledger_entry_id);
+
+
+--
+-- Name: reader_credits reader_credits_stripe_refund_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.reader_credits
+    ADD CONSTRAINT reader_credits_stripe_refund_id_key UNIQUE (stripe_refund_id);
+
+
+--
 -- Name: reading_log reading_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3873,14 +4450,6 @@ ALTER TABLE ONLY public.stripe_webhook_events
 
 ALTER TABLE ONLY public.subscription_events
     ADD CONSTRAINT subscription_events_pkey PRIMARY KEY (id);
-
-
---
--- Name: subscription_nudge_log subscription_nudge_log_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.subscription_nudge_log
-    ADD CONSTRAINT subscription_nudge_log_pkey PRIMARY KEY (reader_id, writer_id, month);
 
 
 --
@@ -4124,6 +4693,14 @@ ALTER TABLE ONLY public.waitlist
 
 
 --
+-- Name: writer_applications writer_applications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.writer_applications
+    ADD CONSTRAINT writer_applications_pkey PRIMARY KEY (account_id);
+
+
+--
 -- Name: writer_payouts writer_payouts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4145,22 +4722,6 @@ ALTER TABLE ONLY public.writer_payouts
 
 ALTER TABLE ONLY traffology.half_day_buckets
     ADD CONSTRAINT half_day_buckets_pkey PRIMARY KEY (piece_id, source_id, bucket_start);
-
-
---
--- Name: nostr_events nostr_events_event_id_key; Type: CONSTRAINT; Schema: traffology; Owner: -
---
-
-ALTER TABLE ONLY traffology.nostr_events
-    ADD CONSTRAINT nostr_events_event_id_key UNIQUE (event_id);
-
-
---
--- Name: nostr_events nostr_events_pkey; Type: CONSTRAINT; Schema: traffology; Owner: -
---
-
-ALTER TABLE ONLY traffology.nostr_events
-    ADD CONSTRAINT nostr_events_pkey PRIMARY KEY (id);
 
 
 --
@@ -4193,14 +4754,6 @@ ALTER TABLE ONLY traffology.pieces
 
 ALTER TABLE ONLY traffology.pieces
     ADD CONSTRAINT pieces_pkey PRIMARY KEY (id);
-
-
---
--- Name: public_mentions public_mentions_pkey; Type: CONSTRAINT; Schema: traffology; Owner: -
---
-
-ALTER TABLE ONLY traffology.public_mentions
-    ADD CONSTRAINT public_mentions_pkey PRIMARY KEY (id);
 
 
 --
@@ -4252,6 +4805,13 @@ ALTER TABLE ONLY traffology.writer_baselines
 
 
 --
+-- Name: account_email_changes_account_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX account_email_changes_account_idx ON public.account_email_changes USING btree (account_id, changed_at DESC);
+
+
+--
 -- Name: accounts_discovery_sweep_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -4273,6 +4833,13 @@ CREATE INDEX atproto_oauth_pending_states_expires_at_idx ON public.atproto_oauth
 
 
 --
+-- Name: feed_formula_sources_account_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX feed_formula_sources_account_uniq ON public.feed_formula_sources USING btree (formula_id, tag_value) WHERE (source_type = 'account'::text);
+
+
+--
 -- Name: feed_sources_account_uniq; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -4284,13 +4851,6 @@ CREATE UNIQUE INDEX feed_sources_account_uniq ON public.feed_sources USING btree
 --
 
 CREATE UNIQUE INDEX feed_sources_external_uniq ON public.feed_sources USING btree (feed_id, external_source_id) WHERE (source_type = 'external_source'::text);
-
-
---
--- Name: feed_sources_feed_active_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX feed_sources_feed_active_idx ON public.feed_sources USING btree (feed_id, sampling_mode) WHERE (muted_at IS NULL);
 
 
 --
@@ -4322,6 +4882,13 @@ CREATE INDEX feeds_owner_idx ON public.feeds USING btree (owner_id, created_at D
 
 
 --
+-- Name: idx_account_key_exports_account; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_account_key_exports_account ON public.account_key_exports USING btree (account_id, exported_at DESC);
+
+
+--
 -- Name: idx_accounts_display_name_trgm; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -4336,17 +4903,10 @@ CREATE INDEX idx_accounts_email ON public.accounts USING btree (email) WHERE (em
 
 
 --
--- Name: idx_accounts_nostr_pubkey; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_accounts_unpayable_since; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_accounts_nostr_pubkey ON public.accounts USING btree (nostr_pubkey);
-
-
---
--- Name: idx_accounts_username; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_accounts_username ON public.accounts USING btree (username);
+CREATE INDEX idx_accounts_unpayable_since ON public.accounts USING btree (unpayable_since) WHERE (unpayable_since IS NOT NULL);
 
 
 --
@@ -4385,17 +4945,17 @@ CREATE INDEX idx_article_unlocks_article ON public.article_unlocks USING btree (
 
 
 --
--- Name: idx_article_unlocks_reader; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_article_unlocks_reader ON public.article_unlocks USING btree (reader_id);
-
-
---
 -- Name: idx_articles_content_free_trgm; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_articles_content_free_trgm ON public.articles USING gin (content_free public.gin_trgm_ops);
+
+
+--
+-- Name: idx_articles_d_tag_only; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_articles_d_tag_only ON public.articles USING btree (nostr_d_tag);
 
 
 --
@@ -4434,10 +4994,10 @@ CREATE UNIQUE INDEX idx_articles_unique_live ON public.articles USING btree (wri
 
 
 --
--- Name: idx_articles_writer_id; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_atproto_oauth_sessions_account; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_articles_writer_id ON public.articles USING btree (writer_id);
+CREATE INDEX idx_atproto_oauth_sessions_account ON public.atproto_oauth_sessions USING btree (account_id);
 
 
 --
@@ -4473,6 +5033,20 @@ CREATE INDEX idx_comments_parent ON public.comments USING btree (parent_comment_
 --
 
 CREATE INDEX idx_comments_target ON public.comments USING btree (target_event_id, published_at) WHERE (deleted_at IS NULL);
+
+
+--
+-- Name: idx_config_audit_changed_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_config_audit_changed_at ON public.config_audit USING btree (changed_at DESC);
+
+
+--
+-- Name: idx_config_audit_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_config_audit_key ON public.config_audit USING btree (key, changed_at DESC);
 
 
 --
@@ -4522,13 +5096,6 @@ CREATE INDEX idx_dm_conversation ON public.direct_messages USING btree (conversa
 --
 
 CREATE UNIQUE INDEX idx_dm_pricing_default ON public.dm_pricing USING btree (owner_id) WHERE (target_id IS NULL);
-
-
---
--- Name: idx_dm_reactions_message; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_dm_reactions_message ON public.dm_reactions USING btree (message_id);
 
 
 --
@@ -4585,13 +5152,6 @@ CREATE INDEX idx_drafts_writer_id ON public.article_drafts USING btree (writer_i
 --
 
 CREATE INDEX idx_drives_creator ON public.pledge_drives USING btree (creator_id);
-
-
---
--- Name: idx_drives_nostr; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_drives_nostr ON public.pledge_drives USING btree (nostr_event_id);
 
 
 --
@@ -4693,13 +5253,6 @@ CREATE INDEX idx_ext_subs_source ON public.external_subscriptions USING btree (s
 
 
 --
--- Name: idx_ext_subs_subscriber; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_ext_subs_subscriber ON public.external_subscriptions USING btree (subscriber_id);
-
-
---
 -- Name: idx_external_authors_account_id; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -4728,6 +5281,20 @@ CREATE INDEX idx_external_authors_source_id ON public.external_authors USING btr
 
 
 --
+-- Name: idx_external_item_sources_item; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_external_item_sources_item ON public.external_item_sources USING btree (external_item_id);
+
+
+--
+-- Name: idx_external_items_created_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_external_items_created_at ON public.external_items USING btree (created_at);
+
+
+--
 -- Name: idx_external_items_dedup_fp; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -4746,6 +5313,13 @@ CREATE INDEX idx_external_sources_display_name_trgm ON public.external_sources U
 --
 
 CREATE INDEX idx_external_sources_handle_trgm ON public.external_sources USING gin (handle public.gin_trgm_ops);
+
+
+--
+-- Name: idx_external_sources_signed_fetch_refused; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_external_sources_signed_fetch_refused ON public.external_sources USING btree (signed_fetch_refused_at) WHERE (signed_fetch_refused_at IS NOT NULL);
 
 
 --
@@ -4781,6 +5355,13 @@ CREATE UNIQUE INDEX idx_feed_items_article ON public.feed_items USING btree (art
 --
 
 CREATE INDEX idx_feed_items_author ON public.feed_items USING btree (author_id, published_at DESC) WHERE (deleted_at IS NULL);
+
+
+--
+-- Name: idx_feed_items_comment; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_feed_items_comment ON public.feed_items USING btree (comment_id) WHERE (comment_id IS NOT NULL);
 
 
 --
@@ -4836,7 +5417,7 @@ CREATE INDEX idx_feed_items_score ON public.feed_items USING btree (score DESC, 
 -- Name: idx_feed_items_source; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_feed_items_source ON public.feed_items USING btree (source_id, published_at DESC) WHERE ((source_id IS NOT NULL) AND (deleted_at IS NULL));
+CREATE INDEX idx_feed_items_source ON public.feed_items USING btree (source_id, published_at DESC) WHERE (source_id IS NOT NULL);
 
 
 --
@@ -4903,13 +5484,6 @@ CREATE INDEX idx_gift_links_article ON public.gift_links USING btree (article_id
 
 
 --
--- Name: idx_gift_links_token; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_gift_links_token ON public.gift_links USING btree (token);
-
-
---
 -- Name: idx_identity_links_source_a; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -4921,6 +5495,20 @@ CREATE INDEX idx_identity_links_source_a ON public.external_identity_links USING
 --
 
 CREATE INDEX idx_identity_links_source_b ON public.external_identity_links USING btree (source_b_id);
+
+
+--
+-- Name: idx_key_access_log_account; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_key_access_log_account ON public.key_access_log USING btree (account_id, accessed_at DESC);
+
+
+--
+-- Name: idx_key_access_log_at; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_key_access_log_at ON public.key_access_log USING btree (accessed_at);
 
 
 --
@@ -4987,10 +5575,17 @@ CREATE INDEX idx_media_uploads_uploader ON public.media_uploads USING btree (upl
 
 
 --
--- Name: idx_network_presences_account; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_moderation_reports_queue; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_network_presences_account ON public.network_presences USING btree (account_id);
+CREATE INDEX idx_moderation_reports_queue ON public.moderation_reports USING btree (priority, created_at) WHERE (status = ANY (ARRAY['open'::public.report_status, 'under_review'::public.report_status]));
+
+
+--
+-- Name: idx_moderation_reports_subject; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_moderation_reports_subject ON public.moderation_reports USING btree (subject_account_id) WHERE (subject_account_id IS NOT NULL);
 
 
 --
@@ -5001,10 +5596,24 @@ CREATE INDEX idx_network_presences_refresh ON public.network_presences USING btr
 
 
 --
+-- Name: idx_network_presences_stable_handle; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_network_presences_stable_handle ON public.network_presences USING btree (protocol, stable_handle) WHERE (stable_handle IS NOT NULL);
+
+
+--
 -- Name: idx_notes_author_id; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_notes_author_id ON public.notes USING btree (author_id);
+
+
+--
+-- Name: idx_notes_external_parent; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_notes_external_parent ON public.notes USING btree (external_parent_id) WHERE (external_parent_id IS NOT NULL);
 
 
 --
@@ -5025,7 +5634,7 @@ CREATE INDEX idx_notes_reply_to ON public.notes USING btree (reply_to_event_id) 
 -- Name: idx_notifications_dedup; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX idx_notifications_dedup ON public.notifications USING btree (recipient_id, actor_id, type, COALESCE(article_id, '00000000-0000-0000-0000-000000000000'::uuid), COALESCE(note_id, '00000000-0000-0000-0000-000000000000'::uuid), COALESCE(comment_id, '00000000-0000-0000-0000-000000000000'::uuid), COALESCE(offer_id, '00000000-0000-0000-0000-000000000000'::uuid), COALESCE(drive_id, '00000000-0000-0000-0000-000000000000'::uuid)) WHERE (read = false);
+CREATE UNIQUE INDEX idx_notifications_dedup ON public.notifications USING btree (recipient_id, actor_id, type, COALESCE(article_id, '00000000-0000-0000-0000-000000000000'::uuid), COALESCE(note_id, '00000000-0000-0000-0000-000000000000'::uuid), COALESCE(comment_id, '00000000-0000-0000-0000-000000000000'::uuid), COALESCE(offer_id, '00000000-0000-0000-0000-000000000000'::uuid), COALESCE(drive_id, '00000000-0000-0000-0000-000000000000'::uuid), COALESCE(publication_id, '00000000-0000-0000-0000-000000000000'::uuid)) WHERE (read = false);
 
 
 --
@@ -5033,6 +5642,20 @@ CREATE UNIQUE INDEX idx_notifications_dedup ON public.notifications USING btree 
 --
 
 CREATE INDEX idx_notifications_drive ON public.notifications USING btree (drive_id) WHERE (drive_id IS NOT NULL);
+
+
+--
+-- Name: idx_notifications_external_item; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_notifications_external_item ON public.notifications USING btree (recipient_id, type, external_item_id) WHERE (external_item_id IS NOT NULL);
+
+
+--
+-- Name: idx_notifications_external_item_ref; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_notifications_external_item_ref ON public.notifications USING btree (external_item_id) WHERE (external_item_id IS NOT NULL);
 
 
 --
@@ -5047,6 +5670,13 @@ CREATE INDEX idx_notifications_note ON public.notifications USING btree (note_id
 --
 
 CREATE INDEX idx_notifications_offer ON public.notifications USING btree (offer_id) WHERE (offer_id IS NOT NULL);
+
+
+--
+-- Name: idx_notifications_publication; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_notifications_publication ON public.notifications USING btree (publication_id) WHERE (publication_id IS NOT NULL);
 
 
 --
@@ -5078,6 +5708,13 @@ CREATE INDEX idx_outbound_posts_pending ON public.outbound_posts USING btree (st
 
 
 --
+-- Name: idx_outbound_posts_sent_uri; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_outbound_posts_sent_uri ON public.outbound_posts USING btree (external_post_uri) WHERE (status = 'sent'::text);
+
+
+--
 -- Name: idx_payout_transfers_parent; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5103,13 +5740,6 @@ CREATE INDEX idx_payout_transfers_settlement ON public.payout_transfers USING bt
 --
 
 CREATE UNIQUE INDEX idx_payout_transfers_stripe_transfer ON public.payout_transfers USING btree (stripe_transfer_id) WHERE (stripe_transfer_id IS NOT NULL);
-
-
---
--- Name: idx_pledges_drive; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_pledges_drive ON public.pledges USING btree (drive_id);
 
 
 --
@@ -5239,20 +5869,6 @@ CREATE INDEX idx_publications_name_trgm ON public.publications USING gin (name p
 
 
 --
--- Name: idx_publications_nostr_pubkey; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_publications_nostr_pubkey ON public.publications USING btree (nostr_pubkey);
-
-
---
--- Name: idx_publications_slug; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_publications_slug ON public.publications USING btree (slug);
-
-
---
 -- Name: idx_read_events_article_id; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5288,13 +5904,6 @@ CREATE INDEX idx_read_events_reader_article ON public.read_events USING btree (r
 
 
 --
--- Name: idx_read_events_reader_id; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_read_events_reader_id ON public.read_events USING btree (reader_id);
-
-
---
 -- Name: idx_read_events_settled_unpaid; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5316,10 +5925,52 @@ CREATE INDEX idx_read_events_tab_id ON public.read_events USING btree (tab_id);
 
 
 --
+-- Name: idx_read_events_tab_settlement; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_read_events_tab_settlement ON public.read_events USING btree (tab_settlement_id) WHERE (tab_settlement_id IS NOT NULL);
+
+
+--
 -- Name: idx_read_events_writer_id; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_read_events_writer_id ON public.read_events USING btree (writer_id);
+
+
+--
+-- Name: idx_read_events_writer_payout; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_read_events_writer_payout ON public.read_events USING btree (writer_payout_id) WHERE (writer_payout_id IS NOT NULL);
+
+
+--
+-- Name: idx_reader_credits_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_reader_credits_open ON public.reader_credits USING btree (reader_id) WHERE (status = 'pending_refund'::text);
+
+
+--
+-- Name: idx_reader_credits_refund_charge; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_reader_credits_refund_charge ON public.reader_credits USING btree (refund_charge_id) WHERE (refund_charge_id IS NOT NULL);
+
+
+--
+-- Name: idx_reader_credits_refund_inflight; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_reader_credits_refund_inflight ON public.reader_credits USING btree (refund_reserved_at) WHERE ((status = 'pending_refund'::text) AND (stripe_refund_id IS NULL));
+
+
+--
+-- Name: idx_reader_credits_source_open; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_reader_credits_source_open ON public.reader_credits USING btree (source_ref_table, source_ref_id) WHERE (status = 'pending_refund'::text);
 
 
 --
@@ -5348,13 +5999,6 @@ CREATE INDEX idx_reading_positions_sweep ON public.reading_positions USING btree
 --
 
 CREATE INDEX idx_reading_positions_user ON public.reading_positions USING btree (user_id, updated_at DESC);
-
-
---
--- Name: idx_reading_tabs_reader_id; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_reading_tabs_reader_id ON public.reading_tabs USING btree (reader_id);
 
 
 --
@@ -5568,13 +6212,6 @@ CREATE INDEX idx_tab_settlements_settled_at ON public.tab_settlements USING btre
 
 
 --
--- Name: idx_tags_name; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_tags_name ON public.tags USING btree (name);
-
-
---
 -- Name: idx_tribute_accruals_payout_transfer; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5593,13 +6230,6 @@ CREATE INDEX idx_tribute_accruals_released_unclaimed ON public.tribute_accruals 
 --
 
 CREATE INDEX idx_tribute_accruals_state ON public.tribute_accruals USING btree (state);
-
-
---
--- Name: idx_tribute_accruals_tribute; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_tribute_accruals_tribute ON public.tribute_accruals USING btree (tribute_id);
 
 
 --
@@ -5642,13 +6272,6 @@ CREATE INDEX idx_tributes_proposed_window ON public.tributes USING btree (window
 --
 
 CREATE INDEX idx_tributes_resolved_account ON public.tributes USING btree (resolved_account_id);
-
-
---
--- Name: idx_vault_keys_article_id; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_vault_keys_article_id ON public.vault_keys USING btree (article_id);
 
 
 --
@@ -5715,6 +6338,13 @@ CREATE INDEX idx_votes_created ON public.votes USING btree (created_at DESC);
 
 
 --
+-- Name: idx_votes_one_per_direction; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_votes_one_per_direction ON public.votes USING btree (voter_id, target_nostr_event_id, direction) WHERE (sequence_number = 1);
+
+
+--
 -- Name: idx_votes_target; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5750,6 +6380,13 @@ CREATE INDEX idx_vouches_subject ON public.vouches USING btree (subject_id) WHER
 
 
 --
+-- Name: idx_writer_applications_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_writer_applications_pending ON public.writer_applications USING btree (created_at) WHERE (admitted_at IS NULL);
+
+
+--
 -- Name: idx_writer_payouts_status; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5768,6 +6405,13 @@ CREATE INDEX idx_writer_payouts_writer_id ON public.writer_payouts USING btree (
 --
 
 CREATE UNIQUE INDEX network_presences_protocol_external_id_uniq ON public.network_presences USING btree (protocol, external_id) WHERE (external_id IS NOT NULL);
+
+
+--
+-- Name: platform_blocks_identity_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX platform_blocks_identity_idx ON public.platform_blocks USING btree (kind, protocol, target_key);
 
 
 --
@@ -5817,6 +6461,13 @@ CREATE INDEX trust_polls_subject_idx ON public.trust_polls USING btree (subject_
 --
 
 CREATE UNIQUE INDEX uniq_outbound_posts_dedup ON public.outbound_posts USING btree (account_id, nostr_event_id, linked_account_id, action_type) NULLS NOT DISTINCT;
+
+
+--
+-- Name: uq_comp_offer_outstanding; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_comp_offer_outstanding ON public.subscription_offers USING btree (writer_id, recipient_id) WHERE (is_comp AND (revoked_at IS NULL) AND (redemption_count = 0));
 
 
 --
@@ -5876,17 +6527,10 @@ CREATE UNIQUE INDEX uq_tributes_invite_token ON public.tributes USING btree (inv
 
 
 --
--- Name: idx_traf_mentions_piece; Type: INDEX; Schema: traffology; Owner: -
+-- Name: vault_keys_article_id_key; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_traf_mentions_piece ON traffology.public_mentions USING btree (piece_id);
-
-
---
--- Name: idx_traf_nostr_events_piece; Type: INDEX; Schema: traffology; Owner: -
---
-
-CREATE INDEX idx_traf_nostr_events_piece ON traffology.nostr_events USING btree (piece_id);
+CREATE UNIQUE INDEX vault_keys_article_id_key ON public.vault_keys USING btree (article_id);
 
 
 --
@@ -5988,10 +6632,17 @@ CREATE INDEX idx_traf_sources_writer ON traffology.sources USING btree (writer_i
 
 
 --
--- Name: articles articles_size_tier_default; Type: TRIGGER; Schema: public; Owner: -
+-- Name: config_audit config_audit_append_only_trg; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER articles_size_tier_default BEFORE INSERT ON public.articles FOR EACH ROW EXECUTE FUNCTION public.articles_derive_size_tier();
+CREATE TRIGGER config_audit_append_only_trg BEFORE DELETE OR UPDATE ON public.config_audit FOR EACH ROW EXECUTE FUNCTION public.config_audit_append_only();
+
+
+--
+-- Name: config_audit config_audit_no_truncate_trg; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER config_audit_no_truncate_trg BEFORE TRUNCATE ON public.config_audit FOR EACH STATEMENT EXECUTE FUNCTION public.config_audit_append_only();
 
 
 --
@@ -5999,6 +6650,13 @@ CREATE TRIGGER articles_size_tier_default BEFORE INSERT ON public.articles FOR E
 --
 
 CREATE TRIGGER external_items_dedup_fp BEFORE INSERT OR UPDATE OF canonical_url, content_text ON public.external_items FOR EACH ROW EXECUTE FUNCTION public.external_items_set_fingerprint();
+
+
+--
+-- Name: external_items external_items_home_membership; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER external_items_home_membership AFTER INSERT OR UPDATE OF source_id, is_context_only ON public.external_items FOR EACH ROW EXECUTE FUNCTION public.external_items_home_membership();
 
 
 --
@@ -6030,6 +6688,20 @@ CREATE TRIGGER feeds_touch_updated_at BEFORE UPDATE ON public.feeds FOR EACH ROW
 
 
 --
+-- Name: key_access_log key_access_log_append_only_trg; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER key_access_log_append_only_trg BEFORE DELETE OR UPDATE ON public.key_access_log FOR EACH ROW EXECUTE FUNCTION public.key_access_log_append_only();
+
+
+--
+-- Name: key_access_log key_access_log_no_truncate_trg; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER key_access_log_no_truncate_trg BEFORE TRUNCATE ON public.key_access_log FOR EACH STATEMENT EXECUTE FUNCTION public.key_access_log_append_only();
+
+
+--
 -- Name: ledger_entries ledger_entries_append_only_trg; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -6041,6 +6713,13 @@ CREATE TRIGGER ledger_entries_append_only_trg BEFORE DELETE OR UPDATE ON public.
 --
 
 CREATE TRIGGER ledger_entries_no_truncate_trg BEFORE TRUNCATE ON public.ledger_entries FOR EACH STATEMENT EXECUTE FUNCTION public.ledger_entries_append_only();
+
+
+--
+-- Name: network_presences network_presences_claim; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER network_presences_claim AFTER INSERT OR DELETE OR UPDATE OF stable_handle, lifecycle_state, account_id, protocol ON public.network_presences FOR EACH ROW EXECUTE FUNCTION public.network_presences_claim();
 
 
 --
@@ -6170,11 +6849,35 @@ CREATE TRIGGER trust_polls_touch_updated_at BEFORE UPDATE ON public.trust_polls 
 
 
 --
+-- Name: account_email_changes account_email_changes_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.account_email_changes
+    ADD CONSTRAINT account_email_changes_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: account_key_exports account_key_exports_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.account_key_exports
+    ADD CONSTRAINT account_key_exports_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
 -- Name: accounts accounts_arrival_article_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.accounts
     ADD CONSTRAINT accounts_arrival_article_id_fkey FOREIGN KEY (arrival_article_id) REFERENCES public.articles(id) ON DELETE SET NULL;
+
+
+--
+-- Name: accounts accounts_writer_admitted_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.accounts
+    ADD CONSTRAINT accounts_writer_admitted_by_fkey FOREIGN KEY (writer_admitted_by) REFERENCES public.accounts(id);
 
 
 --
@@ -6258,6 +6961,14 @@ ALTER TABLE ONLY public.articles
 
 
 --
+-- Name: atproto_oauth_sessions atproto_oauth_sessions_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.atproto_oauth_sessions
+    ADD CONSTRAINT atproto_oauth_sessions_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
 -- Name: blocks blocks_blocked_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6303,6 +7014,22 @@ ALTER TABLE ONLY public.comments
 
 ALTER TABLE ONLY public.comments
     ADD CONSTRAINT comments_parent_comment_id_fkey FOREIGN KEY (parent_comment_id) REFERENCES public.comments(id) ON DELETE CASCADE;
+
+
+--
+-- Name: config_audit config_audit_actor_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.config_audit
+    ADD CONSTRAINT config_audit_actor_account_id_fkey FOREIGN KEY (actor_account_id) REFERENCES public.accounts(id);
+
+
+--
+-- Name: config_audit config_audit_subject_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.config_audit
+    ADD CONSTRAINT config_audit_subject_account_id_fkey FOREIGN KEY (subject_account_id) REFERENCES public.accounts(id);
 
 
 --
@@ -6514,6 +7241,22 @@ ALTER TABLE ONLY public.external_identity_links
 
 
 --
+-- Name: external_item_sources external_item_sources_external_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.external_item_sources
+    ADD CONSTRAINT external_item_sources_external_item_id_fkey FOREIGN KEY (external_item_id) REFERENCES public.external_items(id) ON DELETE CASCADE;
+
+
+--
+-- Name: external_item_sources external_item_sources_source_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.external_item_sources
+    ADD CONSTRAINT external_item_sources_source_id_fkey FOREIGN KEY (source_id) REFERENCES public.external_sources(id) ON DELETE CASCADE;
+
+
+--
 -- Name: external_items external_items_source_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6607,6 +7350,14 @@ ALTER TABLE ONLY public.feed_items
 
 ALTER TABLE ONLY public.feed_items
     ADD CONSTRAINT feed_items_author_id_fkey FOREIGN KEY (author_id) REFERENCES public.accounts(id) ON DELETE SET NULL;
+
+
+--
+-- Name: feed_items feed_items_comment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.feed_items
+    ADD CONSTRAINT feed_items_comment_id_fkey FOREIGN KEY (comment_id) REFERENCES public.comments(id) ON DELETE CASCADE;
 
 
 --
@@ -6794,6 +7545,22 @@ ALTER TABLE ONLY public.gift_links
 
 
 --
+-- Name: key_access_log key_access_log_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.key_access_log
+    ADD CONSTRAINT key_access_log_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id);
+
+
+--
+-- Name: key_access_log key_access_log_actor_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.key_access_log
+    ADD CONSTRAINT key_access_log_actor_account_id_fkey FOREIGN KEY (actor_account_id) REFERENCES public.accounts(id);
+
+
+--
 -- Name: ledger_entries ledger_entries_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6826,6 +7593,14 @@ ALTER TABLE ONLY public.media_uploads
 
 
 --
+-- Name: moderation_reports moderation_reports_priority_raised_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.moderation_reports
+    ADD CONSTRAINT moderation_reports_priority_raised_by_fkey FOREIGN KEY (priority_raised_by) REFERENCES public.accounts(id) ON DELETE SET NULL;
+
+
+--
 -- Name: moderation_reports moderation_reports_reporter_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6842,11 +7617,35 @@ ALTER TABLE ONLY public.moderation_reports
 
 
 --
+-- Name: moderation_reports moderation_reports_subject_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.moderation_reports
+    ADD CONSTRAINT moderation_reports_subject_account_id_fkey FOREIGN KEY (subject_account_id) REFERENCES public.accounts(id) ON DELETE SET NULL;
+
+
+--
 -- Name: moderation_reports moderation_reports_target_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.moderation_reports
     ADD CONSTRAINT moderation_reports_target_account_id_fkey FOREIGN KEY (target_account_id) REFERENCES public.accounts(id) ON DELETE SET NULL;
+
+
+--
+-- Name: moderation_reports moderation_reports_target_conversation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.moderation_reports
+    ADD CONSTRAINT moderation_reports_target_conversation_id_fkey FOREIGN KEY (target_conversation_id) REFERENCES public.conversations(id) ON DELETE SET NULL;
+
+
+--
+-- Name: moderation_reports moderation_reports_target_profile_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.moderation_reports
+    ADD CONSTRAINT moderation_reports_target_profile_id_fkey FOREIGN KEY (target_profile_id) REFERENCES public.accounts(id) ON DELETE SET NULL;
 
 
 --
@@ -6938,6 +7737,14 @@ ALTER TABLE ONLY public.notifications
 
 
 --
+-- Name: notifications notifications_external_item_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notifications
+    ADD CONSTRAINT notifications_external_item_id_fkey FOREIGN KEY (external_item_id) REFERENCES public.external_items(id) ON DELETE CASCADE;
+
+
+--
 -- Name: notifications notifications_note_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6951,6 +7758,22 @@ ALTER TABLE ONLY public.notifications
 
 ALTER TABLE ONLY public.notifications
     ADD CONSTRAINT notifications_offer_id_fkey FOREIGN KEY (offer_id) REFERENCES public.subscription_offers(id) ON DELETE CASCADE;
+
+
+--
+-- Name: notifications notifications_parent_comment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notifications
+    ADD CONSTRAINT notifications_parent_comment_id_fkey FOREIGN KEY (parent_comment_id) REFERENCES public.comments(id) ON DELETE SET NULL;
+
+
+--
+-- Name: notifications notifications_publication_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notifications
+    ADD CONSTRAINT notifications_publication_id_fkey FOREIGN KEY (publication_id) REFERENCES public.publications(id) ON DELETE SET NULL;
 
 
 --
@@ -6999,6 +7822,14 @@ ALTER TABLE ONLY public.payout_transfers
 
 ALTER TABLE ONLY public.payouts_halted_accounts
     ADD CONSTRAINT payouts_halted_accounts_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: platform_blocks platform_blocks_blocked_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.platform_blocks
+    ADD CONSTRAINT platform_blocks_blocked_by_fkey FOREIGN KEY (blocked_by) REFERENCES public.accounts(id) ON DELETE SET NULL;
 
 
 --
@@ -7218,19 +8049,51 @@ ALTER TABLE ONLY public.read_events
 
 
 --
--- Name: read_events read_events_via_subscription_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.read_events
-    ADD CONSTRAINT read_events_via_subscription_id_fkey FOREIGN KEY (via_subscription_id) REFERENCES public.subscriptions(id);
-
-
---
 -- Name: read_events read_events_writer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.read_events
     ADD CONSTRAINT read_events_writer_id_fkey FOREIGN KEY (writer_id) REFERENCES public.accounts(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: reader_credits reader_credits_quarantine_ledger_entry_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.reader_credits
+    ADD CONSTRAINT reader_credits_quarantine_ledger_entry_id_fkey FOREIGN KEY (quarantine_ledger_entry_id) REFERENCES public.ledger_entries(id);
+
+
+--
+-- Name: reader_credits reader_credits_reader_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.reader_credits
+    ADD CONSTRAINT reader_credits_reader_id_fkey FOREIGN KEY (reader_id) REFERENCES public.accounts(id);
+
+
+--
+-- Name: reader_credits reader_credits_refund_actor_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.reader_credits
+    ADD CONSTRAINT reader_credits_refund_actor_id_fkey FOREIGN KEY (refund_actor_id) REFERENCES public.accounts(id);
+
+
+--
+-- Name: reader_credits reader_credits_refund_ledger_entry_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.reader_credits
+    ADD CONSTRAINT reader_credits_refund_ledger_entry_id_fkey FOREIGN KEY (refund_ledger_entry_id) REFERENCES public.ledger_entries(id);
+
+
+--
+-- Name: reader_credits reader_credits_release_ledger_entry_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.reader_credits
+    ADD CONSTRAINT reader_credits_release_ledger_entry_id_fkey FOREIGN KEY (release_ledger_entry_id) REFERENCES public.ledger_entries(id);
 
 
 --
@@ -7343,30 +8206,6 @@ ALTER TABLE ONLY public.subscription_events
 
 ALTER TABLE ONLY public.subscription_events
     ADD CONSTRAINT subscription_events_writer_payout_id_fkey FOREIGN KEY (writer_payout_id) REFERENCES public.writer_payouts(id);
-
-
---
--- Name: subscription_nudge_log subscription_nudge_log_publication_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.subscription_nudge_log
-    ADD CONSTRAINT subscription_nudge_log_publication_id_fkey FOREIGN KEY (publication_id) REFERENCES public.publications(id);
-
-
---
--- Name: subscription_nudge_log subscription_nudge_log_reader_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.subscription_nudge_log
-    ADD CONSTRAINT subscription_nudge_log_reader_id_fkey FOREIGN KEY (reader_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
-
-
---
--- Name: subscription_nudge_log subscription_nudge_log_writer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.subscription_nudge_log
-    ADD CONSTRAINT subscription_nudge_log_writer_id_fkey FOREIGN KEY (writer_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
 
 
 --
@@ -7610,14 +8449,6 @@ ALTER TABLE ONLY public.vote_charges
 
 
 --
--- Name: votes votes_tab_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.votes
-    ADD CONSTRAINT votes_tab_id_fkey FOREIGN KEY (tab_id) REFERENCES public.reading_tabs(id) ON DELETE SET NULL;
-
-
---
 -- Name: votes votes_target_author_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -7658,6 +8489,22 @@ ALTER TABLE ONLY public.waitlist
 
 
 --
+-- Name: writer_applications writer_applications_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.writer_applications
+    ADD CONSTRAINT writer_applications_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: writer_applications writer_applications_admitted_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.writer_applications
+    ADD CONSTRAINT writer_applications_admitted_by_fkey FOREIGN KEY (admitted_by) REFERENCES public.accounts(id);
+
+
+--
 -- Name: writer_payouts writer_payouts_writer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -7687,14 +8534,6 @@ ALTER TABLE ONLY traffology.half_day_buckets
 
 ALTER TABLE ONLY traffology.half_day_buckets
     ADD CONSTRAINT half_day_buckets_source_id_fkey FOREIGN KEY (source_id) REFERENCES traffology.sources(id) ON DELETE CASCADE;
-
-
---
--- Name: nostr_events nostr_events_piece_id_fkey; Type: FK CONSTRAINT; Schema: traffology; Owner: -
---
-
-ALTER TABLE ONLY traffology.nostr_events
-    ADD CONSTRAINT nostr_events_piece_id_fkey FOREIGN KEY (piece_id) REFERENCES traffology.pieces(id) ON DELETE CASCADE;
 
 
 --
@@ -7751,14 +8590,6 @@ ALTER TABLE ONLY traffology.pieces
 
 ALTER TABLE ONLY traffology.pieces
     ADD CONSTRAINT pieces_writer_id_fkey FOREIGN KEY (writer_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
-
-
---
--- Name: public_mentions public_mentions_piece_id_fkey; Type: FK CONSTRAINT; Schema: traffology; Owner: -
---
-
-ALTER TABLE ONLY traffology.public_mentions
-    ADD CONSTRAINT public_mentions_piece_id_fkey FOREIGN KEY (piece_id) REFERENCES traffology.pieces(id) ON DELETE CASCADE;
 
 
 --
@@ -7829,7 +8660,8 @@ ALTER TABLE ONLY traffology.writer_baselines
 -- PostgreSQL database dump complete
 --
 
-\unrestrict RWocryERm9LrsGM0l2qc6Kdvh5Hcja3EIw4pd7mSV1iE8teAKF5dNwwCF6fPphJ
+\unrestrict Gq80UVf0Iq5PehM3vYeiHc4ohcroSVZ9kAgzmZJ3C6iW1wzYZT14yUM8brrJ8ku
+
 
 
 --
@@ -8026,4 +8858,87 @@ INSERT INTO public._migrations (filename) VALUES
     ('187_parallel_safe_functions.sql'),
     ('188_accounts_arrival.sql'),
     ('189_reading_log.sql'),
-    ('190_feeds_name_optional.sql');
+    ('190_feeds_name_optional.sql'),
+    ('191_payouts_halted_accounts_comment.sql'),
+    ('192_key_export_step_up.sql'),
+    ('193_comp_offers.sql'),
+    ('194_atproto_sessions_account.sql'),
+    ('195_ledger_trigger_type_check.sql'),
+    ('196_discoverable_by_email.sql'),
+    ('197_relay_outbox_entity_type_edges.sql'),
+    ('198_notification_target_binding.sql'),
+    ('199_feed_items_source_index_drop.sql'),
+    ('200_feed_items_source_index_create.sql'),
+    ('201_onboarded_at_comment.sql'),
+    ('202_source_throughput.sql'),
+    ('203_sampling_mode_vocabulary.sql'),
+    ('204_terms_acceptance.sql'),
+    ('205_settlement_trigger_vocabulary.sql'),
+    ('206_reader_credit_quarantine.sql'),
+    ('207_reader_credit_refund.sql'),
+    ('208_read_event_fee_stamp.sql'),
+    ('209_config_audit.sql'),
+    ('210_writer_payout_preferences.sql'),
+    ('211_unpayable_writer_timer.sql'),
+    ('212_account_date_of_birth.sql'),
+    ('213_key_access_log.sql'),
+    ('214_report_category_terrorism.sql'),
+    ('215_report_category_csam.sql'),
+    ('216_report_category_grooming.sql'),
+    ('217_report_category_fraud.sql'),
+    ('218_report_category_hate.sql'),
+    ('219_report_category_intimate_image_abuse.sql'),
+    ('220_report_category_cyberflashing.sql'),
+    ('221_report_category_self_harm_promotion.sql'),
+    ('222_report_status_actioned.sql'),
+    ('223_moderation_record.sql'),
+    ('224_platform_blocks.sql'),
+    ('225_magic_link_appeal_purpose.sql'),
+    ('226_report_priority_raise.sql'),
+    ('227_settlement_receipt_email.sql'),
+    ('228_reactivate_unsigned_fetch_sources.sql'),
+    ('229_backfill_activitypub_canonical_url.sql'),
+    ('230_notification_parent_comment.sql'),
+    ('231_external_sources_signed_fetch_refused.sql'),
+    ('232_feed_items_comments.sql'),
+    ('233_feeds_seen_baseline.sql'),
+    ('234_notes_external_parent_index.sql'),
+    ('235_outbound_posts_sent_uri_index.sql'),
+    ('236_linked_notifications.sql'),
+    ('237_presence_identity_claim.sql'),
+    ('238_read_events_writer_payout_index.sql'),
+    ('239_read_events_tab_settlement_index.sql'),
+    ('240_articles_d_tag_index.sql'),
+    ('241_external_items_created_at_index.sql'),
+    ('242_drop_idx_accounts_nostr_pubkey.sql'),
+    ('243_drop_idx_accounts_username.sql'),
+    ('244_drop_idx_reading_tabs_reader_id.sql'),
+    ('245_drop_idx_gift_links_token.sql'),
+    ('246_drop_idx_tags_name.sql'),
+    ('247_drop_idx_publications_slug.sql'),
+    ('248_drop_idx_publications_nostr_pubkey.sql'),
+    ('249_drop_idx_drives_nostr.sql'),
+    ('250_drop_idx_read_events_reader_id.sql'),
+    ('251_drop_idx_articles_writer_id.sql'),
+    ('252_drop_idx_article_unlocks_reader.sql'),
+    ('253_drop_idx_ext_subs_subscriber.sql'),
+    ('254_drop_idx_network_presences_account.sql'),
+    ('255_drop_idx_dm_reactions_message.sql'),
+    ('256_drop_idx_pledges_drive.sql'),
+    ('257_drop_idx_tribute_accruals_tribute.sql'),
+    ('258_drop_feed_sources_feed_active_idx.sql'),
+    ('259_external_sources_fetch_enqueued_at.sql'),
+    ('260_accounts_discovery_attempted_at.sql'),
+    ('261_vault_keys_algorithm_default.sql'),
+    ('262_drop_dead_schema.sql'),
+    ('263_inert_dial_descriptions.sql'),
+    ('264_drop_unused_traffology_tables.sql'),
+    ('265_votes_one_per_direction.sql'),
+    ('266_external_items_last_seen_at.sql'),
+    ('267_external_items_last_seen_at_index.sql'),
+    ('268_vault_keys_one_per_article.sql'),
+    ('269_external_item_sources.sql'),
+    ('270_seed_on_admit.sql'),
+    ('271_writer_admitted.sql'),
+    ('272_writer_applications.sql'),
+    ('273_email_change_record.sql');

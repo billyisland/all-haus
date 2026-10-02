@@ -1,4 +1,17 @@
 import { safeFetch } from "@platform-pub/shared/lib/http-client.js";
+import { fetchApDocument } from "@platform-pub/shared/lib/activitypub-fetch.js";
+import { authoritativeId } from "@platform-pub/shared/lib/activitypub-origin.js";
+import {
+  fetchMastodonAccountByActorUri,
+  isSignedFetchRefusal,
+  lookupMastodonAccountByAcct,
+  mastodonAccountIdentity,
+  parseMastodonAccount,
+  qualifyAcct,
+  readMastodonFollowing,
+  readMastodonJson,
+  type MastodonAccount,
+} from "@platform-pub/shared/lib/mastodon-api.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 
 // =============================================================================
@@ -12,15 +25,18 @@ import logger from "@platform-pub/shared/lib/logger.js";
 //                              both fediverse handles and Mastodon URLs.
 // =============================================================================
 
-const AP_ACCEPT =
-  'application/activity+json, application/ld+json;profile="https://www.w3.org/ns/activitystreams", application/json;q=0.9';
-
 interface ActorProfile {
   actorUri: string;
   displayName: string | null;
   description: string | null;
   avatar: string | null;
   handle: string | null; // e.g. alice@mastodon.social
+  // Counts an AP actor document does NOT carry: `followers_count` and friends
+  // are Mastodon CLIENT-API field names, so the AP arm always left these
+  // undefined and `fetchAPProfile` always fell through to its REST count
+  // fallback. The client-API arm below really does have them, so on a
+  // secure-mode instance the counts now arrive with the profile and that
+  // fallback is spared a round trip.
   followersCount?: number;
   followingCount?: number;
   postsCount?: number;
@@ -78,22 +94,104 @@ export function isAcctShape(s: string): boolean {
 // Actor fetch → profile metadata
 // -----------------------------------------------------------------------------
 
+/**
+ * An actor document, or a verdict on whether the SECOND door is worth trying.
+ *
+ * `retryable` is the whole point of the shape: an instance in secure mode
+ * (`AUTHORIZED_FETCH`) answers 401 to our unsigned GET, and a transport fault
+ * or timeout (a reported mastodon.social tarpit, not reproduced) — neither
+ * is a fact about the ACCOUNT, and the client API answers both. A 404/410 IS a
+ * fact about the account, and a non-authoritative id is a REFUSAL (§2.9): both
+ * end here rather than getting a second chance at the same claim.
+ */
+type ApActorAttempt =
+  | { ok: true; profile: ActorProfile }
+  | { ok: false; retryable: boolean; signedFetchRefused: boolean };
+
+/**
+ * The profile, plus WHY there isn't one.
+ *
+ * `signedFetchRefused` is the difference between "there is no such account"
+ * and "this instance will not let us read, and we cannot make it". They are
+ * the same `null` to every caller that only wants the profile, and they are
+ * two entirely different sentences to a member who has just pasted a handle —
+ * one is their typo, the other is our missing capability. `addSource`'s
+ * liveness leg is the surface that has to tell them apart, which is the whole
+ * reason this shape exists beside the plain fetcher below.
+ */
+export interface ApProfileAttempt {
+  profile: ActorProfile | null;
+  signedFetchRefused: boolean;
+}
+
+export async function fetchActorProfileWithVerdict(
+  actorUri: string,
+): Promise<ApProfileAttempt> {
+  const direct = await fetchActorProfileViaAp(actorUri);
+  if (direct.ok) return { profile: direct.profile, signedFetchRefused: false };
+  if (!direct.retryable)
+    return { profile: null, signedFetchRefused: direct.signedFetchRefused };
+  const profile = await fetchActorProfileViaMastodonApi(actorUri);
+  // The refusal only survives if the client API could not stand in either —
+  // a source we CAN read is not a source we are locked out of, whatever the
+  // front door said.
+  return {
+    profile,
+    signedFetchRefused: profile === null && direct.signedFetchRefused,
+  };
+}
+
 export async function fetchActorProfile(
   actorUri: string,
 ): Promise<ActorProfile | null> {
-  try {
-    const res = await safeFetch(actorUri, { headers: { Accept: AP_ACCEPT } });
-    if (!res.ok) return null;
-    const actor = JSON.parse(res.text);
-    if (!actor || typeof actor !== "object") return null;
+  return (await fetchActorProfileWithVerdict(actorUri)).profile;
+}
 
-    const id = typeof actor.id === "string" ? actor.id : actorUri;
-    let host: string;
-    try {
-      host = new URL(id).hostname;
-    } catch {
-      return null;
+async function fetchActorProfileViaAp(
+  actorUri: string,
+): Promise<ApActorAttempt> {
+  try {
+    // Unsigned, then SIGNED if the instance refused the unsigned read
+    // (`shared/lib/activitypub-fetch.ts`). `signedFetchRefused` means the
+    // refusal survived a signature, so the client API is the last door.
+    const { res, signedFetchRefused } = await fetchApDocument(actorUri);
+    if (!res.ok) {
+      if (signedFetchRefused)
+        logger.info(
+          { actorUri, status: res.status },
+          "Actor fetch refused even signed — trying the Mastodon client API",
+        );
+      return {
+        ok: false,
+        retryable: isSignedFetchRefusal(res.status),
+        signedFetchRefused,
+      };
     }
+    const actor = JSON.parse(res.text);
+    if (!actor || typeof actor !== "object")
+      return { ok: false, retryable: true, signedFetchRefused: false };
+
+    // An actor may only claim an id on the origin that served it (§2.9,
+    // `shared/lib/activitypub-origin.ts`). The authority is the post-redirect
+    // `res.url`, never the uri we asked for; and a document that fails it is
+    // REFUSED, where the old `actor.id ?? actorUri` quietly substituted the
+    // safe value. This half is less consequential than the ingest half — the
+    // uri lands on `external_sources.source_uri`, which the poller then
+    // fetches — but the same rule is cheaper than the argument for exempting
+    // it.
+    const id = authoritativeId(actor.id, res.url);
+    if (!id) {
+      logger.warn(
+        { actorUri, servedBy: res.url },
+        "Actor id is not authoritative for the host that served it",
+      );
+      // NOT retryable: the refusal is the finding. Asking the same host's
+      // client API would be giving the claim a second door. And it is OURS,
+      // not a signed-fetch refusal — the instance answered us perfectly well.
+      return { ok: false, retryable: false, signedFetchRefused: false };
+    }
+    // `authoritativeId` has already parsed it as an http(s) URL.
+    const host = new URL(id).hostname;
 
     const username =
       typeof actor.preferredUsername === "string"
@@ -105,29 +203,58 @@ export async function fetchActorProfile(
       typeof actor.summary === "string" ? stripTags(actor.summary) : null;
 
     return {
-      actorUri: id,
-      displayName:
-        typeof actor.name === "string" && actor.name ? actor.name : handle,
-      description,
-      avatar,
-      handle,
-      followersCount:
-        typeof actor.followers_count === "number"
-          ? actor.followers_count
-          : undefined,
-      followingCount:
-        typeof actor.following_count === "number"
-          ? actor.following_count
-          : undefined,
-      postsCount:
-        typeof actor.statuses_count === "number"
-          ? actor.statuses_count
-          : undefined,
+      ok: true,
+      profile: {
+        actorUri: id,
+        displayName:
+          typeof actor.name === "string" && actor.name ? actor.name : handle,
+        description,
+        avatar,
+        handle,
+      },
     };
   } catch (err) {
+    // A throw is a timeout or a transport fault, never a verdict on the
+    // account — and a secure-mode instance tarpitting repeat unsigned actor
+    // GETs would arrive here rather than as a 401 (reported for mastodon.social;
+    // not reproduced 2026-09-25, when six in a row each answered 401 at once).
+    // The client API is worth asking either way; ingest's `fetchActor` does the
+    // same.
     logger.warn({ actorUri, err }, "Actor fetch failed");
-    return null;
+    return { ok: false, retryable: true, signedFetchRefused: false };
   }
+}
+
+/**
+ * The same profile, read through the instance's client API. §2.9 holds on this
+ * door too — `mastodonAccountIdentity` is the check.
+ */
+async function fetchActorProfileViaMastodonApi(
+  actorUri: string,
+): Promise<ActorProfile | null> {
+  const account = await fetchMastodonAccountByActorUri(actorUri);
+  if (!account) return null;
+  return mastodonAccountToProfile(account, actorUri);
+}
+
+export function mastodonAccountToProfile(
+  account: MastodonAccount,
+  askedFor: string,
+): ActorProfile | null {
+  const identity = mastodonAccountIdentity(account, askedFor);
+  if (!identity) return null;
+  const { id, host } = identity;
+  const handle = qualifyAcct(account.acct, host);
+  return {
+    actorUri: id,
+    displayName: account.displayName ?? handle,
+    description: account.note ? stripTags(account.note) : null,
+    avatar: account.avatar,
+    handle,
+    followersCount: account.followersCount ?? undefined,
+    followingCount: account.followingCount ?? undefined,
+    postsCount: account.statusesCount ?? undefined,
+  };
 }
 
 function extractImageUrl(obj: any): string | null {
@@ -199,57 +326,15 @@ export function extractFromMastodonUrl(
 //     instances; WebFinger is only the fallback for older serializers
 // -----------------------------------------------------------------------------
 
-export interface MastodonApiAccount {
-  id: string;
-  acct: string;
-  /** Actor URI (canonical stored form) — absent on pre-4.2 origin instances. */
-  uri: string | null;
-  displayName: string | null;
-  avatar: string | null;
-  followingCount: number | null;
-}
-
-function parseApiAccount(raw: unknown): MastodonApiAccount | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const a = raw as Record<string, unknown>;
-  if (typeof a.id !== "string" || typeof a.acct !== "string") return null;
-  let uri: string | null = null;
-  if (typeof a.uri === "string") {
-    try {
-      if (new URL(a.uri).protocol === "https:") uri = a.uri;
-    } catch {
-      // not a URL — leave null, the WebFinger fallback handles it
-    }
-  }
-  return {
-    id: a.id,
-    acct: a.acct,
-    uri,
-    displayName:
-      typeof a.display_name === "string" && a.display_name
-        ? a.display_name
-        : null,
-    avatar: typeof a.avatar === "string" ? a.avatar : null,
-    followingCount:
-      typeof a.following_count === "number" ? a.following_count : null,
-  };
-}
+/** Re-exported: the entity and its parser live in `shared/lib/mastodon-api.ts`,
+ *  because feed-ingest reads the same endpoints through the same shapes. */
+export type MastodonApiAccount = MastodonAccount;
 
 export async function lookupMastodonAccount(
   apiOrigin: string,
   acct: string,
 ): Promise<MastodonApiAccount | null> {
-  try {
-    const res = await safeFetch(
-      `${apiOrigin}/api/v1/accounts/lookup?acct=${encodeURIComponent(acct)}`,
-      { headers: { Accept: "application/json" } },
-    );
-    if (!res.ok) return null;
-    return parseApiAccount(JSON.parse(res.text));
-  } catch (err) {
-    logger.warn({ apiOrigin, acct, err }, "Mastodon account lookup failed");
-    return null;
-  }
+  return lookupMastodonAccountByAcct(apiOrigin, acct);
 }
 
 // Link: <https://host/api/v1/accounts/1/following?max_id=…>; rel="next", …
@@ -294,10 +379,9 @@ export async function fetchMastodonFollowing(
   accessToken?: string,
 ): Promise<MastodonFollowingRead | null> {
   const accounts: MastodonApiAccount[] = [];
-  const headers: Record<string, string> = { Accept: "application/json" };
-  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
-  let next: string | null =
-    `${apiOrigin}/api/v1/accounts/${encodeURIComponent(accountId)}/following?limit=80`;
+  // Page 1 from the home's endpoint; every later page is the instance's own
+  // `rel=next`, origin-checked by `parseNextLink` before it is followed.
+  let next: string | null = null;
   let firstPage = true;
   // Hard page ceiling. The origin is attacker-steerable (it derives from a
   // user-pasted handle) and loop progress is measured in PARSED accounts, so
@@ -308,15 +392,17 @@ export async function fetchMastodonFollowing(
   // engine already treats as removal-suppressing.
   const maxPages = Math.ceil(cap / 80) + 7;
   let pages = 0;
-  while (next && accounts.length < cap) {
+  while ((firstPage || next) && accounts.length < cap) {
     if (++pages > maxPages) return { accounts, complete: false };
     let page: unknown;
     let linkHeader: string | null = null;
     try {
-      const res = await safeFetch(next, { headers });
-      if (!res.ok) throw new Error(`following returned HTTP ${res.status}`);
-      linkHeader = res.headers?.get?.("link") ?? null;
-      page = JSON.parse(res.text);
+      const read = firstPage
+        ? await readMastodonFollowing(apiOrigin, accountId, { accessToken })
+        : await readMastodonJson(next!, { accessToken });
+      if (!read.ok) throw new Error(`following returned HTTP ${read.status}`);
+      linkHeader = read.link;
+      page = read.body;
     } catch (err) {
       logger.warn(
         { apiOrigin, accountId, page: firstPage ? "first" : "later", err },
@@ -329,7 +415,7 @@ export async function fetchMastodonFollowing(
     if (page.length === 0) return { accounts, complete: true };
     let i = 0;
     for (; i < page.length && accounts.length < cap; i++) {
-      const parsed = parseApiAccount(page[i]);
+      const parsed = parseMastodonAccount(page[i]);
       if (parsed) accounts.push(parsed);
     }
     next = parseNextLink(linkHeader, apiOrigin);

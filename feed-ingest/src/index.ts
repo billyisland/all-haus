@@ -6,11 +6,11 @@ import {
   trustSystemEnabled,
   identityLinkDetectEnabled,
 } from "@platform-pub/shared/lib/env.js";
+import { assertApSigningKeyUsable } from "@platform-pub/shared/lib/http-signature.js";
 import { feedIngestPoll } from "./tasks/feed-ingest-poll.js";
 import { feedIngestRss } from "./tasks/feed-ingest-rss.js";
 import { feedIngestNostr } from "./tasks/feed-ingest-nostr.js";
 import { externalItemsPrune } from "./tasks/external-items-prune.js";
-import { sourceMetadataRefresh } from "./tasks/source-metadata-refresh.js";
 import { feedItemsReconcile } from "./tasks/feed-items-reconcile.js";
 import { feedItemsAuthorRefresh } from "./tasks/feed-items-author-refresh.js";
 import { feedIngestAtprotoBackfill } from "./tasks/feed-ingest-atproto-backfill.js";
@@ -35,6 +35,8 @@ import { externalParentPrefetch } from "./tasks/external-parent-prefetch.js";
 import { externalContextGc } from "./tasks/external-context-gc.js";
 import { feedIngestEmail } from "./tasks/feed-ingest-email.js";
 import { identityLinkDetect } from "./tasks/identity-link-detect.js";
+import { linkedNotificationsPoll } from "./tasks/linked-notifications-poll.js";
+import { presenceSourcesSync } from "./tasks/presence-sources-sync.js";
 import { JetstreamListener } from "./jetstream/listener.js";
 
 // =============================================================================
@@ -43,13 +45,16 @@ import { JetstreamListener } from "./jetstream/listener.js";
 // Background job runner using Graphile Worker. No HTTP server — pure
 // background processing. All jobs use the shared PostgreSQL connection.
 //
-// Scheduled jobs:
-//   feed_ingest_poll        — find sources due for polling, enqueue per-source jobs
-//   external_items_prune    — delete expired external items (daily)
-//   source_metadata_refresh — refresh source display metadata (daily)
-//
-// Reactive jobs (queued by poll or gateway):
-//   feed_ingest_rss         — fetch + parse a single RSS source
+// THE JOB LIST IS `cronItems` AND `taskList` BELOW, and is deliberately not
+// restated here. This header used to carry a summary naming three scheduled
+// jobs and one reactive one; the worker runs twenty-nine, so the summary had
+// been a sample of the class for years — and a summary of a registry is the
+// shape that always drifts, because adding a task never forces anyone to open
+// the comment. `cronItems` is what is SCHEDULED (each line carries its own
+// note and its flag, where it has one — trust and identity-link detect are
+// withheld rather than unregistered); `taskList` is every handler that
+// resolves, scheduled or queued by the poll, the gateway or another task.
+// Read those two.
 // =============================================================================
 
 async function start() {
@@ -58,6 +63,12 @@ async function start() {
     logger.error("DATABASE_URL is required");
     process.exit(1);
   }
+
+  // The ActivityPub signing key, if one is configured. A no-op when it is not.
+  // A key that is SET and unusable must die here, not inside a poll: this
+  // worker's error handling would catch the throw, count it against the
+  // source's budget and report it as a fact about somebody's Mastodon account.
+  assertApSigningKeyUsable();
 
   // Trust is parked by default (architecture-audit item 7): when
   // TRUST_SYSTEM_ENABLED is off we simply don't register the three trust
@@ -75,14 +86,19 @@ async function start() {
     "* * * * * feed_ingest_poll",
     // Prune old external items — daily at 02:15 UTC
     "15 2 * * * external_items_prune",
-    // Refresh source metadata — daily at 03:00 UTC
-    "0 3 * * * source_metadata_refresh",
     // Refresh denormalised author metadata in feed_items — daily at 04:00 UTC
     "0 4 * * * feed_items_author_refresh",
     // Reconcile feed_items with source tables — daily at 05:00 UTC
     "0 5 * * * feed_items_reconcile",
     // Refresh expiring OAuth tokens for linked accounts — every 30 min
     "*/30 * * * * outbound_token_refresh",
+    // Replies/mentions/quotes addressed to members on Bluesky/Mastodon — every
+    // minute, but each presence only once per linked_notifications_poll_seconds
+    // (the task claims what is due; CROSS-NETWORK-ROUNDTRIP-ADR rung C)
+    "* * * * * linked_notifications_poll",
+    // A member's own posts on their linked accounts get an ingest source —
+    // every 5 min (CROSS-NETWORK-ROUNDTRIP-ADR rung D2)
+    "*/5 * * * * presence_sources_sync",
     // Prune expired atproto OAuth pending states — every 5 min
     "*/5 * * * * atproto_oauth_states_prune",
     // Prune expired resolver Phase B results — every 5 min
@@ -136,7 +152,6 @@ async function start() {
       feed_ingest_rss: feedIngestRss,
       feed_ingest_nostr: feedIngestNostr,
       external_items_prune: externalItemsPrune,
-      source_metadata_refresh: sourceMetadataRefresh,
       feed_items_reconcile: feedItemsReconcile,
       feed_items_author_refresh: feedItemsAuthorRefresh,
       feed_ingest_atproto_backfill: feedIngestAtprotoBackfill,
@@ -161,6 +176,8 @@ async function start() {
       external_context_gc: externalContextGc,
       feed_ingest_email: feedIngestEmail,
       identity_link_detect: identityLinkDetect,
+      linked_notifications_poll: linkedNotificationsPoll,
+      presence_sources_sync: presenceSourcesSync,
     },
   });
 

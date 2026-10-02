@@ -24,25 +24,34 @@ import { PostLinkProfileOffer } from './PostLinkProfileOffer'
 import { EmailChange } from './EmailChange'
 import { PaymentSection } from './PaymentSection'
 import { NetworkReachPanel } from './NetworkReachPanel'
+import { BlockList } from '../social/BlockList'
+import { MuteList } from '../social/MuteList'
+import { DmFeeSettings } from '../social/DmFeeSettings'
+import { VouchList } from '../trust/VouchList'
+import { trustEnabled } from '../../lib/featureFlags'
 import { NotificationPreferences } from '../social/NotificationPreferences'
 import { ReadingPreferences } from './ReadingPreferences'
 import { TypeSizeControl } from './TypeSizeControl'
 import { ColorModeControl } from './ColorModeControl'
 // ThemeSection retired from Settings (GLASSHOUSE-AND-PALETTE-ADR §III.5) — the
 // preset-theme picker is no longer user-facing; the file is parked, not deleted.
-import { ExportModal } from '../ExportModal'
+import { ExportPanel } from './ExportPanel'
 import { DangerZone } from './DangerZone'
 import { PageShell, PageHeader } from '../ui/PageShell'
 import { SettingsGroup, SettingsSection, SettingsRow } from './SettingsSection'
-
-function bannerFor(linked: string | null): { kind: 'ok' | 'error'; msg: string } | null {
-  if (linked === 'mastodon') return { kind: 'ok', msg: 'Mastodon account connected.' }
-  if (linked === 'bluesky') return { kind: 'ok', msg: 'Bluesky account connected.' }
-  if (linked === 'already-linked')
-    return { kind: 'error', msg: 'That account is already connected to another all.haus profile.' }
-  if (linked === 'error') return { kind: 'error', msg: 'Connection failed. Please try again.' }
-  return null
-}
+import {
+  SETTINGS_TITLE,
+  SETTINGS_GROUP_ACCOUNT, SETTINGS_PROFILE_LABEL, SETTINGS_EMAIL_LABEL, SETTINGS_PAYMENT_LABEL, SETTINGS_PAYMENT_LABEL_READER,
+  SETTINGS_REACH_LABEL, SETTINGS_REACH_DESCRIPTION,
+  SETTINGS_GROUP_PREFERENCES, SETTINGS_NOTIFICATIONS_LABEL, SETTINGS_NOTIFICATIONS_DESCRIPTION,
+  SETTINGS_BLOCKED_LABEL, SETTINGS_MUTED_LABEL, SETTINGS_READING_LABEL,
+  SETTINGS_GROUP_DATA, SETTINGS_EXPORT_LABEL, SETTINGS_EXPORT_DESCRIPTION, SETTINGS_EXPORT_BUTTON,
+  SETTINGS_GROUP_LEGAL, SETTINGS_LEGAL_READ,
+  LEGAL_TERMS_LABEL, LEGAL_TERMS_DESCRIPTION, LEGAL_PRIVACY_LABEL, LEGAL_PRIVACY_DESCRIPTION,
+  LEGAL_READER_TERMS_LABEL, LEGAL_READER_TERMS_DESCRIPTION,
+  LEGAL_WRITER_AGREEMENT_LABEL, LEGAL_WRITER_AGREEMENT_DESCRIPTION,
+  connectBannerFor, type ConnectBanner,
+} from '../../content/settings'
 
 export function SettingsPanel({
   inOverlay = false,
@@ -58,8 +67,8 @@ export function SettingsPanel({
   const { user, loading } = useAuth()
   const router = useRouter()
   const [showExport, setShowExport] = useState(false)
-  const [banner, setBanner] = useState<{ kind: 'ok' | 'error'; msg: string } | null>(
-    () => bannerFor(initialLinked),
+  const [banner, setBanner] = useState<ConnectBanner | null>(
+    () => connectBannerFor(initialLinked),
   )
 
   useEffect(() => { if (!inOverlay && !loading && !user) router.push('/auth?mode=login') }, [inOverlay, user, loading, router])
@@ -96,7 +105,7 @@ export function SettingsPanel({
 
   const body = (
     <>
-      {inOverlay && <PageHeader title="Settings" />}
+      {inOverlay && <PageHeader title={SETTINGS_TITLE} />}
       <div className="space-y-12">
         {banner && (
           <div className={`px-4 py-3 text-ui-sm ${banner.kind === 'ok' ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-800'}`}>
@@ -127,33 +136,69 @@ export function SettingsPanel({
           </>
         )}
 
-        <SettingsGroup title="Account">
-          <SettingsSection label="Profile">
+        <SettingsGroup title={SETTINGS_GROUP_ACCOUNT}>
+          <SettingsSection label={SETTINGS_PROFILE_LABEL}>
             <ProfileSection />
           </SettingsSection>
-          <SettingsSection label="Email">
+          <SettingsSection label={SETTINGS_EMAIL_LABEL}>
             <EmailChange />
           </SettingsSection>
-          <SettingsSection label="Payment & payouts" dataExplain="settings.payment">
+          <SettingsSection
+            label={user.canWrite ? SETTINGS_PAYMENT_LABEL : SETTINGS_PAYMENT_LABEL_READER}
+            dataExplain={user.canWrite ? "settings.payment" : "settings.paymentReader"}
+          >
             <PaymentSection />
           </SettingsSection>
           <SettingsSection
             dataExplain="settings.reach"
-            label="Reach other networks"
-            description="Your all.haus account is a Nostr identity. Reach outward to other networks — link an account you already have, or have all.haus set one up and run it for you."
+            label={SETTINGS_REACH_LABEL}
+            description={SETTINGS_REACH_DESCRIPTION}
           >
             <NetworkReachPanel />
           </SettingsSection>
         </SettingsGroup>
 
-        <SettingsGroup title="Preferences">
+        <SettingsGroup title={SETTINGS_GROUP_PREFERENCES}>
           <SettingsSection
-            label="Notifications"
-            description="Choose which events generate notifications."
+            label={SETTINGS_NOTIFICATIONS_LABEL}
+            description={SETTINGS_NOTIFICATIONS_DESCRIPTION}
           >
             <NotificationPreferences />
           </SettingsSection>
-          <SettingsSection label="Reading">
+          {/* THE QUIET LISTS, from the dissolved Network page (2026-09-15).
+              They sat behind tab pills there but had always been written in
+              this register — a label over a well of rows with an undo each —
+              which is why that page had to wrap each one in a second well to
+              pass it off as a tab panel. Here `SettingsSection` supplies the
+              label and the card and they render bare content, so there is one
+              settings grammar rather than a tabbed imitation of one.
+
+              They are two sections, not one "Blocked and muted": each is a
+              self-contained list with its own empty state, and each carries
+              its own Explain anchor, which a merged section could not. They
+              sit beside Notifications because all four of the things in this
+              run answer the same question — who reaches you, and how loudly. */}
+          <SettingsSection label={SETTINGS_BLOCKED_LABEL} dataExplain="settings.blocked">
+            <BlockList />
+          </SettingsSection>
+          <SettingsSection label={SETTINGS_MUTED_LABEL} dataExplain="settings.muted">
+            <MuteList />
+          </SettingsSection>
+          {/* Vouches followed the same reasoning — a management list, so it
+              lands in Settings rather than on the public profile — and stays
+              behind the parked trust flag, which is why nothing renders here
+              today. Its old address was /network?tab=vouches; the shim now
+              sends that here. */}
+          {trustEnabled() && (
+            <SettingsSection label="Vouches">
+              <VouchList />
+            </SettingsSection>
+          )}
+          {/* Suspended, and it draws its own box — see the component. A
+              `SettingsSection` around it would paint an empty well whenever it
+              returns null, which is every render while priced DMs are off. */}
+          <DmFeeSettings />
+          <SettingsSection label={SETTINGS_READING_LABEL}>
             <ReadingPreferences />
           </SettingsSection>
           <SettingsSection label="Display" description="Applies to this device.">
@@ -176,22 +221,94 @@ export function SettingsPanel({
           </SettingsSection>
         </SettingsGroup>
 
-        <SettingsGroup title="Your data">
+        <SettingsGroup title={SETTINGS_GROUP_DATA}>
           <SettingsSection
-            label="Export my data"
-            description="Download your data, receipts, and content keys."
+            label={SETTINGS_EXPORT_LABEL}
+            description={SETTINGS_EXPORT_DESCRIPTION}
           >
-            <button onClick={() => setShowExport(true)} data-explain="settings.export" className="btn">Export</button>
+            {/* The two exports reveal IN the section (CA-E9) — there is
+                nothing modal about two rows, and a pane floated over the
+                settings Glasshouse was a hand-rolled scrim with a by-name
+                exemption from the one-close-affordance rule. */}
+            {showExport ? (
+              <ExportPanel />
+            ) : (
+              <button onClick={() => setShowExport(true)} data-explain="settings.export" className="btn">{SETTINGS_EXPORT_BUTTON}</button>
+            )}
+          </SettingsSection>
+        </SettingsGroup>
+
+        {/* THE FOUR DOCUMENTS THAT BIND, reachable from inside the account
+            rather than only from the logged-out register — a term you can be
+            held to and cannot find is not much of a term. The order is the
+            order they reach a member: the Terms and the Privacy Policy apply
+            from the moment there is an account, the other two are accepted by
+            version at a gesture (a card, a paid publish). They open in a
+            NEW TAB: Settings is a workspace Glasshouse, and a same-tab
+            navigation to a standalone page is exactly the escape the overlay
+            rules exist to stop. A new tab is also what you want of a document
+            you are checking something against. */}
+        <SettingsGroup title={SETTINGS_GROUP_LEGAL}>
+          <SettingsSection
+            label={LEGAL_TERMS_LABEL}
+            description={LEGAL_TERMS_DESCRIPTION}
+          >
+            <a
+              href="/terms"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn"
+            >
+              {SETTINGS_LEGAL_READ}
+            </a>
+          </SettingsSection>
+          <SettingsSection
+            label={LEGAL_PRIVACY_LABEL}
+            description={LEGAL_PRIVACY_DESCRIPTION}
+          >
+            <a
+              href="/privacy"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn"
+            >
+              {SETTINGS_LEGAL_READ}
+            </a>
+          </SettingsSection>
+          <SettingsSection
+            label={LEGAL_READER_TERMS_LABEL}
+            description={LEGAL_READER_TERMS_DESCRIPTION}
+          >
+            <a
+              href="/reader-terms"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn"
+            >
+              {SETTINGS_LEGAL_READ}
+            </a>
+          </SettingsSection>
+          <SettingsSection
+            label={LEGAL_WRITER_AGREEMENT_LABEL}
+            description={LEGAL_WRITER_AGREEMENT_DESCRIPTION}
+          >
+            <a
+              href="/writer-agreement"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn"
+            >
+              {SETTINGS_LEGAL_READ}
+            </a>
           </SettingsSection>
         </SettingsGroup>
 
         <DangerZone />
       </div>
 
-      {showExport && <ExportModal onClose={() => setShowExport(false)} />}
     </>
   )
 
   if (inOverlay) return body
-  return <PageShell width="article" title="Settings">{body}</PageShell>
+  return <PageShell width="article" title={SETTINGS_TITLE}>{body}</PageShell>
 }

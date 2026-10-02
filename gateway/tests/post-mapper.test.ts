@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
   nostrTargetPostId,
   POST_SELECT,
@@ -113,6 +115,40 @@ describe("feedItemToPost surfaces the external interact-back key", () => {
         published_at_epoch: 1000,
       }).externalItemId,
     ).toBeNull();
+  });
+});
+
+// MODERNHAUS-ADR §E7.3: a private email newsletter's cards linked to
+// `/source/<id>`, which `GET /sources/:id` answers 404 — the route serves only a
+// PUBLIC protocol on an ACTIVE row. `origin.sourceBrowsable` is those two
+// conditions, stated where the row is read, so the card links only a page that
+// opens. Each case differs from the browsable one in ONE column.
+describe("origin.sourceBrowsable is the source route's own two conditions", () => {
+  const browsable = {
+    item_type: "external",
+    post_id: "e2",
+    published_at_epoch: 1000,
+    source_id: "src-1",
+    source_protocol: "rss",
+    source_is_active: true,
+    source_display_name: "A Blog",
+    ei_is_context_only: false,
+  };
+  it("is true for an active row of a public protocol", () => {
+    expect(feedItemToPost(browsable).origin.sourceBrowsable).toBe(true);
+  });
+  it("is false for an email newsletter, which the route will not serve to anybody", () => {
+    expect(feedItemToPost({ ...browsable, source_protocol: "email" }).origin.sourceBrowsable).toBe(false);
+  });
+  it("is false for an inactive source", () => {
+    expect(feedItemToPost({ ...browsable, source_is_active: false }).origin.sourceBrowsable).toBe(false);
+  });
+  it("is false for a context-only row, whose source is the hydrating focal's, not its own", () => {
+    expect(feedItemToPost({ ...browsable, ei_is_context_only: true }).origin.sourceBrowsable).toBe(false);
+  });
+  it("FEED_SELECT carries the row's is_active off the source join", () => {
+    expect(FEED_SELECT).toContain("xs.is_active AS source_is_active");
+    expect(FEED_JOINS).toContain("LEFT JOIN external_sources xs ON xs.id = fi.source_id");
   });
 });
 
@@ -268,4 +304,97 @@ describe("external author fields: an empty string is an absent value", () => {
     });
     expect(post.author.displayName).toBe("Kiran Stacey");
   });
+});
+
+// =============================================================================
+// A COMMENT SAYS WHICH CONVERSATION IT IS IN, OR A REPLY TO IT CANNOT BE SENT.
+//
+// A comment is projected as a Post of `type: "note"` with its own event id in
+// `version` — the union has no third value — so on the wire nothing else tells
+// it from a top-level note. The web's `replyTargetFromPost` had nothing else to
+// read either, addressed the reply at the comment's own event, and `POST
+// /replies` refused it: 400 `target_is_reply`, correctly, since
+// `comments.target_event_id` is the conversation's ROOT and nesting is
+// `parentCommentId`. Replying to a reply failed on every card surface.
+//
+// `conversation` is what closes that, and it is worth being precise about what
+// each half of this section can see. The projection is behavioural. The two
+// QUERIES are a text pin and say so: `commentToPost` reads columns that two
+// separate statements must select, only one of which is typed against
+// `CommentRow` at all (`author.ts` queries `<any>`), and a `pool.query<T>` is a
+// claim about the SQL rather than a check of it in either case. A dropped
+// column is silent all the way to the browser, where it reappears as the same
+// 400 this fixed.
+// =============================================================================
+
+const COMMENT_ROW = {
+  id: "comment-uuid",
+  derived_post_id: "c1",
+  nostr_event_id: "comment-event",
+  parent_comment_id: null,
+  parent_post_id: null,
+  target_event_id: "root-event",
+  target_kind: 30023,
+  content: "a remark",
+  published_at_epoch: 1,
+  deleted_at: null,
+  author_id: "a",
+  acc_display_name: "A",
+  acc_username: "a",
+  nostr_pubkey: "pk",
+  pip_status: null,
+  vt_up: 0,
+  vt_down: 0,
+} as any;
+
+describe("commentToPost stamps the conversation a reply must be addressed to", () => {
+  it("carries the root event, the root kind and the comment's own row id", () => {
+    const post = commentToPost(COMMENT_ROW, "root", new Set());
+    expect(post.conversation).toEqual({
+      rootEventId: "root-event",
+      rootKind: 30023,
+      commentId: "comment-uuid",
+    });
+    // The comment's OWN event stays where it was: it is the NIP-10 `e` reply
+    // tag and the vote target, and it is not what the reply is addressed to.
+    expect(post.version).toBe("comment-event");
+  });
+
+  it("coerces the kind, because a smallint that ever arrives as text is a kind nothing matches", () => {
+    const post = commentToPost(
+      { ...COMMENT_ROW, target_kind: "1" },
+      "root",
+      new Set(),
+    );
+    expect(post.conversation?.rootKind).toBe(1);
+  });
+
+  it("is absent from a THING, which is how a card tells the two apart", () => {
+    // `feedItemToPost` never sets it, and must not learn to: an article or a
+    // note IS the root, so a reply to one is addressed to it directly.
+    expect(
+      feedItemToPost({
+        post_id: "x",
+        published_at_epoch: 1000,
+        item_type: "native",
+        content_type: "note",
+      } as any).conversation,
+    ).toBeUndefined();
+  });
+});
+
+describe("TEXT PIN — both statements that build a CommentRow select those columns", () => {
+  const read = (rel: string) =>
+    readFileSync(path.resolve(__dirname, "..", "src", rel), "utf8");
+
+  for (const [what, rel] of [
+    ["the thread projector", "routes/post-thread.ts"],
+    ["the author's replies log", "routes/author.ts"],
+  ] as const) {
+    it(`${what} selects target_event_id and target_kind`, () => {
+      const src = read(rel);
+      expect(src).toContain("c.target_event_id");
+      expect(src).toContain("c.target_kind");
+    });
+  }
 });

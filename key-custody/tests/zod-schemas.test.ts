@@ -84,9 +84,21 @@ describe('UnwrapKeySchema', () => {
   it('parses valid input', () => {
     const result = UnwrapKeySchema.safeParse({
       signerId: validUuid,
+      actorAccountId: validUuid,
       encryptedKey: 'some-encrypted-data',
     })
     expect(result.success).toBe(true)
+  })
+
+  // L6.6 — the audit row this call produces has to be attributable, so the
+  // actor is required rather than optional. An optional audit field is a field
+  // a caller forgets, and the row would then say "somebody".
+  it('fails when actorAccountId is absent', () => {
+    const result = UnwrapKeySchema.safeParse({
+      signerId: validUuid,
+      encryptedKey: 'some-encrypted-data',
+    })
+    expect(result.success).toBe(false)
   })
 
   it('fails when encryptedKey is empty', () => {

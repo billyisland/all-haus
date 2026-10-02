@@ -64,9 +64,9 @@ export default function TraffologyOverviewPage() {
       {baseline && (
         <div className="grid grid-cols-4 border-t-[4px] border-b-[4px] border-black mb-8">
           {[
-            { label: 'Avg first day', value: Math.round(baseline.mean_first_day_readers).toLocaleString() },
-            { label: 'Free subs', value: baseline.total_free_subscribers.toLocaleString() },
-            { label: 'Paying subs', value: baseline.total_paying_subscribers.toLocaleString() },
+            { label: 'Avg first day', value: Math.round(baseline.mean_first_day_readers).toLocaleString('en-GB') },
+            { label: 'Free subs', value: baseline.total_free_subscribers.toLocaleString('en-GB') },
+            { label: 'Paying subs', value: baseline.total_paying_subscribers.toLocaleString('en-GB') },
             { label: 'Revenue (month)', value: `\u00a3${parseFloat(baseline.monthly_revenue).toFixed(2)}` },
           ].map((item, i) => (
             <div
@@ -125,7 +125,7 @@ export default function TraffologyOverviewPage() {
           </div>
           <div className="space-y-1">
             {topics.map(t => (
-              <div key={t.topic} className="flex items-center justify-between py-2 border-b border-grey-200">
+              <div key={t.topic} className="flex items-center justify-between py-2">
                 <div className="text-ui-xs text-black font-medium">{t.topic}</div>
                 <div className="text-ui-xs text-grey-400 tabular-nums">
                   {t.piece_count} pieces &middot; {Math.round(t.mean_readers)} avg readers
@@ -170,7 +170,7 @@ function PieceTile({ piece }: { piece: OverviewPiece }) {
       </div>
 
       <div className="flex items-center justify-between text-mono-xs text-grey-400 tabular-nums">
-        <span>{(piece.total_readers ?? 0).toLocaleString()} readers</span>
+        <span>{(piece.total_readers ?? 0).toLocaleString('en-GB')} readers</span>
         <span>
           {piece.top_source_name
             ? `${piece.top_source_name} (${piece.top_source_pct ? Math.round(piece.top_source_pct * 100) : 0}%)`

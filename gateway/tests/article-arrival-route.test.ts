@@ -10,9 +10,13 @@ import Fastify from "fastify";
 // arrival is the single exception, and what makes it safe is not the client that
 // calls it — a client cannot be a bound — but four server-side conditions in the
 // route, of which the third and fourth are the money ones: NO CARD, and an
-// allowance that still covers the piece. A card holder consumes no allowance by
-// design ("a card does not revoke the gift"), so the SAME call on the SAME piece
-// would be a full-price charge fired by a page load. That branch is unreachable
+// allowance that still covers the piece. When this was written a card holder
+// consumed no allowance, so the SAME call on the SAME piece would have been a
+// full-price charge fired by a page load. Since walkthrough A1 (2026-09-24) a
+// card holder spends the allowance first, so condition 4 alone would make their
+// arrival free too — and NO CARD still stands, because the allowance check here
+// and the gate pass are two statements in two services, and for a card holder
+// whatever the allowance lost in between is a charge. That branch is unreachable
 // today only because no signup can carry a card; it is written for the day one
 // can, and until this file existed nothing anywhere held it.
 //

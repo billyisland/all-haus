@@ -125,6 +125,26 @@ export interface RelayReqHandle<T extends RelayEventLike = RelayEventLike> {
 const DEFAULT_TIMEOUT_MS = 10_000;
 
 /**
+ * The most events one REQ will collect before it stops listening and settles
+ * with what it has (MIRROR-AUDIT §3 *Security*, S16).
+ *
+ * `maxPayload` bounds one FRAME; this bounds the array. Without it a relay could
+ * stream well-formed, individually-small events for the whole timeout window and
+ * every one of them was retained — a slow memory exhaustion that costs the
+ * sender nothing and looks, from our side, exactly like a chatty relay.
+ *
+ * Well above every real filter here: `maxFilterLimit` on our own relay is 500,
+ * the engagement tally chunks ids in far smaller batches, and a profile lookup
+ * wants one event. A caller that legitimately needs more should be paging, not
+ * holding a socket open. Hitting it settles the request rather than failing it —
+ * a truncated answer from an over-talkative relay is still an answer, and the
+ * ingest paths that must not read silence as "this author posted nothing" are
+ * protected by `onSocketError: 'reject'`, which is about a broken socket rather
+ * than a full one.
+ */
+export const MAX_EVENTS_PER_REQ = 2_000;
+
+/**
  * Open one REQ against one relay. Returns immediately with a handle; the socket
  * is pinned and opened in the background.
  *
@@ -224,11 +244,41 @@ export function openRelayReq<T extends RelayEventLike = RelayEventLike>(
       }
     });
     ws.on("message", (raw: { toString(): string }) => {
+      // Already settled — by EOSE, by timeout, by the cap below, or by the
+      // caller hanging up. Frames can still arrive after `close()` (they were in
+      // flight), and collecting them would let the array grow past the cap it
+      // was just stopped at, which is the whole thing the cap is for.
+      if (settled) return;
       try {
         const msg = JSON.parse(raw.toString()) as unknown[];
         if (msg[0] === "EVENT" && msg[1] === subId) {
-          const ev = msg[2] as T;
+          // The frame's TAG was checked and its PAYLOAD was not, so whatever
+          // sat at msg[2] was collected and handed to the caller as a `T`.
+          // `["EVENT", <sub>, null]` is well-formed JSON that a hostile or
+          // merely broken relay can send, and `null` survives every optional
+          // chain a consumer might defend itself with: `validateNostrEvents`
+          // reads `event.created_at` FIRST, unguarded, inside a `Promise.all`,
+          // so one such frame threw and rejected the whole batch — a source's
+          // entire backfill lost to one bad frame among thousands, and lost
+          // again on every retry for as long as the relay kept sending it.
+          //
+          // The guard is here rather than in that validator because this is the
+          // one place a relay's bytes become a `T`: a caller cannot open a
+          // socket through this module and forget it, which is the same reason
+          // DNS pinning and `maxPayload` live in this file. An event is an
+          // object per NIP-01; anything else is not a short event, it is not an
+          // event, and it is dropped as silently as a malformed frame already
+          // was — the cap, the timeout and the EOSE are all still ahead of it.
+          const raw2 = msg[2];
+          if (typeof raw2 !== "object" || raw2 === null || Array.isArray(raw2)) {
+            return;
+          }
+          const ev = raw2 as T;
           if (onEvent?.(ev) !== false) events.push(ev);
+          if (events.length >= MAX_EVENTS_PER_REQ) {
+            finish();
+            return;
+          }
         } else if (msg[0] === "EOSE" && msg[1] === subId) {
           onEose?.();
           finish();

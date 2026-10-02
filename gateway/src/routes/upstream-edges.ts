@@ -8,9 +8,12 @@ import { applyLedgerDelta } from '@platform-pub/shared/lib/ledger.js'
 import { enqueueRelayPublish, type SignedNostrEvent } from '@platform-pub/shared/lib/relay-outbox.js'
 import { upstreamEdgesEnabled } from '@platform-pub/shared/lib/env.js'
 import { requireAuth, optionalAuth } from '../middleware/auth.js'
+import { requireWriter } from '../lib/writer-gate.js'
 import { signEvent } from '../lib/key-custody-client.js'
 import { resolve as resolveIdentity } from '../lib/resolver.js'
 import logger from '@platform-pub/shared/lib/logger.js'
+import { zodValidationError } from '@platform-pub/shared/lib/validation.js'
+import { isUuid } from '../lib/request-inputs.js'
 
 // =============================================================================
 // Upstream Edges — Phase 1 (credit / citation / dispute)
@@ -193,11 +196,11 @@ export async function upstreamEdgeRoutes(app: FastifyInstance) {
   // ---------------------------------------------------------------------------
   // POST /credits — author acknowledges a debt. Piece-level, no money, no consent.
   // ---------------------------------------------------------------------------
-  app.post('/credits', { preHandler: requireAuth }, async (req, reply) => {
+  app.post('/credits', { preHandler: [requireAuth, requireWriter] }, async (req, reply) => {
     const writerId = req.session!.sub
     const parsed = CreditSchema.safeParse(req.body)
     if (!parsed.success) {
-      return reply.status(400).send({ error: parsed.error.flatten() })
+      return reply.status(400).send(zodValidationError(parsed.error))
     }
     const { articleId, target, note } = parsed.data
 
@@ -224,11 +227,11 @@ export async function upstreamEdgeRoutes(app: FastifyInstance) {
   // ---------------------------------------------------------------------------
   // POST /citations — author pins "X argues Y" to source bytes (excerpt + hash).
   // ---------------------------------------------------------------------------
-  app.post('/citations', { preHandler: requireAuth }, async (req, reply) => {
+  app.post('/citations', { preHandler: [requireAuth, requireWriter] }, async (req, reply) => {
     const writerId = req.session!.sub
     const parsed = CitationSchema.safeParse(req.body)
     if (!parsed.success) {
-      return reply.status(400).send({ error: parsed.error.flatten() })
+      return reply.status(400).send(zodValidationError(parsed.error))
     }
     const data = parsed.data
 
@@ -340,7 +343,7 @@ export async function upstreamEdgeRoutes(app: FastifyInstance) {
     const disputantId = req.session!.sub
     const parsed = DisputeSchema.safeParse(req.body)
     if (!parsed.success) {
-      return reply.status(400).send({ error: parsed.error.flatten() })
+      return reply.status(400).send(zodValidationError(parsed.error))
     }
     const data = parsed.data
 
@@ -530,8 +533,8 @@ export async function upstreamEdgeRoutes(app: FastifyInstance) {
     { preHandler: requireAuth },
     async (req, reply) => {
       const disputantId = req.session!.sub
-      if (!UUID_RE.test(req.params.id)) {
-        return reply.status(400).send({ error: 'Invalid id' })
+      if (!isUuid(req.params.id)) {
+        return reply.status(404).send({ error: 'Dispute not found or already withdrawn' })
       }
 
       let notFound = false
@@ -605,8 +608,8 @@ export async function upstreamEdgeRoutes(app: FastifyInstance) {
     '/articles/:id/credits',
     { preHandler: optionalAuth },
     async (req, reply) => {
-      if (!UUID_RE.test(req.params.id)) {
-        return reply.status(400).send({ error: 'Invalid id' })
+      if (!isUuid(req.params.id)) {
+        return reply.status(404).send({ error: 'Article not found' })
       }
       const viewerId = req.session?.sub ?? null
 
@@ -701,8 +704,8 @@ export async function upstreamEdgeRoutes(app: FastifyInstance) {
     '/articles/:id/citations',
     { preHandler: optionalAuth },
     async (req, reply) => {
-      if (!UUID_RE.test(req.params.id)) {
-        return reply.status(400).send({ error: 'Invalid id' })
+      if (!isUuid(req.params.id)) {
+        return reply.status(404).send({ error: 'Article not found' })
       }
       const viewerId = req.session?.sub ?? null
 

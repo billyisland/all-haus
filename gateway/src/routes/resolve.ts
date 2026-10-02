@@ -10,6 +10,16 @@ import logger from '@platform-pub/shared/lib/logger.js'
 // GET  /resolve/:id      — Poll for async remote resolution results
 // =============================================================================
 
+/** The `ResolveContext` union, as a value the route can test against. Typed so
+ *  a member added to the type and forgotten here is a compile error. */
+const RESOLVE_CONTEXTS: readonly ResolveContext[] = [
+  'subscribe',
+  'invite',
+  'dm',
+  'import',
+  'general',
+]
+
 export async function resolveRoutes(app: FastifyInstance) {
 
   // POST /resolve — resolve an arbitrary input string
@@ -29,6 +39,17 @@ export async function resolveRoutes(app: FastifyInstance) {
       return reply.status(400).send({ error: 'query too long (max 500 characters)' })
     }
 
+    // `context` reaches the resolver as its dispatch key and decides which
+    // chains run and in what order. It arrived unvalidated and typed by the
+    // route generic alone, so an unknown value fell through every branch and
+    // an unexpected TYPE could be compared against the union members without
+    // ever matching one — a resolver that silently searches nothing. Refuse it
+    // rather than defaulting: an unrecognised context is a client bug, and
+    // quietly answering as `general` hides it.
+    if (context !== undefined && !RESOLVE_CONTEXTS.includes(context)) {
+      return reply.status(400).send({ error: 'invalid context' })
+    }
+
     try {
       // discover=true (explicit submit only) opts into the §V.5.8 discovery
       // fallback — external candidate search for names the exact chains miss.
@@ -36,7 +57,7 @@ export async function resolveRoutes(app: FastifyInstance) {
       return reply.send(result)
     } catch (err) {
       logger.error({ err, query }, 'Resolver error')
-      return reply.status(500).send({ error: 'Resolution failed' })
+      return reply.status(500).send({ error: "Couldn't look that up. Please try again." })
     }
   })
 

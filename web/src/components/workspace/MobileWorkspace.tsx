@@ -339,7 +339,7 @@ export function MobileWorkspace({
             feed's settings sheet (the FeedComposer — §VI). */}
         <div
           role="tablist"
-          aria-label={`Feeds, ${activeIndex + 1} of ${count}`}
+          aria-label={`Channels, ${activeIndex + 1} of ${count}`}
           style={{
             display: "flex",
             alignItems: "center",
@@ -354,7 +354,7 @@ export function MobileWorkspace({
             // Stable identity number (may have gaps) AND gapless strip position
             // (NAV-ROW-MUSTER-ADR §III.1): "Feed 4, 3 of 4" — the number matches
             // the desktop badge, the position tells a linear scan where it is.
-            const label = `Feed ${numeralFor(f.id)}, ${i + 1} of ${count}${
+            const label = `Channel ${numeralFor(f.id)}, ${i + 1} of ${count}${
               name ? `: ${name}` : ""
             }`;
             return (
@@ -363,7 +363,7 @@ export function MobileWorkspace({
                 type="button"
                 role="tab"
                 aria-selected={isActive}
-                aria-label={isActive ? `${label} — feed settings` : `Go to ${label}`}
+                aria-label={isActive ? `${label} — channel settings` : `Go to ${label}`}
                 onClick={() =>
                   isActive ? onOpenFeedSettings(f.id) : jumpRef.current(i)
                 }
@@ -429,7 +429,7 @@ export function MobileWorkspace({
               transform: "translateY(-50%)",
             }}
           >
-            ALL FEEDS HIDDEN — RESTORE THEM FROM THE ∀ MENU
+            ALL CHANNELS HIDDEN — RESTORE THEM FROM THE ∀ MENU
           </div>
         ) : (
           <div
@@ -444,45 +444,101 @@ export function MobileWorkspace({
             }}
           >
             {feeds.map((f) => (
-              <div
+              <MobileFeedPage
                 key={f.id}
-                style={{
-                  // Island the page like a desktop vessel: the feed renders its
-                  // colourway's light/dark variant (chosen by paletteFor in the
-                  // parent), and the island keeps the derived text slugs the
-                  // palette references resolving canonical regardless of mode.
-                  // The mobile bar above is NOT islanded — it is global chrome
-                  // and inverts with the toggle.
-                  ...LIGHT_ISLAND_STYLE,
-                  width: `${100 / count}%`,
-                  height: "100%",
-                  overflowY: "auto",
-                  WebkitOverflowScrolling: "touch",
-                  background: interiorFor(f.id),
-                }}
-                onScroll={(e) => {
-                  const sc = e.currentTarget;
-                  if (sc.scrollHeight - sc.scrollTop - sc.clientHeight < 320)
-                    onLoadMore(f.id);
-                }}
+                feedId={f.id}
+                widthPct={100 / count}
+                background={interiorFor(f.id)}
+                onLoadMore={onLoadMore}
+                onRefresh={onRefresh}
               >
-                <PullToRefresh onRefresh={() => onRefresh(f.id)}>
-                  <div
-                    style={{
-                      display: "flex",
-                      flexDirection: "column",
-                      gap: 12,
-                      padding: 16,
-                    }}
-                  >
-                    {renderFeedContents(f.id)}
-                  </div>
-                </PullToRefresh>
-              </div>
+                {renderFeedContents(f.id)}
+              </MobileFeedPage>
             ))}
           </div>
         )}
       </div>
     </>
+  );
+}
+
+// One page of the pager. It is a component rather than a mapped <div> for one
+// reason: it needs a hook. Load-more used to hang off `onScroll` alone, and a
+// page whose first batch does not fill the screen — a short feed, headline
+// density, a tall phone — never scrolls, so no event ever fires and the feed
+// stops at page one while looking merely short. "Near the end" is geometry, so
+// the ResizeObserver (on the scroller and on its content) is what notices the
+// two non-scroll ways it changes: a page arriving, and the box resizing.
+// Desktop's `Vessel` carries the same pair for the same reason; re-firing is
+// safe because `loadMoreVesselItems` is guarded by its own cursor and latch.
+function MobileFeedPage({
+  feedId,
+  widthPct,
+  background,
+  onLoadMore,
+  onRefresh,
+  children,
+}: {
+  feedId: string;
+  widthPct: number;
+  background: string;
+  onLoadMore: (feedId: string) => void;
+  onRefresh: (feedId: string) => Promise<void>;
+  children: ReactNode;
+}) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const THRESHOLD = 320;
+    function check() {
+      if (!el) return;
+      if (el.scrollHeight - el.scrollTop - el.clientHeight < THRESHOLD) {
+        onLoadMore(feedId);
+      }
+    }
+    el.addEventListener("scroll", check, { passive: true });
+    const content = el.firstElementChild;
+    const ro = new ResizeObserver(check);
+    ro.observe(el);
+    if (content) ro.observe(content);
+    return () => {
+      el.removeEventListener("scroll", check);
+      ro.disconnect();
+    };
+  }, [feedId, onLoadMore]);
+
+  return (
+    <div
+      ref={scrollRef}
+      style={{
+        // Island the page like a desktop vessel: the feed renders its
+        // colourway's light/dark variant (chosen by paletteFor in the
+        // parent), and the island keeps the derived text slugs the
+        // palette references resolving canonical regardless of mode.
+        // The mobile bar above is NOT islanded — it is global chrome
+        // and inverts with the toggle.
+        ...LIGHT_ISLAND_STYLE,
+        width: `${widthPct}%`,
+        height: "100%",
+        overflowY: "auto",
+        WebkitOverflowScrolling: "touch",
+        background,
+      }}
+    >
+      <PullToRefresh onRefresh={() => onRefresh(feedId)}>
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: 12,
+            padding: 16,
+          }}
+        >
+          {children}
+        </div>
+      </PullToRefresh>
+    </div>
   );
 }

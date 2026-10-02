@@ -16,6 +16,8 @@ import {
 } from "./nostr-ingest.js";
 import { insertAtprotoItem } from "./atproto-ingest.js";
 import { insertActivityPubItem } from "./activitypub-ingest.js";
+import { insertEmailItem } from "./email-ingest.js";
+import { recordServed } from "./item-membership.js";
 import type { NormalisedAtprotoItem } from "../adapters/atproto.js";
 import type { NormalisedActivityPubItem } from "../adapters/activitypub.js";
 
@@ -27,7 +29,8 @@ import type { NormalisedActivityPubItem } from "../adapters/activitypub.js";
 // is_profile_hydrated cleared and source_id re-homed from the hydrating
 // focal's source to the author's own — on BOTH external_items and feed_items.
 // The re-home is load-bearing: nostr kind-5 deletion application matches on
-// source_id, and feed membership resolves through feed_sources.source_id.
+// source_id. Feed membership resolves through external_item_sources (CA-C4),
+// which the promoting source joins and the hydrating focal never does.
 // Real rows must keep the old semantics (atproto/AP: DO NOTHING no-op; nostr:
 // the published_at ratchet still blocks re-ingest of the same event).
 //
@@ -318,5 +321,204 @@ describe.skipIf(!DB_URL)("§4.2 ingest promotion", () => {
 
     const again = await insertActivityPubItem(client, authorSource, apItem());
     expect(again).toBe(false);
+  });
+  // ── CA-C8: a promotion takes the REAL payload ─────────────────────────────
+  //
+  // A context row is the THIN write (the parent prefetch stores media = '[]',
+  // the client-API hydrators carry no poll or CW) and FEED_SELECT renders
+  // COALESCE(ei.media, fi.media), so a promoted post kept the empty media it
+  // was hydrated with. The promotion arm now takes content/media/CW/title/
+  // language from EXCLUDED and MERGES interaction_data, newcomer last, so a
+  // key only the context fetch knew survives and a shared key is the real
+  // ingest's. DB-backed because `||` and COALESCE are Postgres's.
+  //
+  // MUTATION: strip the new columns from the atproto arm → the atproto case;
+  // `interaction_data = EXCLUDED.interaction_data` back in the nostr arm → the
+  // nostr case (the context key vanishes).
+
+  async function payload(uri: string) {
+    const { rows } = await client.query(
+      `SELECT content_text, content_html, language, media, content_warning, title,
+              interaction_data, like_count
+         FROM external_items WHERE source_item_uri = $1`,
+      [uri],
+    );
+    return rows[0];
+  }
+
+  it("atproto: a promotion takes the real media and content, merges interaction_data, keeps the higher count", async () => {
+    const focalSource = await createSource("atproto", "did:plc:focal999");
+    const authorSource = await createSource("atproto", "did:plc:author123");
+    const extId = await seedContextRow({
+      sourceId: focalSource.id,
+      protocol: "atproto",
+      uri: AT_URI,
+      publishedAt: new Date("2026-06-01T10:00:00Z"),
+      interactionData: { uri: AT_URI, cid: "stale-cid", grandparent: "at://x/y/z" },
+    });
+    await client.query(
+      `UPDATE external_items SET media = '[]'::jsonb, like_count = 7 WHERE id = $1`,
+      [extId],
+    );
+
+    const real = atprotoItem();
+    real.media = [{ type: "image", url: "https://cdn.example/a.jpg", alt: "a" }] as never;
+    real.contentText = "the real body";
+    real.contentHtml = "<p>the real body</p>";
+    real.language = "en";
+    expect(await insertAtprotoItem(client, authorSource, real, { likeCount: 2 })).toBe(true);
+
+    const p = await payload(AT_URI);
+    expect(p.content_text).toBe("the real body");
+    expect(p.content_html).toBe("<p>the real body</p>");
+    expect(p.language).toBe("en");
+    expect(p.media).toEqual([{ type: "image", url: "https://cdn.example/a.jpg", alt: "a" }]);
+    // Merged: the context-only key survives, the shared key is the newcomer's.
+    expect(p.interaction_data).toMatchObject({ grandparent: "at://x/y/z", cid: "cid123" });
+    // Monotonic: the context fetch had read fresher counts.
+    expect(Number(p.like_count)).toBe(7);
+  });
+
+  it("activitypub: a promotion takes the real title, CW, media and content, merging interaction_data", async () => {
+    const focalSource = await createSource("activitypub", "https://mastodon.example/users/focal");
+    const authorSource = await createSource("activitypub", "https://mastodon.example/users/author");
+    const extId = await seedContextRow({
+      sourceId: focalSource.id,
+      protocol: "activitypub",
+      uri: AP_URI,
+      publishedAt: new Date("2026-06-01T11:00:00Z"),
+      interactionData: { id: AP_URI, webUrl: "https://mastodon.example/@author/1" },
+    });
+    await client.query(`UPDATE external_items SET media = '[]'::jsonb WHERE id = $1`, [extId]);
+
+    const real = apItem();
+    real.title = "A title";
+    real.contentWarning = "spoilers";
+    real.media = [{ type: "image", url: "https://files.example/b.png" }] as never;
+    real.interactionData = { id: AP_URI, poll: { options: [], multiple: false, expiresAt: null, closed: true } };
+    expect(await insertActivityPubItem(client, authorSource, real)).toBe(true);
+
+    const p = await payload(AP_URI);
+    expect(p.title).toBe("A title");
+    expect(p.content_warning).toBe("spoilers");
+    expect(p.content_text).toBe("toot body");
+    expect(p.media).toEqual([{ type: "image", url: "https://files.example/b.png" }]);
+    expect(p.interaction_data).toMatchObject({
+      webUrl: "https://mastodon.example/@author/1",
+      poll: { closed: true },
+    });
+  });
+
+  it("nostr: a promotion MERGES interaction_data — the context write's relay hints survive", async () => {
+    const focalSource = await createSource("nostr_external", "c".repeat(64));
+    const authorSource = await createSource("nostr_external", AUTHOR_PUBKEY);
+    const event = nostrEvent();
+    const uri = nostrEventUri(EVENT_ID);
+    await seedContextRow({
+      sourceId: focalSource.id,
+      protocol: "nostr_external",
+      uri,
+      publishedAt: new Date(event.created_at * 1000),
+      interactionData: { id: EVENT_ID, relays: ["wss://only-the-hydrator-knew.example"], root: "r".repeat(64) },
+    });
+    expect(
+      await insertNostrItem(client, authorSource, event, { relays: [], sourceNip05: null }),
+    ).toBe("updated");
+    const p = await payload(uri);
+    expect(p.interaction_data).toMatchObject({ root: "r".repeat(64) });
+    expect(p.interaction_data.id).toBe(EVENT_ID);
+  });
+
+  // ── CA-C4: every source that SERVES an item is a member of it ─────────────
+  //
+  // The feed arm joins through external_item_sources, so a writer that did not
+  // record its source would deliver nothing to a feed built on it. A context
+  // row's source is INHERITED (the card that was expanded), so it is never a
+  // member; the promoting source is. And a second source ingesting an item
+  // another source already holds as REAL writes no row — only a membership.
+
+  async function membersOf(uri: string): Promise<string[]> {
+    const { rows } = await client.query<{ source_id: string }>(
+      `SELECT m.source_id FROM external_item_sources m
+         JOIN external_items ei ON ei.id = m.external_item_id
+        WHERE ei.source_item_uri = $1`,
+      [uri],
+    );
+    return rows.map((r) => r.source_id).sort();
+  }
+
+  it("nostr: the promoting source is a member, the hydrating focal is not; a second source joins", async () => {
+    const focal = await createSource("nostr_external", "c".repeat(64));
+    const author = await createSource("nostr_external", AUTHOR_PUBKEY);
+    const second = await createSource("nostr_external", "d".repeat(64));
+    const event = nostrEvent();
+    const uri = nostrEventUri(EVENT_ID);
+    const opts = { relays: ["wss://relay.example"], sourceNip05: null };
+    await seedContextRow({
+      sourceId: focal.id,
+      protocol: "nostr_external",
+      uri,
+      publishedAt: new Date(event.created_at * 1000),
+    });
+    expect(await membersOf(uri)).toEqual([]);
+
+    await insertNostrItem(client, author, event, opts);
+    expect(await membersOf(uri)).toEqual([author.id]);
+
+    expect(await insertNostrItem(client, second, event, opts)).toBe("skipped");
+    expect(await membersOf(uri)).toEqual([author.id, second.id].sort());
+  });
+
+  it("atproto: an already-real post ingested by a second source makes it a member", async () => {
+    const author = await createSource("atproto", "did:plc:author123");
+    const second = await createSource("atproto", "did:plc:second456");
+    expect(await insertAtprotoItem(client, author, atprotoItem())).toBe(true);
+    expect(await insertAtprotoItem(client, second, atprotoItem())).toBe(false);
+    expect(await membersOf(AT_URI)).toEqual([author.id, second.id].sort());
+  });
+
+  it("activitypub: a community and its poster both carry the same object", async () => {
+    const poster = await createSource("activitypub", "https://mastodon.example/users/author");
+    const community = await createSource("activitypub", "https://lemmy.example/c/things");
+    expect(await insertActivityPubItem(client, poster, apItem())).toBe(true);
+    expect(await insertActivityPubItem(client, community, apItem())).toBe(false);
+    expect(await membersOf(AP_URI)).toEqual([poster.id, community.id].sort());
+  });
+
+  it("email: one issue reaching two members' ingest addresses is in both", async () => {
+    const a = await createSource("email", `ingest-a-${EVENT_ID.slice(0, 8)}@in.example`);
+    const b = await createSource("email", `ingest-b-${EVENT_ID.slice(0, 8)}@in.example`);
+    const issue = {
+      sourceItemUri: "<issue-42@newsletter.example>",
+      title: "Issue 42",
+      authorName: "The Newsletter",
+      authorHandle: "news@newsletter.example",
+      contentText: "this week",
+      contentHtml: "<p>this week</p>",
+      canonicalUrl: null,
+      media: [],
+      publishedAt: new Date("2026-06-01T12:00:00Z"),
+    };
+    expect(await insertEmailItem(client, { ...a, source_uri: a.source_uri }, issue)).toBe(true);
+    expect(await insertEmailItem(client, { ...b, source_uri: b.source_uri }, issue)).toBe(false);
+    expect(await membersOf(issue.sourceItemUri)).toEqual([a.id, b.id].sort());
+  });
+
+  it("recordServed counts only what is NEW to the source, and never records a context row", async () => {
+    const author = await createSource("atproto", "did:plc:author123");
+    const second = await createSource("atproto", "did:plc:second456");
+    await insertAtprotoItem(client, author, atprotoItem());
+    expect(await recordServed(client, second.id, "atproto", [AT_URI])).toBe(1);
+    expect(await recordServed(client, second.id, "atproto", [AT_URI])).toBe(0);
+
+    const ctxUri = "at://did:plc:other/app.bsky.feed.post/ctx";
+    await seedContextRow({
+      sourceId: author.id,
+      protocol: "atproto",
+      uri: ctxUri,
+      publishedAt: new Date("2026-06-01T10:00:00Z"),
+    });
+    expect(await recordServed(client, second.id, "atproto", [ctxUri])).toBe(0);
+    expect(await membersOf(ctxUri)).toEqual([]);
   });
 });

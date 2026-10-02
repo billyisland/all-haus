@@ -19,7 +19,13 @@ interface FeedWeights {
   gatePass: number
 }
 
-async function loadFeedWeights(): Promise<FeedWeights> {
+// Exported for the fallback-parity suite, which drives THIS function against an
+// empty `platform_config` so it pins the shipping fallback path rather than a
+// copy of it. Five dials lived here as literals with nothing holding them in
+// step with `config-defaults.sql`, and a drifted one is silent by construction:
+// it substitutes exactly when the row is missing, which is the one case the
+// fallback exists for, and the only symptom is a feed that ranks a bit oddly.
+export async function loadFeedWeights(): Promise<FeedWeights> {
   const { rows } = await pool.query<{ key: string; value: string }>(
     `SELECT key, value FROM platform_config WHERE key LIKE 'feed_%'`
   )

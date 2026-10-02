@@ -17,6 +17,7 @@ import { PersonCard } from "./PersonCard";
 import { FEED_LOG_STYLE } from "./ProfileChrome";
 import { formatDateFromISO } from "../../lib/format";
 import type { VesselPalette } from "../workspace/tokens";
+import { request, failureSentence } from "../../lib/api/client";
 
 interface Follower {
   id: string;
@@ -41,6 +42,8 @@ export function FollowersTab({
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
+  // A failed page SAYS so under the button, which stays as the retry.
+  const [moreError, setMoreError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -48,16 +51,9 @@ export function FollowersTab({
       setLoading(true);
       setFailed(false);
       try {
-        const res = await fetch(
-          `/api/v1/writers/${username}/followers?limit=30`,
-          { credentials: "include" },
+        const data = await request<{ followers?: Follower[]; total?: number }>(
+          `/writers/${username}/followers?limit=30`,
         );
-        if (cancelled) return;
-        if (!res.ok) {
-          setFailed(true);
-          return;
-        }
-        const data = await res.json();
         if (cancelled) return;
         setFollowers(data.followers ?? []);
         setTotal(data.total ?? 0);
@@ -75,17 +71,14 @@ export function FollowersTab({
 
   async function loadMore() {
     setLoadingMore(true);
+    setMoreError(null);
     try {
-      const res = await fetch(
-        `/api/v1/writers/${username}/followers?limit=30&offset=${followers.length}`,
-        { credentials: "include" },
+      const data = await request<{ followers?: Follower[] }>(
+        `/writers/${username}/followers?limit=30&offset=${followers.length}`,
       );
-      if (res.ok) {
-        const data = await res.json();
-        setFollowers((prev) => [...prev, ...(data.followers ?? [])]);
-      }
-    } catch {
-      /* silently fail */
+      setFollowers((prev) => [...prev, ...(data.followers ?? [])]);
+    } catch (err) {
+      setMoreError(failureSentence(err, "Couldn’t load the next page. Please try again."));
     } finally {
       setLoadingMore(false);
     }
@@ -97,7 +90,7 @@ export function FollowersTab({
         className="py-10 text-center text-ui-sm"
         style={{ color: palette.cardMeta }}
       >
-        Loading...
+        Loading…
       </div>
     );
   }
@@ -154,9 +147,14 @@ export function FollowersTab({
             className="btn-soft py-1.5 px-4 text-ui-xs disabled:opacity-50"
           >
             {loadingMore
-              ? "Loading..."
+              ? "Loading…"
               : `Load more (${total - followers.length} remaining)`}
           </button>
+          {moreError && (
+            <p role="alert" className="mt-2 text-ui-xs text-crimson">
+              {moreError}
+            </p>
+          )}
         </div>
       )}
     </div>

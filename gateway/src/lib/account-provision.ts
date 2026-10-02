@@ -45,6 +45,13 @@ import { resolveArrivalGift } from "@platform-pub/shared/auth/arrival-gift.js";
 // copies in two packages. A gift the Google path doesn't give is worse than no
 // gift, because the copy still promises it.
 //
+// `provisioned_by_admit` IS THE ONE COLUMN THE TWO CALLERS SET DIFFERENTLY
+// (RESHAPE-PLAN-2026-10 §A.2.6). The admit route passes `byAdmit`, the Google
+// path does not, and `signup()` leaves the default. It is written once and
+// never cleared: with `age_declared_at IS NULL` it is the "admitted, has not
+// arrived" predicate that keeps a seeded member's name out of other members'
+// source lists until they sign in (`accountArrivedSql`, feeds/sources.ts).
+//
 // `deriveUsername` MOVED to shared/auth (D9): `signup()` needs it too and
 // cannot import from a service. Re-exported here so the existing callers and
 // `gateway/tests/derive-username.test.ts` are unchanged by the move.
@@ -68,6 +75,7 @@ export async function provisionAccount(
   email: string,
   displayName: string,
   arrivalDTag?: string | null,
+  opts: { byAdmit?: boolean } = {},
 ): Promise<ProvisionedAccount> {
   const keypair = await generateKeypair();
   const username = await deriveUsername(email, displayName);
@@ -80,8 +88,8 @@ export async function provisionAccount(
       `INSERT INTO accounts (
          nostr_pubkey, nostr_privkey_enc, username, display_name, email,
          status, free_allowance_granted_pence, free_allowance_remaining_pence,
-         arrival_article_id, arrival_gift_pence
-       ) VALUES ($1, $2, $3, $4, $5, 'active', $6, $6, $7, $8)
+         arrival_article_id, arrival_gift_pence, provisioned_by_admit
+       ) VALUES ($1, $2, $3, $4, $5, 'active', $6, $6, $7, $8, $9)
        RETURNING id`,
       [
         keypair.pubkeyHex,
@@ -92,6 +100,7 @@ export async function provisionAccount(
         freeAllowancePence + arrival.giftPence,
         arrival.articleId,
         arrival.giftPence,
+        opts.byAdmit === true,
       ],
     );
 

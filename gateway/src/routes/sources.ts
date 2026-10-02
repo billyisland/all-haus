@@ -1,4 +1,3 @@
-import { UUID_RE } from "../lib/uuid.js";
 import type { FastifyInstance } from "fastify";
 import { pool } from "@platform-pub/shared/db/client.js";
 import { requireAuth } from "../middleware/auth.js";
@@ -6,6 +5,8 @@ import logger from "@platform-pub/shared/lib/logger.js";
 import { FEED_SELECT, FEED_JOINS, parseCursor } from "../lib/feed-sql.js";
 import { POST_SELECT, POST_JOINS, feedItemToPost } from "../lib/post-mapper.js";
 import { encodeTsIdCursor } from "../lib/cursor.js";
+import { isPublicSourceProtocol } from "../lib/public-source-protocols.js";
+import { parseLimit, isUuid } from "../lib/request-inputs.js";
 
 // =============================================================================
 // External source surface (CARD-BEHAVIOUR-ADR §VI.2)
@@ -42,15 +43,12 @@ export async function sourcesRoutes(app: FastifyInstance) {
     },
     async (req, reply) => {
       const { id } = req.params;
-      if (!UUID_RE.test(id)) {
-        return reply.status(400).send({ error: "Invalid source id" });
+      if (!isUuid(id)) {
+        return reply.status(404).send({ error: "We couldn't find that source." });
       }
 
       const cursor = parseCursor(req.query.cursor);
-      const limit = Math.min(
-        parseInt(req.query.limit ?? String(DEFAULT_LIMIT), 10) || DEFAULT_LIMIT,
-        MAX_LIMIT,
-      );
+      const limit = parseLimit(req.query.limit, DEFAULT_LIMIT, MAX_LIMIT);
 
       try {
         const { rows: sourceRows } = await pool.query(
@@ -60,8 +58,21 @@ export async function sourcesRoutes(app: FastifyInstance) {
           [id],
         );
 
-        if (sourceRows.length === 0) {
-          return reply.status(404).send({ error: "Source not found" });
+        // A source row is shared by every subscriber to it, and this route
+        // takes its uuid from the caller — so without a protocol check any
+        // member could read any other member's private email newsletter by
+        // guessing a row id (MIRROR-AUDIT §3 *Security*, S16). One home for the
+        // list, and the reason it is an allow-list rather than a refusal of
+        // `email`, in lib/public-source-protocols.ts.
+        //
+        // 404 rather than 403: a non-public source must not be distinguishable
+        // from one that does not exist, or the route stays an oracle for which
+        // uuids name a private newsletter even after it stops serving one.
+        if (
+          sourceRows.length === 0 ||
+          !isPublicSourceProtocol(sourceRows[0].protocol)
+        ) {
+          return reply.status(404).send({ error: "We couldn't find that source." });
         }
 
         const s = sourceRows[0];
@@ -112,11 +123,15 @@ export async function sourcesRoutes(app: FastifyInstance) {
             -- skips every remaining row inside that second.
             EXTRACT(EPOCH FROM fi.published_at) AS published_at_secs
           FROM feed_items fi
+          -- Everything this source SERVED, including items another source
+          -- wrote first (CA-C4) — never fi.source_id, which names only the
+          -- first writer.
+          JOIN external_item_sources eis
+            ON eis.external_item_id = fi.external_item_id AND eis.source_id = $1
           ${FEED_JOINS}
           ${POST_JOINS}
           WHERE fi.deleted_at IS NULL
             AND fi.item_type = 'external'
-            AND fi.source_id = $1
             AND (ei.is_context_only IS NOT TRUE)
             ${cursorClause}
           ORDER BY fi.published_at DESC, fi.id DESC
@@ -139,7 +154,7 @@ export async function sourcesRoutes(app: FastifyInstance) {
         return reply.send({ source, items, nextCursor });
       } catch (err) {
         logger.error({ err, sourceId: id }, "Source surface fetch failed");
-        return reply.status(500).send({ error: "Source fetch failed" });
+        return reply.status(500).send({ error: "Couldn't load that source. Please try again." });
       }
     },
   );

@@ -40,9 +40,12 @@
 // the three registers are SSR'd.
 // =============================================================================
 
+import Link from "next/link";
 import { useState, type CSSProperties, type ReactNode } from "react";
 import { useLightbox } from "../../stores/lightbox";
+import { useDiscCloseActive } from "../../stores/glasshouse";
 import { InwardLink } from "../ui/InwardLink";
+import { safeHttpUrl } from "../../lib/external-links";
 import { LIGHT_ISLAND_STYLE } from "../../lib/palette/island";
 import {
   globalContentPalette,
@@ -222,6 +225,7 @@ export function ProfileBar({
   actions,
   onClose,
 }: ProfileBarProps) {
+  const discClose = useDiscCloseActive();
   return (
     <div
       // `--drag` follows `onClose`, which is the overlay register's own seam
@@ -321,8 +325,15 @@ export function ProfileBar({
             onto line 2 (Q2, judged on screen 2026-08-28): inside the group it
             rode the wrap and a full-screen sheet's close sat 60px below the top
             corner every reader looks in. The desktop order is unchanged — the
-            ordering is in globals.css §1e, since the wrap is a media query. */}
-        {onClose && (
+            ordering is in globals.css §1e, since the wrap is a media query.
+
+            On the mobile workspace it withdraws entirely: the ∀ disc has
+            already flipped to this sheet's X, and the pane needs exactly one.
+            The gate is the disc's own DECLARATION, never `isMobile` — this
+            pane opens from /article/:dTag and the public register too, where
+            no disc is mounted (stores/glasshouse.ts::useDiscCloseActive). The
+            page registers pass no `onClose` at all and are untouched. */}
+        {onClose && !discClose && (
           <button
             type="button"
             onClick={onClose}
@@ -356,29 +367,39 @@ export function BarButton({
   palette,
   className = "",
   style,
+  href,
   ...rest
 }: {
   variant?: "primary" | "secondary";
   palette: VesselPalette;
+  /** Renders a real `<Link>` wearing the bar tone instead of a `<button>`.
+   *  A bar control that NAVIGATES is still a bar control — the logged-out
+   *  "Log in to follow" offer took `.btn`, which is ink on ink against
+   *  `barBg` and so invisible in dark mode, which is the whole reason the
+   *  tone lives here and not at the call sites. */
+  href?: string;
 } & React.ButtonHTMLAttributes<HTMLButtonElement>) {
   const tone: CSSProperties =
     variant === "primary"
       ? { background: palette.barText, color: palette.barBg }
       : { background: palette.barInputBg, color: palette.barInputText };
-  return (
-    <button
-      {...rest}
-      className={`focus-ring font-sans text-ui-xs font-medium transition-opacity hover:opacity-85 disabled:opacity-50 ${className}`}
-      style={{
-        border: "none",
-        borderRadius: 0,
-        padding: "0.375rem 0.875rem",
-        cursor: "pointer",
-        ...tone,
-        ...style,
-      }}
-    />
-  );
+  const cls = `focus-ring font-sans text-ui-xs font-medium transition-opacity hover:opacity-85 disabled:opacity-50 ${className}`;
+  const css: CSSProperties = {
+    border: "none",
+    borderRadius: 0,
+    padding: "0.375rem 0.875rem",
+    cursor: "pointer",
+    ...tone,
+    ...style,
+  };
+  if (href) {
+    return (
+      <Link href={href} className={`inline-block ${cls}`} style={css}>
+        {rest.children}
+      </Link>
+    );
+  }
+  return <button {...rest} className={cls} style={css} />;
 }
 
 // -----------------------------------------------------------------------------
@@ -440,10 +461,13 @@ export function ProfileIdentityRow({
             </span>
           </>
         );
-        return id.href ? (
+        // Every href that leaves all.haus goes through `safeHttpUrl` (CA-E15);
+        // one it refuses renders as the plain label.
+        const href = safeHttpUrl(id.href);
+        return href ? (
           <a
             key={id.key}
-            href={id.href}
+            href={href}
             target="_blank"
             rel="noopener noreferrer"
             className="text-ui-xs hover:underline"

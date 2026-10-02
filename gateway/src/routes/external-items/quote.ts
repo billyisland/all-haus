@@ -1,7 +1,14 @@
 import type { FastifyInstance } from "fastify";
 import { pool } from "@platform-pub/shared/db/client.js";
 import { safeFetch } from "@platform-pub/shared/lib/http-client.js";
-import { sanitizeContent } from "@platform-pub/shared/lib/sanitize.js";
+import {
+  blueskyInteractionData,
+  type AtprotoReplyRefs,
+} from "@platform-pub/shared/lib/atproto-reply-refs.js";
+import {
+  httpUrlOrNull,
+  sanitizeContent,
+} from "@platform-pub/shared/lib/sanitize.js";
 import { requireAuth } from "../../middleware/auth.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 import {
@@ -16,6 +23,11 @@ import {
   ensureContextFeedItem,
   rowToParentItem,
 } from "../../lib/external-items-shared.js";
+import {
+  readMastodonStatus,
+  mastodonStatusIdentity,
+} from "@platform-pub/shared/lib/mastodon-api.js";
+import { isUuid } from "../../lib/request-inputs.js";
 
 interface QuoteResponse {
   // A quoted post is rendered as a nested mini-card; it carries the same shape
@@ -48,6 +60,9 @@ export function registerQuoteRoutes(app: FastifyInstance) {
     },
     async (req, reply) => {
       const { id } = req.params;
+      if (!isUuid(id)) {
+        return reply.status(404).send({ error: "We couldn't find that post." });
+      }
 
       const cached = quoteCache.get(id);
       if (cached && cached.expiresAt > Date.now()) {
@@ -62,7 +77,7 @@ export function registerQuoteRoutes(app: FastifyInstance) {
       );
 
       if (rows.length === 0) {
-        return reply.status(404).send({ error: "Item not found" });
+        return reply.status(404).send({ error: "We couldn't find that post." });
       }
 
       const item = rows[0];
@@ -134,9 +149,13 @@ function mastodonCardToMedia(
 ): QuoteMedia | null {
   if (!card?.url) return null;
   if (card.type && card.type !== "link") return null;
+  // Rendered as an `href`, so a non-http(s) scheme is refused rather than
+  // stored (see httpUrlOrNull's header).
+  const url = httpUrlOrNull(card.url);
+  if (!url) return null;
   return {
     type: "link",
-    url: card.url,
+    url,
     thumbnail: card.image ?? undefined,
     title: card.title || undefined,
     description: card.description || undefined,
@@ -181,7 +200,7 @@ async function fetchBlueskyQuote(
           displayName?: string;
           avatar?: string;
         };
-        record: { text?: string; createdAt?: string };
+        record: { text?: string; createdAt?: string; reply?: AtprotoReplyRefs };
         likeCount?: number;
         replyCount?: number;
         repostCount?: number;
@@ -221,7 +240,7 @@ async function fetchBlueskyQuote(
         post.author.did,
         post.record.text ?? null,
         JSON.stringify(media),
-        JSON.stringify({ uri: post.uri, cid: post.cid }),
+        JSON.stringify(blueskyInteractionData(post)),
         post.likeCount ?? 0,
         post.replyCount ?? 0,
         post.repostCount ?? 0,
@@ -266,14 +285,11 @@ async function fetchMastodonQuote(
 
   try {
     const host = new URL(quoteUri).hostname;
-    const res = await safeFetch(`https://${host}/api/v1/statuses/${statusId}`, {
-      headers: { Accept: "application/json" },
-      timeout: NEIGHBOURHOOD_FETCH_TIMEOUT_MS,
-    });
+    const res = await readMastodonStatus(`https://${host}`, statusId, { timeout: NEIGHBOURHOOD_FETCH_TIMEOUT_MS });
 
     if (!res.ok) return null;
 
-    const status = JSON.parse(res.text) as {
+    const status = res.body as {
       id: string;
       url: string;
       uri: string;
@@ -304,6 +320,10 @@ async function fetchMastodonQuote(
       } | null;
     };
 
+    // §2.9 on this door too (CA-A10) — see `mastodonStatusIdentity`.
+    const identity = mastodonStatusIdentity(status, `https://${host}`);
+    if (!identity) return null;
+
     const publishedAt = Math.floor(
       new Date(status.created_at).getTime() / 1000,
     );
@@ -323,12 +343,16 @@ async function fetchMastodonQuote(
 
     const insertResult = await pool.query(
       `INSERT INTO external_items (
-        source_id, protocol, tier, source_item_uri,
+        source_id, protocol, tier, source_item_uri, canonical_url,
         author_name, author_handle, author_avatar_url, author_uri,
         content_html, media, interaction_data,
         like_count, reply_count, repost_count,
         published_at, is_context_only
-      ) VALUES ($1, $2, 'tier3', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, TRUE)
+        -- canonical_url: the permalink the object declares, distinct from the
+        -- id. The conflict arm STAYS as it is -- the RETURNING clause is what
+        -- tells the caller this row is NEW, and widening it would hand back
+        -- pre-existing rows as fresh and mint duplicate feed_items.
+      ) VALUES ($1, $2, 'tier3', $3, $15, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, TRUE)
       ON CONFLICT (protocol, source_item_uri) DO UPDATE SET
         like_count = EXCLUDED.like_count,
         reply_count = EXCLUDED.reply_count,
@@ -338,29 +362,31 @@ async function fetchMastodonQuote(
       [
         sourceId,
         "activitypub",
-        status.uri || status.url || quoteUri,
+        identity.uri,
         status.account.display_name || status.account.acct,
         status.account.acct,
         status.account.avatar ?? null,
-        status.account.uri ?? status.account.url,
+        identity.authorUri,
         sanitizeContent(status.content),
         JSON.stringify(media),
-        JSON.stringify({ id: status.uri, webUrl: status.url }),
+        JSON.stringify({ id: identity.uri, webUrl: status.url }),
         status.favourites_count ?? 0,
         status.replies_count ?? 0,
         status.reblogs_count ?? 0,
         new Date(status.created_at),
+        // The permalink the object declares, distinct from the id.
+        httpUrlOrNull(status.url),
       ],
     );
 
     return {
       id: insertResult.rows[0].id,
       sourceProtocol: "activitypub",
-      sourceItemUri: status.uri || status.url || quoteUri,
+      sourceItemUri: identity.uri,
       authorName: status.account.display_name || status.account.acct,
       authorHandle: status.account.acct,
       authorAvatarUrl: status.account.avatar ?? null,
-      authorUri: status.account.uri ?? status.account.url,
+      authorUri: identity.authorUri,
       contentText: null,
       contentHtml: sanitizeContent(status.content),
       title: null,

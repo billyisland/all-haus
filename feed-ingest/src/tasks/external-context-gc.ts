@@ -2,6 +2,37 @@ import type { Task } from "graphile-worker";
 import { pool } from "@platform-pub/shared/db/client.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 
+// Exported so the integration test runs THIS statement (the repo idiom:
+// EXTERNAL_ITEMS_PRUNE_SQL, GC_CULL_SQL). $1 = retention days.
+export const EXTERNAL_CONTEXT_GC_SQL = `
+    WITH stale AS (
+      SELECT ei.id
+        FROM external_items ei
+       WHERE ei.is_context_only = TRUE
+         AND ei.created_at < now() - ($1 || ' days')::interval
+         AND NOT EXISTS (
+           SELECT 1 FROM notes n WHERE n.external_parent_id = ei.id
+         )
+         -- citation_edges.source_external_item_id has no ON DELETE action, so a
+         -- cited item would fail the DELETE with a RESTRICT violation and wedge
+         -- the whole batch permanently (M15, same as external-items-prune).
+         AND NOT EXISTS (
+           SELECT 1 FROM citation_edges ce WHERE ce.source_external_item_id = ei.id
+         )
+         -- A notification's target (migration 236). A reply that reached a
+         -- member from Bluesky or Mastodon is filed context-only, and the
+         -- notification CASCADEs with it — so reaping it would silently take a
+         -- member's notification away.
+         AND NOT EXISTS (
+           SELECT 1 FROM notifications nt WHERE nt.external_item_id = ei.id
+         )
+    ),
+    del_fi AS (
+      DELETE FROM feed_items WHERE external_item_id IN (SELECT id FROM stale)
+    )
+    DELETE FROM external_items WHERE id IN (SELECT id FROM stale)
+`;
+
 export const externalContextGc: Task = async (_payload, _helpers) => {
   const {
     rows: [config],
@@ -17,30 +48,7 @@ export const externalContextGc: Task = async (_payload, _helpers) => {
   // forever. Real feed content is is_context_only = FALSE, so the predicate never
   // touches it. feed_items is deleted first (FK from feed_items.external_item_id).
   // The notes guard stays: a context item that became a reply's parent is kept.
-  const { rowCount } = await pool.query(
-    `
-    WITH stale AS (
-      SELECT ei.id
-        FROM external_items ei
-       WHERE ei.is_context_only = TRUE
-         AND ei.created_at < now() - ($1 || ' days')::interval
-         AND NOT EXISTS (
-           SELECT 1 FROM notes n WHERE n.external_parent_id = ei.id
-         )
-         -- citation_edges.source_external_item_id has no ON DELETE action, so a
-         -- cited item would fail the DELETE with a RESTRICT violation and wedge
-         -- the whole batch permanently (M15, same as external-items-prune).
-         AND NOT EXISTS (
-           SELECT 1 FROM citation_edges ce WHERE ce.source_external_item_id = ei.id
-         )
-    ),
-    del_fi AS (
-      DELETE FROM feed_items WHERE external_item_id IN (SELECT id FROM stale)
-    )
-    DELETE FROM external_items WHERE id IN (SELECT id FROM stale)
-  `,
-    [retentionDays],
-  );
+  const { rowCount } = await pool.query(EXTERNAL_CONTEXT_GC_SQL, [retentionDays]);
 
   if (rowCount && rowCount > 0) {
     logger.info(

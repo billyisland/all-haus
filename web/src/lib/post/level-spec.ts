@@ -16,7 +16,7 @@ import { authorMark, platformMark } from "./resonance";
 // "+1 step" of indentation. Matches the documented thread step-in (CLAUDE.md →
 // "Thread step-in … indented 32px once (ml-8)"). Phase 3 owns the thread walk;
 // here it only governs parent/reply offset in the harness.
-const INDENT_STEP_PX = 32;
+export const INDENT_STEP_PX = 32;
 
 // CLAUDE feed/thread rhythm. Exported because the feed gap is a card's own
 // half of the 20px a vessel renders (the column's `VESSEL_GAP` is the other),
@@ -30,7 +30,16 @@ type VideoMode = "autoplay-unmute" | "static" | "none";
 type HausMode = "full" | "numerals-only" | "none";
 type CountersMode = "fresh-on-expand" | "static" | "inline-numerals" | "none";
 type QuoteMode = "full-child" | "mini" | "stub" | "none";
-type ClickAction = "collapse" | "expand-focal" | "reroot-focal" | "reader-pane" | "none";
+// `focus` walks the queue to the row's feed (WORKSPACE-QUEUE-ADR §VII.5) — a
+// member of its own, never an overload of `expand-focal`, because what it opens
+// is a FEED, not the post.
+type ClickAction =
+  | "collapse"
+  | "expand-focal"
+  | "reroot-focal"
+  | "reader-pane"
+  | "focus"
+  | "none";
 
 interface LevelSpec {
   textScale: number; // × ctx.bodyPx
@@ -41,7 +50,7 @@ interface LevelSpec {
   video: VideoMode;
   haus: HausMode; // all.haus vote/repost/save
   originTag: boolean;
-  report: boolean; // further gated to native-only in resolveSpec
+  report: boolean; // whether this LEVEL offers the control at all
   originCounters: CountersMode;
   quoteEmbed: QuoteMode;
   click: ClickAction;
@@ -51,6 +60,13 @@ interface LevelSpec {
   // reader is deciding whether to read, not on context chrome around something
   // they're already reading.
   resonance: boolean;
+  // The post's time, in the byline or (tier D) on the provenance line. Off only
+  // for a preview row, which shows none (WORKSPACE-QUEUE-ADR §VI.3).
+  timestamp: boolean;
+  // A content-warned post's SHOW CONTENT toggle. Off, the warning label stands
+  // in place of the text with nothing to reveal it — a preview row is not
+  // where a warned post is opened (§VII.5).
+  warningReveal: boolean;
 }
 
 // One row per §4 column. Read the ADR §4 table top-to-bottom against this.
@@ -69,6 +85,8 @@ export const LEVEL_SPEC: Record<Level, LevelSpec> = {
     quoteEmbed: "full-child",
     click: "collapse",
     resonance: true,
+    timestamp: true,
+    warningReveal: true,
   },
   feed: {
     textScale: 1.0,
@@ -84,6 +102,8 @@ export const LEVEL_SPEC: Record<Level, LevelSpec> = {
     quoteEmbed: "mini",
     click: "expand-focal",
     resonance: true,
+    timestamp: true,
+    warningReveal: true,
   },
   // THE SPINE IS CONTEXT, EXCEPT WHERE IT IS AN ARTICLE (2026-09-05).
   // ARTICLE-HEADED-CONVERSATIONS-ADR D1. This row went full-size and flush on
@@ -120,6 +140,8 @@ export const LEVEL_SPEC: Record<Level, LevelSpec> = {
     quoteEmbed: "mini",
     click: "reroot-focal",
     resonance: false,
+    timestamp: true,
+    warningReveal: true,
   },
   "thread-reply": {
     textScale: 0.9,
@@ -135,6 +157,8 @@ export const LEVEL_SPEC: Record<Level, LevelSpec> = {
     quoteEmbed: "mini",
     click: "reroot-focal",
     resonance: false,
+    timestamp: true,
+    warningReveal: true,
   },
   quoted: {
     textScale: 0.85,
@@ -150,6 +174,8 @@ export const LEVEL_SPEC: Record<Level, LevelSpec> = {
     quoteEmbed: "stub",
     click: "reroot-focal",
     resonance: false,
+    timestamp: true,
+    warningReveal: true,
   },
   condensed: {
     textScale: 0.85,
@@ -165,6 +191,35 @@ export const LEVEL_SPEC: Record<Level, LevelSpec> = {
     quoteEmbed: "stub",
     click: "expand-focal",
     resonance: false,
+    timestamp: true,
+    warningReveal: true,
+  },
+  // THE QUEUE'S PREVIEW ROWS (WORKSPACE-QUEUE-ADR §VII.5): a feed ahead of the
+  // reader, shown as a list of what is in it. `condensed` with the cells that
+  // make a row a GLANCE rather than a card: its provenance line (`originTag`),
+  // no actions (`haus`), no origin counts, and a click that walks the queue to
+  // the feed and opens the row's conversation there (`focus`, 2026-09-27) — except on an ARTICLE, whose click `resolveSpec`
+  // rewrites to `reader-pane` here as everywhere (D6: a click on an article is
+  // already the decision to read it). And three cells §VI.3 asks for that the
+  // §VII.5 table did not list: no quote (the stub is a control, and it would
+  // re-root a thread nobody can see), no timestamp, and a content warning
+  // that stands in for the text rather than offering to reveal it.
+  preview: {
+    textScale: 0.85,
+    indentStep: 0,
+    gapBelow: "tight",
+    body: "one-line",
+    media: "none",
+    video: "none",
+    haus: "none",
+    originTag: true,
+    report: false,
+    originCounters: "none",
+    quoteEmbed: "none",
+    click: "focus",
+    resonance: false,
+    timestamp: false,
+    warningReveal: false,
   },
 };
 
@@ -219,7 +274,7 @@ export interface ResolvedSpec {
   haus: HausMode;
   showOriginTag: boolean;
   originTagSourceOnly: boolean;
-  showReport: boolean; // native-only AND level permits
+  showReport: boolean; // the level permits it (every tier may be reported)
   originCounters: CountersMode; // "none" once the tier has no origin counters
   quoteEmbed: QuoteMode;
   click: ClickAction; // articles override to "reader-pane"
@@ -243,11 +298,11 @@ export interface ResolvedSpec {
   // does not — the mark earns its space where the reader is deciding whether to
   // read, not on context chrome around something they are already reading.
   showPlatformResonance: boolean;
-}
-
-// A Post is native iff it carries a nostr pubkey (external items never do).
-export function isNativePost(post: Post): boolean {
-  return post.origin.protocol === "nostr" && !!post.author.pubkey;
+  // The byline's time. (The provenance line's is `originTagTime`, which this
+  // gates too.)
+  showTime: boolean;
+  // A content warning offers SHOW CONTENT; false, it is a label alone.
+  warningReveal: boolean;
 }
 
 export function resolveSpec(
@@ -257,7 +312,6 @@ export function resolveSpec(
 ): ResolvedSpec {
   const spec = LEVEL_SPEC[level];
   const caps = tierCaps(tier);
-  const native = isNativePost(post);
   // A post names someone when it carries any author identity at all: a native
   // pubkey, an external_authors record, or a name/handle (a record-less name
   // is a data gap the byline still shows, via its protocol fallback — never
@@ -290,8 +344,16 @@ export function resolveSpec(
     haus: spec.haus, // never tier-masked
     showOriginTag: spec.originTag,
     originTagSourceOnly: caps.originTagSourceOnly,
-    // Report is native-only (§4 note); the level must also permit it.
-    showReport: spec.report && native,
+    // REPORTING IS NOT NATIVE-ONLY ANY MORE (L6.3; D1 §9.2, which says
+    // reporting covers "native, DM, and ingested"). It was, because the report
+    // table could only hold a Nostr event id or an account id — so an external
+    // card had no identifier to report WITH, and the honest thing was to
+    // withhold a control that could not work. `moderation_reports.target_post_id`
+    // (migration 223) is `feed_items.post_id`, which every card carries
+    // whatever it is made of, so the reason for the restriction is gone and the
+    // restriction goes with it. The level still decides: a quoted or condensed
+    // card offers nothing, because the full card underneath it does.
+    showReport: spec.report,
     // Origin counters require both the tier to expose them AND actual data
     // (native is null per §6, so it never shows origin counters).
     originCounters:
@@ -308,7 +370,7 @@ export function resolveSpec(
     // fact; the mask is the fallback for a post that carries none.
     bylineProfile: caps.bylineProfile || !!post.author.id,
     showByline,
-    originTagTime: !showByline && spec.originTag,
+    originTagTime: !showByline && spec.originTag && spec.timestamp,
     threads: caps.threads,
     interactBack: caps.interactBack,
     // Not tier-masked: resonance is a property of the response a post drew, not
@@ -318,5 +380,7 @@ export function resolveSpec(
     // silence lives in the data, deliberately, rather than in a tier mask here.
     showResonance: spec.resonance && authorMark(post) !== null,
     showPlatformResonance: spec.resonance && platformMark(post),
+    showTime: spec.timestamp,
+    warningReveal: spec.warningReveal,
   };
 }

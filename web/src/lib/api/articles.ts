@@ -26,7 +26,9 @@ export interface ArticleMetadata {
   coverImageUrl: string | null;
   publishedAt: string | null;
   writerSpendThisMonthPence: number | null;
-  nudgeShownThisMonth: boolean;
+  /** The piece has been withdrawn and this viewer holds an unlock for it —
+   *  the only shape in which a withdrawn piece is ever answered (§0z 18). */
+  withdrawn?: boolean;
   writer: {
     id: string;
     username: string;
@@ -129,33 +131,6 @@ export const articles = {
 };
 
 // =============================================================================
-// Content Resolution
-// =============================================================================
-
-export interface ResolvedContent {
-  type: "note" | "article";
-  eventId: string;
-  content?: string;
-  title?: string;
-  dTag?: string;
-  accessMode?: string;
-  isPaywalled?: boolean;
-  publishedAt: number;
-  author: {
-    username: string;
-    displayName: string | null;
-    avatar: string | null;
-  };
-}
-
-export const content = {
-  resolve: (eventId: string) =>
-    request<ResolvedContent>(
-      `/content/resolve?eventId=${encodeURIComponent(eventId)}`,
-    ),
-};
-
-// =============================================================================
 // Article Management (editorial dashboard)
 // =============================================================================
 
@@ -211,11 +186,6 @@ export const tags = {
   search: (q: string) =>
     request<{ tags: TagSuggestion[] }>(
       `/tags/search?q=${encodeURIComponent(q)}`,
-    ),
-
-  getByName: (name: string, limit = 20, offset = 0) =>
-    request<{ tag: string; articles: any[]; total: number }>(
-      `/tags/${encodeURIComponent(name)}?limit=${limit}&offset=${offset}`,
     ),
 
   getForArticle: (articleId: string) =>
@@ -287,7 +257,13 @@ export const readingLog = {
   // join, so a full page can arrive short and "shorter than asked for" does not
   // mean "the end".
   list: (limit = 50, offset = 0) =>
-    request<{ items: ReadingLogEntry[]; hasMore: boolean }>(
+    request<{
+      items: ReadingLogEntry[]
+      hasMore: boolean
+      // The `reading_log_retention_days` dial, so the empty state can name the
+      // window instead of restating a literal that drifts the day it is tuned.
+      retentionDays: number
+    }>(
       `/reading-log?limit=${limit}&offset=${offset}`,
     ),
 
@@ -333,33 +309,69 @@ export interface ReadingPrefs {
   alwaysOpenAtTop: boolean;
   /** D1's stop-logging switch for Recent reading. */
   readingLogEnabled: boolean;
+  /** The `reading_log_retention_days` dial, so Settings names the window
+   *  rather than a literal. On the GET only; absent ⇒ say no figure. */
+  retentionDays?: number;
 }
+
+// The reader asks "open at the top?" on every open and every skip (CA-G10), so
+// the answer is held for the page's life. Only a SUCCESS is held — a failed
+// read is asked again next time — and every settings write drops it, whatever
+// its outcome. A logout is a full document load, which drops it with the rest.
+let cachedPrefs: Promise<ReadingPrefs> | null = null;
 
 export const readingPreferences = {
   get: () => request<ReadingPrefs>("/me/reading-preferences"),
 
-  // Both dials go in one call because they share a settings section and a row.
-  // `readingLogEnabled` is optional at the route: omitting it leaves the column
-  // alone, so a caller that knows only about resume cannot switch a member's
-  // logging back on by touching the other toggle.
-  update: (prefs: { alwaysOpenAtTop: boolean; readingLogEnabled?: boolean }) =>
-    request<{ ok: true } & ReadingPrefs>("/me/reading-preferences", {
+  /** `get`, held until a settings write — for the reader, never for Settings,
+   *  which shows what the server says now. */
+  getCached: () => {
+    if (!cachedPrefs) {
+      const p = readingPreferences.get();
+      cachedPrefs = p;
+      p.catch(() => {
+        if (cachedPrefs === p) cachedPrefs = null;
+      });
+    }
+    return cachedPrefs;
+  },
+
+  // Both dials go in one call because they share a settings section and a row,
+  // and BOTH are optional at the route: an omitted field leaves its column
+  // alone, so a caller that knows about one toggle can never move the other.
+  // Send only what the member actually changed.
+  update: (prefs: {
+    alwaysOpenAtTop?: boolean;
+    readingLogEnabled?: boolean;
+  }) => {
+    cachedPrefs = null;
+    return request<{ ok: true } & ReadingPrefs>("/me/reading-preferences", {
       method: "PUT",
       body: JSON.stringify(prefs),
-    }),
+    }).finally(() => {
+      cachedPrefs = null;
+    });
+  },
 };
 
 export const privacyPreferences = {
   get: () =>
-    request<{ discoveryEnabled: boolean; publishFollowGraph: boolean }>(
-      "/me/privacy-preferences",
-    ),
+    request<{
+      discoveryEnabled: boolean;
+      publishFollowGraph: boolean;
+      discoverableByEmail: boolean;
+    }>("/me/privacy-preferences"),
 
-  update: (prefs: { discoveryEnabled?: boolean; publishFollowGraph?: boolean }) =>
+  update: (prefs: {
+    discoveryEnabled?: boolean;
+    publishFollowGraph?: boolean;
+    discoverableByEmail?: boolean;
+  }) =>
     request<{
       ok: boolean;
       discoveryEnabled: boolean;
       publishFollowGraph: boolean;
+      discoverableByEmail: boolean;
     }>("/me/privacy-preferences", {
       method: "PUT",
       body: JSON.stringify(prefs),

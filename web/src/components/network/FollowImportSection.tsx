@@ -17,6 +17,7 @@ import type { UseFollowImportRun } from '../../hooks/useFollowImportRun'
 import { useOpmlImport } from '../../hooks/useOpmlImport'
 import type { FollowImportProtocol } from '../../lib/api'
 import { FollowImportStatus } from './FollowImportStatus'
+import * as C from '../../content/networks'
 
 export function FollowImportSection({
   importable,
@@ -60,12 +61,11 @@ export function FollowImportSection({
 
   return (
     <div>
-      <p className="text-ui-sm text-black">Bring your follows</p>
+      <p className="text-ui-sm text-black">{C.FOLLOW_IMPORT_TITLE}</p>
       <p className="text-ui-xs text-grey-600 mt-1 leading-relaxed">
-        Already follow people elsewhere? Paste a Bluesky handle,
-        {importable.includes('activitypub') && ' a Mastodon handle,'} an npub,
-        or a NIP-05 address and all.haus builds a new feed from everyone that
-        account follows. One-way: nothing changes on the other network.
+        {C.FOLLOW_IMPORT_INTRO_START}
+        {importable.includes('activitypub') && C.FOLLOW_IMPORT_INTRO_MASTODON}
+        {C.FOLLOW_IMPORT_INTRO_END}
       </p>
       <input
         type="text"
@@ -79,25 +79,23 @@ export function FollowImportSection({
         }}
         placeholder={
           importable.includes('activitypub')
-            ? 'alice.bsky.social · @user@instance · npub1…'
-            : 'alice.bsky.social · npub1… · name@domain.com'
+            ? C.FOLLOW_IMPORT_PLACEHOLDER_WITH_MASTODON
+            : C.FOLLOW_IMPORT_PLACEHOLDER
         }
         className="w-full bg-glasshouse-well px-4 py-2.5 text-sm text-black placeholder-grey-300 focus:outline-none max-w-sm mt-3"
       />
       <div className="mt-2 space-y-1">
         {ri.resolving && (
-          <p className="font-mono text-mono-xs text-grey-600">RESOLVING…</p>
+          <p className="font-mono text-mono-xs text-grey-600">{C.FOLLOW_IMPORT_RESOLVING}</p>
         )}
         {(ri.doneEmpty || ri.resolveError) && (
           <p className="font-mono text-mono-xs text-grey-600">
-            No match. Press Enter to search, or try a full handle, npub, or
-            NIP-05 address.
+            {C.FOLLOW_IMPORT_NO_MATCH}
           </p>
         )}
         {onlyUnimportable && (
           <p className="font-mono text-mono-xs text-grey-600">
-            Found it, but importing follows isn&rsquo;t available for that
-            network yet.
+            {C.FOLLOW_IMPORT_UNIMPORTABLE}
           </p>
         )}
         {candidates.map(opt => (
@@ -121,7 +119,7 @@ export function FollowImportSection({
               disabled={busy}
               className="btn-text shrink-0"
             >
-              Import follows
+              {C.FOLLOW_IMPORT_ACTION}
             </button>
           </div>
         ))}
@@ -201,13 +199,11 @@ function OpmlImportBlock() {
     const text = await file.text()
     const preview = previewOpml(file.name, text)
     if (!preview) {
-      setFileError(
-        'Could not read that file as OPML — export a fresh copy from your reader and try again.',
-      )
+      setFileError(C.OPML_UNREADABLE)
       return
     }
     if (preview.entries === 0) {
-      setFileError('No feed URLs found in this file.')
+      setFileError(C.OPML_NO_URLS)
       return
     }
     setPending(preview)
@@ -222,8 +218,7 @@ function OpmlImportBlock() {
   return (
     <div className="mt-4">
       <p className="text-ui-xs text-grey-600 leading-relaxed">
-        Coming from a feed reader instead? Upload its OPML export and your
-        subscriptions arrive as feeds — one per folder.
+        {C.OPML_INTRO}
       </p>
       <input
         ref={fileRef}
@@ -243,19 +238,16 @@ function OpmlImportBlock() {
           disabled={busy}
           className="btn-text mt-2"
         >
-          Upload an OPML file
+          {C.OPML_UPLOAD}
         </button>
       )}
       {pending && (
         <div className="mt-2">
           <p className="font-mono text-mono-xs text-grey-600">
-            {pending.fileName.toUpperCase()} — {pending.entries} FEED URLS
-            {pending.folders > 0 && ` IN ${pending.folders} FOLDERS`}
+            {C.opmlFileSummary(pending.fileName, pending.entries, pending.folders)}
           </p>
           <p className="text-ui-xs text-grey-600 mt-1">
-            This creates up to {Math.min(pending.folders + 1, 10)}{' '}
-            {Math.min(pending.folders + 1, 10) === 1 ? 'feed' : 'feeds'} in
-            your workspace.
+            {C.opmlCreatesUpTo(Math.min(pending.folders + 1, 10))}
           </p>
           <div className="flex items-center gap-4 mt-2">
             <button
@@ -264,14 +256,14 @@ function OpmlImportBlock() {
               disabled={busy}
               className="btn-text"
             >
-              Import
+              {C.OPML_IMPORT}
             </button>
             <button
               type="button"
               onClick={() => setPending(null)}
               className="btn-text-muted"
             >
-              Cancel
+              {C.OPML_CANCEL}
             </button>
           </div>
         </div>
@@ -287,30 +279,24 @@ function OpmlImportBlock() {
         )}
         {opmlImport.starting && (
           <p className="font-mono text-mono-xs text-grey-600">
-            READING FILE…
+            {C.OPML_READING}
           </p>
         )}
         {opmlImport.runs.map((run) => {
           const name =
-            opmlImport.feeds[run.feedId]?.name?.trim() || 'Imported feeds'
+            opmlImport.feeds[run.feedId]?.name?.trim() || C.OPML_DEFAULT_FEED_NAME
           const processed = run.imported + run.skipped + run.failed
           return (
             <p key={run.id} className="font-mono text-mono-xs text-grey-600">
-              &ldquo;{name}&rdquo; —{' '}
+              {C.opmlRunLead(name)}
               {run.status === 'failed' ? (
                 <span className="text-red-600">
-                  FAILED{run.error ? ` — ${run.error}` : ''}
+                  {C.opmlRunFailed(run.error)}
                 </span>
               ) : run.status === 'done' ? (
-                <>
-                  {run.imported} IMPORTED
-                  {run.skipped > 0 && ` · ${run.skipped} ALREADY PRESENT`}
-                  {run.failed > 0 && ` · ${run.failed} FAILED`}
-                </>
+                C.opmlRunDone(run.imported, run.skipped, run.failed)
               ) : (
-                <>
-                  IMPORTING {processed}/{run.total}…
-                </>
+                C.importProgress(processed, run.total)
               )}
             </p>
           )
@@ -318,17 +304,17 @@ function OpmlImportBlock() {
         {opmlImport.runs.length > 0 && (
           <p className="text-ui-xs text-grey-600 leading-relaxed">
             {allDone
-              ? 'Your imported feeds are in your workspace — retune, redistribute, or delete them like any feed.'
-              : 'Building your feeds in the workspace — you can keep working while they fill.'}
+              ? C.OPML_DONE
+              : C.OPML_RUNNING}
             {plan?.truncated &&
-              ` Imported the first ${plan.totalEntries} of ${plan.remoteTotal} feed URLs; re-import a smaller file for the rest.`}
+              C.opmlTruncated(plan.totalEntries, plan.remoteTotal)}
             {(plan?.foldedFolders ?? 0) > 0 &&
-              ` ${plan!.foldedFolders} extra folders were folded into the first feed.`}
+              C.opmlFolded(plan!.foldedFolders)}
             {(plan?.invalidEntries ?? 0) > 0 &&
-              ` ${plan!.invalidEntries} entries were skipped (not valid feed URLs).`}
+              C.opmlInvalid(plan!.invalidEntries)}
             {allDone &&
               anyFailedEntries &&
-              ' Failed entries were dead or unreachable feeds — everything else came through.'}
+              C.OPML_FAILED_ENTRIES}
           </p>
         )}
       </div>

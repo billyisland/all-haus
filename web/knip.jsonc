@@ -1,0 +1,29 @@
+{
+  // web/ is NOT a root workspace (it carries its own lockfile), so the root
+  // knip pass has no path into it; this is web's own, run from web/ in CI's
+  // `backend` job (CA-J1). Next's app-router entries come from knip's Next
+  // plugin; tests are entries, so an export a test uses is a used export.
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "entry": [
+    "scripts/**/*.ts",
+    "src/**/*.test.{ts,tsx}",
+    "tests/**/*.{ts,tsx}",
+    // The source of the hand-built public/traffology.js page script; nothing
+    // imports it (app/article/[dTag]/page.tsx loads the built file by URL).
+    "src/lib/traffology.ts"
+  ],
+  "project": ["src/**/*.{ts,tsx}", "scripts/**/*.ts", "tests/**/*.{ts,tsx}"],
+  "ignore": [
+    // PARKED, not dead (GLASSHOUSE-AND-PALETTE §III.5): the preset-theme
+    // picker is unmounted and kept, with the theme table only it reads.
+    "src/components/account/ThemeSection.tsx",
+    "src/lib/palette/themes.ts",
+    // PARKED with the trust graph's surface (root CLAUDE.md › Trust graph):
+    // the pip is a decorative dot and the panel is unmounted (CA-I2) until
+    // both are revived.
+    "src/components/workspace/PipTrigger.tsx",
+    "src/components/workspace/PipPanel.tsx"
+  ],
+  "ignoreBinaries": ["tsx"],
+  "ignoreExportsUsedInFile": true
+}

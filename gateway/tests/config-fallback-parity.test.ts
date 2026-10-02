@@ -6,7 +6,7 @@ import { diffAgainstDefaults } from "@platform-pub/shared/db/config-defaults-par
 //
 // Twin of feed-ingest/tests/config-fallback-parity.test.ts; see that file for
 // the full rationale. The gateway half matters for a specific reason: these
-// four dials drive the D6 read-time blend, whose entire design premise is that
+// dials drive the TOP criterion, whose entire design premise is that
 // it can be retuned by an UPDATE instead of a deploy (CLAUDE.md's
 // tuning-dials rule). A fallback that drifted from the seeded value would
 // quietly defeat that premise on any DB where the row went missing — the
@@ -25,6 +25,9 @@ vi.mock("../src/lib/platform-config.js", () => ({
 
 const { loadProofBlendParams } = await import("../src/lib/feed-rank.js");
 const { formulaMaxSources } = await import("../src/routes/feeds/formulas.js");
+const { rssStartIntervalSeconds } = await import("../src/routes/feeds/sources.js");
+const { pledgeMaxPence } = await import("../src/routes/drives.js");
+const { emailChangeExportHoldDays } = await import("../src/lib/email-change-hold.js");
 
 describe("feed-rank fallbacks vs config-defaults.sql", () => {
   beforeEach(() => {
@@ -36,16 +39,19 @@ describe("feed-rank fallbacks vs config-defaults.sql", () => {
     const bad = diffAgainstDefaults({
       feed_alpha_following: p.alphaFollowing,
       feed_alpha_explore: p.alphaExplore,
-      feed_gravity: p.gravity,
+      // feed_gravity is no longer read here — the age decay went with the
+      // feed-level ranking (migration 202). Its one remaining reader is
+      // feed-ingest's loadFeedWeights, and that is where its fallback is
+      // parity-tested now.
       feed_proof_floor: p.floor,
     });
     expect(bad).toEqual([]);
   });
 
   it("a seeded value wins over the fallback", async () => {
-    configMock.current = new Map([["feed_gravity", "2.25"]]);
+    configMock.current = new Map([["feed_proof_floor", "0.42"]]);
     const p = await loadProofBlendParams();
-    expect(p.gravity).toBe(2.25);
+    expect(p.floor).toBe(0.42);
   });
 });
 
@@ -111,6 +117,24 @@ describe("dead-job arrival window fallback vs config-defaults.sql", () => {
     expect(
       diffAgainstDefaults({
         dead_job_arrival_window_hours: DEAD_JOB_ARRIVAL_WINDOW_HOURS_FALLBACK,
+      }),
+    ).toEqual([]);
+  });
+});
+
+describe("linked-notification liveness fallbacks vs config-defaults.sql", () => {
+  it("the in-code fallbacks match the seeded defaults", async () => {
+    // The overview's threshold for calling a presence's notification poll
+    // DOWN (CROSS-NETWORK-ROUNDTRIP-ADR C4). Two dials with different values,
+    // so a crossed wire between them fails here rather than agreeing.
+    const {
+      LINKED_NOTIFICATIONS_POLL_SECONDS_FALLBACK,
+      LINKED_NOTIFICATIONS_STALE_INTERVALS_FALLBACK,
+    } = await import("../src/routes/admin-dashboard.js");
+    expect(
+      diffAgainstDefaults({
+        linked_notifications_poll_seconds: LINKED_NOTIFICATIONS_POLL_SECONDS_FALLBACK,
+        linked_notifications_stale_intervals: LINKED_NOTIFICATIONS_STALE_INTERVALS_FALLBACK,
       }),
     ).toEqual([]);
   });
@@ -203,6 +227,82 @@ describe("reading-log retention fallback vs config-defaults.sql", () => {
         diffAgainstDefaults({
           reading_log_retention_days: await readingLogRetentionDays(),
         }),
+      ).toEqual([]);
+    }
+  });
+});
+
+describe("pledge cap fallback vs config-defaults.sql", () => {
+  beforeEach(() => {
+    configMock.current = new Map();
+  });
+
+  it("the in-code fallback matches the seeded default", async () => {
+    expect(diffAgainstDefaults({ pledge_max_pence: await pledgeMaxPence() })).toEqual([]);
+  });
+
+  it("a seeded value wins over the fallback", async () => {
+    configMock.current = new Map([["pledge_max_pence", "2500"]]);
+    expect(await pledgeMaxPence()).toBe(2500);
+  });
+
+  it("falls back rather than trusting junk in the row", async () => {
+    // A NaN cap compares false against every amount, so the ceiling silently
+    // stops existing — which is the state this dial was added to end.
+    for (const junk of ["", "not-a-number", "0", "-5"]) {
+      configMock.current = new Map([["pledge_max_pence", junk]]);
+      expect(await pledgeMaxPence()).toBeGreaterThan(0);
+      expect(diffAgainstDefaults({ pledge_max_pence: await pledgeMaxPence() })).toEqual([]);
+    }
+  });
+});
+
+describe("a new RSS source's start interval vs config-defaults.sql (CA-F4)", () => {
+  beforeEach(() => {
+    configMock.current = new Map();
+  });
+
+  it("the in-code fallback matches the seeded default", async () => {
+    expect(
+      diffAgainstDefaults({ feed_ingest_rss_interval_seconds: await rssStartIntervalSeconds() }),
+    ).toEqual([]);
+  });
+
+  it("a seeded value wins over the fallback", async () => {
+    configMock.current = new Map([["feed_ingest_rss_interval_seconds", "900"]]);
+    expect(await rssStartIntervalSeconds()).toBe(900);
+  });
+
+  it("falls back on junk rather than storing it as an interval", async () => {
+    for (const junk of ["", "5 min", "0", "-60", "1.5"]) {
+      configMock.current = new Map([["feed_ingest_rss_interval_seconds", junk]]);
+      expect(await rssStartIntervalSeconds()).toBe(300);
+    }
+  });
+});
+
+describe("email-change export hold fallback vs config-defaults.sql", () => {
+  beforeEach(() => {
+    configMock.current = new Map();
+  });
+
+  it("the in-code fallback matches the seeded default, and a seeded value wins", async () => {
+    // The hold keeps the old address's undo ahead of a key export that cannot
+    // be taken back, so a drifted fallback would quietly shorten (or lengthen)
+    // the one window that protection lives in, on exactly the DB missing the row.
+    expect(diffAgainstDefaults({ email_change_export_hold_days: await emailChangeExportHoldDays() }))
+      .toEqual([]);
+    configMock.current = new Map([["email_change_export_hold_days", "3"]]);
+    expect(await emailChangeExportHoldDays()).toBe(3);
+    configMock.current = new Map([["email_change_export_hold_days", "0"]]);
+    expect(await emailChangeExportHoldDays()).toBe(0);
+  });
+
+  it("falls back rather than trusting junk in the row", async () => {
+    for (const junk of ["", "seven", "-1", "2.5"]) {
+      configMock.current = new Map([["email_change_export_hold_days", junk]]);
+      expect(
+        diffAgainstDefaults({ email_change_export_hold_days: await emailChangeExportHoldDays() }),
       ).toEqual([]);
     }
   });

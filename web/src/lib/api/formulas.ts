@@ -195,11 +195,3 @@ export function formulasAvailable(): Promise<boolean> {
   }
   return availability
 }
-
-/** Drop the cached verdict. The answer is a property of the SERVER flag and not
- *  of the viewer, so this deliberately does NOT hang off logout the way
- *  `useFollows` does — it exists for an operator flipping the flag under a live
- *  tab in dev. */
-export function resetFormulaAvailability() {
-  availability = null
-}

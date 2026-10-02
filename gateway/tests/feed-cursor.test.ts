@@ -118,32 +118,30 @@ describe("explore feed cursor codec — epoch precision (M13)", () => {
     expect(decodeFeedCursor(wire)).toEqual(c); // …and survives the trip back
   });
 
-  it("the scored cursor still round-trips", () => {
-    const c = { kind: "scored" as const, score: 1.5, id: UUID };
-    expect(decodeFeedCursor(encodeFeedCursor(c))).toEqual(c);
-  });
-
-  it("the scored cursor round-trips a fractional asOf (§0i.2 pinned-age keyset)", () => {
-    // asOf is what pins the D6 blend's age term across pages; losing its
-    // fraction shifts every page-2 score and un-pins the keyset.
-    const c = { kind: "scored" as const, score: 1.5, id: UUID, asOf: FRACTIONAL };
+  it("the composed-feed cursor round-trips a FRACTIONAL epoch", () => {
+    // The feed is a timeline (migration 202), so this is a descending keyset on
+    // (published_at, id) — the direction where a truncated epoch loses rows into
+    // a gap between pages that nothing ever revisits. The fraction has to reach
+    // the wire and come back.
+    const c = { kind: "ts" as const, ts: FRACTIONAL, id: UUID };
     const wire = encodeFeedCursor(c);
     expect(wire).toContain(String(FRACTIONAL));
     expect(decodeFeedCursor(wire)).toEqual(c);
   });
 
-  it("a 3-part scored cursor (pre-asOf, in-flight at deploy) still decodes", () => {
-    expect(decodeFeedCursor(`scored:1.5:${UUID}`)).toEqual({
-      kind: "scored",
-      score: 1.5,
-      id: UUID,
-    });
+  it("rejects an empty or non-finite composed-feed epoch", () => {
+    expect(decodeFeedCursor(`ts::${UUID}`)).toBeUndefined();
+    expect(decodeFeedCursor(`ts:Infinity:${UUID}`)).toBeUndefined();
+    expect(decodeFeedCursor(`ts:abc:${UUID}`)).toBeUndefined();
+    expect(decodeFeedCursor(`ts:1.5:not-a-uuid`)).toBeUndefined();
   });
 
-  it("rejects an empty or non-finite scored asOf", () => {
-    expect(decodeFeedCursor(`scored:1.5:${UUID}:`)).toBeUndefined();
-    expect(decodeFeedCursor(`scored:1.5:${UUID}:Infinity`)).toBeUndefined();
-    expect(decodeFeedCursor(`scored:1.5:${UUID}:abc`)).toBeUndefined();
+  it("a `scored:` cursor held across the deploy restarts rather than mis-paging", () => {
+    // The old wire shape ranked on a score this query no longer computes, so
+    // honouring it would page an order that does not exist. Decoding to
+    // undefined is the documented degradation: one clean restart from page 1.
+    expect(decodeFeedCursor(`scored:1.5:${UUID}`)).toBeUndefined();
+    expect(decodeFeedCursor(`scored:1.5:${UUID}:${FRACTIONAL}`)).toBeUndefined();
   });
 
   it("a foreign/untagged shape decodes to undefined (clean restart)", () => {

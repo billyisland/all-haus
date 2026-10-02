@@ -138,31 +138,6 @@ export function EmptyState() {
   )
 }
 
-/**
- * An outage is NOT an empty publication.
- *
- * The public pub fetchers used to answer any non-ok response with an empty
- * list, so a gateway 500 painted "NO ARTICLES PUBLISHED YET" over a publication
- * with a full archive — and, being an ordinary render, it cached for the
- * revalidate window. A visitor was told, with total confidence, the opposite of
- * the truth: that this writer had published nothing. The failure has to say it
- * is a failure, and it has to say the thing the visitor can act on, which is
- * that trying again is worth it.
- *
- * `notFound()` is not the alternative — a 404 makes the same false claim in a
- * stronger form, that the publication does not exist.
- */
-export function LoadFailed({ what = 'this page' }: { what?: string }) {
-  return (
-    <div className="py-16 text-center">
-      <p className="label-ui text-grey-600">COULDN&rsquo;T LOAD</p>
-      <p className="font-sans text-ui-sm text-grey-600 mt-3">
-        Something went wrong at our end while loading {what}. Nothing is missing — please try
-        again in a moment.
-      </p>
-    </div>
-  )
-}
 
 /**
  * The shared link wrapper, and the seam that lets ONE set of templates serve

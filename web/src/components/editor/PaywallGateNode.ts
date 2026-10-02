@@ -1,4 +1,5 @@
 import { Node, mergeAttributes } from "@tiptap/core";
+import { PAYWALL_GATE_MARKER } from "../../lib/gate-marker";
 
 // =============================================================================
 // PaywallGateNode — TipTap Extension
@@ -30,7 +31,12 @@ declare module "@tiptap/core" {
   }
 }
 
-export const PAYWALL_GATE_MARKER = "<!-- paywall-gate -->";
+// The marker string lives in `lib/gate-marker.ts`, beside the one function
+// that splits at it, so a server route can split a draft without loading the
+// editor; it is re-exported here for the editor code that imports it from the
+// node. This node is still the pair's other end: its renderer and parse rules
+// below are what write and read the marker.
+export { PAYWALL_GATE_MARKER };
 
 export const PaywallGateNode = Node.create({
   name: "paywallGate",
@@ -66,12 +72,21 @@ export const PaywallGateNode = Node.create({
     return {
       markdown: {
         serialize(state: any) {
-          state.write("<!-- paywall-gate -->\n\n");
+          state.write(PAYWALL_GATE_MARKER + "\n\n");
         },
         parse: {
           setup(markdownit: any) {
+            // Two arms, because the marker arrives as a DIFFERENT token
+            // depending on `Markdown.configure({ html })`, and the editor ships
+            // `html: false`. Under `html: true` markdown-it emits an
+            // `html_block`; under `html: false` its html_block rule returns
+            // immediately and the marker lands as an ordinary paragraph. The
+            // D334 fix (2026-05-16) handled only the first, against a parser
+            // that cannot emit one — so the gate was silently lost on every
+            // edit of a paywalled article, and the piece republished free.
+            // Keep both arms so the rule cannot die again if `html` is flipped.
             markdownit.core.ruler.after(
-              "block",
+              "inline",
               "paywall_gate",
               (state: any) => {
                 const tokens = state.tokens;
@@ -79,14 +94,32 @@ export const PaywallGateNode = Node.create({
                   const token = tokens[i];
                   if (
                     token.type === "html_block" &&
-                    token.content.trim() === "<!-- paywall-gate -->"
+                    token.content.trim() === PAYWALL_GATE_MARKER
                   ) {
-                    token.type = "paywallGate";
+                    token.type = "paywall_gate";
                     token.content = "";
+                    token.block = true;
+                    continue;
                   }
+                  if (token.type !== "paragraph_open") continue;
+                  const inline = tokens[i + 1];
+                  if (!inline || inline.type !== "inline") continue;
+                  const close = tokens[i + 2];
+                  if (!close || close.type !== "paragraph_close") continue;
+                  if (inline.content.trim() !== PAYWALL_GATE_MARKER) continue;
+                  const gate = new state.Token("paywall_gate", "", 0);
+                  gate.block = true;
+                  tokens.splice(i, 3, gate);
                 }
               },
             );
+            // The half the D334 fix never had. tiptap-markdown does not hand
+            // the editor the token stream — it calls `md.render()` and
+            // DOM-parses the HTML. A token with no renderer rule falls to
+            // `renderToken`, which builds its tag from `token.tag` (empty
+            // here), so the gate renders as `<>` and `parseHTML` never matches.
+            markdownit.renderer.rules.paywall_gate = () =>
+              '<div data-paywall-gate=""></div>';
           },
         },
       },

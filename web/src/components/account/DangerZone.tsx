@@ -1,10 +1,21 @@
 'use client'
 
-import React, { useState } from 'react'
+import React, { useRef, useState } from 'react'
 import { auth } from '../../lib/api'
+import { apiErrorMessage } from '../../lib/api/client'
 import { useAuth } from '../../stores/auth'
 import { useRouter } from 'next/navigation'
 import { SettingsSection } from './SettingsSection'
+import { ConfirmDialog, useConfirm } from '../ui/ConfirmDialog'
+import {
+  DANGER_HEADING,
+  DEACTIVATE_LABEL, DEACTIVATE_HELP, DEACTIVATE_BUTTON,
+  DEACTIVATE_CONFIRM_TITLE, DEACTIVATE_CONFIRM_BODY, DEACTIVATE_CONFIRM_LABEL, DEACTIVATE_FAILED,
+  DELETE_LABEL, DELETE_HELP, DELETE_BUTTON, DELETE_CONFIRM_TITLE, DELETE_CONFIRM_LABEL,
+  DELETE_CONSEQUENCES_INTRO, DELETE_CONSEQUENCES,
+  DELETE_EARNINGS_BEFORE, DELETE_EARNINGS_EMPHASIS, DELETE_EARNINGS_AFTER,
+  DELETE_EMAIL_CONFIRM_LABEL, DELETE_FAILED,
+} from '../../content/settings'
 
 export function DangerZone() {
   const { user, logout } = useAuth()
@@ -14,29 +25,42 @@ export function DangerZone() {
   const [emailInput, setEmailInput] = useState('')
   const [deleting, setDeleting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
+  const deleteRef = useRef<HTMLButtonElement>(null)
+  const { ask, dialog } = useConfirm()
 
   if (!user) return null
 
-  async function handleDeactivate() {
-    if (!confirm('Deactivate your account? Your content will be hidden until you log back in.')) return
+  async function handleDeactivate(e: React.MouseEvent<HTMLElement>) {
+    const ok = await ask(e.currentTarget, {
+      title: DEACTIVATE_CONFIRM_TITLE,
+      body: DEACTIVATE_CONFIRM_BODY,
+      confirmLabel: DEACTIVATE_CONFIRM_LABEL,
+    })
+    if (!ok) return
+    setError(null)
     try {
       await auth.deactivate()
       await logout()
       router.push('/')
     } catch (err: any) {
-      setError(err.message ?? 'Deactivation failed')
+      setError(apiErrorMessage(err) ?? DEACTIVATE_FAILED)
     }
   }
 
   async function handleDelete() {
     setDeleting(true)
-    setError(null)
+    setDeleteError(null)
     try {
       await auth.deleteAccount(emailInput)
       await logout()
       router.push('/')
     } catch (err: any) {
-      setError(err.message ?? 'Deletion failed')
+      // The two money refusals (a declined final charge, a settlement still in
+      // flight) each send a sentence naming what to do about it. `err.message`
+      // is the ApiError's own "API error 402: {…}" and would show the reader a
+      // JSON blob at the one moment they most need a plain instruction.
+      setDeleteError(apiErrorMessage(err) ?? DELETE_FAILED)
       setDeleting(false)
     }
   }
@@ -49,85 +73,79 @@ export function DangerZone() {
 
       <section>
         <h2 className="font-sans text-base font-medium text-crimson tracking-tight mb-5">
-          Close your account
+          {DANGER_HEADING}
         </h2>
 
         <div className="space-y-6">
-          <SettingsSection label="Deactivate">
+          <SettingsSection label={DEACTIVATE_LABEL}>
             <p className="text-ui-xs text-grey-600 mb-4 leading-relaxed">
-              Your profile and content will be hidden. You can reactivate by logging back in.
+              {DEACTIVATE_HELP}
             </p>
             <button onClick={handleDeactivate} className="btn-soft py-2 px-4 text-sm">
-              Deactivate account
+              {DEACTIVATE_BUTTON}
             </button>
           </SettingsSection>
 
-          <SettingsSection label="Delete permanently">
+          <SettingsSection label={DELETE_LABEL}>
             <p className="text-ui-xs text-grey-600 mb-4 leading-relaxed">
-              Your content will be removed and your account data erased. This cannot be undone.
+              {DELETE_HELP}
             </p>
             <button
+              ref={deleteRef}
               onClick={() => setShowDeleteModal(true)}
               className="btn py-2 px-4 text-sm"
               style={{ backgroundColor: 'var(--ah-danger-red)', borderColor: 'var(--ah-danger-red)' }}
             >
-              Delete account
+              {DELETE_BUTTON}
             </button>
           </SettingsSection>
         </div>
 
-        {error && <p className="text-sm text-red-600 mt-4">{error}</p>}
+        {error && <p className="text-ui-xs text-crimson mt-4">{error}</p>}
       </section>
 
-      {/* Delete confirmation modal */}
-      {showDeleteModal && (
-        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-white max-w-md w-full px-8 py-8">
-            <h2 className="font-serif text-xl text-black mb-4">Delete your account?</h2>
+      {dialog}
 
-            <p className="text-sm text-black mb-3">This will:</p>
-            <ul className="text-sm text-grey-600 space-y-1 mb-4 list-disc pl-5">
-              <li>Cancel all active subscriptions</li>
-              <li>Settle your reading tab</li>
-              <li>Remove all published articles</li>
-              <li>Publish Nostr deletion events</li>
-            </ul>
-            <p className="text-ui-xs text-grey-600 mb-6">
-              Any outstanding earnings will be paid out to your connected Stripe account.
-            </p>
-
-            <label className="label-ui text-grey-600 block mb-2">
-              Enter your email to confirm:
-            </label>
-            <input
-              type="email"
-              value={emailInput}
-              onChange={e => setEmailInput(e.target.value)}
-              placeholder={user.email}
-              className="w-full bg-glasshouse-well px-4 py-2.5 text-sm text-black placeholder-grey-300 focus:outline-none mb-4"
-            />
-
-            {error && <p className="text-ui-xs text-red-600 mb-4">{error}</p>}
-
-            <div className="flex items-center justify-between">
-              <button
-                onClick={() => { setShowDeleteModal(false); setEmailInput(''); setError(null) }}
-                className="btn-soft py-2 px-4 text-sm"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleDelete}
-                disabled={!emailMatch || deleting}
-                className="btn py-2 px-4 text-sm disabled:opacity-50"
-                style={{ backgroundColor: 'var(--ah-danger-red)', borderColor: 'var(--ah-danger-red)' }}
-              >
-                {deleting ? 'Deleting…' : 'Delete my account'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <ConfirmDialog
+        anchorRef={deleteRef}
+        open={showDeleteModal}
+        title={DELETE_CONFIRM_TITLE}
+        confirmLabel={DELETE_CONFIRM_LABEL}
+        busy={deleting}
+        confirmDisabled={!emailMatch}
+        error={deleteError}
+        width={380}
+        onConfirm={handleDelete}
+        onCancel={() => { setShowDeleteModal(false); setEmailInput(''); setDeleteError(null) }}
+      >
+        {/* THIS LIST IS A PROMISE AND MUST MATCH THE ROUTE, and the route
+            moved: POST /auth/delete-account now takes the final payment for
+            an outstanding reading tab before it deletes anything (Reader
+            Terms 12.1), and refuses the deletion if that charge cannot be
+            completed. So the first line is a charge the reader is about to
+            authorise and belongs at the top, where a charge belongs.
+            EARNINGS ARE STILL NOT PAID OUT — Writer Agreement 9.4/13.3 hold
+            them — so that half of the old warning stands, on its own, where
+            it is true. If either half of the route moves again, this list
+            moves with it. */}
+        <p className="text-black">{DELETE_CONSEQUENCES_INTRO}</p>
+        <ul className="space-y-1 list-disc pl-5">
+          {DELETE_CONSEQUENCES.map(item => <li key={item}>{item}</li>)}
+        </ul>
+        <p>
+          {DELETE_EARNINGS_BEFORE}<strong className="text-black">{DELETE_EARNINGS_EMPHASIS}</strong>{DELETE_EARNINGS_AFTER}
+        </p>
+        <label className="label-ui text-grey-600 block pt-1">
+          {DELETE_EMAIL_CONFIRM_LABEL}
+          <input
+            type="email"
+            value={emailInput}
+            onChange={e => setEmailInput(e.target.value)}
+            placeholder={user.email}
+            className="mt-2 w-full bg-glasshouse-well px-3 py-2 text-ui-sm normal-case tracking-normal font-sans text-black placeholder-grey-300 focus:outline-none"
+          />
+        </label>
+      </ConfirmDialog>
     </>
   )
 }

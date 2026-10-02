@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { isExternalHref, externalizeHtml } from "./external-links";
+import {
+  isExternalHref,
+  externalizeHtml,
+  safeHttpUrl,
+} from "./external-links";
 
 describe("isExternalHref", () => {
   it("treats http(s) links to other hosts as external", () => {
@@ -93,5 +97,52 @@ describe("externalizeHtml", () => {
     const out = externalizeHtml('<a title="a > b" href="https://example.com">x</a>');
     expect(out).toContain('target="_blank"');
     expect(out).toContain('title="a > b"');
+  });
+});
+
+// The gate between ingested data and an `href`. React 18 renders a
+// `javascript:` href (it only warns that a future version will block it), so
+// nothing downstream of this catches a miss.
+describe("safeHttpUrl", () => {
+  it.each([
+    ["an https URL", "https://example.com/x?a=1#b"],
+    ["an http URL", "http://example.com"],
+  ])("returns %s unchanged", (_label, url) => {
+    expect(safeHttpUrl(url)).toBe(url);
+  });
+
+  it("trims before deciding, and returns the trimmed value", () => {
+    expect(safeHttpUrl("  https://example.com  ")).toBe("https://example.com");
+    // Leading whitespace is how a scheme gets past a naive startsWith check.
+    expect(safeHttpUrl("  javascript:alert(1)")).toBeUndefined();
+  });
+
+  it.each([
+    ["javascript:", "javascript:alert(1)"],
+    ["javascript: with mixed case and a tab", "jAvAsCrIpT:\talert(1)"],
+    ["data:", "data:text/html;base64,PHNjcmlwdD4="],
+    ["vbscript:", "vbscript:msgbox(1)"],
+    ["a bare word", "not a url"],
+    ["a relative path", "/source/abc"],
+    ["a hash", "#top"],
+    ["a protocol-relative URL", "//example.com/x"],
+    ["the empty string", ""],
+    ["whitespace only", "   "],
+  ])("refuses %s", (_label, url) => {
+    expect(safeHttpUrl(url)).toBeUndefined();
+  });
+
+  it.each([
+    ["null", null],
+    ["undefined", undefined],
+  ])("refuses %s", (_label, url) => {
+    expect(safeHttpUrl(url)).toBeUndefined();
+  });
+
+  // `undefined`, never "#": React omits the attribute entirely, so the element
+  // stops being a link rather than becoming one that silently does nothing.
+  it("returns undefined rather than a placeholder href", () => {
+    expect(safeHttpUrl("javascript:alert(1)")).not.toBe("#");
+    expect(safeHttpUrl("javascript:alert(1)")).toBeUndefined();
   });
 });

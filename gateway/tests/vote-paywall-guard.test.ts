@@ -100,19 +100,11 @@ function scriptedQuery(sql: string, params: unknown[] = []) {
     return Promise.resolve({ rows: [], rowCount: 0 });
   }
 
-  if (sql.includes("pg_advisory_xact_lock")) {
-    return Promise.resolve({ rows: [], rowCount: 0 });
-  }
-  if (sql.includes("SELECT COUNT(*) AS count FROM votes")) {
-    return Promise.resolve({ rows: [{ count: "0" }], rowCount: 1 });
-  }
   if (sql.includes("INSERT INTO votes")) {
     return Promise.resolve({ rows: [{ id: "vote-1" }], rowCount: 1 });
   }
-  if (sql.includes("INSERT INTO vote_tallies")) {
-    return Promise.resolve({ rows: [], rowCount: 1 });
-  }
-  if (sql.includes("FROM vote_tallies")) {
+  // The upsert RETURNs the tally; the capped arm SELECTs it.
+  if (sql.includes("INSERT INTO vote_tallies") || sql.includes("FROM vote_tallies")) {
     return Promise.resolve({
       rows: [{ upvote_count: 1, downvote_count: 0, net_score: 1 }],
       rowCount: 1,
@@ -262,6 +254,58 @@ describe("POST /votes — the paywall guard on a COMMENT target (kind 1111)", ()
     );
     expect(target).toBeDefined();
     expect(target!.sql).toContain("target_event_id");
+    await app.close();
+  });
+});
+
+describe("POST /votes — the declared kind cannot choose the table (§2.7)", () => {
+  it("guards a paywalled article even when the request calls it a note", async () => {
+    // The squat: mint a note under the article's event id (POST /notes takes
+    // the id from the client), then declare kind 1. The old branch searched
+    // `notes`, left `article` null, and neither arm of the guard ran — while
+    // the vote still tallied against the article's event id.
+    const app = await build();
+    const res = await vote(app, PAYWALLED_EVENT, 1);
+
+    expect(res.statusCode).toBe(403);
+    expect(accessCalls).toHaveLength(1);
+    expect(accessCalls[0]).toEqual([VOTER, PAYWALLED_ARTICLE, WRITER, null]);
+    expect(ran("INSERT INTO votes")).toBe(false);
+    await app.close();
+  });
+
+  it("finds a comment when the request calls it a note — the honest mismatch", async () => {
+    // Not an attack: `commentToPost` projects a native reply as a Post of
+    // `type: "note"`, so PostActions declares kind 1 for it. The old branch
+    // searched `notes`, found nothing, and 404'd every such vote.
+    lockedRoots = new Set([PAYWALLED_EVENT]);
+    const app = await build();
+    const res = await vote(app, LOCKED_COMMENT_EVENT, 1);
+
+    // Found — and guarded as the comment it is, not waved through as a note.
+    expect(res.statusCode).toBe(403);
+    expect(lockedRootCalls).toEqual([[VOTER, [PAYWALLED_EVENT]]]);
+    await app.close();
+  });
+
+  it("searches the squattable table LAST", async () => {
+    const app = await build();
+    await vote(app, PAYWALLED_EVENT, 1);
+
+    // Order is the whole defence: `notes` is the one table whose event id is
+    // attacker-chosen, so a squat must only ever be able to lose.
+    const tables = calls
+      .filter((c) => c.sql.includes("WHERE nostr_event_id"))
+      .map((c) =>
+        c.sql.includes("FROM articles")
+          ? "articles"
+          : c.sql.includes("FROM comments")
+            ? "comments"
+            : "notes",
+      );
+    expect(tables[0]).toBe("articles");
+    // And it stopped there — a resolved article never reaches `notes` at all.
+    expect(tables).not.toContain("notes");
     await app.close();
   });
 });

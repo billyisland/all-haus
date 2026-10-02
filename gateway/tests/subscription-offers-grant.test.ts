@@ -25,7 +25,14 @@ import Fastify from 'fastify'
 
 const mockPoolQuery = vi.fn()
 vi.mock('@platform-pub/shared/db/client.js', () => ({
-  pool: { query: (...args: unknown[]) => mockPoolQuery(...args) },
+  pool: {
+    query: (...args: unknown[]) =>
+      // The writer gate's read (lib/writer-gate.ts): the offer's author is a
+      // writer. Its reader cases live in writer-gate.test.ts.
+      String(args[0]).includes('AS can_write')
+        ? Promise.resolve({ rows: [{ can_write: true }], rowCount: 1 })
+        : mockPoolQuery(...args),
+  },
 }))
 
 vi.mock('@platform-pub/shared/lib/logger.js', () => ({

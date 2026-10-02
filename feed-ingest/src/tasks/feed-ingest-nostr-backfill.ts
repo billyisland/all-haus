@@ -1,6 +1,7 @@
 import type { Task } from "graphile-worker";
 import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
 import logger from "@platform-pub/shared/lib/logger.js";
+import { isSourceBlocked } from "@platform-pub/shared/lib/platform-blocks.js";
 import {
   pinnedWebSocketOptions,
   type PinnedWebSocketOptions,
@@ -221,6 +222,15 @@ export async function completeBackfillSource(
 
 export const feedIngestNostrBackfill: Task = async (payload, _helpers) => {
   const { sourceId } = payload as { sourceId: string };
+  // THE OPERATOR'S REFUSAL (L6.5, D7 §7). Checked per fetch rather than only at
+  // the poll selector, because a job can be enqueued from several places (the
+  // poll, a re-add, a backfill) and the guard has to sit where the work
+  // actually happens. One indexed lookup against an HTTP fetch we are about to
+  // spend.
+  if (await isSourceBlocked(sourceId)) {
+    logger.info({ sourceId }, "Source is blocked platform-wide — skipping fetch");
+    return;
+  }
 
   const {
     rows: [source],

@@ -1,10 +1,21 @@
 import logger from '../lib/logger.js'
 import { notePostmarkResponse, trackSend } from './email-health.js'
+import { requireEnv } from './env.js'
+import { renderEmail } from './email/layout.js'
+import {
+  keyExportNoticeEmail,
+  keyExportStepUpEmail,
+  magicLinkEmail,
+} from './email/templates/auth.js'
+import { waitlistInviteEmail, writerAccessGrantedEmail } from './email/templates/waitlist.js'
 
 // =============================================================================
 // Email Service
 //
-// Sends transactional emails. At launch, the only email is the magic link.
+// The TRANSPORT: sends transactional and broadcast email. What an email SAYS
+// and how it LOOKS is `./email/` — a template per family under
+// `./email/templates/`, one layout in `./email/layout.ts`. Nothing here or in
+// any caller writes an email's markup by hand.
 //
 // Provider selection via EMAIL_PROVIDER env var:
 //   - 'postmark'  → Postmark API (recommended for transactional)
@@ -29,10 +40,51 @@ interface EmailParams {
   subject: string
   textBody: string
   htmlBody: string
+  /** From `renderEmail` — `List-Unsubscribe` and its one-click partner. */
+  headers?: Record<string, string>
+}
+
+function postmarkHeaders(params: EmailParams): { Headers?: Array<{ Name: string; Value: string }> } {
+  if (!params.headers) return {}
+  return { Headers: Object.entries(params.headers).map(([Name, Value]) => ({ Name, Value })) }
+}
+
+// UNSET AND EXPLICITLY `console` ARE DIFFERENT FACTS, and only the first is a
+// deployment that never chose anything. `console` sends nothing and prints the
+// magic link, so a production process that reached this default has every
+// login link going to a log file — the outage `email-health.ts` exists to make
+// visible, arriving before a single send has been attempted. It is a WARN and
+// not a throw for that module's own reason: email dying must not take reading
+// and auth down with it. Once, because it is a fact about the process.
+let warnedProviderUnset = false
+function resolveProvider(): string {
+  const configured = process.env.EMAIL_PROVIDER
+  if (!configured && !warnedProviderUnset) {
+    warnedProviderUnset = true
+    logger.warn(
+      { provider: 'console' },
+      'EMAIL_PROVIDER is not set, so nothing is being emailed: every magic link, receipt and notification is being written to this log instead. Expected in dev; in production set EMAIL_PROVIDER and the matching API key.',
+    )
+  }
+  return configured ?? 'console'
+}
+
+/**
+ * Can a send here reach anybody? `console` resolves normally and delivers
+ * nothing, so a caller that stamps a record on "the send did not throw" is
+ * recording a delivery that did not happen. Most sends do not care — a lost
+ * receipt is a lesser harm than a blocked read — but a notice that is the
+ * PRECONDITION of something being taken away (the unpayable withdrawal, Writer
+ * 9.3) must ask this before it counts itself sent (§0z item 7). A provider
+ * whose credential is missing still answers true here: its send THROWS, which
+ * the caller already treats as not sent.
+ */
+export function emailDeliverable(): boolean {
+  return resolveProvider() !== 'console'
 }
 
 export async function sendEmail(params: EmailParams): Promise<void> {
-  const provider = process.env.EMAIL_PROVIDER ?? 'console'
+  const provider = resolveProvider()
 
   return trackSend(() => {
     switch (provider) {
@@ -48,7 +100,7 @@ export async function sendEmail(params: EmailParams): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Magic link email — the specific email template
+// Magic link — the one email every member depends on
 // ---------------------------------------------------------------------------
 
 /**
@@ -57,52 +109,75 @@ export async function sendEmail(params: EmailParams): Promise<void> {
  * article's IDENTIFIER, never a path or a URL: `/auth/verify` reconstructs
  * `/article/<dTag>` from it rather than navigating to a string it was handed,
  * which is what keeps an emailed value out of the classic open-redirect shape.
+ *
+ * `surface` says WHICH verify page the link opens, for the same reason: it is
+ * a closed identifier, never a path. `'modernhaus'` is the no-script register
+ * (MODERNHAUS-ADR §D1.8.1), whose verify page renders a button rather than
+ * spending the token on a page load.
  */
+export type MagicLinkSurface = 'modernhaus'
+
+export function magicLinkUrl(
+  appUrl: string,
+  token: string,
+  arrivalDTag: string | null,
+  surface: MagicLinkSurface | null,
+): string {
+  const verifyPath = surface === 'modernhaus' ? '/modernhaus/auth/verify' : '/auth/verify'
+  return (
+    `${appUrl}${verifyPath}?token=${encodeURIComponent(token)}` +
+    (arrivalDTag ? `&arrival=${encodeURIComponent(arrivalDTag)}` : '')
+  )
+}
+
 export async function sendMagicLinkEmail(
   to: string,
   token: string,
   expiresAt: Date,
-  arrivalDTag: string | null = null
+  arrivalDTag: string | null = null,
+  surface: MagicLinkSurface | null = null
 ): Promise<void> {
-  const appUrl = process.env.APP_URL ?? 'http://localhost:3000'
-  const verifyUrl =
-    `${appUrl}/auth/verify?token=${encodeURIComponent(token)}` +
-    (arrivalDTag ? `&arrival=${encodeURIComponent(arrivalDTag)}` : '')
+  const verifyUrl = magicLinkUrl(requireEnv('APP_URL'), token, arrivalDTag, surface)
   const expiresInMinutes = Math.round((expiresAt.getTime() - Date.now()) / 60000)
 
-  await sendEmail({
-    to,
-    subject: 'Your all.haus login link',
-    textBody: [
-      'Click this link to log in to all.haus:',
-      '',
-      verifyUrl,
-      '',
-      `This link expires in ${expiresInMinutes} minutes.`,
-      '',
-      'If you didn\'t request this, you can ignore this email.',
-    ].join('\n'),
-    htmlBody: `
-      <div style="font-family: -apple-system, system-ui, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px 0;">
-        <h2 style="font-size: 20px; font-weight: 600; color: #1c1917; margin-bottom: 16px;">
-          Log in to all.haus
-        </h2>
-        <p style="font-size: 15px; color: #57534e; line-height: 1.6; margin-bottom: 24px;">
-          Click the button below to log in. This link expires in ${expiresInMinutes} minutes.
-        </p>
-        <a href="${verifyUrl}"
-           style="display: inline-block; background: #1c1917; color: #ffffff; font-size: 14px; font-weight: 500; padding: 12px 28px; border-radius: 6px; text-decoration: none;">
-          Log in
-        </a>
-        <p style="font-size: 13px; color: #a8a29e; margin-top: 32px; line-height: 1.5;">
-          If you didn't request this email, you can safely ignore it.
-        </p>
-        <p style="font-size: 12px; color: #d6d3d1; margin-top: 24px;">
-          all.haus — writing worth reading
-        </p>
-      </div>
-    `.trim(),
-  })
+  await sendEmail({ to, ...renderEmail(magicLinkEmail({ verifyUrl, expiresInMinutes })) })
+}
+
+// ---------------------------------------------------------------------------
+// Key export — the step-up, and the notice (MIRROR-AUDIT §2.6)
+//
+// Two emails, and the second is the one that matters most. The export ships the
+// account's root Nostr secret key, which IS the identity and cannot be rotated,
+// so a session compromise was a permanent one and nothing anywhere recorded
+// that it had happened.
+//
+// The step-up is a CONFIRMATION, never a refusal: the export is mandated by the
+// custodial-identity rule, so nothing here may become a way to withhold a
+// member's own key from them. The notice is unconditional and goes out on the
+// EXPORT, not on the request — an attacker holding the session may well hold
+// the inbox too, but the notice is what turns a silent theft into a dated event
+// the member can point at.
+// ---------------------------------------------------------------------------
+
+export async function sendKeyExportStepUpEmail(
+  to: string,
+  token: string,
+  expiresAt: Date
+): Promise<void> {
+  const appUrl = requireEnv('APP_URL')
+  // Same rule as the magic link: the email carries an IDENTIFIER and the page
+  // builds the path, never a URL handed over for the browser to follow.
+  const confirmUrl = `${appUrl}/account/export?token=${encodeURIComponent(token)}`
+  const expiresInMinutes = Math.round((expiresAt.getTime() - Date.now()) / 60000)
+
+  await sendEmail({ to, ...renderEmail(keyExportStepUpEmail({ confirmUrl, expiresInMinutes })) })
+}
+
+export async function sendKeyExportNoticeEmail(
+  to: string,
+  exportedAt: Date
+): Promise<void> {
+  await sendEmail({ to, ...renderEmail(keyExportNoticeEmail({ exportedAt })) })
 }
 
 // ---------------------------------------------------------------------------
@@ -132,57 +207,16 @@ export async function sendMagicLinkEmail(
 // ---------------------------------------------------------------------------
 
 export async function sendWaitlistInviteEmail(to: string): Promise<void> {
-  const appUrl = process.env.APP_URL ?? 'http://localhost:3000'
+  const appUrl = requireEnv('APP_URL')
   const loginUrl = `${appUrl}/auth`
 
-  await sendEmail({
-    to,
-    // The page promises "we'll write when we're ready for you", so this is the
-    // sentence that keeps it. Changed together on 2026-07-27 — if the page's
-    // wording moves again, move this with it: a promise and its fulfilment
-    // reading differently is how a real message starts to sound like a template.
-    subject: "We're ready for you on all.haus",
-    textBody: [
-      "You asked to be told when we were ready for you on all.haus. We are.",
-      '',
-      `Your account is ready. Log in at ${loginUrl} with this address (${to})`,
-      'and we will email you a link to get in — no password to remember.',
-      '',
-      'all.haus is a place to read and write without an algorithm deciding what',
-      'you see. You build your own feeds, from here and from anywhere else you',
-      'already read.',
-      '',
-      "We're still small and still fixing things. If something is broken or",
-      'wrong, reply to this email — it reaches a person.',
-    ].join('\n'),
-    htmlBody: `
-      <div style="font-family: -apple-system, system-ui, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px 0;">
-        <h2 style="font-size: 20px; font-weight: 600; color: #1c1917; margin-bottom: 16px;">
-          We're ready for you on all.haus
-        </h2>
-        <p style="font-size: 15px; color: #57534e; line-height: 1.6; margin-bottom: 24px;">
-          You asked to be told when we were ready for you. We are — your account is
-          ready. Log in with this address (<strong>${to}</strong>) and we'll email you a link
-          to get in. There's no password to remember.
-        </p>
-        <a href="${loginUrl}"
-           style="display: inline-block; background: #1c1917; color: #ffffff; font-size: 14px; font-weight: 500; padding: 12px 28px; border-radius: 6px; text-decoration: none;">
-          Log in
-        </a>
-        <p style="font-size: 15px; color: #57534e; line-height: 1.6; margin-top: 32px;">
-          all.haus is a place to read and write without an algorithm deciding what you
-          see. You build your own feeds, from here and from anywhere else you already read.
-        </p>
-        <p style="font-size: 13px; color: #a8a29e; margin-top: 32px; line-height: 1.5;">
-          We're still small and still fixing things. If something is broken or wrong,
-          reply to this email — it reaches a person.
-        </p>
-        <p style="font-size: 12px; color: #d6d3d1; margin-top: 24px;">
-          all.haus — writing worth reading
-        </p>
-      </div>
-    `.trim(),
-  })
+  await sendEmail({ to, ...renderEmail(waitlistInviteEmail({ to, loginUrl })) })
+}
+
+/** "You can now publish" — after a writer-access grant commits. */
+export async function sendWriterAccessGrantedEmail(to: string): Promise<void> {
+  const appUrl = requireEnv('APP_URL')
+  await sendEmail({ to, ...renderEmail(writerAccessGrantedEmail({ writeUrl: `${appUrl}/write` })) })
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +229,7 @@ interface BroadcastEmailParams extends EmailParams {
 }
 
 export async function sendBroadcastEmail(params: BroadcastEmailParams): Promise<void> {
-  const provider = process.env.EMAIL_PROVIDER ?? 'console'
+  const provider = resolveProvider()
 
   return trackSend(() => {
     switch (provider) {
@@ -233,6 +267,7 @@ async function sendViaPostmark(params: EmailParams): Promise<void> {
       Subject: params.subject,
       TextBody: params.textBody,
       HtmlBody: params.htmlBody,
+      ...postmarkHeaders(params),
       MessageStream: 'outbound',
     }),
   })
@@ -269,6 +304,7 @@ async function sendViaResend(params: EmailParams): Promise<void> {
       subject: params.subject,
       text: params.textBody,
       html: params.htmlBody,
+      ...(params.headers ? { headers: params.headers } : {}),
     }),
   })
 
@@ -312,6 +348,7 @@ async function sendBroadcastViaPostmark(params: BroadcastEmailParams): Promise<v
       Subject: params.subject,
       TextBody: params.textBody,
       HtmlBody: params.htmlBody,
+      ...postmarkHeaders(params),
       MessageStream: stream,
     }),
   })

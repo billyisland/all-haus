@@ -221,26 +221,17 @@ export function PalettePanel() {
   const panelRef = useRef<HTMLDivElement>(null);
 
   // Operator-only entry (GLASSHOUSE-AND-PALETTE-ADR §III.5): there is no shipped
-  // menu/settings row anymore. The panel is reachable two ways — a `?palette`
-  // query param (deep-linkable) or the Ctrl+Alt+P chord (toggle). Boot-time
-  // hydration of persisted overrides lives in the headless PaletteHydrator, not
-  // here, so it runs even when this panel never opens.
+  // menu/settings row anymore, and no key chord either — the Ctrl+Alt+P toggle
+  // was retired 2026-09-15, so the `?palette` query param (deep-linkable) is the
+  // ONE way in and nothing the operator types at a page can open this by
+  // accident. Boot-time hydration of persisted overrides lives in the headless
+  // PaletteHydrator, not here, so it runs even when this panel never opens.
   useEffect(() => {
     try {
       if (new URLSearchParams(window.location.search).has("palette")) open();
     } catch {
       /* ignore malformed search */
     }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.altKey && (e.key === "p" || e.key === "P")) {
-        e.preventDefault();
-        const s = usePaletteDevtool.getState();
-        if (s.isOpen) s.close();
-        else s.open();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
   }, [open]);
 
   const currentHex = useCallback(

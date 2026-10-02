@@ -3,6 +3,11 @@
 import React, { useState } from 'react'
 import { auth } from '../../lib/api'
 import { useAuth } from '../../stores/auth'
+import {
+  EMAIL_PLACEHOLDER, EMAIL_NONE, EMAIL_CHANGE_FAILED, emailVerificationSentSentence,
+  SETTINGS_SAVE, SETTINGS_SAVING, SETTINGS_CANCEL, SETTINGS_CHANGE,
+} from '../../content/settings'
+import { failureSentence } from '../../lib/api/client'
 
 export function EmailChange() {
   const { user } = useAuth()
@@ -11,6 +16,7 @@ export function EmailChange() {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [sent, setSent] = useState(false)
+  const [sentTo, setSentTo] = useState('')
 
   if (!user) return null
 
@@ -21,12 +27,17 @@ export function EmailChange() {
     setError(null)
     try {
       await auth.changeEmail(trimmed)
+      // The address that was actually sent to, kept separately: the field is
+      // cleared on the next line, so the confirmation read `newEmail ||
+      // 'your new address'` and therefore ALWAYS took the fallback — the one
+      // sentence whose whole job is to say which inbox to go and look in.
+      setSentTo(trimmed)
       setSent(true)
       setEditing(false)
       setNewEmail('')
       setTimeout(() => setSent(false), 8000)
     } catch (err: any) {
-      setError(err.message ?? 'Failed to send verification email')
+      setError(failureSentence(err, EMAIL_CHANGE_FAILED))
     } finally {
       setSaving(false)
     }
@@ -46,7 +57,7 @@ export function EmailChange() {
               type="email"
               value={newEmail}
               onChange={e => setNewEmail(e.target.value)}
-              placeholder="new@example.com"
+              placeholder={EMAIL_PLACEHOLDER}
               autoFocus
               className="w-full bg-glasshouse-well px-4 py-2.5 text-sm text-black placeholder-grey-300 focus:outline-none max-w-sm"
               onKeyDown={e => { if (e.key === 'Enter') void handleSave() }}
@@ -58,27 +69,27 @@ export function EmailChange() {
                 disabled={saving || !newEmail.trim()}
                 className="btn-text"
               >
-                {saving ? 'Saving…' : 'Save'}
+                {saving ? SETTINGS_SAVING : SETTINGS_SAVE}
               </button>
               <button onClick={handleCancel} className="btn-text-muted">
-                Cancel
+                {SETTINGS_CANCEL}
               </button>
             </div>
           </div>
         ) : (
           <div className="flex items-center justify-between">
-            <p className="text-sm text-black">{user.email ?? '(no email)'}</p>
+            <p className="text-sm text-black">{user.email ?? EMAIL_NONE}</p>
             <button
               onClick={() => setEditing(true)}
               className="btn-text-muted"
             >
-              Change
+              {SETTINGS_CHANGE}
             </button>
           </div>
         )}
         {sent && (
           <p className="text-ui-xs text-grey-600 mt-3">
-            Verification email sent to {newEmail || 'your new address'}. Check your inbox.
+            {emailVerificationSentSentence(sentTo)}
           </p>
         )}
     </>

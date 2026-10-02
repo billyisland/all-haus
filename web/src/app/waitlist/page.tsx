@@ -15,6 +15,17 @@ import {
   PublicLink,
   FormError,
 } from '../../components/public/Field'
+import {
+  AUTH_TRY_AGAIN,
+  WAITLIST_TITLE,
+  waitlistIntro,
+  WAITLIST_SUBMIT,
+  WAITLIST_JOINED_TITLE,
+  WAITLIST_JOINED_BEFORE,
+  WAITLIST_JOINED_AFTER,
+  WAITLIST_HAVE_ACCOUNT,
+  LINK_LOG_IN,
+} from '../../content/auth'
 import { usePublicPalette } from '../../components/public/palette'
 
 // Closed-beta waiting-list surface (CLOSED-BETA-ADR Phase 2, D2/D4).
@@ -57,7 +68,7 @@ export default function WaitlistPage() {
       await waitlist.join({ email })
       setJoined(true)
     } catch {
-      setError('Something went wrong. Please try again.')
+      setError(AUTH_TRY_AGAIN)
     } finally {
       setLoading(false)
     }
@@ -68,19 +79,19 @@ export default function WaitlistPage() {
       <PublicShell>
         <PublicVessel>
           <PublicCard>
-            <PublicTitle>You’re on the list.</PublicTitle>
+            <PublicTitle>{WAITLIST_JOINED_TITLE}</PublicTitle>
           </PublicCard>
           <PublicCard>
             <PublicBody>
-              We’ll write to{' '}
-              <span style={{ color: palette.cardTitle }}>{email}</span> when
-              we’re ready for you.
+              {WAITLIST_JOINED_BEFORE}
+              <span style={{ color: palette.cardTitle }}>{email}</span>
+              {WAITLIST_JOINED_AFTER}
             </PublicBody>
           </PublicCard>
           <PublicCard>
             <PublicBody>
-              Already have an account?{' '}
-              <PublicLink href="/auth?mode=login">Log in</PublicLink>
+              {WAITLIST_HAVE_ACCOUNT}{' '}
+              <PublicLink href="/auth?mode=login">{LINK_LOG_IN}</PublicLink>
             </PublicBody>
           </PublicCard>
         </PublicVessel>
@@ -92,12 +103,10 @@ export default function WaitlistPage() {
     <PublicShell>
       <PublicVessel>
         <PublicCard>
-          <PublicTitle>Not open yet.</PublicTitle>
+          <PublicTitle>{WAITLIST_TITLE}</PublicTitle>
           <div style={{ marginTop: 10 }}>
             <PublicBody>
-              {fromBeta
-                ? 'You’re not in the beta yet. Join the waiting list and we’ll be in touch when we’re ready for you.'
-                : 'all.haus is in closed beta. Join the list and we’ll write when we’re ready for you.'}
+              {waitlistIntro(fromBeta)}
             </PublicBody>
           </div>
         </PublicCard>
@@ -120,15 +129,15 @@ export default function WaitlistPage() {
               placeholder="you@example.com"
             />
             <PublicButton type="submit" full disabled={loading}>
-              {loading ? 'Working…' : 'Join the list'}
+              {loading ? 'Joining…' : WAITLIST_SUBMIT}
             </PublicButton>
           </form>
         </PublicCard>
 
         <PublicCard>
           <PublicBody>
-            Already have an account?{' '}
-            <PublicLink href="/auth?mode=login">Log in</PublicLink>
+            {WAITLIST_HAVE_ACCOUNT}{' '}
+            <PublicLink href="/auth?mode=login">{LINK_LOG_IN}</PublicLink>
           </PublicBody>
         </PublicCard>
       </PublicVessel>

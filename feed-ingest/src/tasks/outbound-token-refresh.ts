@@ -2,6 +2,7 @@ import type { Task } from 'graphile-worker'
 import { pool } from '@platform-pub/shared/db/client.js'
 import { getAtprotoClient } from '@platform-pub/shared/lib/atproto-oauth.js'
 import logger from '@platform-pub/shared/lib/logger.js'
+import { invalidatePresence } from '@platform-pub/shared/lib/presence-health.js'
 
 // =============================================================================
 // outbound_token_refresh — daemon-style cron job
@@ -36,10 +37,16 @@ export const outboundTokenRefresh: Task = async () => {
   // expires_at are non-expiring (Mastodon) and are skipped.
   const { rows } = await pool.query<DueRow>(`
     SELECT id, protocol, handle, token_expires_at
-    FROM network_presences
+    FROM network_presences np
     WHERE is_valid = TRUE
       AND provenance <> 'concierge'
       AND lifecycle_state = 'active'
+      -- Never refresh a credential for an account that has left (§2.10). The
+      -- deletion transaction deprovisions its presences, so this predicate is
+      -- belt and braces — but it is the only thing that reaches presences
+      -- deprovisioned by nothing, i.e. every one that predates that fix.
+      AND EXISTS (SELECT 1 FROM accounts a
+                   WHERE a.id = np.account_id AND a.status = 'active')
       AND credentials_enc IS NOT NULL
       AND token_expires_at IS NOT NULL
       AND last_refreshed_at IS NOT NULL
@@ -77,6 +84,8 @@ export const outboundTokenRefresh: Task = async () => {
       AND la.provenance <> 'concierge'
       AND la.lifecycle_state = 'active'
       AND la.is_valid = TRUE
+      AND EXISTS (SELECT 1 FROM accounts a
+                   WHERE a.id = la.account_id AND a.status = 'active')
       AND (la.last_refreshed_at IS NULL OR la.last_refreshed_at < now() - INTERVAL '7 days')
     ORDER BY la.last_refreshed_at ASC NULLS FIRST
     LIMIT 50
@@ -87,11 +96,7 @@ export const outboundTokenRefresh: Task = async () => {
   const client = await getAtprotoClient()
   for (const row of atpRows) {
     if (!row.has_session) {
-      logger.info({ id: row.id, did: row.external_id }, 'atproto session missing; marking invalid')
-      await pool.query(
-        `UPDATE network_presences SET is_valid = FALSE, updated_at = now() WHERE id = $1`,
-        [row.id]
-      )
+      await invalidatePresence(pool, row.id, 'atproto session missing')
       continue
     }
     try {
@@ -115,10 +120,7 @@ export const outboundTokenRefresh: Task = async () => {
         logger.warn({ errName, errMessage, id: row.id, did: row.external_id }, 'atproto session refresh hit transient error; will retry next cycle')
       } else {
         logger.warn({ errName, errMessage, id: row.id, did: row.external_id }, 'atproto session restore failed; marking invalid')
-        await pool.query(
-          `UPDATE network_presences SET is_valid = FALSE, updated_at = now() WHERE id = $1`,
-          [row.id]
-        )
+        await invalidatePresence(pool, row.id, `atproto session restore failed: ${errName}`)
       }
     }
   }

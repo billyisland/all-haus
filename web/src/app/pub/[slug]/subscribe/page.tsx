@@ -15,7 +15,7 @@ import { PublicPage } from '../../../../components/public/PublicPage'
 const GATEWAY = process.env.GATEWAY_INTERNAL_URL ?? process.env.GATEWAY_URL ?? 'http://localhost:3000'
 
 async function getPublication(slug: string) {
-  const res = await fetch(`${GATEWAY}/api/v1/publications/${slug}/public`, {
+  const res = await fetch(`${GATEWAY}/api/v1/publications/${encodeURIComponent(slug)}/public`, {
     next: { revalidate: 60 },
   })
   if (!res.ok) return null

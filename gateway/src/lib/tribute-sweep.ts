@@ -1,7 +1,10 @@
 import { randomBytes, createHash } from 'node:crypto'
 import { pool, withTransaction } from '@platform-pub/shared/db/client.js'
 import { sendEmail } from '@platform-pub/shared/lib/email.js'
+import { renderEmail } from '@platform-pub/shared/lib/email/layout.js'
+import { tributePercent, tributeReminderEmail } from '@platform-pub/shared/lib/email/templates/tributes.js'
 import logger from '@platform-pub/shared/lib/logger.js'
+import { requireEnv } from '@platform-pub/shared/lib/env.js'
 
 // =============================================================================
 // Tribute lifecycle sweep — Upstream Edges Phase 2.
@@ -96,40 +99,20 @@ async function sendReminders(): Promise<void> {
 
 async function sendReminderEmail(r: ReminderRow, rawToken: string): Promise<void> {
   if (!r.invite_email) return
-  const appUrl = process.env.APP_URL ?? 'http://localhost:3000'
+  const appUrl = requireEnv('APP_URL')
   const claimUrl = `${appUrl}/tribute/claim?token=${encodeURIComponent(rawToken)}`
-  const pct = (r.percentage_bps / 100).toFixed(r.percentage_bps % 100 === 0 ? 0 : 2)
   const authorName = r.author_display_name ?? r.author_username ?? 'A writer on all.haus'
 
   await sendEmail({
     to: r.invite_email,
-    subject: `Reminder: ${authorName} would still like to share earnings with you`,
-    textBody: [
-      `A little while ago, ${authorName} offered to share ${pct}% of what their piece`,
-      `"${r.article_title}" earns on all.haus with you, as thanks for the inspiration.`,
-      '',
-      'The offer still stands. To read the piece and decide, create a free account here:',
-      '',
-      claimUrl,
-      '',
-      'If you do nothing, the share returns to the writer. You can ignore this safely.',
-    ].join('\n'),
-    htmlBody: `
-      <div style="font-family: -apple-system, system-ui, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px 0;">
-        <p style="font-size: 15px; color: #57534e; line-height: 1.6;">
-          A little while ago, <strong>${escapeHtml(authorName)}</strong> offered to share
-          <strong>${pct}%</strong> of what &ldquo;${escapeHtml(r.article_title)}&rdquo; earns on
-          all.haus with you, as thanks for the inspiration. The offer still stands.
-        </p>
-        <a href="${claimUrl}"
-           style="display: inline-block; background: #1c1917; color: #ffffff; font-size: 14px; font-weight: 500; padding: 12px 28px; border-radius: 6px; text-decoration: none;">
-          Read it &amp; decide
-        </a>
-        <p style="font-size: 13px; color: #a8a29e; margin-top: 32px; line-height: 1.5;">
-          If you do nothing, the share returns to the writer. You can ignore this email safely.
-        </p>
-      </div>
-    `.trim(),
+    ...renderEmail(
+      tributeReminderEmail({
+        authorName,
+        articleTitle: r.article_title,
+        percent: tributePercent(r.percentage_bps),
+        claimUrl,
+      }),
+    ),
   })
 }
 
@@ -146,12 +129,4 @@ async function lapseExpired(): Promise<void> {
     if (rows.length === 0) return
     logger.info({ count: rows.length }, 'Tributes lapsed (window expired)')
   })
-}
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
 }

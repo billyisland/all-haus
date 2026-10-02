@@ -99,6 +99,14 @@ function articleRow() {
 
 function scriptedQuery(sql: string, params: unknown[] = []) {
   // Focal resolution: the comment is NOT a feed_items THING, so this misses.
+  // The comment's conversation root, read through its own feed_items card
+  // (CA-G5). Matched first: its SQL also carries `WHERE fi.post_id = $1`.
+  if (sql.includes("SELECT c.target_event_id") && sql.includes("fi.comment_id")) {
+    return Promise.resolve({
+      rows: [{ target_event_id: ROOT_EVENT_ID }],
+      rowCount: 1,
+    });
+  }
   if (sql.includes("WHERE fi.post_id = $1")) {
     if (params[0] === ROOT_POST_ID) {
       return Promise.resolve({ rows: [articleRow()], rowCount: 1 });
@@ -110,12 +118,6 @@ function scriptedQuery(sql: string, params: unknown[] = []) {
   // point rather than the mock being lazy: both ARE comments on this root at the
   // moment of this read. They part company at the SECOND read below, which is
   // where the deletion has taken effect.
-  if (sql.includes("SELECT target_event_id") && sql.includes("FROM comments")) {
-    return Promise.resolve({
-      rows: [{ target_event_id: ROOT_EVENT_ID }],
-      rowCount: 1,
-    });
-  }
   if (sql.includes("SELECT post_id FROM feed_items")) {
     return Promise.resolve({ rows: [{ post_id: ROOT_POST_ID }], rowCount: 1 });
   }

@@ -10,6 +10,7 @@ import {
 } from "../../lib/api";
 import { useReader } from "../../stores/reader";
 import { useProfile } from "../../stores/profileOverlay";
+import { openSurfaceHref } from "../../stores/surfaceOverlay";
 import { publicationsEnabled } from "../../lib/featureFlags";
 
 const TOKENS = {
@@ -118,17 +119,12 @@ export function SearchPanel({
     [runSearch],
   );
 
-  const navigate = useCallback(
-    (href: string) => {
-      onClose();
-      router.push(href);
-    },
-    [onClose, router],
-  );
-
-  // Writers and articles open as workspace overlays (profile / reader) rather
-  // than navigating to a black-topbar page; publications have no overlay yet,
-  // so they still fall back to navigate() (flagged for overlay work).
+  // Every result opens as a workspace overlay — profile, reader, surface — and
+  // none of them navigates. The publication row was the last that did, on a
+  // comment saying "publications have no overlay yet"; `SurfaceOverlay` has
+  // carried `/pub/:slug` since it was unified, so `openSurfaceHref` handles it
+  // like any other surface. Publications are suspended, so the row is dormant
+  // — which is exactly why it would have stayed an escape unnoticed.
   const openWriter = useCallback(
     (username: string) => {
       onClose();
@@ -142,6 +138,14 @@ export function SearchPanel({
       useReader.getState().openNative(dTag);
     },
     [onClose],
+  );
+  const openPublication = useCallback(
+    (slug: string) => {
+      const href = `/pub/${encodeURIComponent(slug)}`;
+      onClose();
+      if (!openSurfaceHref(href)) router.push(href);
+    },
+    [onClose, router],
   );
 
   const totalResults =
@@ -244,7 +248,7 @@ export function SearchPanel({
               textAlign: "center",
             }}
           >
-            Couldn’t run search
+            Search ran into a problem. Please try again in a moment.
           </div>
         )}
         {showEmpty && (
@@ -340,7 +344,7 @@ export function SearchPanel({
               <button
                 key={p.id}
                 type="button"
-                onClick={() => navigate(`/pub/${p.slug}`)}
+                onClick={() => openPublication(p.slug)}
                 style={rowStyle}
                 onMouseEnter={(e) => {
                   e.currentTarget.style.background = TOKENS.rowHoverBg;

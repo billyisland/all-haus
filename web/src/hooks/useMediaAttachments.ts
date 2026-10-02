@@ -1,5 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { uploadImage, isEmbeddableUrl, extractUrls, fetchOEmbed, type OEmbedResult } from '../lib/media'
+import { failureSentence } from '../lib/api/client'
+import { joinTextAndImages } from '../lib/note-compose'
 
 export interface MediaAttachment {
   url: string
@@ -33,7 +35,7 @@ export function useMediaAttachments() {
           setAttachments(prev => [...prev, { url: r.url, type: 'image' }])
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Upload failed')
+        setError(failureSentence(err, 'Couldn’t upload that image. Please try again.'))
       } finally {
         setUploading(false)
       }
@@ -82,9 +84,7 @@ export function useMediaAttachments() {
 
   /** Build final content for publishing: text + attachment URLs joined by newlines. */
   const buildContent = useCallback((text: string): string => {
-    const imageUrls = attachments.filter(a => a.type === 'image').map(a => a.url)
-    const parts = [text.trim(), ...imageUrls].filter(Boolean)
-    return parts.join('\n')
+    return joinTextAndImages(text, attachments.filter(a => a.type === 'image').map(a => a.url))
   }, [attachments])
 
   /** Total char count of the content that will be published. */

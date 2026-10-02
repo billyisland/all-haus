@@ -1,4 +1,6 @@
 import { nip19, verifyEvent } from "nostr-tools";
+import { CONTEXT_INTERACTION_MERGE_SQL } from "@platform-pub/shared/lib/context-persist.js";
+import { recordServed } from "./item-membership.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 import { type PinnedWebSocketOptions } from "@platform-pub/shared/lib/http-client.js";
 import { truncatePreview } from "@platform-pub/shared/lib/text.js";
@@ -70,6 +72,36 @@ export function nostrAddrUri(
   identifier: string,
 ): string {
   return nip19.naddrEncode({ kind, pubkey, identifier });
+}
+
+// THE DECODING IS ONE RULE TOO, AND IT WAS SPELT TWICE. An `a` tag is
+// `<kind>:<pubkey>:<d-identifier>`, and NIP-01 puts no character class on the
+// d-identifier — a colon in it is ordinary and this platform's own d-tags are
+// slugs that can carry one. `const [kind, pubkey, dTag] = coord.split(":")`
+// therefore silently truncates the identifier at the next colon, and both
+// readers of an `a` tag had their own copy of the parse: `detectNostrRepost`
+// spread the rest and rejoined it, the kind-5 deletion handler did not. So a
+// deletion request naming `30023:<pk>:on-writing:part-two` built the naddr for
+// `on-writing`, matched no row, and the author's retraction was dropped with
+// nothing logged — the article stayed live and the system reported success.
+//
+// One home, beside the encoder, for the same reason the encoder is one home:
+// two spellings of an identity rule disagree silently, and the disagreement
+// surfaces somewhere else entirely. Returns null rather than a partial coord,
+// so a caller cannot act on half a parse.
+export interface NostrAddrCoord {
+  kind: number;
+  pubkey: string;
+  identifier: string;
+}
+
+export function parseNostrAddrCoord(coord: string): NostrAddrCoord | null {
+  const [kindStr, pubkey, ...rest] = coord.split(":");
+  const kind = parseInt(kindStr ?? "", 10);
+  if (!Number.isFinite(kind) || !pubkey) return null;
+  // `rest` is empty for a non-parameterized replaceable coord (`0:<pk>:` or
+  // `10002:<pk>`), where the empty identifier is the correct answer.
+  return { kind, pubkey, identifier: rest.join(":") };
 }
 
 // =============================================================================
@@ -159,12 +191,9 @@ export function detectNostrRepost(event: NostrEvent): DetectedRepost | null {
 
   let targetHandle: string | null = null;
   if (aTag) {
-    // 'a' coordinate is "<kind>:<pubkey>:<d-identifier>"; the d-identifier may
-    // itself contain ':' so keep everything after the second colon.
-    const [kindStr, pubkey, ...rest] = aTag[1].split(":");
-    const kind = parseInt(kindStr ?? "", 10);
-    if (Number.isFinite(kind) && pubkey) {
-      targetHandle = nostrAddrUri(kind, pubkey, rest.join(":"));
+    const coord = parseNostrAddrCoord(aTag[1]);
+    if (coord) {
+      targetHandle = nostrAddrUri(coord.kind, coord.pubkey, coord.identifier);
     }
   }
   if (!targetHandle && eTag) {
@@ -265,6 +294,19 @@ export async function insertNostrItem(
 ): Promise<NostrInsertOutcome> {
   const normalised = normaliseNostrEvent(event, opts.relays);
 
+  // Resolve the author's name ONCE and write the SAME value to both columns
+  // (MIRROR-AUDIT §3, S17; the shape insertAtprotoItem already uses). One nostr
+  // source is one pubkey is one author, and the source's display_name is that
+  // pubkey's own kind-0 name — ratcheted by this very task — so resolving
+  // through it names the author, not the source. What was wrong was writing the
+  // resolved value to external_items and the UNRESOLVED one to feed_items:
+  // feed_items_author_refresh repairs feed_items from NULLIF(ei.author_name,'')
+  // every night and the next re-ingest of a replaceable kind put it back, so
+  // the two disagreed on a nightly cycle for ever. `?? "Unknown"` went with it
+  // — migration 184 names that placeholder as the thing the column must not
+  // hold; NULL is absent, and the protocol label is the FRONTEND's last resort.
+  const authorName = normalised.authorName ?? source.display_name ?? null;
+
   const { rowCount, rows } = await client.query(
     `
     INSERT INTO external_items (
@@ -285,7 +327,9 @@ export async function insertNostrItem(
       title = EXCLUDED.title,
       published_at = EXCLUDED.published_at,
       source_reply_uri = EXCLUDED.source_reply_uri,
-      interaction_data = EXCLUDED.interaction_data,
+      -- MERGED, newcomer last (CA-C8): a context write's relay hints and
+      -- thread keys survive a promotion, and a revision's keys win.
+      ${CONTEXT_INTERACTION_MERGE_SQL},
       author_name = EXCLUDED.author_name,
       author_handle = COALESCE(EXCLUDED.author_handle, external_items.author_handle),
       is_context_only = FALSE,
@@ -299,7 +343,7 @@ export async function insertNostrItem(
     [
       source.id,
       normalised.sourceItemUri,
-      normalised.authorName ?? source.display_name ?? "Unknown",
+      authorName,
       normalised.authorHandle ?? opts.sourceNip05,
       normalised.contentText,
       normalised.title,
@@ -309,14 +353,19 @@ export async function insertNostrItem(
     ],
   );
 
+  // This source served it, whether the row is new, promoted, revised or
+  // already real under another source (CA-C4) — and it is seen now (CA-G10b).
+  await recordServed(client, source.id, "nostr_external", [normalised.sourceItemUri]);
+
   if (!rowCount || rowCount === 0) return "skipped";
 
   // Dual-write feed_items. On insert, create the row; on a replaceable-kind
   // revision update OR a §4.2 promotion, refresh the denormalised fields so
   // the feed shows the newest title/preview without waiting for reconcile.
-  // source_id rides along because feed membership queries resolve through
-  // feed_sources.source_id — a promoted post left on the hydrating focal's
-  // source would surface in the wrong feeds, or none.
+  // source_id rides along because kind-5 deletions and the provenance line
+  // read it — a promoted post left on the hydrating focal's source would dodge
+  // its author's deletions and name the wrong source. (Feed membership is the
+  // item's SERVING sources, external_item_sources — CA-C4.)
   await client.query(
     `
     INSERT INTO feed_items (
@@ -346,10 +395,11 @@ export async function insertNostrItem(
   `,
     [
       rows[0].id,
-      // The author's own name or NULL — never the source's (migration 184,
-      // BYLINE-AND-PROVENANCE D9 ⟂). The display name the card shows comes
-      // from external_authors, keyed on author_uri, not from this column.
-      normalised.authorName || null,
+      // The same resolved value external_items got, byte for byte (S17): a
+      // nostr source is one pubkey, so the chain above names the author. The
+      // display name the card shows still comes from external_authors, keyed on
+      // the pubkey, not from this column.
+      authorName,
       source.avatar_url,
       normalised.title,
       truncatePreview(normalised.contentText),
@@ -414,13 +464,13 @@ export async function applyNostrDeletions(
     }
 
     for (const aAddr of aTagAddrs) {
-      const [kindStr, aPubkey, dTag] = aAddr.split(":");
-      const kind = parseInt(kindStr ?? "", 10);
+      const coord = parseNostrAddrCoord(aAddr);
+      if (!coord) continue;
+      const { kind, pubkey: aPubkey, identifier: dTag } = coord;
       // Only act on addresses the source actually owns — a hostile signer
       // can't forge the pubkey, but a mis-authored kind-5 could still
       // carry a foreign 'a' tag. Also gate to replaceable kinds.
-      if (!Number.isFinite(kind)) continue;
-      if (!aPubkey || aPubkey.toLowerCase() !== expected) continue;
+      if (aPubkey.toLowerCase() !== expected) continue;
       if (
         !isParameterizedReplaceable(kind) &&
         !(kind >= 10000 && kind < 20000)
@@ -428,7 +478,7 @@ export async function applyNostrDeletions(
         continue;
 
       // Relay-free, to match the THING's relay-free source_item_uri.
-      const naddr = nostrAddrUri(kind, aPubkey, dTag ?? "");
+      const naddr = nostrAddrUri(kind, aPubkey, dTag);
 
       await db.query(
         `UPDATE external_items SET deleted_at = now()

@@ -18,6 +18,8 @@ import { postThread, type PostThreadResponse } from "../lib/api/post";
 import type { Post, RepostEdge } from "../lib/post/types";
 
 const REPLY_PAGE = 5; // §8 initial descendant page
+// GET /thread's own ceiling (`post-thread.ts::MAX_REPLY_LIMIT`).
+const MAX_REPLY_LIMIT = 50;
 
 // When the host thread fetch reports background hydration in flight, poll with
 // backoff and merge whatever landed, STOPPING only when a response arrives with
@@ -47,6 +49,14 @@ const CACHE_MAX = 200;
 // Exported for the cache-hygiene test (D2): a `hydrating: true` response must
 // never round-trip through the cache. Test-only reset clears module state.
 export function __resetThreadCache(): void {
+  cache.clear();
+}
+/** Drop every cached thread. Called when a reply publishes (see
+ *  `stores/threadRefresh.ts`): a 60-second cache is a convenience for a reader
+ *  reopening a pane, and it becomes a lie the moment they have written into
+ *  the conversation themselves. Separate from `__resetThreadCache` because
+ *  that one says test-only in its own comment and should keep saying it. */
+export function invalidateThreadCache(): void {
   cache.clear();
 }
 export function readCache(id: string): PostThreadResponse | undefined {
@@ -226,8 +236,19 @@ export function usePostThread(
   // Bumping this busts the host's cached thread and refetches — used after a
   // reply is published so the new node appears without waiting out the TTL.
   refreshKey?: number,
+  // The Nostr event id of the post that reply was made ON. A refresh is
+  // ADDRESSED: only a thread whose pool contains that post refetches, and it
+  // does so in place. See `stores/threadRefresh.ts`.
+  refreshTargetEventId?: string | null,
+  // How many descendants a page carries. The workspace's §8 page is small
+  // because a conversation there is one card's worth of context; the article
+  // page's conversation IS the foot of the page and pages by the old ten.
+  replyPage: number = REPLY_PAGE,
 ): PostThreadApi {
   const [state, dispatch] = useReducer(reducer, INITIAL);
+  // Read through a ref by the callbacks below, which are deliberately stable.
+  const pageRef = useRef(replyPage);
+  pageRef.current = replyPage;
   // The refreshKey we've already serviced; lets us tell a real refresh from the
   // initial mount (where cache-first is correct).
   const servicedKey = useRef<number | undefined>(undefined);
@@ -248,14 +269,56 @@ export function usePostThread(
   // Initial host fetch (on expand). Cache-first, like the legacy thread hooks.
   useEffect(() => {
     if (!enabled || !rootPostId) return;
-    // A changed refreshKey (after first mount) forces a network refetch.
-    const isRefresh =
+    // A changed refreshKey (after first mount) means a reply was published
+    // somewhere. Whether it was published into THIS conversation is a
+    // different question, and the answer is the pool: a thread that does not
+    // hold the reply's target has nothing to refetch.
+    const bumped =
       refreshKey !== undefined &&
       servicedKey.current !== undefined &&
       refreshKey !== servicedKey.current;
     servicedKey.current = refreshKey;
-    if (isRefresh) cache.delete(rootPostId);
     let cancelled = false;
+
+    if (bumped) {
+      const holdsTarget =
+        !!refreshTargetEventId &&
+        [...stateRef.current.pool.values()].some(
+          (p) => p.version === refreshTargetEventId,
+        );
+      if (!holdsTarget) return;
+      // IN PLACE: `merge` folds the new reply into the pool and deliberately
+      // leaves root, focal and loading alone, so a conversation the reader has
+      // re-rooted inside keeps its re-root and never flashes "Loading…" (which
+      // also re-fired the autoScroll and panned the floor behind it).
+      cache.delete(rootPostId);
+      // AS MUCH AS IS ALREADY LOADED, plus room for what is new. `merge`
+      // replaces the pagination cursor with this response's, so a refetch of
+      // page one alone put the cursor back to the end of page one under a
+      // pool that had paged past it: "Show N more" counted replies already on
+      // screen, and the new reply — the newest, so the LAST — sat beyond a
+      // cursor that no longer pointed at it. Refetching what is loaded keeps
+      // the cursor honest up to the server's cap.
+      postThread(rootPostId, {
+        replyLimit: Math.min(
+          Math.max(pageRef.current, stateRef.current.pool.size + pageRef.current),
+          MAX_REPLY_LIMIT,
+        ),
+      })
+        .then((res) => {
+          writeCache(rootPostId, res);
+          if (cancelled || !mounted.current) return;
+          dispatch({ kind: "merge", res });
+        })
+        .catch(() => {
+          // A failed refresh leaves the thread exactly as it was — the reader
+          // keeps the conversation they are reading, minus the newest reply.
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
+
     // Background-hydration poll (external threads): the host fetch may return
     // `hydrating: true` before ancestors/replies are in the DB. Poll with backoff
     // and merge whatever landed, stopping only when a response reports
@@ -269,7 +332,7 @@ export function usePostThread(
       const tick = () => {
         if (cancelled || !mounted.current) return;
         if (Date.now() - startedAt > HYDRATION_POLL_BUDGET_MS) return; // give up
-        postThread(rootPostId, { replyLimit: REPLY_PAGE })
+        postThread(rootPostId, { replyLimit: pageRef.current })
           .then((res) => {
             if (cancelled || !mounted.current) return;
             writeCache(rootPostId, res); // no-op while hydrating (hygiene)
@@ -293,7 +356,7 @@ export function usePostThread(
       };
       timers.push(setTimeout(tick, HYDRATION_POLL_MS[0]));
     };
-    const cached = isRefresh ? undefined : readCache(rootPostId);
+    const cached = readCache(rootPostId);
     if (cached) {
       // Only settled results are ever cached now (writeCache hygiene), so a
       // cached response is complete — no poll needed on a cache hit.
@@ -304,7 +367,7 @@ export function usePostThread(
       };
     }
     dispatch({ kind: "init-start" });
-    postThread(rootPostId, { replyLimit: REPLY_PAGE })
+    postThread(rootPostId, { replyLimit: pageRef.current })
       .then((res) => {
         writeCache(rootPostId, res);
         if (cancelled || !mounted.current) return;
@@ -319,7 +382,7 @@ export function usePostThread(
       cancelled = true;
       for (const t of timers) clearTimeout(t);
     };
-  }, [enabled, rootPostId, refreshKey]);
+  }, [enabled, rootPostId, refreshKey, refreshTargetEventId]);
 
   const fetchFocal = useCallback((
     id: string,
@@ -332,7 +395,7 @@ export function usePostThread(
     const cached = readCache(id);
     const p = cached
       ? Promise.resolve(cached)
-      : postThread(id, { replyLimit: REPLY_PAGE });
+      : postThread(id, { replyLimit: pageRef.current });
     // Background-hydration poll, reroot flavour (§0i.8, the §0f-5 residual):
     // re-rooting on an external node can come back `hydrating: true` exactly
     // like the initial host fetch — without a poll the focal rests reply-light
@@ -345,7 +408,7 @@ export function usePostThread(
       const tick = () => {
         if (!mounted.current || seq !== reqSeq.current) return;
         if (Date.now() - startedAt > HYDRATION_POLL_BUDGET_MS) return;
-        postThread(id, { replyLimit: REPLY_PAGE })
+        postThread(id, { replyLimit: pageRef.current })
           .then((res) => {
             if (!mounted.current || seq !== reqSeq.current) return;
             writeCache(id, res); // no-op while hydrating (hygiene)
@@ -410,7 +473,7 @@ export function usePostThread(
     if (!m?.cursor || s.loadingMore) return;
     const focal = s.focalId;
     dispatch({ kind: "more-start" });
-    postThread(focal, { replyLimit: REPLY_PAGE, replyCursor: m.cursor })
+    postThread(focal, { replyLimit: pageRef.current, replyCursor: m.cursor })
       .then((res) => {
         if (!mounted.current) return;
         dispatch({ kind: "ingest", res });

@@ -1,16 +1,34 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { pool, loadConfig, withTransaction } from '@platform-pub/shared/db/client.js'
+import { isIntegerDialKey } from '@platform-pub/shared/db/dial-kinds.js'
 import { zodValidationError } from '@platform-pub/shared/lib/validation.js'
+import { recordConfigAudit } from '@platform-pub/shared/lib/config-audit.js'
 import logger from '@platform-pub/shared/lib/logger.js'
+import { NOTIFICATIONS_NEEDS_RECONNECT } from '@platform-pub/shared/lib/presence-health.js'
 import { requireEnv, publicationsEnabled } from '@platform-pub/shared/lib/env.js'
-import { requireAdmin } from '../middleware/admin.js'
+import { requireAdmin, invalidateAdminIdsCache } from '../middleware/admin.js'
+import { grantWriterAccess } from '../lib/writer-gate.js'
+import { UUID_RE } from '../lib/uuid.js'
 import { getParityReport } from '../lib/internal-parity.js'
 import { invalidatePlatformConfig } from '../lib/platform-config.js'
 import { provisionAccount } from '../lib/account-provision.js'
 import { freezeFeedIntoFormula, formulaMaxSources } from './feeds/formulas.js'
-import { sendWaitlistInviteEmail } from '@platform-pub/shared/lib/email.js'
+import {
+  appendAccountToSeed,
+  carryAdmittedIntoSeed,
+  countCarryForFeed,
+  type SeedAppendOutcome,
+} from './feeds/seed-append.js'
+import {
+  sendWaitlistInviteEmail,
+  sendWriterAccessGrantedEmail,
+} from '@platform-pub/shared/lib/email.js'
 import { getEmailHealth } from '@platform-pub/shared/lib/email-health.js'
+import {
+  currentTermsVersion,
+  termsMajor,
+} from '@platform-pub/shared/lib/terms-versions.js'
 
 // =============================================================================
 // Owner dashboard — operator visibility over the money pipeline, users,
@@ -21,20 +39,34 @@ import { getEmailHealth } from '@platform-pub/shared/lib/email-health.js'
 //
 // GET  /admin/dashboard/overview    — money pipeline stage-by-stage
 // GET  /admin/dashboard/users       — account totals, growth, KYC-stuck writers
+// GET  /admin/dashboard/members     — the roster itself, searchable by
+//                                     address / handle / display name
 // GET  /admin/dashboard/content     — publishing activity + system health
 // GET  /admin/dashboard/config      — all platform_config rows
 // PATCH /admin/dashboard/config     — update existing keys (never insert)
 // GET  /admin/dashboard/regulatory  — revenue vs UK tax thresholds, custody
 // GET  /admin/dashboard/waitlist    — the closed-beta waiting list
 // GET  /admin/dashboard/allocation-coverage — funds segregation, measured (W2)
+// GET  /admin/dashboard/reader-credits — reading tabs in credit (W1 incident)
 // GET  /admin/dashboard/seed-formula   — what every new account is seeded from
 // POST /admin/dashboard/seed-formula   — designate that (FEED-FORMULAS D6/D11)
-// POST /admin/dashboard/waitlist/admit — admit one waitlister (creates their
-//                                        account, sends the invitation)
+// POST /admin/dashboard/waitlist/admit — admit a batch (creates accounts,
+//                                        appends them to the seed, sends nothing)
+// POST /admin/dashboard/waitlist/invite — send the invitation to admitted rows
 // POST /admin/dashboard/waitlist/remove — drop one UNADMITTED waitlister
+// GET  /admin/dashboard/writer-applications — the writers' waiting list
+// POST /admin/dashboard/writer-applications/grant — admit one as a writer
+//                                        (reason required, config_audit row)
 // POST /admin/dashboard/dead-jobs/reap — clear one arm of the dead-job pile
 // POST /admin/dashboard/trigger-settlements — proxy to payment-service
 // POST /admin/dashboard/trigger-payouts     — proxy to payment-service
+//                                        (both: reason required, request
+//                                        recorded in config_audit first)
+// POST /admin/dashboard/resume-payouts[/:accountId] — release a payout halt
+//                                        (proxy; actor + reason recorded)
+// POST /admin/dashboard/halt-payouts/:accountId — freeze ONE account's payouts
+//                                        as an operator decision (D9 §4.1;
+//                                        proxy; actor + reason + class recorded)
 //
 // All numbers are computed live; at launch scale that is fine (spec §1).
 // =============================================================================
@@ -50,13 +82,34 @@ const num = (v: unknown): number => Number(v ?? 0)
 // jetstream_healthy is written by the ingest listener.)
 // (feed_ingest_heartbeat is stamped every 60s by the feed-ingest poll; editing
 // it by hand would forge the liveness signal the overview alarms on.)
-const STATE_KEYS = new Set(['payouts_halted', 'jetstream_healthy', 'feed_ingest_heartbeat'])
+// (jetstream_cursor is the listener's stream position, written by its cursor
+// flush; editing it by hand would replay or skip the firehose.)
+// (the waitlist digest's two watermarks and last-sent stamp, and the engagement
+// sweep's resume cursor, are positions their workers upsert; a bad hand edit
+// re-sends or skips digests, or re-walks or skips the long tail — CA-F3.)
+// Every runtime `INSERT INTO platform_config` in the services must name a key
+// here: `gateway/tests/state-keys-derived.test.ts` finds them in the source.
+const STATE_KEYS = new Set([
+  'payouts_halted',
+  'jetstream_healthy',
+  'feed_ingest_heartbeat',
+  'jetstream_cursor',
+  'waitlist_digest_watermark',
+  'waitlist_digest_last_sent_at',
+  'writer_applications_digest_watermark',
+  'engagement_daily_sweep_cursor',
+])
 
 // The in-code twin of config-defaults.sql's ingest_heartbeat_alert_seconds.
 // Exported so the fallback-parity suite can hold the two copies together — a
 // drifted fallback never errors, it just substitutes silently, in exactly the
 // case it exists for (the row missing).
 export const INGEST_HEARTBEAT_ALERT_SECONDS_FALLBACK = 600
+
+// The in-code twins of config-defaults.sql's two linked-notification dials the
+// overview reads (CROSS-NETWORK-ROUNDTRIP-ADR C4), parity-tested like the rest.
+export const LINKED_NOTIFICATIONS_POLL_SECONDS_FALLBACK = 300
+export const LINKED_NOTIFICATIONS_STALE_INTERVALS_FALLBACK = 6
 
 // The in-code twin of config-defaults.sql's dead_job_arrival_window_hours,
 // parity-tested for the same reason as the one above.
@@ -76,6 +129,57 @@ export const REGULATORY_DIAL_DEFAULTS = {
 type RegulatoryDial = keyof typeof REGULATORY_DIAL_DEFAULTS
 
 const NUMERIC_RE = /^-?\d+(\.\d+)?$/
+
+// A malformed dial falls back — in the SQL below, where the threshold is
+// applied — and says so here, once per key (a fallback is for an ABSENT value).
+const warnedMalformedDial = new Set<string>()
+function warnIfMalformedDial(key: string, raw: unknown): void {
+  if (raw == null || /^[0-9]+$/.test(String(raw)) || warnedMalformedDial.has(key)) return
+  warnedMalformedDial.add(key)
+  logger.warn({ key, value: raw }, 'platform_config value malformed; using fallback')
+}
+
+// One reading of every presence the notification poller serves (the same
+// predicate its claim uses) against the two dials, in one statement. DOWN
+// counts from the last SUCCESS, never the last attempt, and from the link date
+// where there has never been one; `awaiting_reconnect` is the subset of DOWN
+// whose last poll said the grant lacks a scope.
+export const LINKED_POLL_HEALTH_SQL = `
+    WITH dial AS (
+      SELECT
+        (SELECT value FROM platform_config WHERE key = 'linked_notifications_poll_seconds') AS poll_raw,
+        (SELECT value FROM platform_config WHERE key = 'linked_notifications_stale_intervals') AS stale_raw,
+        COALESCE((SELECT NULLIF(value, '')::numeric FROM platform_config
+                   WHERE key = 'linked_notifications_poll_seconds'
+                     AND value ~ '^[0-9]+$'), ${LINKED_NOTIFICATIONS_POLL_SECONDS_FALLBACK}) AS poll_seconds,
+        COALESCE((SELECT NULLIF(value, '')::numeric FROM platform_config
+                   WHERE key = 'linked_notifications_stale_intervals'
+                     AND value ~ '^[0-9]+$'), ${LINKED_NOTIFICATIONS_STALE_INTERVALS_FALLBACK}) AS stale_intervals
+    ),
+    served AS (
+      SELECT np.notifications_polled_at, np.created_at, np.notifications_poll_error
+        FROM network_presences np
+        JOIN accounts a ON a.id = np.account_id AND a.status = 'active'
+       WHERE np.lifecycle_state = 'active'
+         AND np.is_valid = TRUE
+         AND np.provenance <> 'concierge'
+         AND np.protocol IN ('atproto', 'activitypub')
+    )
+    SELECT dial.poll_raw, dial.stale_raw, dial.poll_seconds, dial.stale_intervals,
+           COUNT(served.*)::int AS presences,
+           COUNT(served.*) FILTER (WHERE stale)::int AS down,
+           COUNT(served.*) FILTER (
+             WHERE stale AND served.notifications_poll_error LIKE $1 || '%'
+           )::int AS awaiting_reconnect,
+           MIN(served.notifications_polled_at) AS oldest_success_at
+      FROM dial
+      LEFT JOIN LATERAL (
+        SELECT s.*,
+               COALESCE(s.notifications_polled_at, s.created_at)
+                 < now() - make_interval(secs => dial.poll_seconds * dial.stale_intervals) AS stale
+          FROM served s
+      ) served ON TRUE
+     GROUP BY dial.poll_raw, dial.stale_raw, dial.poll_seconds, dial.stale_intervals`
 
 // -----------------------------------------------------------------------------
 // Dead background jobs (CONSOLIDATED-TODO §8.15).
@@ -222,6 +326,10 @@ const SeedFormulaSchema = z
     feedId: z.string().uuid(),
     name: z.string().trim().min(1).max(80).optional(),
     description: z.string().trim().max(500).optional(),
+    // RESHAPE-PLAN-2026-10 §A.2.7: a re-cut carries the outgoing seed's
+    // admitted members across unless the operator starts this seed without
+    // them. Absent means carry — the silent loss is the failure this guards.
+    carryAdmitted: z.boolean().optional(),
   })
   .strict()
 
@@ -235,6 +343,15 @@ const PatchConfigSchema = z.object({
     )
     .min(1)
     .max(50),
+  // REQUIRED (L5.2). A dial edit changes what the platform does with other
+  // people's money — the fee rate, the settlement threshold, the tab cap — and
+  // an operator who cannot say why in one line is about to make a change
+  // somebody will have to reconstruct from a diff of two numbers. Required in
+  // three places, the refund precedent: here, and in the `config_audit`
+  // column's own CHECK, with the button refusing an empty field so nobody meets
+  // the 400 by accident. `.trim()` before `.min(1)` because a space is not a
+  // reason. One reason covers the whole batch: the batch is the operator's act.
+  reason: z.string().trim().min(1).max(500),
 })
 
 // Which arm of the dead-job surface to clear. Two values, never "all": the two
@@ -267,7 +384,12 @@ const PAYMENT_SERVICE_READ_TIMEOUT_MS = 10_000
 
 async function callPaymentService(
   path: string,
-  method: 'GET' | 'POST' = 'POST'
+  method: 'GET' | 'POST' = 'POST',
+  // The trigger proxies send the actor and their reason; the refund sends what
+  // it is about. An OPTIONAL body rather than a second helper: the token, the
+  // timeouts and the non-2xx log line below are the parts that must not be
+  // written twice, and they are all here.
+  payload?: unknown
 ): Promise<{ status: number; body: unknown }> {
   const isRead = method === 'GET'
   const res = await fetch(`${PAYMENT_SERVICE_URL}/api/v1${path}`, {
@@ -279,7 +401,7 @@ async function callPaymentService(
     signal: AbortSignal.timeout(
       isRead ? PAYMENT_SERVICE_READ_TIMEOUT_MS : PAYMENT_SERVICE_WRITE_TIMEOUT_MS
     ),
-    ...(isRead ? {} : { body: JSON.stringify({}) }),
+    ...(isRead ? {} : { body: JSON.stringify(payload ?? {}) }),
   })
   let body: unknown = null
   try {
@@ -319,19 +441,32 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
 
       const deadJobWindowHours = await deadJobWindowHoursDial()
 
-      const [tabs, readStates, settlements, payouts, outstanding, halt, revenue, custody, counts, holdingDial, haltedAccounts, ingestBeat, ingestProtocols, deadJobs] =
+      const [tabs, readStates, settlements, payouts, outstanding, halt, revenue, custody, counts, holdingDial, haltedAccounts, ingestBeat, ingestProtocols, deadJobs, linkedPolls] =
         await Promise.all([
           pool.query(
+            // NO CREDIT FILTER HERE, DELIBERATELY. This block carried a
+            // `-SUM(balance_pence) FILTER (WHERE balance_pence < 0)` that the
+            // page rendered as an ordinary stat card, "Reader credit", between
+            // Active tabs and Near threshold — a figure with no count, no
+            // account, no alarm and no suggestion that anything was wrong. A
+            // reading tab in credit is an INCIDENT with a runbook
+            // (PAYMENT-PERIMETER-ADR W1), and stating its total in the voice of
+            // a metric is how it becomes a number somebody stops reading. It
+            // now has its own banner, fed by the payment service's own detector
+            // — the one home for the predicate — with the count, the deepest
+            // accounts and what to do. One figure, one place.
             `SELECT
                COUNT(*) FILTER (WHERE balance_pence > 0) AS active_tab_count,
                COALESCE(SUM(balance_pence) FILTER (WHERE balance_pence > 0), 0) AS total_accrued_pence,
-               COALESCE(-SUM(balance_pence) FILTER (WHERE balance_pence < 0), 0) AS total_credit_pence,
                COUNT(*) FILTER (WHERE balance_pence >= $1) AS near_threshold_tabs
              FROM reading_tabs`,
             [nearThresholdPence]
           ),
           pool.query(
-            `SELECT state, COUNT(*) AS n, COALESCE(SUM(amount_pence), 0) AS total_pence
+            // chargeable_pence, not the list price: a read part-covered by the
+            // free allowance was never charged for those pence, so counting
+            // them here reports money that does not exist in any state.
+            `SELECT state, COUNT(*) AS n, COALESCE(SUM(chargeable_pence), 0) AS total_pence
              FROM read_events GROUP BY state`
           ),
           pool.query(
@@ -374,8 +509,14 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
              FROM tab_settlements WHERE status = 'completed'`
           ),
           pool.query(
+            // GROSS COLLECTED, and chargeable_pence is what that means: the
+            // platform cannot be holding pence the free allowance gave away and
+            // nobody ever paid. It is deliberately still gross of the platform
+            // fee — this tile asks how much settled money is sitting unclaimed,
+            // not what is owed to writers; that figure is the ledger view pair
+            // (ledger_writer_earned − ledger_writer_earnings).
             `SELECT COUNT(*) AS held_read_count,
-                    COALESCE(SUM(amount_pence), 0) AS total_held_pence,
+                    COALESCE(SUM(chargeable_pence), 0) AS total_held_pence,
                     MIN(read_at) AS oldest_held_read_at
              FROM read_events
              -- Unclaimed by EITHER cycle (migration 168). A publication read is
@@ -420,9 +561,25 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
                (SELECT value FROM platform_config WHERE key = 'feed_ingest_heartbeat') AS heartbeat,
                (SELECT value FROM platform_config WHERE key = 'ingest_heartbeat_alert_seconds') AS alert_seconds`
           ),
+          // Per protocol: how many active sources, when any of them last
+          // delivered, and — the §0aa.2 figure — how many are ACTIVE AND
+          // UNREADABLE. That last state is the one nothing could see: a source
+          // refused for want of a signature stays active and on schedule and
+          // delivers nothing for ever, which is indistinguishable from an
+          // author who has not posted. `MAX(last_fetched_at)` cannot show it,
+          // because we DO keep fetching; only the refusal stamp can.
+          //
+          // The FILTER rides this query rather than sitting in its own, so the
+          // two figures are read of the same table at the same instant: a
+          // separate round trip could report 40 refused out of 30 active and
+          // send an operator looking for a bug that is theirs.
           pool.query(
             `SELECT protocol::text AS protocol,
                     COUNT(*)::int AS active_sources,
+                    COUNT(*) FILTER (
+                      WHERE signed_fetch_refused_at IS NOT NULL
+                    )::int AS refused_sources,
+                    MIN(signed_fetch_refused_at) AS refused_since,
                     MAX(last_fetched_at) AS last_fetched_at
                FROM external_sources
               WHERE is_active = TRUE
@@ -440,6 +597,9 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
             req.log.warn({ err }, 'dead-job query failed — graphile_worker schema may have moved')
             return null
           }),
+          // Linked-account notification polling (rung C). The dials ride the
+          // same statement so the threshold and the count are one reading.
+          pool.query(LINKED_POLL_HEALTH_SQL, [NOTIFICATIONS_NEEDS_RECONNECT]),
         ])
 
       const stateRow = (state: string) => {
@@ -473,7 +633,6 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
         accrual: {
           activeTabCount: num(t.active_tab_count),
           totalAccruedPence: num(t.total_accrued_pence),
-          totalCreditPence: num(t.total_credit_pence),
           nearThresholdTabs: num(t.near_threshold_tabs),
           settlementThresholdPence: config.tabSettlementThresholdPence,
           provisionalReadCount: provisional.count,
@@ -617,7 +776,37 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
               protocol: p.protocol,
               activeSources: num(p.active_sources),
               lastFetchedAt: p.last_fetched_at ?? null,
+              // How many of those active sources we currently cannot read at
+              // all, and since when the oldest of them has been that way.
+              // Zero is the ordinary answer and is rendered as nothing.
+              refusedSources: num(p.refused_sources),
+              refusedSince: p.refused_since
+                ? new Date(p.refused_since).toISOString()
+                : null,
             })),
+          }
+        })(),
+        // Linked-account notifications (CROSS-NETWORK-ROUNDTRIP-ADR C4). The
+        // heartbeat is PER PRESENCE and stamped only by a poll that succeeded,
+        // so a presence whose poll keeps failing — or a poller that has stopped
+        // — ages here rather than reporting itself fine. One that has never
+        // been polled ages from its link date: down, never "unknown", once it
+        // has had the threshold's worth of chances. Those awaiting a reconnect
+        // (a grant from before the notification scopes) are counted apart: a
+        // capability the member lacks is not a failure of ours, and an alarm
+        // that mixes them is one an operator learns past.
+        linkedNotifications: (() => {
+          const r = linkedPolls.rows[0] ?? {}
+          warnIfMalformedDial('linked_notifications_poll_seconds', r.poll_raw)
+          warnIfMalformedDial('linked_notifications_stale_intervals', r.stale_raw)
+          const pollSeconds = Number(r.poll_seconds) || LINKED_NOTIFICATIONS_POLL_SECONDS_FALLBACK
+          const staleIntervals = Number(r.stale_intervals) || LINKED_NOTIFICATIONS_STALE_INTERVALS_FALLBACK
+          return {
+            presences: num(r.presences),
+            down: num(r.down),
+            awaitingReconnect: num(r.awaiting_reconnect),
+            staleSeconds: pollSeconds * staleIntervals,
+            oldestSuccessAt: r.oldest_success_at ? new Date(r.oldest_success_at).toISOString() : null,
           }
         })(),
         // Dead background jobs (§8.15). The third arm of the same question the
@@ -695,12 +884,44 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
              COUNT(*) FILTER (WHERE status = 'moderated') AS moderated,
              COUNT(*) FILTER (WHERE status = 'deactivated') AS deactivated,
              COUNT(*) FILTER (WHERE stripe_customer_id IS NOT NULL) AS with_card,
-             COUNT(*) FILTER (WHERE stripe_customer_id IS NULL AND free_allowance_remaining_pence > 0) AS on_free_allowance,
-             COUNT(*) FILTER (WHERE stripe_customer_id IS NULL AND free_allowance_remaining_pence <= 0) AS allowance_exhausted,
+             -- Card or no card: a card holder spends what is left of the
+             -- allowance before anything reaches their tab (walkthrough A1,
+             -- 2026-09-24), so "has a card" no longer means "off the allowance".
+             COUNT(*) FILTER (WHERE free_allowance_remaining_pence > 0) AS on_free_allowance,
+             COUNT(*) FILTER (WHERE free_allowance_remaining_pence <= 0) AS allowance_exhausted,
              COUNT(*) FILTER (WHERE card_action_required_at IS NOT NULL) AS card_action_required,
+             -- WHO THE TWO TERMS REFUSALS WILL ACTUALLY TURN AWAY, and nobody
+             -- else. Not "has not accepted": most members have no card and
+             -- have never sold paid access, so they are not being asked and
+             -- counting them would bury the figure that matters under the
+             -- whole membership. These two are the pre-text cohorts — a reader
+             -- who registered a card before the Reader Terms existed, and a
+             -- writer with paid work published before the Writer Agreement did.
+             --
+             -- Compared on MAJOR ALONE, the same rule as
+             -- termsAcceptanceIsCurrent: a text-only bump must not light
+             -- this tile up with the entire membership. The versions arrive as
+             -- params rather than as literals, so there is only ever one copy.
+             COUNT(*) FILTER (
+               WHERE stripe_customer_id IS NOT NULL
+                 AND split_part(COALESCE(reader_terms_version, ''), '.', 1) IS DISTINCT FROM $1
+             ) AS reader_terms_outstanding,
+             COUNT(*) FILTER (
+               WHERE split_part(COALESCE(writer_terms_version, ''), '.', 1) IS DISTINCT FROM $2
+                 AND EXISTS (
+                   SELECT 1 FROM articles ar
+                    WHERE ar.writer_id = accounts.id
+                      AND ar.access_mode = 'paywalled'
+                      AND ar.deleted_at IS NULL
+                 )
+             ) AS writer_terms_outstanding,
              COUNT(*) FILTER (WHERE created_at > now() - interval '7 days') AS signups_7d,
              COUNT(*) FILTER (WHERE created_at > now() - interval '30 days') AS signups_30d
-           FROM accounts WHERE status <> 'deleted'`
+           FROM accounts WHERE status <> 'deleted'`,
+          [
+            termsMajor(currentTermsVersion('reader')),
+            termsMajor(currentTermsVersion('writer')),
+          ]
         ),
         // Writers holding modeled-but-unpaid earnings who cannot receive a
         // payout: KYC incomplete (or Connect never started). The outstanding
@@ -742,6 +963,12 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
           readersOnFreeAllowance: num(t.on_free_allowance),
           readersAllowanceExhausted: num(t.allowance_exhausted),
           cardActionRequired: num(t.card_action_required),
+          // Beside the KYC-stuck tile: a writer who cannot publish paid access
+          // and a reader who cannot make a paid read are both stuck on
+          // something only they can clear, and the operator has no other way
+          // to see it.
+          readerTermsOutstanding: num(t.reader_terms_outstanding),
+          writerTermsOutstanding: num(t.writer_terms_outstanding),
         },
         growth: {
           signupsLast7d: num(t.signups_7d),
@@ -767,6 +994,200 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
     } catch (err) {
       req.log.error({ err }, 'admin dashboard users failed')
       return reply.status(500).send({ error: 'Failed to load user metrics' })
+    }
+  })
+
+  // ---------------------------------------------------------------------------
+  // GET /admin/dashboard/members — the roster, searchable
+  //
+  // The tab above this one has been aggregates since it shipped: totals,
+  // growth, a conversion funnel and the KYC-stuck list. It could tell the
+  // operator that four accounts are suspended and nothing at all about WHICH.
+  // Its own closing line said so ("a standalone account search is a
+  // follow-on"), and the gap had a sharper edge than a missing screen: the
+  // platform's one direct moderation power, POST /admin/suspend/:accountId
+  // (moderation.ts), takes an account UUID, and no surface anywhere in the
+  // dashboard has ever rendered one. Suspending somebody the operator found
+  // herself — rather than through a report — meant psql on the box, which is
+  // the same shape of failure §XI was written about: a capability that exists
+  // and is unreachable from the only screen that looks.
+  //
+  // SEARCH IS TYPED, NOT INFERRED. The roster matches a substring against the
+  // three things an operator actually holds when they go looking — the address
+  // somebody emailed from, the handle on a post, the display name on a card —
+  // and does nothing else. No scoring, no "suspicious account" flag, no
+  // heuristic about who looks like a test row: the same rule the waitlist
+  // panel is built on (CLOSED-BETA-ADR §XI.2, "triage, not policy"), for the
+  // same reason — a rule about people belongs to a person reading a screen.
+  //
+  // THE PATTERN IS ESCAPED. `%` and `_` are ILIKE wildcards, so an operator
+  // searching for a literal underscore in a username would otherwise match any
+  // character, and a stray `%` would match everybody while looking like it had
+  // matched somebody. `likePattern` escapes both (and the escape character
+  // itself) — this is not injection defence, the value is still a bound
+  // parameter; it is the search meaning what it says.
+  //
+  // DELETED ROWS ARE OUT UNLESS ASKED FOR. The default list is everyone who
+  // still exists; `status=deleted` is how you look at the others, and it is
+  // the one filter that widens rather than narrows. `deactivated` is NOT the
+  // same state and is never hidden — that is a member's own choice and they
+  // are still here.
+  //
+  // THE COUNTS DO NOT MOVE WHEN THE FILTER DOES. Every per-status count is
+  // computed against the SEARCH alone, so switching between Active and
+  // Suspended doesn't rewrite the numbers on the buttons you are switching
+  // between. `matched` is derived from those same counts rather than a second
+  // query, so the two can't disagree.
+  //
+  // Capped at 200 with an explicit `truncated` flag, like the waitlist: a
+  // silent LIMIT reads as "that's everyone" precisely when it isn't.
+  // ---------------------------------------------------------------------------
+  const ROSTER_CAP = 200
+
+  const MEMBER_STATUSES = [
+    'active',
+    'suspended',
+    'moderated',
+    'deactivated',
+    'deleted',
+  ] as const
+
+  const MembersQuerySchema = z.object({
+    q: z.string().trim().max(200).optional(),
+    status: z.enum(MEMBER_STATUSES).optional(),
+  })
+
+  /**
+   * A literal substring as an ILIKE pattern. `%`, `_` and `\` are escaped, so
+   * the search matches the characters the operator typed and not the wildcard
+   * they didn't know they were writing. Paired with `ESCAPE '\'` in the SQL.
+   */
+  const likePattern = (q: string): string =>
+    '%' + q.replace(/[\\%_]/g, (c) => '\\' + c) + '%'
+
+  app.get('/admin/dashboard/members', { preHandler: requireAdmin }, async (req, reply) => {
+    const parsed = MembersQuerySchema.safeParse(req.query)
+    if (!parsed.success) {
+      return reply.status(400).send(zodValidationError(parsed.error))
+    }
+    const q = parsed.data.q ? likePattern(parsed.data.q) : null
+    const status = parsed.data.status ?? null
+
+    try {
+      const [counts, rows] = await Promise.all([
+        // Cast on the first use, then again where the type differs — node-
+        // postgres sends parameters untyped and infers from first use, so an
+        // uncast `$1` here would be resolved by whichever comparison Postgres
+        // reached first.
+        pool.query(
+          `SELECT
+             COUNT(*) FILTER (WHERE status = 'active') AS active,
+             COUNT(*) FILTER (WHERE status = 'suspended') AS suspended,
+             COUNT(*) FILTER (WHERE status = 'moderated') AS moderated,
+             COUNT(*) FILTER (WHERE status = 'deactivated') AS deactivated,
+             COUNT(*) FILTER (WHERE status = 'deleted') AS deleted
+           FROM accounts
+           WHERE ($1::text IS NULL
+                  OR email ILIKE $1::text ESCAPE '\\'
+                  OR username ILIKE $1::text ESCAPE '\\'
+                  OR display_name ILIKE $1::text ESCAPE '\\')`,
+          [q]
+        ),
+        pool.query(
+          `SELECT a.id, a.username, a.display_name, a.email, a.status::text AS status,
+                  a.created_at, a.onboarded_at,
+                  (a.stripe_customer_id IS NOT NULL) AS has_card,
+                  (a.stripe_connect_id IS NOT NULL) AS connect_started,
+                  a.stripe_connect_kyc_complete,
+                  a.reader_terms_version, a.writer_terms_version,
+                  h.mismatch_class AS halt_class, h.created_at AS halt_since,
+                  COALESCE(p.published, 0) AS articles_published
+             FROM accounts a
+             LEFT JOIN payouts_halted_accounts h ON h.account_id = a.id
+             LEFT JOIN (
+                   SELECT writer_id, COUNT(*) AS published
+                     FROM articles
+                    WHERE deleted_at IS NULL AND published_at IS NOT NULL
+                    GROUP BY writer_id
+                 ) p ON p.writer_id = a.id
+            WHERE ($1::text IS NOT NULL OR a.status <> 'deleted')
+              AND ($1::text IS NULL OR a.status = $1::account_status)
+              AND ($2::text IS NULL
+                   OR a.email ILIKE $2::text ESCAPE '\\'
+                   OR a.username ILIKE $2::text ESCAPE '\\'
+                   OR a.display_name ILIKE $2::text ESCAPE '\\')
+            ORDER BY a.created_at DESC
+            LIMIT $3`,
+          [status, q, ROSTER_CAP + 1]
+        ),
+      ])
+
+      const c = counts.rows[0]
+      const byStatus = {
+        active: num(c.active),
+        suspended: num(c.suspended),
+        moderated: num(c.moderated),
+        deactivated: num(c.deactivated),
+        deleted: num(c.deleted),
+      }
+      // Derived from the counts above rather than asked for separately, so the
+      // number under the list and the numbers on the filters cannot disagree.
+      // With no filter the list excludes deleted rows, and so does this.
+      const matched = status
+        ? byStatus[status]
+        : byStatus.active + byStatus.suspended + byStatus.moderated + byStatus.deactivated
+
+      const truncated = rows.rows.length > ROSTER_CAP
+      const shown = truncated ? rows.rows.slice(0, ROSTER_CAP) : rows.rows
+
+      return reply.send({
+        byStatus,
+        matched,
+        truncated,
+        shown: shown.length,
+        members: shown.map((r: any) => ({
+          id: r.id as string,
+          username: (r.username as string | null) ?? null,
+          displayName: (r.display_name as string | null) ?? null,
+          // An account can exist with no address — a seeded dev account, and
+          // anyone who arrived by a route that never asked for one. NULL here
+          // means we do not have one, never that it is hidden.
+          email: (r.email as string | null) ?? null,
+          status: r.status as string,
+          joinedAt: new Date(r.created_at).toISOString(),
+          // The member-level once-per-member gate (feeds rule). Absent means
+          // they have never finished arriving, which is a different thing from
+          // never having come back.
+          onboardedAt: r.onboarded_at ? new Date(r.onboarded_at).toISOString() : null,
+          hasCard: Boolean(r.has_card),
+          connectStarted: Boolean(r.connect_started),
+          connectKycComplete: Boolean(r.stripe_connect_kyc_complete),
+          // Which legal text this member accepted — the version string as
+          // stored, not a boolean. NULL means they have never accepted that
+          // text; a version that is not the current one is a member who
+          // accepted an older one, and the roster shows the difference rather
+          // than collapsing both into "no". Nothing here refuses anything.
+          readerTermsVersion: (r.reader_terms_version as string | null) ?? null,
+          writerTermsVersion: (r.writer_terms_version as string | null) ?? null,
+          articlesPublished: num(r.articles_published),
+          // WHETHER THIS MEMBER'S PAYOUTS ARE FROZEN, and under what — read
+          // here so the row can say so and so the freeze button is not offered
+          // on somebody already frozen. It is a fact about their MONEY and not
+          // about their status: a frozen member is otherwise an ordinary
+          // member, which is exactly what makes the freeze silent and exactly
+          // why the roster has to render it rather than leave it on a page the
+          // operator is not looking at.
+          payoutsHalted: r.halt_class
+            ? {
+                mismatchClass: r.halt_class as string,
+                since: new Date(r.halt_since).toISOString(),
+              }
+            : null,
+        })),
+      })
+    } catch (err) {
+      req.log.error({ err }, 'admin dashboard members failed')
+      return reply.status(500).send({ error: 'Failed to load the member list' })
     }
   })
 
@@ -935,6 +1356,14 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
             .status(400)
             .send({ error: `'${u.key}' is numeric; got a non-numeric value` })
         }
+        // A whole-number dial takes a whole number (CA-F2): "20.00" for a
+        // pence threshold was accepted here and read as 20p. The fractional
+        // dials (gravity, alphas, bands) keep NUMERIC_RE alone.
+        if (isIntegerDialKey(u.key) && !/^-?\d+$/.test(u.value)) {
+          return reply
+            .status(400)
+            .send({ error: `'${u.key}' is a whole number; got '${u.value}'` })
+        }
         if (u.key.endsWith('_bps')) {
           const v = Number(u.value)
           if (!Number.isInteger(v) || v < 0 || v > 10_000) {
@@ -968,6 +1397,21 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
           if (result.rowCount !== 1) {
             throw new Error(`config key '${u.key}' vanished mid-update`)
           }
+          // THE EVIDENCE, IN THE SAME TRANSACTION AS THE CHANGE (L5.2,
+          // migration 209). Outside it, a crash between the two leaves either a
+          // change nobody can account for or a record of one that never
+          // happened — and afterwards there is no way to tell which. The pino
+          // line below still fires, for the operator watching a terminal; this
+          // is the row that survives log retention and can be read beside the
+          // dial it describes. A no-op edit (`oldValue === u.value`) is skipped
+          // above and therefore records nothing: it changed nothing.
+          await recordConfigAudit(client, {
+            actorAccountId: adminId,
+            key: u.key,
+            oldValue: oldValue ?? null,
+            newValue: u.value,
+            reason: parsed.data.reason,
+          })
           applied.push({ key: u.key, oldValue, newValue: u.value })
         }
       })
@@ -978,6 +1422,10 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
       // it was the only one; nothing called it (found via knip, 2026-08-24).
       // Other processes keep their own caches and still age out on the TTL.
       if (applied.length > 0) invalidatePlatformConfig()
+      // The admin set has its own 60s cache (`getAdminIds`), so an operator who
+      // adds or removes an admin sees it take effect on the next request here,
+      // not a minute later (CA-I8). Other processes age out on the TTL.
+      if (applied.some((a) => a.key === 'admin_account_ids')) invalidateAdminIdsCache()
 
       // Log after commit so a rolled-back batch leaves no "changed" lines.
       for (const entry of applied) {
@@ -1011,10 +1459,13 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
            FROM tab_settlements WHERE status = 'completed'`
         ),
         pool.query(
-          `SELECT COALESCE(SUM(amount_pence), 0) AS total_held_pence,
+          `SELECT COALESCE(SUM(chargeable_pence), 0) AS total_held_pence,
                   MIN(read_at) AS oldest_held_read_at
            FROM read_events
-           -- Unclaimed by EITHER cycle (migration 168) — see the ops-overview twin.
+           -- Unclaimed by EITHER cycle (migration 168) — see the ops-overview
+           -- twin, which also carries why this is chargeable_pence and why it
+           -- stays gross of the platform fee. The two must agree: they are the
+           -- same figure on two pages.
            WHERE state = 'platform_settled'
              AND writer_payout_id IS NULL AND publication_payout_id IS NULL`
         ),
@@ -1108,10 +1559,14 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
   //
   // The admission state (migration 163) rides along: `admittedAt` says an
   // account exists for this address, `invitedAt` says the invitation email
-  // actually went, and they are separate because the send happens outside
-  // the admission transaction and can fail on its own. A row that is admitted
-  // but not invited is the state the panel offers a retry on — an admission
-  // nobody heard about is the exact failure this section exists to stop.
+  // actually went. Since the admit/invite split (RESHAPE-PLAN-2026-10 §A.2.2)
+  // "admitted, not invited" is ALSO the ordinary state of a cohort waiting to
+  // be told, so it is no longer the failure signal: `inviteFailedAt` is, set
+  // by a send that failed and cleared by a good one. `inSeed` says whether
+  // the member is in the designated seed (NULL with nothing designated) —
+  // false on an admitted row is the repair cue, and admitting again re-runs
+  // the append. `arrived` says whether they have signed in (the age
+  // declaration), which is when other members' source lists start naming them.
   //
   // NO FILTERING, BY DESIGN. The list attracts disposable addresses — one of
   // the first three real rows was from a temp-mail domain. The domain is right
@@ -1131,14 +1586,27 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
           `SELECT COUNT(*) AS total,
                   COUNT(*) FILTER (WHERE created_at > now() - interval '7 days') AS joined_7d,
                   COUNT(*) FILTER (WHERE admitted_at IS NOT NULL) AS admitted,
-                  COUNT(*) FILTER (WHERE admitted_at IS NOT NULL AND invited_at IS NULL) AS admitted_not_invited
+                  COUNT(*) FILTER (WHERE admitted_at IS NOT NULL AND invited_at IS NULL) AS admitted_not_invited,
+                  COUNT(*) FILTER (WHERE admitted_at IS NOT NULL AND invited_at IS NULL
+                                     AND invite_failed_at IS NOT NULL) AS invite_failed
              FROM waitlist`
         ),
         pool.query(
           `SELECT w.email, w.created_at,
-                  w.admitted_at, w.invited_at, a.username
+                  w.admitted_at, w.invited_at, w.invite_failed_at, a.username,
+                  CASE WHEN a.id IS NULL OR a.status = 'deleted' THEN NULL
+                       ELSE a.age_declared_at IS NOT NULL END AS arrived,
+                  -- NULL, not false, for a DELETED account: the replay skips
+                  -- one (skippedGone), so there is nothing to repair and the
+                  -- panel must not offer to.
+                  CASE WHEN a.id IS NULL OR a.status = 'deleted' OR seed.id IS NULL THEN NULL
+                       ELSE EXISTS (SELECT 1 FROM feed_formula_sources s
+                                     WHERE s.formula_id = seed.id AND s.source_type = 'account'
+                                       AND s.tag_value = a.nostr_pubkey)
+                  END AS in_seed
              FROM waitlist w
              LEFT JOIN accounts a ON a.id = w.admitted_account_id
+             LEFT JOIN feed_formulas seed ON seed.is_default_seed
             ORDER BY w.created_at DESC
             LIMIT $1`,
           [CAP + 1]
@@ -1161,6 +1629,7 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
           joinedLast7d: num(t.joined_7d),
           admitted: num(t.admitted),
           admittedNotInvited: num(t.admitted_not_invited),
+          inviteFailed: num(t.invite_failed),
         },
         lastDigestAt: digest.rows[0]?.value ?? null,
         truncated,
@@ -1170,6 +1639,10 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
           joinedAt: new Date(r.created_at).toISOString(),
           admittedAt: r.admitted_at ? new Date(r.admitted_at).toISOString() : null,
           invitedAt: r.invited_at ? new Date(r.invited_at).toISOString() : null,
+          inviteFailedAt: r.invite_failed_at ? new Date(r.invite_failed_at).toISOString() : null,
+          inSeed: (r.in_seed as boolean | null) ?? null,
+          // NULL with no account behind the row, like `username`.
+          arrived: (r.arrived as boolean | null) ?? null,
           // NULL for an unadmitted row, and also for one whose member has since
           // deleted their account (the FK is ON DELETE SET NULL) — the panel
           // reads it as "admitted, account gone", not as "never admitted",
@@ -1184,245 +1657,349 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
   })
 
   // ---------------------------------------------------------------------------
-  // POST /admin/dashboard/waitlist/admit — admit one waitlister
+  // POST /admin/dashboard/waitlist/admit — admit a batch of waitlisters
   //
-  // CLOSED-BETA-ADR §XI.2 "Actions", build order item 3. The one write on this
-  // panel, and the §3.7 minimum for running a closed beta at all: until now,
-  // converting a waitlister into a member meant hand-writing SQL on the box.
+  // CLOSED-BETA-ADR §XI.2 "Actions", as split by RESHAPE-PLAN-2026-10 §A.2.
+  // ADMITTING AND INVITING ARE TWO ACTS NOW: this route makes accounts and
+  // appends each new member to the default seed, and SENDS NOTHING. A cohort
+  // is admitted first and invited together (POST …/waitlist/invite), so each
+  // member's first workspace load finds the whole cohort in their seed feed —
+  // the seed is a snapshot taken at that load, and anyone admitted after it is
+  // not in it.
   //
-  // It does three things, in this order, and the order is the design:
+  // Per row, in this order, and the order is the design:
   //
   //   1. CLAIM the row (`admitted_at IS NULL` → now()). One statement, so two
-  //      concurrent admits — the operator double-clicking a slow button — race
-  //      on the database and exactly one wins. The loser reads the row back to
-  //      find out WHICH outcome it lost to — already admitted, or removed out
-  //      from under it — rather than reporting the one it assumed.
+  //      concurrent admits — a double-click, two admin tabs — race on the
+  //      database and exactly one wins. The loser reads the row back to find
+  //      out WHICH outcome it lost to — already admitted, or removed out from
+  //      under it — rather than reporting the one it assumed.
   //   2. Find-or-create the account. `provisionAccount` deliberately BYPASSES
   //      the CLOSED_BETA gate: that constant exists to reserve account creation
   //      to a human decision, and this IS that decision, taken by an admin
   //      behind requireAdmin. A prospect who is already a member (the operator
-  //      testing the form with their own address is the likely first case, and
-  //      one of the three live prod rows is exactly that) is LINKED, not
-  //      duplicated — accounts.email is unique, so a blind insert would 500.
-  //   3. Send the invitation, and stamp `invited_at` only if it went.
-  //
-  // THE EMAIL IS OUTSIDE THE CLAIM, AND ITS FAILURE DOES NOT UNDO ANYTHING
-  // (D7's rule, applied to admission). The account is the product; the message
-  // is the courtesy. A Postmark blip must not roll back a real account or
-  // release the claim, because the retry would then try to create it again.
-  // Instead the row rests at "admitted, not yet told", the panel shows that
-  // state and offers a resend, and this route's own resend path is the same
-  // endpoint called again.
+  //      testing the form with their own address) is LINKED, not duplicated —
+  //      accounts.email is unique, so a blind insert would 500. Only a CREATED
+  //      account is marked `provisioned_by_admit`, which is what keeps its
+  //      email-derived name out of other members' source lists until its owner
+  //      arrives (feeds/sources.ts › accountArrivedSql).
+  //   3. Append the account to the designated seed (`appendAccountToSeed`), in
+  //      its own transaction with its `config_audit` row. `provisionAccount`
+  //      commits on its own, so this cannot share its transaction; an append
+  //      that fails afterwards leaves a member who exists but is not in the
+  //      seed. So RE-ADMITTING AN ADMITTED ROW RE-RUNS THE APPEND — a no-op
+  //      when the row is there — rather than answering `already_admitted`, and
+  //      every result says what the append did.
   //
   // RESERVE→CREATE→CONFIRM, so a failure between the claim and the account is
   // not a stuck row: if provisioning throws, the claim is RELEASED (guarded on
   // `admitted_account_id IS NULL`, so it can never clobber a concurrent
-  // success) and the operator can simply click again.
+  // success) and the operator can simply press again.
+  //
+  // A PARTIAL OUTCOME IS NOT A TOTAL ONE. The batch runs row by row; a failure
+  // on one row is a fact about that row, the loop does not abort, and the
+  // shortfall ships beside the total. `reason` is the operator's one note for
+  // the batch (the cohort's name is enough) and lands on every append's audit
+  // row, which is what makes the trail readable later.
   // ---------------------------------------------------------------------------
+  const WAITLIST_BATCH_MAX = 200
   const AdmitSchema = z.object({
-    email: z.string().trim().max(254).email(),
+    emails: z.array(z.string().trim().max(254).email()).min(1).max(WAITLIST_BATCH_MAX),
+    reason: z.string().trim().min(1).max(500),
   })
+
+  type SeedResult = SeedAppendOutcome | 'error'
+  type AdmitRowResult =
+    | {
+        email: string
+        outcome: 'admitted' | 'already_admitted'
+        accountCreated: boolean
+        username: string | null
+        seed: SeedResult
+      }
+    | { email: string; outcome: 'not_on_list' | 'removed_meanwhile' | 'admit_in_progress' | 'error' }
+
+  async function appendToSeedFor(accountId: string, adminId: string, reason: string): Promise<SeedResult> {
+    try {
+      return await withTransaction((client) =>
+        appendAccountToSeed(client, { accountId, actorId: adminId, reason })
+      )
+    } catch (err) {
+      // The admission stands — the account is real — and the row says the
+      // append did not happen, which is the repair cue: admitting again
+      // re-runs it.
+      logger.error({ err, accountId }, 'waitlist admit: seed append failed — member exists, not in the seed')
+      return 'error'
+    }
+  }
+
+  async function admitOne(email: string, adminId: string, reason: string): Promise<AdmitRowResult> {
+    const existingRow = await pool.query<{
+      id: string
+      admitted_at: Date | null
+      admitted_account_id: string | null
+    }>(
+      `SELECT id, admitted_at, admitted_account_id
+         FROM waitlist WHERE email = $1`,
+      [email]
+    )
+    // A real reason, not a blurred one: this is behind requireAdmin, so there
+    // is no enumeration surface here, and blurring would hide a typo from the
+    // one person who can fix it.
+    if (existingRow.rows.length === 0) return { email, outcome: 'not_on_list' }
+    const row = existingRow.rows[0]
+
+    if (row.admitted_at) {
+      // The repair path. With no account behind the stamp, either another
+      // press is between its claim and its account, or one failed AND its
+      // release failed too (logged loudly below) — indistinguishable from
+      // here, and neither is this call's to append for.
+      if (!row.admitted_account_id) return { email, outcome: 'admit_in_progress' }
+      const account = await pool.query<{ username: string | null }>(
+        'SELECT username FROM accounts WHERE id = $1',
+        [row.admitted_account_id]
+      )
+      return {
+        email,
+        outcome: 'already_admitted',
+        accountCreated: false,
+        username: account.rows[0]?.username ?? null,
+        seed: await appendToSeedFor(row.admitted_account_id, adminId, reason),
+      }
+    }
+
+    // 1. Claim.
+    const claim = await pool.query<{ id: string }>(
+      `UPDATE waitlist SET admitted_at = now()
+        WHERE id = $1 AND admitted_at IS NULL
+        RETURNING id`,
+      [row.id]
+    )
+    if (claim.rows.length === 0) {
+      // A concurrent admit took the row, or a concurrent remove deleted it.
+      // Read back rather than assume: "already admitted" for a row that no
+      // longer exists would tell the operator someone is a member when
+      // nothing was created.
+      const still = await pool.query('SELECT admitted_at FROM waitlist WHERE id = $1', [row.id])
+      if (still.rows.length === 0) return { email, outcome: 'removed_meanwhile' }
+      return { email, outcome: 'admit_in_progress' }
+    }
+
+    let accountId: string
+    let username: string | null
+    let accountCreated = false
+    try {
+      // 2. Find-or-create.
+      const account = await pool.query<{ id: string; username: string | null }>(
+        'SELECT id, username FROM accounts WHERE email = $1',
+        [email]
+      )
+      if (account.rows.length > 0) {
+        accountId = account.rows[0].id
+        username = account.rows[0].username
+      } else {
+        // Display name from the local part — it is all a waitlist row
+        // carries, and the member renames themselves once they are in.
+        const provisioned = await provisionAccount(email, email.split('@')[0], null, {
+          byAdmit: true,
+        })
+        accountId = provisioned.accountId
+        username = provisioned.username
+        accountCreated = true
+      }
+
+      await pool.query('UPDATE waitlist SET admitted_account_id = $1 WHERE id = $2', [
+        accountId,
+        row.id,
+      ])
+    } catch (err) {
+      // Release the claim so a retry is possible. Guarded on
+      // admitted_account_id IS NULL: if a concurrent admit somehow got
+      // further than this one, its stamp survives.
+      await pool
+        .query(
+          `UPDATE waitlist SET admitted_at = NULL
+            WHERE id = $1 AND admitted_account_id IS NULL`,
+          [row.id]
+        )
+        .catch((releaseErr) => {
+          // The release itself failing leaves a claimed row with no account —
+          // the one state that needs a human, so say so loudly rather than
+          // burying it under the provisioning error.
+          logger.error(
+            { err: releaseErr, cause: err, waitlistId: row.id },
+            'waitlist admit: FAILED TO RELEASE CLAIM — row is admitted with no account'
+          )
+        })
+      throw err
+    }
+
+    // 3. Append. An admit that LINKED an existing account appends too; the
+    // index makes that harmless.
+    const seed = await appendToSeedFor(accountId, adminId, reason)
+    logger.info(
+      { adminId, waitlistId: row.id, accountId, accountCreated, seed },
+      'waitlist admit'
+    )
+    return { email, outcome: 'admitted', accountCreated, username, seed }
+  }
 
   app.post('/admin/dashboard/waitlist/admit', { preHandler: requireAdmin }, async (req, reply) => {
     const parsed = AdmitSchema.safeParse(req.body)
     if (!parsed.success) {
       return reply.status(400).send(zodValidationError(parsed.error))
     }
-    // POST /waitlist lower-cases before insert, so the stored key is lower-case
-    // and the lookup has to match it.
-    const email = parsed.data.email.toLowerCase().trim()
     const adminId = (req as any).session!.sub as string
+    // POST /waitlist lower-cases before insert, so the stored key is
+    // lower-case and the lookup has to match it. De-duplicated after folding,
+    // or one address typed twice would race itself.
+    const emails = [...new Set(parsed.data.emails.map((e) => e.toLowerCase().trim()))]
+
+    const results: AdmitRowResult[] = []
+    for (const email of emails) {
+      try {
+        results.push(await admitOne(email, adminId, parsed.data.reason))
+      } catch (err) {
+        req.log.error({ err, email: email.slice(0, 3) + '***' }, 'waitlist admit: row failed')
+        results.push({ email, outcome: 'error' })
+      }
+    }
+    const done = results.filter((r) => r.outcome === 'admitted' || r.outcome === 'already_admitted')
+    return reply.send({
+      results,
+      admitted: results.filter((r) => r.outcome === 'admitted').length,
+      // Everything that did not end with an account — counted, never omitted.
+      skipped: results.length - done.length,
+      seedAppended: done.filter((r) => 'seed' in r && r.seed === 'appended').length,
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // POST /admin/dashboard/waitlist/invite — tell admitted members they are in
+  //
+  // The second act of the split (RESHAPE-PLAN-2026-10 §A.2.2). `{ emails }`
+  // invites those rows; `{ allPending: true }` invites every admitted row not
+  // yet told — the "invite the cohort" press.
+  //
+  // THE CLAIM IS THE ONE THE OLD SINGLE ROUTE USED, AND FOR THE SAME REASON.
+  // `invited_at` is stamped FIRST (`invited_at IS NULL` → now()) and released
+  // when the send fails: without it, two presses both read the row as untold
+  // and the person gets two emails. Two presses contend on one statement and
+  // exactly one sends.
+  //
+  // A FAILED SEND NEEDS ITS OWN SIGNAL. "Admitted, not invited" used to arise
+  // only from a failed send; it is now also the ordinary state of a cohort
+  // waiting to be told, so the release branch stamps `invite_failed_at` and a
+  // good send clears it. The panel reads that, not the absence of
+  // `invited_at`, to put a row in red.
+  //
+  // THE EMAIL'S FAILURE UNDOES NOTHING (D7's rule, applied to admission). The
+  // account is the product; the message is the courtesy.
+  // ---------------------------------------------------------------------------
+  const InviteSchema = z.union([
+    z.object({ emails: z.array(z.string().trim().max(254).email()).min(1).max(WAITLIST_BATCH_MAX) }),
+    z.object({ allPending: z.literal(true) }),
+  ])
+
+  type InviteOutcome =
+    | 'invited'
+    | 'send_failed'
+    | 'already_invited'
+    | 'not_admitted'
+    | 'admit_in_progress'
+    | 'not_on_list'
+    | 'error'
+
+  async function inviteOne(email: string): Promise<InviteOutcome> {
+    const found = await pool.query<{
+      id: string
+      admitted_at: Date | null
+      invited_at: Date | null
+      admitted_account_id: string | null
+    }>(
+      `SELECT id, admitted_at, invited_at, admitted_account_id FROM waitlist WHERE email = $1`,
+      [email]
+    )
+    if (found.rows.length === 0) return 'not_on_list'
+    const row = found.rows[0]
+    if (!row.admitted_at) return 'not_admitted'
+    // Never invite someone to an account this call cannot confirm exists.
+    if (!row.admitted_account_id) return 'admit_in_progress'
+    if (row.invited_at) return 'already_invited'
+
+    const inviteClaim = await pool.query<{ id: string }>(
+      `UPDATE waitlist SET invited_at = now()
+        WHERE id = $1 AND invited_at IS NULL
+        RETURNING id`,
+      [row.id]
+    )
+    // Someone else's press is sending it, or already has.
+    if (inviteClaim.rows.length === 0) return 'already_invited'
 
     try {
-      const existingRow = await pool.query<{
-        id: string
-        admitted_at: Date | null
-        invited_at: Date | null
-        admitted_account_id: string | null
-      }>(
-        `SELECT id, admitted_at, invited_at, admitted_account_id
-           FROM waitlist WHERE email = $1`,
-        [email]
-      )
-
-      if (existingRow.rows.length === 0) {
-        // Deliberately a real 404 with a real reason. This endpoint is behind
-        // requireAdmin, so there is no enumeration surface to protect here —
-        // that concern belongs to the public POST /waitlist, and blurring the
-        // admin's error would only hide a typo from the one person who can fix
-        // it.
-        return reply.status(404).send({ error: 'not_on_list' })
-      }
-
-      const row = existingRow.rows[0]
-
-      if (row.admitted_at && row.invited_at) {
-        return reply.status(409).send({ error: 'already_admitted' })
-      }
-
-      let accountId = row.admitted_account_id
-      let username: string | null = null
-      let accountCreated = false
-      // Read once, before the claim moves it: this call is either the admission
-      // or a resend to a row that was admitted and never told, and step 3 needs
-      // to know which when it loses a race.
-      const isResend = Boolean(row.admitted_at)
-
-      if (!row.admitted_at) {
-        // 1. Claim.
-        const claim = await pool.query<{ id: string }>(
-          `UPDATE waitlist SET admitted_at = now()
-            WHERE id = $1 AND admitted_at IS NULL
-            RETURNING id`,
+      await sendWaitlistInviteEmail(email)
+    } catch (err) {
+      // Release the stamp and say the send failed. The admission stands; the
+      // row must go on saying "not yet told", now marked as a failure so the
+      // retry cue stands out from rows nobody has tried yet.
+      await pool
+        .query(
+          `UPDATE waitlist SET invited_at = NULL, invite_failed_at = now() WHERE id = $1`,
           [row.id]
         )
-        if (claim.rows.length === 0) {
-          // The claim found nothing to stamp, and since Remove landed there
-          // are two ways that happens: a concurrent admit took the row (the
-          // double-click this claim exists to absorb), or a concurrent remove
-          // deleted it. Read back rather than assume — reporting "already
-          // admitted" for a row that no longer exists would tell the operator
-          // someone is a member when nothing was created.
-          const still = await pool.query('SELECT admitted_at FROM waitlist WHERE id = $1', [
-            row.id,
-          ])
-          if (still.rows.length === 0) {
-            return reply.status(404).send({ error: 'removed_meanwhile' })
-          }
-          return reply.status(409).send({ error: 'already_admitted' })
-        }
-
-        try {
-          // 2. Find-or-create.
-          const account = await pool.query<{ id: string; username: string | null }>(
-            'SELECT id, username FROM accounts WHERE email = $1',
-            [email]
-          )
-          if (account.rows.length > 0) {
-            accountId = account.rows[0].id
-            username = account.rows[0].username
-          } else {
-            // Display name from the local part — it is all a waitlist row
-            // carries, and the member renames themselves in Settings.
-            const provisioned = await provisionAccount(email, email.split('@')[0])
-            accountId = provisioned.accountId
-            username = provisioned.username
-            accountCreated = true
-          }
-
-          await pool.query('UPDATE waitlist SET admitted_account_id = $1 WHERE id = $2', [
-            accountId,
-            row.id,
-          ])
-        } catch (err) {
-          // Release the claim so a retry is possible. Guarded on
-          // admitted_account_id IS NULL: if a concurrent admit somehow got
-          // further than this one, its stamp survives.
-          await pool
-            .query(
-              `UPDATE waitlist SET admitted_at = NULL
-                WHERE id = $1 AND admitted_account_id IS NULL`,
-              [row.id]
-            )
-            .catch((releaseErr) => {
-              // The release itself failing leaves a claimed row with no
-              // account — the one state that needs a human, so say so loudly
-              // rather than burying it under the provisioning error.
-              logger.error(
-                { err: releaseErr, waitlistId: row.id },
-                'waitlist admit: FAILED TO RELEASE CLAIM — row is admitted with no account'
-              )
-            })
-          throw err
-        }
-      } else {
-        // Already admitted, never told: this call is the resend.
-        if (!accountId) {
-          // Stamped, but with no account behind it — which means either another
-          // click is between its claim and its account (the mid-flight window),
-          // or one failed AND its release failed too (loudly logged above).
-          // Both are indistinguishable from here and neither is a resend: this
-          // call must not invite someone to an account it cannot confirm
-          // exists. Refusing also keeps a second click out of the first's way
-          // rather than racing it.
-          return reply.status(409).send({ error: 'admit_in_progress' })
-        }
-        // Read back the username so the response can name who they are.
-        const account = accountId
-          ? await pool.query<{ username: string | null }>(
-              'SELECT username FROM accounts WHERE id = $1',
-              [accountId]
-            )
-          : { rows: [] as Array<{ username: string | null }> }
-        username = account.rows[0]?.username ?? null
-      }
-
-      // 3. Tell them — and claim the invitation the same way the admission was
-      // claimed, for the same reason. Without it there is a window between the
-      // admission claim and the send in which a second click reads the row as
-      // "admitted, never told", takes the resend path, and mails the person a
-      // duplicate. Stamping FIRST and releasing on failure closes it: two
-      // clicks contend on one statement and exactly one sends.
-      let invited = false
-      const inviteClaim = await pool.query<{ id: string }>(
-        `UPDATE waitlist SET invited_at = now()
-          WHERE id = $1 AND invited_at IS NULL
-          RETURNING id`,
-        [row.id]
-      )
-
-      if (inviteClaim.rows.length === 0) {
-        // Someone else's click is sending it, or already has. If this call had
-        // nothing else to do — a resend that lost the race — say so rather than
-        // reporting a send it did not make.
-        if (isResend) {
-          return reply.status(409).send({ error: 'already_admitted' })
-        }
-        invited = true
-      } else {
-        try {
-          await sendWaitlistInviteEmail(email)
-          invited = true
-        } catch (err) {
-          // Release the stamp. The admission stands — the account is real and
-          // the person is a member — but the row must go on saying "not yet
-          // told", because that is the state the panel offers the retry on and
-          // an invitation nobody received is the failure this section exists to
-          // stop.
-          await pool
-            .query(
-              `UPDATE waitlist SET invited_at = NULL WHERE id = $1`,
-              [row.id]
-            )
-            .catch((releaseErr) => {
-              logger.error(
-                { err: releaseErr, waitlistId: row.id },
-                'waitlist admit: FAILED TO RELEASE INVITE STAMP — row reads as told when it was not'
-              )
-            })
+        .catch((releaseErr) => {
           logger.error(
-            { err, waitlistId: row.id, email: email.slice(0, 3) + '***' },
-            'waitlist admit: invitation email failed — admission stands, not yet told'
+            { err: releaseErr, cause: err, waitlistId: row.id },
+            'waitlist invite: FAILED TO RELEASE INVITE STAMP — row reads as told when it was not'
           )
-        }
-      }
-
-      logger.info(
-        { adminId, waitlistId: row.id, accountId, accountCreated, invited },
-        'waitlist admit'
+        })
+      logger.error(
+        { err, waitlistId: row.id, email: email.slice(0, 3) + '***' },
+        'waitlist invite: invitation email failed — admission stands, not yet told'
       )
-
-      return reply.send({
-        email,
-        admitted: true,
-        accountCreated,
-        username,
-        invited,
-      })
-    } catch (err) {
-      req.log.error({ err }, 'waitlist admit failed')
-      return reply.status(500).send({ error: 'Failed to admit' })
+      return 'send_failed'
     }
+    await pool.query(`UPDATE waitlist SET invite_failed_at = NULL WHERE id = $1`, [row.id])
+    return 'invited'
+  }
+
+  app.post('/admin/dashboard/waitlist/invite', { preHandler: requireAdmin }, async (req, reply) => {
+    const parsed = InviteSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return reply.status(400).send(zodValidationError(parsed.error))
+    }
+    const adminId = (req as any).session!.sub as string
+
+    let emails: string[]
+    if ('allPending' in parsed.data) {
+      try {
+        const { rows } = await pool.query<{ email: string }>(
+          `SELECT email FROM waitlist
+            WHERE admitted_at IS NOT NULL AND admitted_account_id IS NOT NULL
+              AND invited_at IS NULL
+            ORDER BY admitted_at ASC`
+        )
+        emails = rows.map((r) => r.email)
+      } catch (err) {
+        req.log.error({ err }, 'waitlist invite: pending read failed')
+        return reply.status(500).send({ error: 'Failed to read the admitted rows' })
+      }
+    } else {
+      emails = [...new Set(parsed.data.emails.map((e) => e.toLowerCase().trim()))]
+    }
+
+    const results: Array<{ email: string; outcome: InviteOutcome }> = []
+    for (const email of emails) {
+      try {
+        results.push({ email, outcome: await inviteOne(email) })
+      } catch (err) {
+        req.log.error({ err, email: email.slice(0, 3) + '***' }, 'waitlist invite: row failed')
+        results.push({ email, outcome: 'error' })
+      }
+    }
+    const invited = results.filter((r) => r.outcome === 'invited').length
+    logger.info({ adminId, asked: results.length, invited }, 'waitlist invite')
+    return reply.send({ results, invited, skipped: results.length - invited })
   })
 
   // ---------------------------------------------------------------------------
@@ -1524,6 +2101,157 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
   })
 
   // ---------------------------------------------------------------------------
+  // GET /admin/dashboard/writer-applications — the writers' waiting list
+  //
+  // READER-WRITER-SPLIT-ADR §8 (D3). Readers who pressed "Apply to write",
+  // OLDEST FIRST — the order they asked in, and no other. NO HEURISTIC TRIAGE
+  // (CLOSED-BETA-ADR §XI.2): the application carries nothing but the account
+  // and the moment (O4), and the operator judges from what the member has
+  // posted, which is what the profile link on each row is for.
+  //
+  // A deleted account's application is left out: there is nobody to grant.
+  // A suspended one is shown with its status, because whether to grant is the
+  // operator's call and the row must not hide the fact it would be made on.
+  //
+  // The granted half is the record (newest first, the last 50): who was
+  // admitted, when, and by whom. Capped with an explicit `truncated` flag on
+  // the pending half, like the waitlist — a silent LIMIT would read as
+  // "that's everyone" precisely when it isn't.
+  // ---------------------------------------------------------------------------
+  app.get('/admin/dashboard/writer-applications', { preHandler: requireAdmin }, async (req, reply) => {
+    try {
+      const CAP = 500
+      const GRANTED_SHOWN = 50
+      const [totals, pending, granted] = await Promise.all([
+        pool.query(
+          `SELECT COUNT(*) FILTER (WHERE wa.admitted_at IS NULL) AS pending,
+                  COUNT(*) FILTER (WHERE wa.admitted_at IS NOT NULL) AS granted
+             FROM writer_applications wa
+             JOIN accounts a ON a.id = wa.account_id
+            WHERE a.status <> 'deleted'`
+        ),
+        pool.query(
+          `SELECT wa.account_id, wa.created_at, a.username, a.display_name, a.status,
+                  a.created_at AS member_since
+             FROM writer_applications wa
+             JOIN accounts a ON a.id = wa.account_id
+            WHERE wa.admitted_at IS NULL AND a.status <> 'deleted'
+            ORDER BY wa.created_at ASC
+            LIMIT $1`,
+          [CAP + 1]
+        ),
+        pool.query(
+          `SELECT wa.account_id, wa.created_at, wa.admitted_at, a.username, a.display_name,
+                  a.status, a.created_at AS member_since, g.username AS admitted_by_username
+             FROM writer_applications wa
+             JOIN accounts a ON a.id = wa.account_id
+             LEFT JOIN accounts g ON g.id = wa.admitted_by
+            WHERE wa.admitted_at IS NOT NULL AND a.status <> 'deleted'
+            ORDER BY wa.admitted_at DESC
+            LIMIT $1`,
+          [GRANTED_SHOWN]
+        ),
+      ])
+
+      const t = totals.rows[0]
+      const truncated = pending.rows.length > CAP
+      const rows = truncated ? pending.rows.slice(0, CAP) : pending.rows
+      const member = (r: any) => ({
+        accountId: r.account_id as string,
+        username: (r.username as string | null) ?? null,
+        displayName: (r.display_name as string | null) ?? null,
+        status: r.status as string,
+        memberSince: new Date(r.member_since).toISOString(),
+        appliedAt: new Date(r.created_at).toISOString(),
+      })
+
+      return reply.send({
+        totals: { pending: num(t?.pending), granted: num(t?.granted) },
+        truncated,
+        pending: rows.map(member),
+        granted: granted.rows.map((r: any) => ({
+          ...member(r),
+          grantedAt: new Date(r.admitted_at).toISOString(),
+          grantedBy: (r.admitted_by_username as string | null) ?? null,
+        })),
+      })
+    } catch (err) {
+      req.log.error({ err }, 'admin dashboard writer applications failed')
+      return reply.status(500).send({ error: 'Failed to load the writer applications' })
+    }
+  })
+
+  // ---------------------------------------------------------------------------
+  // POST /admin/dashboard/writer-applications/grant — admit one as a writer
+  //
+  // READER-WRITER-SPLIT-ADR §8. The work is `grantWriterAccess` (lib/
+  // writer-gate.ts): the column, the application's stamp and the
+  // `config_audit` row, in THIS route's transaction. This route adds only that
+  // an application must exist — a grant with none is D4's to offer (plan §D.5
+  // q3), and the function already takes one — and the email.
+  //
+  // THE EMAIL WAITS FOR COMMIT, and a failed send does not undo the grant: the
+  // member can publish whether or not they have been told, and a rolled-back
+  // grant because Postmark hiccupped would be the mail deciding who writes.
+  // The response says what happened to it (`emailed`), and the panel says a
+  // failure in red, so the operator can tell them another way.
+  //
+  // Refusals are chosen statuses with fixed codes: 404 `no_application` /
+  // `no_account`, 409 `already_writer` (a second admin's press, or a double
+  // click, lost the claim and recorded nothing).
+  // ---------------------------------------------------------------------------
+  const GrantWriterSchema = z.object({
+    accountId: z.string().regex(UUID_RE),
+    reason: z.string().trim().min(1).max(500),
+  })
+
+  app.post('/admin/dashboard/writer-applications/grant', { preHandler: requireAdmin }, async (req, reply) => {
+    const parsed = GrantWriterSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return reply.status(400).send(zodValidationError(parsed.error))
+    }
+    const { accountId, reason } = parsed.data
+    const adminId = (req as any).session!.sub as string
+
+    const result = await withTransaction(async (client) => {
+      const app = await client.query(
+        'SELECT 1 FROM writer_applications WHERE account_id = $1',
+        [accountId]
+      )
+      if (app.rows.length === 0) return { outcome: 'no_application' as const, email: null }
+      const grant = await grantWriterAccess(client, { accountId, adminId, reason })
+      if (grant.outcome !== 'granted') return { outcome: grant.outcome, email: null }
+      const acct = await client.query<{ email: string | null }>(
+        'SELECT email FROM accounts WHERE id = $1',
+        [accountId]
+      )
+      return { outcome: 'granted' as const, email: acct.rows[0]?.email ?? null }
+    })
+
+    if (result.outcome === 'no_application' || result.outcome === 'no_account') {
+      return reply.status(404).send({ error: result.outcome })
+    }
+    if (result.outcome === 'already_writer') {
+      return reply.status(409).send({ error: 'already_writer' })
+    }
+
+    // Nothing to invalidate: the writer gate and /auth/me both read the column
+    // uncached (the auth-state cache holds status and age only).
+    let emailed: 'sent' | 'failed' | 'no_address' = 'no_address'
+    if (result.email) {
+      try {
+        await sendWriterAccessGrantedEmail(result.email)
+        emailed = 'sent'
+      } catch (err) {
+        emailed = 'failed'
+        logger.error({ err, accountId }, 'writer grant: email failed — the grant stands, the member has not been told')
+      }
+    }
+    logger.info({ adminId, accountId, emailed }, 'writer access granted')
+    return reply.send({ outcome: 'granted', emailed })
+  })
+
+  // ---------------------------------------------------------------------------
   // GET /admin/dashboard/allocation-coverage — funds segregation, measured
   //
   // PAYMENT-PERIMETER-ADR W2. A PROXY rather than a query here, unlike the W4
@@ -1550,6 +2278,134 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
       }
     }
   )
+
+  // ---------------------------------------------------------------------------
+  // GET /admin/dashboard/reader-credits — who is in credit (W1, L3.4)
+  //
+  // A reading tab in credit is the platform owing a reader, redeemable against
+  // future reads. Reader Terms 4.3 (published) promises to refund it to the
+  // card rather than let anyone spend it, so it is a state to END. Until this
+  // panel the only surface was a FATAL log line three times a day — the right
+  // shape for an alert and the wrong one for "is anyone in credit right now",
+  // which is the question an operator actually arrives with. Runbook:
+  // docs/runbooks/reader-tab-credit.md.
+  //
+  // A PROXY, for the allocation-coverage reason one level down: the detector is
+  // exported from `reconcile-ledger.ts` as its one home precisely so the
+  // scheduled check and anything else asking run the same statement, and a
+  // retyped `balance_pence < 0` here would be a second definition of the
+  // incident. The gateway adds only what the payment service has no business
+  // knowing: who these account ids belong to. A uuid alone is not actionable,
+  // and the runbook's first step is to go and look at a person.
+  //
+  // The enrichment is a LEFT-side lookup: a credit on an account row that has
+  // since gone still reports, with no name. Dropping it would hide the one
+  // account whose state is strangest.
+  // ---------------------------------------------------------------------------
+  app.get(
+    '/admin/dashboard/reader-credits',
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      let body: any
+      try {
+        const res = await callPaymentService('/reader-credits', 'GET')
+        if (res.status !== 200) {
+          req.log.error({ status: res.status }, 'reader-credits upstream returned non-200')
+          return reply.status(502).send({ error: 'Payment service unreachable' })
+        }
+        body = res.body
+      } catch (err) {
+        req.log.error({ err }, 'reader-credits proxy failed')
+        return reply.status(502).send({ error: 'Payment service unreachable' })
+      }
+
+      const accounts: any[] = Array.isArray(body?.accounts) ? body.accounts : []
+      const ids = accounts.map((a) => a.accountId).filter(Boolean)
+      const names = new Map<string, { username: string | null; displayName: string | null }>()
+      if (ids.length > 0) {
+        const { rows } = await pool.query<{
+          id: string
+          username: string | null
+          display_name: string | null
+        }>(`SELECT id, username, display_name FROM accounts WHERE id = ANY($1::uuid[])`, [ids])
+        for (const r of rows) {
+          names.set(r.id, { username: r.username, displayName: r.display_name })
+        }
+      }
+
+      return reply.status(200).send({
+        ...body,
+        accounts: accounts.map((a) => ({
+          ...a,
+          username: names.get(a.accountId)?.username ?? null,
+          displayName: names.get(a.accountId)?.displayName ?? null,
+        })),
+      })
+    }
+  )
+
+  // ---------------------------------------------------------------------------
+  // POST /admin/dashboard/refund — send one payable back to the card (L3.1)
+  //
+  // Reader Terms 4.3, published and live at /reader-terms, says that where a
+  // billing error leaves a reader in credit "we will refund that amount to the
+  // payment method it came from". Migration 206 made the first half true (the
+  // tab stops being somewhere a credit can live); until this there was no path
+  // in the repo that called `refunds.create` at all, so the promise had a
+  // detector, a banner and a runbook behind it and no button.
+  //
+  // A PROXY, and it decides nothing. The three-phase create, the idempotency
+  // key, the terminal/ambiguous split and every refusal live in the payment
+  // service, which is the only service that may talk to Stripe. What the
+  // gateway adds is the two things the payment service cannot know: that the
+  // caller is an admin, and WHICH admin — forwarded as `actorId` off the
+  // session, never the service token, which proves only that something inside
+  // the mesh asked.
+  //
+  // THE REASON IS REQUIRED HERE TOO. It is required by this schema, by the
+  // service, and by the column's own CHECK. Three places rather than one
+  // because money leaving with nothing said about why is a payment and not a
+  // record — and each of the three is a door somebody could otherwise walk
+  // round.
+  //
+  // The upstream status passes through: every refusal the service distinguishes
+  // is a different thing for the operator to do, and collapsing them into one
+  // "could not refund" sends them to the runbook with no idea which page.
+  // ---------------------------------------------------------------------------
+  const RefundBody = z.object({
+    creditId: z.string().uuid(),
+    reason: z.string().trim().min(1).max(500),
+  })
+
+  app.post('/admin/dashboard/refund', { preHandler: requireAdmin }, async (req, reply) => {
+    const parsed = RefundBody.safeParse(req.body)
+    if (!parsed.success) {
+      return reply.status(400).send(zodValidationError(parsed.error))
+    }
+    const adminId = (req as any).session!.sub as string
+
+    try {
+      const { status, body } = await callPaymentService(
+        '/reader-credits/refund',
+        'POST',
+        { ...parsed.data, actorId: adminId }
+      )
+      req.log.info(
+        { adminId, creditId: parsed.data.creditId, status },
+        'admin reader-credit refund attempted'
+      )
+      return reply.status(status).send(body)
+    } catch (err) {
+      // `fetch` itself threw — a timeout or a refused connection. The refund MAY
+      // have been made: the request left, and nothing here knows whether it
+      // arrived. So this is not "it failed", and it must not read as one.
+      req.log.error({ err, adminId, creditId: parsed.data.creditId }, 'refund proxy failed')
+      return reply.status(502).send({
+        kind: 'unknown',
+        error: 'Payment service unreachable — the refund MAY have been made. Reload before trying again.',
+      })
+    }
+  })
 
   // ---------------------------------------------------------------------------
   // GET /admin/dashboard/seed-formula — what every new account is seeded from
@@ -1602,6 +2458,30 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
           ORDER BY f.sort_rank ASC, f.created_at ASC`,
         [adminId]
       )
+      // THE ADMITTED MEMBERS, AND WHO OF THEM HAS NOT ARRIVED (§A.2.6, §A.2.7).
+      // The operator is the one person who sees the whole composition, so the
+      // panel says how many of the seed's members admission put there, how
+      // many of those other members cannot yet see named (not arrived), and —
+      // per feed — how many a re-cut from it would carry across, stated before
+      // the press rather than discovered after.
+      const admittedStats = designated[0]
+        ? await pool.query<{ admitted: number; awaiting: number }>(
+            `SELECT COUNT(*)::int AS admitted,
+                    COUNT(*) FILTER (WHERE a.provisioned_by_admit AND a.age_declared_at IS NULL)::int AS awaiting
+               FROM feed_formula_sources s
+               JOIN accounts a ON a.nostr_pubkey = s.tag_value
+              WHERE s.formula_id = $1 AND s.source_type = 'account'
+                AND EXISTS (SELECT 1 FROM waitlist w WHERE w.admitted_account_id = a.id)`,
+            [designated[0].id]
+          )
+        : null
+      const carryCounts = designated[0]
+        ? await Promise.all(
+            feeds.map((f: any) =>
+              countCarryForFeed(pool, { fromFormulaId: designated[0].id, feedId: f.id })
+            )
+          )
+        : feeds.map(() => 0)
       return reply.send({
         designated: designated[0]
           ? {
@@ -1620,12 +2500,15 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
               authorIsSelf: designated[0].author_id === adminId,
               sourceFeedId: designated[0].source_feed_id,
               suspendedSourceCount: num(suspended?.rows[0]?.n ?? 0),
+              admittedCount: num(admittedStats?.rows[0]?.admitted ?? 0),
+              awaitingArrivalCount: num(admittedStats?.rows[0]?.awaiting ?? 0),
             }
           : null,
-        feeds: feeds.map((r: any) => ({
+        feeds: feeds.map((r: any, i: number) => ({
           id: r.id,
           name: r.name,
           sourceCount: num(r.source_count),
+          carryCount: carryCounts[i],
         })),
       })
     } catch (err) {
@@ -1730,7 +2613,17 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
         await client.query(`UPDATE feed_formulas SET is_default_seed = TRUE WHERE id = $1`, [
           formulaId,
         ])
-        return { formulaId, minted: true, previous: previous[0] ?? null }
+        // The carry (§A.2.7) — after the swap, because the swap's UPDATE is
+        // what waits out an admit holding the outgoing seed's lock, so a
+        // member appended in that window is read here rather than lost.
+        const carry =
+          previous.length > 0 && parsed.data.carryAdmitted !== false
+            ? await carryAdmittedIntoSeed(client, {
+                fromFormulaId: previous[0].id,
+                toFormulaId: formulaId,
+              })
+            : { carried: 0, dropped: 0 }
+        return { formulaId, minted: true, previous: previous[0] ?? null, carry }
       })
 
       if ('error' in outcome) {
@@ -1740,17 +2633,17 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
           return reply.status(400).send({
             error: 'seed_feed_unnamed',
             message:
-              'This feed has no name. A feed can go without one, but the default seed cannot — name the feed, or give the seed a name here.',
+              'This channel has no name. A channel can go without one, but the default seed cannot — name the channel, or give the seed a name here.',
           })
         if (outcome.error === 'empty')
           return reply.status(400).send({
             error: 'formula_empty',
             message:
-              'A seed formula must carry at least one shareable source — a sourceless feed shows every new member the platform stream instead.',
+              'A seed formula must carry at least one shareable source — a sourceless channel shows every new member the platform stream instead.',
           })
         return reply.status(409).send({
           error: 'formula_too_large',
-          message: 'This feed has more sources than a formula may carry.',
+          message: 'This channel has more sources than a formula may carry.',
         })
       }
 
@@ -1773,6 +2666,8 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
           minted: outcome.minted,
           replaced: outcome.previous?.id ?? null,
           authorId: now[0]?.author_id,
+          carried: outcome.carry.carried,
+          carryDropped: outcome.carry.dropped,
         },
         'owner dashboard: default-seed formula designated'
       )
@@ -1786,6 +2681,10 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
         },
         minted: outcome.minted,
         replaced: outcome.previous,
+        // Carried admitted members, and those the cap refused — counted,
+        // never dropped quietly.
+        carried: outcome.carry.carried,
+        carryDropped: outcome.carry.dropped,
       })
     } catch (err) {
       req.log.error({ err }, 'admin dashboard seed-formula designation failed')
@@ -1846,34 +2745,233 @@ export async function adminDashboardRoutes(app: FastifyInstance) {
 
   // ---------------------------------------------------------------------------
   // Trigger proxies — payment-service internal endpoints (x-internal-token)
+  //
+  // Each runs a whole cron cycle early: the settlement sweep charges every tab
+  // past the fallback window, the payout cycle pays every writer over the
+  // threshold. Neither changes a dial, but at the card networks the effect is
+  // indistinguishable from a decision, so each takes a REQUIRED reason and
+  // leaves a `config_audit` row (walkthrough A17), key
+  // `operator_trigger:settlement` / `operator_trigger:payout`.
+  //
+  // THE ROW IS WRITTEN AT THE REQUEST, BEFORE THE PROXY, IN ITS OWN
+  // TRANSACTION — the one departure from "same transaction as the change"
+  // (ops-and-config.md): the change happens in another service, so no
+  // transaction spans it. It records that the operator ASKED, which is the
+  // decision; the outcome is the cycle's own records. If the row cannot be
+  // written nothing is run — evidence first — and the answer says so
+  // (`not_recorded`), which is the ONE failure the dashboard may call
+  // "nothing ran". Every failure after the request left is AMBIGUOUS (a
+  // 60-second cycle can time out mid-run), so a 502 says "may have run".
   // ---------------------------------------------------------------------------
-  app.post(
-    '/admin/dashboard/trigger-settlements',
-    { preHandler: requireAdmin },
-    async (req, reply) => {
+  const TriggerBody = z.object({
+    reason: z.string().trim().min(1).max(500),
+  })
+
+  const TRIGGERS = [
+    {
+      route: '/admin/dashboard/trigger-settlements',
+      key: 'operator_trigger:settlement',
+      upstream: '/settlement-check/monthly',
+      what: 'monthly settlement check',
+    },
+    {
+      route: '/admin/dashboard/trigger-payouts',
+      key: 'operator_trigger:payout',
+      upstream: '/payout-cycle',
+      what: 'payout cycle',
+    },
+  ] as const
+
+  for (const t of TRIGGERS) {
+    app.post(t.route, { preHandler: requireAdmin }, async (req, reply) => {
+      const parsed = TriggerBody.safeParse(req.body)
+      if (!parsed.success) {
+        return reply.status(400).send(zodValidationError(parsed.error))
+      }
+      const adminId = (req as any).session!.sub as string
+      const reason = parsed.data.reason
+
       try {
-        const adminId = (req as any).session!.sub as string
-        logger.info({ adminId }, 'owner dashboard: monthly settlement check triggered')
-        const { status, body } = await callPaymentService('/settlement-check/monthly')
+        await withTransaction(async (client) => {
+          await recordConfigAudit(client, {
+            actorAccountId: adminId,
+            key: t.key,
+            newValue: 'requested',
+            reason,
+          })
+        })
+      } catch (err) {
+        req.log.error({ err, adminId }, `${t.what} trigger: audit row not written, nothing run`)
+        return reply.status(500).send({
+          error: 'not_recorded',
+          message: 'The request could not be recorded, so nothing was run.',
+        })
+      }
+
+      try {
+        logger.info({ adminId, reason }, `owner dashboard: ${t.what} triggered`)
+        const { status, body } = await callPaymentService(t.upstream, 'POST', {
+          actorId: adminId,
+          reason,
+        })
         return reply.status(status).send(body)
       } catch (err) {
-        req.log.error({ err }, 'trigger-settlements proxy failed')
+        req.log.error({ err, adminId }, `${t.what} trigger proxy failed`)
+        return reply.status(502).send({
+          error: 'upstream_ambiguous',
+          message: `The payment service did not answer. The ${t.what} may have run — check before pressing again.`,
+        })
+      }
+    })
+  }
+
+  // ---------------------------------------------------------------------------
+  // POST /admin/dashboard/resume-payouts[/:accountId] — release a payout halt
+  //
+  // The halt has been visible on this dashboard since W4 and there was no way
+  // to lift it from anywhere but a psql prompt: `POST /payouts/resume` sits
+  // behind the internal token, which no browser holds. So the control that
+  // freezes every writer's money had a display and no inverse, which is the
+  // same asymmetry the reinstate route closed for suspensions.
+  //
+  // A PROXY, and it decides nothing: what the gateway adds is that the caller
+  // is an admin and WHICH admin, forwarded as `actorId` off the session (the
+  // refund precedent). The reason is required here, by the payment service's
+  // schema, and by the `config_audit` column's own CHECK — three doors, because
+  // a freeze lifted with nothing said about why is not a decision anybody can
+  // review.
+  //
+  // The two granularities stay two routes, exactly as they are two halts: an
+  // operator lifting the platform-wide freeze and an operator lifting one
+  // writer's are doing different things, and a single route with an optional id
+  // would let a slip do the larger one.
+  // ---------------------------------------------------------------------------
+  const ResumePayoutsBody = z.object({
+    reason: z.string().trim().min(1).max(500),
+  })
+
+  app.post('/admin/dashboard/resume-payouts', { preHandler: requireAdmin }, async (req, reply) => {
+    const parsed = ResumePayoutsBody.safeParse(req.body)
+    if (!parsed.success) {
+      return reply.status(400).send(zodValidationError(parsed.error))
+    }
+    const adminId = (req as any).session!.sub as string
+
+    try {
+      const { status, body } = await callPaymentService('/payouts/resume', 'POST', {
+        actorId: adminId,
+        reason: parsed.data.reason,
+      })
+      logger.info({ adminId, status }, 'owner dashboard: global payout halt release attempted')
+      return reply.status(status).send(body)
+    } catch (err) {
+      req.log.error({ err, adminId }, 'resume-payouts proxy failed')
+      return reply.status(502).send({ error: 'Payment service unreachable' })
+    }
+  })
+
+  app.post<{ Params: { accountId: string } }>(
+    '/admin/dashboard/resume-payouts/:accountId',
+    { preHandler: requireAdmin },
+    async (req, reply) => {
+      const parsed = ResumePayoutsBody.safeParse(req.body)
+      if (!parsed.success) {
+        return reply.status(400).send(zodValidationError(parsed.error))
+      }
+      const { accountId } = req.params
+      // A path id answers 404, never 400 and never a 500 from the cast
+      // downstream (`lib/request-inputs.ts`).
+      if (!UUID_RE.test(accountId)) {
+        return reply.status(404).send({ resumed: false, error: 'account_not_halted' })
+      }
+      const adminId = (req as any).session!.sub as string
+
+      try {
+        const { status, body } = await callPaymentService(
+          `/payouts/resume/${accountId}`,
+          'POST',
+          { actorId: adminId, reason: parsed.data.reason }
+        )
+        logger.info(
+          { adminId, accountId, status },
+          'owner dashboard: per-account payout halt release attempted'
+        )
+        return reply.status(status).send(body)
+      } catch (err) {
+        req.log.error({ err, adminId, accountId }, 'resume-payouts proxy failed')
         return reply.status(502).send({ error: 'Payment service unreachable' })
       }
     }
   )
 
-  app.post(
-    '/admin/dashboard/trigger-payouts',
+  // ---------------------------------------------------------------------------
+  // POST /admin/dashboard/halt-payouts/:accountId — freeze one account's money
+  //
+  // The inverse of the release above, and it arrives later for the same reason
+  // the release did: the halt was a machine's act, so nothing needed a button.
+  // D9 §4.1 then made it a PERSON's act — on knowledge or suspicion that a
+  // writer is a designated person, freeze before the next cycle pays them — and
+  // shipped with an INSERT statement in the policy document for the operator to
+  // paste into psql. That is the roster's own founding complaint (a capability
+  // that exists and is unreachable from the only screen that looks), against a
+  // table the reconciler also writes, at speed.
+  //
+  // A PROXY, deciding nothing but WHO: `actorId` off the admin's session, the
+  // refund and resume precedent. The reason is required here, by the payment
+  // service's schema and by `config_audit`'s own CHECK.
+  //
+  // THE CLASS VOCABULARY IS A SECOND COPY AND IS PINNED BY A TEST, never by
+  // agreement — there is no module path between these workspaces, so
+  // `web/tests/operator-halt-wire.test.ts` reads this file, the web's copy and
+  // `payment-service/src/lib/payout-halt.ts` and asserts all three match.
+  // A class this end accepts and that end refuses is a 400 on an emergency
+  // freeze; one this end sends and that end stores unrecognised is a legal hold
+  // filed as a books divergence.
+  //
+  // IT DOES NOT SUSPEND, AND SUSPENDING DOES NOT DO THIS. The two are one click
+  // apart on the roster and they are not alternatives: a suspension removes the
+  // member's published work, emails them the reason and offers an appeal (D7),
+  // all three of which are wrong for a sanctions review, which must be silent.
+  // The freeze touches `accounts.status` not at all, so the moderation freeze's
+  // one home (`moderation.ts`) stays the one writer of that column.
+  // ---------------------------------------------------------------------------
+  const OPERATOR_HALT_CLASSES = ['sanctions_review'] as const
+
+  const HaltPayoutsBody = z.object({
+    reason: z.string().trim().min(1).max(500),
+    mismatchClass: z.enum(OPERATOR_HALT_CLASSES),
+  })
+
+  app.post<{ Params: { accountId: string } }>(
+    '/admin/dashboard/halt-payouts/:accountId',
     { preHandler: requireAdmin },
     async (req, reply) => {
+      const parsed = HaltPayoutsBody.safeParse(req.body)
+      if (!parsed.success) {
+        return reply.status(400).send(zodValidationError(parsed.error))
+      }
+      const { accountId } = req.params
+      if (!UUID_RE.test(accountId)) {
+        // The path-id rule, and the same answer the payment service gives an id
+        // that belongs to nobody: a malformed id and an absent one are the same
+        // fact to the operator who typed one.
+        return reply.status(404).send({ halted: false, error: 'no_such_account' })
+      }
+      const adminId = (req as any).session!.sub as string
+
       try {
-        const adminId = (req as any).session!.sub as string
-        logger.info({ adminId }, 'owner dashboard: payout cycle triggered')
-        const { status, body } = await callPaymentService('/payout-cycle')
+        const { status, body } = await callPaymentService(
+          `/payouts/halt/${accountId}`,
+          'POST',
+          { actorId: adminId, reason: parsed.data.reason, mismatchClass: parsed.data.mismatchClass }
+        )
+        logger.warn(
+          { adminId, accountId, mismatchClass: parsed.data.mismatchClass, status },
+          'owner dashboard: per-account payout freeze attempted'
+        )
         return reply.status(status).send(body)
       } catch (err) {
-        req.log.error({ err }, 'trigger-payouts proxy failed')
+        req.log.error({ err, adminId, accountId }, 'halt-payouts proxy failed')
         return reply.status(502).send({ error: 'Payment service unreachable' })
       }
     }

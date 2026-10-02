@@ -3,7 +3,11 @@ import { pool } from "@platform-pub/shared/db/client.js";
 import { requireAuth } from "../../middleware/auth.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 import { FEED_SELECT, FEED_JOINS } from "../../lib/feed-sql.js";
-import { parseCursorEpoch, encodeTsIdCursor } from "../../lib/cursor.js";
+import {
+  parseCursorEpoch,
+  encodeTsIdCursor,
+  feedCursorEpoch,
+} from "../../lib/cursor.js";
 import {
   POST_SELECT,
   POST_JOINS,
@@ -13,17 +17,16 @@ import {
 import { UUID_RE, feedRowToResponse, loadFeed } from "./shared.js";
 import {
   dedupCtes,
-  DEDUP_SUPPRESS_FILTER,
   DEDUP_PROVENANCE_LATERAL,
   dedupApplicableExistsSql,
   dedupMinConfidence,
 } from "../../lib/dedup-sql.js";
-import {
-  resonanceRankingEnabled,
-  loadProofBlendParams,
-  feedAlphaCte,
-  proofBlendScoreSql,
-} from "../../lib/feed-rank.js";
+import { loadProofBlendParams, feedAlphaCte } from "../../lib/feed-rank.js";
+import { sourceSelectionCtes } from "../../lib/source-selection.js";
+import { parseLimit, isUuid } from "../../lib/request-inputs.js";
+import { hiddenFromViewerSql } from "../../lib/blocks.js";
+import { resolveLockedRoots } from "../../lib/root-locked.js";
+import { drawEchoesAsNotes, drawWindowEchoesAsNotes } from "../../lib/cross-post-echo.js";
 
 export function registerFeedItemsRoutes(app: FastifyInstance) {
   // ---------------------------------------------------------------------------
@@ -44,14 +47,14 @@ export function registerFeedItemsRoutes(app: FastifyInstance) {
   }>("/feeds/:id/items", { preHandler: requireAuth }, async (req, reply) => {
     const ownerId = req.session!.sub;
     const { id } = req.params;
-    if (!UUID_RE.test(id))
-      return reply.status(400).send({ error: "Invalid feed id" });
+    if (!isUuid(id))
+      return reply.status(404).send({ error: "We couldn't find that channel." });
 
     const feed = await loadFeed(id, ownerId);
-    if (!feed) return reply.status(404).send({ error: "Feed not found" });
+    if (!feed) return reply.status(404).send({ error: "We couldn't find that channel." });
 
     try {
-      const limit = Math.min(parseInt(req.query.limit ?? "20", 10) || 20, 50);
+      const limit = parseLimit(req.query.limit, 20, 50);
       const page = await loadFeedItemsPage(
         ownerId,
         id,
@@ -62,7 +65,7 @@ export function registerFeedItemsRoutes(app: FastifyInstance) {
       return reply.send({ feed: feedRowToResponse(feed), ...page });
     } catch (err) {
       logger.error({ err, feedId: id }, "Feed items fetch failed");
-      return reply.status(500).send({ error: "Feed items fetch failed" });
+      return reply.status(500).send({ error: "Couldn't load this channel. Please try again." });
     }
   });
 }
@@ -80,26 +83,207 @@ export async function loadFeedItemsPage(
   sourceCount: number,
   cursor: string | undefined,
   limit: number,
+  db: Db = pool,
 ): Promise<{
   items: Post[];
   nextCursor: string | undefined;
   placeholder: boolean;
+  asOf: string;
 }> {
+  // Taken BEFORE the page is read, so a row the page shows can only be above
+  // it — and stays new after a look that sends this token (§IV.1).
+  const { asOf } = await seenSnapshot(db);
   if (sourceCount === 0) {
     const { items, nextCursor } = await placeholderExploreItems(
       ownerId,
       cursor,
       limit,
     );
-    return { items, nextCursor, placeholder: true };
+    return { items, nextCursor, placeholder: true, asOf };
   }
   const { items, nextCursor } = await sourceFilteredItems(
     ownerId,
     feedId,
     cursor,
     limit,
+    db,
   );
-  return { items, nextCursor, placeholder: false };
+  return { items, nextCursor, placeholder: false, asOf };
+}
+
+// =============================================================================
+// Reading counts — the window and the `asOf` token (WORKSPACE-QUEUE-ADR §IV).
+//
+// The client counts a feed's "unread" and "new" against a WINDOW the server
+// hands it: every post the timeline would show from the last UNREAD_WINDOW_DAYS,
+// by id, each flagged `isNew` when its row entered the feed after the member
+// last looked (`feeds.seen_baseline_at`). The client never assembles it from
+// what it happens to have loaded, so paging never moves a count and a post that
+// leaves the feed (a source removed, a volume lowered, a block, the cut
+// drifting) stops being counted at the next fetch.
+// =============================================================================
+
+// The floor: nothing published before `now() - UNREAD_WINDOW_DAYS` is ever
+// counted. Spelled once, here; the client applies the `windowStart` the server
+// sends and never its own clock.
+export const UNREAD_WINDOW_DAYS = 7;
+
+// How many window posts one response lists — the newest by published_at, the
+// ones a reader meets first. Past it the response says `truncated` and the pills
+// read "500+". Not a dial: a bound on a payload, moved against the A1 payload
+// measurement recorded in the ADR (§IV.3), not against a live distribution.
+export const SEEN_WINDOW_CAP = 500;
+
+// THE `asOf` TOKEN. A look is recorded as "I have seen everything up to asOf",
+// and asOf is the server's clock at full Postgres precision — carried as text
+// both ways, never through a JS Date (the timestamp-cursor rule; a truncated
+// watermark errs backwards, which here would re-announce what was just seen).
+//
+// A MINUTE BEHIND `now()`, on purpose. `feed_items.created_at` defaults to the
+// writing TRANSACTION's start time, so a row can commit after this fetch with a
+// created_at before it; stamped at `now()`, the look would sweep it under the
+// baseline unseen and it would never be new. The margin keeps such a row above
+// the baseline. It is an assumption about ingest — no transaction writing
+// feed_items runs longer than a minute — and A1 checked it (ADR §IV.1). A row
+// that commits later still is never new, but it is still UNREAD, because the
+// window lists it. The cost is the other way round and cheap: a post that
+// arrived in the minute before a look can be new once more.
+const AS_OF_MARGIN = "interval '1 minute'";
+
+async function seenSnapshot(
+  db: Db,
+  feedId?: string,
+): Promise<{ asOf: string; windowStart: string; baseline: string | null }> {
+  const {
+    rows: [snap],
+  } = await db.query<{
+    as_of: string;
+    window_start: string;
+    baseline: string | null;
+  }>(
+    `SELECT (now() - ${AS_OF_MARGIN})::text AS as_of,
+            (now() - make_interval(days => $1::int))::text AS window_start,
+            (SELECT seen_baseline_at::text FROM feeds WHERE id = $2::uuid) AS baseline`,
+    [UNREAD_WINDOW_DAYS, feedId ?? null],
+  );
+  return {
+    asOf: snap.as_of,
+    windowStart: snap.window_start,
+    baseline: snap.baseline,
+  };
+}
+
+export interface FeedSeenWindow {
+  asOf: string;
+  seenBaselineAt: string | null;
+  windowStart: string;
+  // post_id; unix seconds (the same rounding as Post.publishedAt); newest
+  // published first.
+  items: { id: string; publishedAt: number; isNew: boolean }[];
+  truncated: boolean;
+}
+
+// The window for one feed. Ownership is the caller's (both routes loadFeed
+// first), exactly as for loadFeedItemsPage.
+//
+// A FEED WITH NO SOURCES HAS AN EMPTY WINDOW. Its vessel shows the platform's
+// explore stream as a placeholder (loadFeedItemsPage), which is not the
+// member's feed and not theirs to "catch up on"; counting it would badge every
+// new, empty feed. Empty lists nothing the timeline hides, which is the rule.
+export async function loadFeedSeenWindow(
+  ownerId: string,
+  feedId: string,
+  sourceCount: number,
+  db: Db = pool,
+): Promise<FeedSeenWindow> {
+  const { asOf, windowStart, baseline } = await seenSnapshot(db, feedId);
+  const base = { asOf, seenBaselineAt: baseline, windowStart };
+  if (sourceCount === 0) return { ...base, items: [], truncated: false };
+
+  // One over the cap, so `truncated` is a fact and not a guess.
+  const { sql, params } = await selectedSlimSql(
+    db,
+    ownerId,
+    feedId,
+    SEEN_WINDOW_CAP + 1,
+    { windowStart },
+  );
+  const baselineParam = params.push(baseline);
+  const { rows } = await db.query<{
+    post_id: string;
+    published_at_epoch: string;
+    is_new: boolean;
+    protocol: string | null;
+    source_item_uri: string | null;
+  }>(
+    `${sql}
+    -- isNew is PROJECTED, never filtered (§IV.2): filtering on created_at
+    -- anywhere before the cut would take the percentile over the new rows
+    -- alone. A NULL baseline (never looked) makes every flag false.
+    --
+    -- And a post published before its source JOINED the feed is never new.
+    -- A source new to the platform brings its back-catalogue in as fresh
+    -- inserts, written by the subscribe-time ingest job AFTER the add has
+    -- answered — so no client re-base can land after them. The join time is
+    -- the fact that says "this was already there when you chose it".
+    SELECT fi.post_id,
+           EXTRACT(EPOCH FROM r.published_at)::bigint AS published_at_epoch,
+           COALESCE(fi.created_at > $${baselineParam}::timestamptz, false)
+             AND r.published_at >= r.joined_at AS is_new,
+           fi.source_protocol::text AS protocol, ei.source_item_uri
+      FROM ranked r
+      JOIN feed_items fi ON fi.id = r.fi_id
+      LEFT JOIN external_items ei ON ei.id = fi.external_item_id
+     WHERE fi.post_id IS NOT NULL
+     ORDER BY r.published_at DESC, r.fi_id DESC`,
+    params,
+  );
+
+  const truncated = rows.length > SEEN_WINDOW_CAP;
+  return {
+    ...base,
+    // The window names what the page DRAWS, so an echo drawn as its note is
+    // counted under the note's id (B3).
+    items: await drawWindowEchoesAsNotes(
+      ownerId,
+      rows.slice(0, SEEN_WINDOW_CAP).map((r) => ({
+        id: r.post_id,
+        // bigint arrives as a string (node-postgres); coerce at the edge.
+        publishedAt: Number(r.published_at_epoch),
+        isNew: r.is_new,
+        protocol: r.protocol,
+        sourceItemUri: r.source_item_uri,
+      })),
+    ),
+    truncated,
+  };
+}
+
+// Move the baseline to `asOf` — forward only, and never past now() — then
+// answer with the window computed against the NEW baseline, which the client
+// adopts wholesale (§IV.4: it cannot tell which of its flags the move covers;
+// the server can). Returns null when the feed is not this owner's.
+//
+// `GREATEST(COALESCE(…, '-infinity'), …)` is what makes a late or reordered
+// request harmless: a beacon from a closing tab can land after a newer look and
+// can never move the watermark back. `LEAST(…, now())` refuses a forged future.
+export async function recordFeedSeen(
+  ownerId: string,
+  feedId: string,
+  asOf: string,
+  sourceCount: number,
+  db: Db = pool,
+): Promise<FeedSeenWindow | null> {
+  const { rowCount } = await db.query(
+    `UPDATE feeds
+        SET seen_baseline_at = GREATEST(
+              COALESCE(seen_baseline_at, '-infinity'::timestamptz),
+              LEAST($3::timestamptz, now()))
+      WHERE id = $1 AND owner_id = $2`,
+    [feedId, ownerId, asOf],
+  );
+  if (!rowCount) return null;
+  return loadFeedSeenWindow(ownerId, feedId, sourceCount, db);
 }
 
 // The candidate SELECT/JOINs (FEED_SELECT/FEED_JOINS) + the Post columns/joins
@@ -107,8 +291,9 @@ export async function loadFeedItemsPage(
 // the same shared SQL every other feed_items read path projects, so the workspace
 // items endpoint emits the unified Post[] with no bespoke row mapper. The old inline
 // FEED_SELECT/FEED_JOINS copies + rowToItem/computeBiddabilityTier were retired here
-// (FEED-RETIREMENT-PLAN Slice 6 item 4); only the per-vessel effective_score ranking
-// and the format-tagged cursor below remain workspace-specific.
+// (FEED-RETIREMENT-PLAN Slice 6 item 4). Since migration 202 there is no
+// per-vessel ranking left either — the vessel is a timeline — so what remains
+// workspace-specific is the per-source selection and the format-tagged cursor.
 
 // Unified, format-tagged cursor codec for GET /feeds/:id/items. Two pagination
 // shapes coexist on this one endpoint and used to share two bare, untyped
@@ -123,38 +308,24 @@ export async function loadFeedItemsPage(
 // page. (One-time effect on deploy: cursors held by in-flight paginators are
 // untagged, so they decode to undefined and restart once — the same graceful
 // degradation this endpoint already had for the source-transition case.)
-// The feed's dominant sampling mode: most common across its non-muted source
-// rows, alphabetical tiebreak for determinism. Exported so the plan-probe test
-// runs the route's own text — this used to be a `feed_mode` CTE read by two
-// correlated scalar subqueries inside a per-row CASE, and moving it out of the
-// query is what lets the ranking pass go parallel (see the plan probe below).
-// `$2` is the feed id, matching the main query's param layout.
-export const FEED_SAMPLING_MODE_SQL = `
-  SELECT sampling_mode
-    FROM feed_sources
-   WHERE feed_id = $2 AND muted_at IS NULL
-   GROUP BY sampling_mode
-   ORDER BY COUNT(*) DESC, sampling_mode
-   LIMIT 1`;
-
 const UNBOUNDED_SCORE = 1e18;
 
 type FeedCursor =
-  // asOf (fractional epoch seconds) pins the D6 blend's age term so later
-  // pages score the corpus at page 1's instant (§0i.2 — a now()-decayed score
-  // re-qualifies boundary items under the strict keyset). Optional: flag-off
-  // cursors don't carry it (fi.score doesn't decay at query time), and a
-  // 3-part cursor decodes fine so in-flight paginators survive the deploy.
-  | { kind: "scored"; score: number; id: string; asOf?: number }
+  // A composed feed is a TIMELINE (migration 202): selection happens per source
+  // and what survives is merged by time, so the cursor is a plain keyset on
+  // (published_at, id) — the pair the ORDER BY uses, riding
+  // idx_feed_items_cursor. It replaces the `scored` kind, whose `asOf` existed
+  // only to stop a time-decaying score re-qualifying boundary items between
+  // pages; with nothing decaying there is nothing to pin. An in-flight
+  // `scored:` cursor decodes to undefined → one clean restart from page 1.
+  | { kind: "ts"; ts: number; id: string }
   | { kind: "explore"; score: number; ts: number; id: string };
 
 // Exported for the cursor round-trip test (M13): the encode→decode pair must be
 // lossless in the epoch, and a unit test is the only thing that pins that.
 export function encodeFeedCursor(c: FeedCursor): string {
-  return c.kind === "scored"
-    ? c.asOf !== undefined
-      ? `scored:${c.score}:${c.id}:${c.asOf}`
-      : `scored:${c.score}:${c.id}`
+  return c.kind === "ts"
+    ? `ts:${encodeTsIdCursor(c.ts, c.id)}`
     : `explore:${c.score}:${c.ts}:${c.id}`;
 }
 
@@ -164,18 +335,15 @@ export function encodeFeedCursor(c: FeedCursor): string {
 export function decodeFeedCursor(raw: string | undefined): FeedCursor | undefined {
   if (!raw) return undefined;
   const parts = raw.split(":");
-  if (parts[0] === "scored") {
-    if (parts.length !== 3 && parts.length !== 4) return undefined;
-    const score = Number(parts[1]);
+  if (parts[0] === "ts") {
+    if (parts.length !== 3) return undefined;
+    // FRACTIONAL epoch through the shared M13 primitive: this is a DESCENDING
+    // keyset, the direction where truncation loses rows into a gap between
+    // pages that nothing revisits.
+    const ts = parseCursorEpoch(parts[1]);
     const id = parts[2];
-    if (Number.isNaN(score) || !UUID_RE.test(id)) return undefined;
-    if (parts.length === 4) {
-      // asOf is a FRACTIONAL epoch — parsed through the shared M13 primitive.
-      const asOf = parseCursorEpoch(parts[3]);
-      if (!Number.isFinite(asOf)) return undefined;
-      return { kind: "scored", score, id, asOf };
-    }
-    return { kind: "scored", score, id };
+    if (!Number.isFinite(ts) || !UUID_RE.test(id)) return undefined;
+    return { kind: "ts", ts, id };
   }
   if (parts[0] === "explore") {
     if (parts.length !== 4) return undefined;
@@ -192,194 +360,151 @@ export function decodeFeedCursor(raw: string | undefined): FeedCursor | undefine
 }
 
 // -----------------------------------------------------------------------------
-// Source-filtered items query — slice 16.
+// Source-filtered items query.
 //
-// Slice 4 shipped the source-set fan-out but ranked everything chronologically
-// regardless of feed_sources.weight or sampling_mode. Slice 14 then surfaced a
-// volume bar that wrote real weight rows but had nothing to do at query time.
-// Slice 16 closes the loop:
+// THE FEED IS A TIMELINE, AND VOLUME IS A FILTER (migration 202). Each source
+// admits a fraction of its own posts — `feed_sources.throughput`, with
+// `sampling_mode` deciding WHICH fraction — and what survives is merged by
+// published_at. One source's setting cannot move another's, because the cut is
+// taken inside that source's own population (lib/source-selection.ts).
 //
-//   - Each item that matches at least one (non-muted) source carries
-//     MAX(weight) across its matches — a writer subscribed via two sources
-//     (e.g. account + publication) gets the louder of the two.
+// This replaced two things the header used to describe as deferred:
 //
-//   - effective_score is computed per item from the feed-level dominant
-//     sampling_mode (most common across non-muted source rows, alphabetical
-//     tiebreak for determinism):
-//       chronological → epoch(published_at) * weight
-//       scored        → feed_items.score * weight
-//                       (or, with RESONANCE_RANKING_ENABLED, the D6 read-time
-//                        proof blend — see lib/feed-rank.ts)
-//       random        → random() * weight  (re-rolls per query)
+//   - `weight` multiplied this query's sort key, which for a chronological feed
+//     meant multiplying a Unix epoch — one step down sorted a post published
+//     today as if published in 1998, i.e. a mute rather than a sample.
+//   - `sampling_mode` was read as the feed's DOMINANT value (a majority vote
+//     across its sources) and applied to every item, so one source switched to
+//     TOP re-ranked every other source in the feed.
 //
-//   - Cursor is (effective_score, id). Random mode's cursor is mathematically
-//     valid but the next page reshuffles — true random pagination requires a
-//     stable seed per cursor and is deferred.
-//
-// Per-source mode mixing inside one feed (one source chronological, another
-// scored) is also deferred — it would need a per-row mode column flowing
-// through a more complex score computation. The dominant-mode rule is the
-// honest first cut.
+// The ORDER BY is now `(published_at, id)` — the pair idx_feed_items_cursor
+// already indexes — and the cursor is that keyset. Nothing decays between
+// pages, so the `asOf` pinning the scored cursor carried is gone with it.
 // -----------------------------------------------------------------------------
 
-async function sourceFilteredItems(
+// Anything with a `query` — the shared pool, or a checked-out client inside a
+// transaction (the DB-backed tests drive the real functions against fixtures
+// they roll back).
+type Db = Pick<typeof pool, "query">;
+
+// THE SELECTION, ONCE — the WITH list through `ranked`, a slim relation of
+// (fi_id, published_at) holding every post the timeline would show, ordered and
+// bounded by `$3`. Two readers follow it with their own projection: the items
+// page (the heavy Post columns) and the reading-count window (post ids and one
+// flag, `loadFeedSeenWindow`). WORKSPACE-QUEUE-ADR §IV.2: a count must not name
+// a post the timeline will not show, so the window is THIS selection with one
+// extra predicate — never a second hand-kept SELECT that could drift from it.
+//
+// `windowStart` is that predicate's value (timestamptz text). It goes to the
+// selection builder, which places it in `matched`, after the cut; see
+// source-selection.ts › windowStartParam for why the arms are the wrong place.
+//
+// Param layout, which the builder depends on: $1 reader, $2 feed, $3 limit,
+// then the optional cursor pair, then everything pushed below.
+async function selectedSlimSql(
+  db: Db,
   readerId: string,
   feedId: string,
-  rawCursor: string | undefined,
   limit: number,
-): Promise<{ items: Post[]; nextCursor: string | undefined }> {
-  const decoded = decodeFeedCursor(rawCursor);
-  const cursor = decoded?.kind === "scored" ? decoded : undefined;
-  const cursorClause = cursor
-    ? `AND (effective_score, fi_id) < ($4::float8, $5::uuid)`
-    : "";
+  opts: {
+    cursor?: { ts: number; id: string };
+    windowStart?: string;
+  },
+): Promise<{ sql: string; params: any[]; dedupOn: boolean }> {
+  const { cursor } = opts;
+  // The cursor's param INDICES, not a clause. It is spent in two places with
+  // two different spellings and the selection builder owns both: a
+  // bucket-granular bound on the measurement window, and the exact keyset
+  // AFTER the cut (source-selection.ts › SOURCE_BUCKET_SQL). It is still a
+  // DESCENDING keyset — a ROW comparison over the same pair the ORDER BY uses,
+  // never a bare `<`, and never through a JS Date (to_timestamp takes the
+  // fractional epoch the cursor carries), because two rows can share a
+  // published_at exactly.
+  const cursorParams = cursor ? { tsParam: 4, idParam: 5 } : null;
   const params: any[] = cursor
-    ? [readerId, feedId, limit, cursor.score, cursor.id]
+    ? [readerId, feedId, limit, cursor.ts, cursor.id]
     : [readerId, feedId, limit];
 
-  // ── D6 read-time proof blend (step 5), behind RESONANCE_RANKING_ENABLED ────
-  // When on, the 'scored' sampling mode ranks every item — native and external
-  // alike — by one commensurable expression built from the stored resonance
-  // columns, instead of the cron-baked native-only fi.score. Off, the branch
-  // below is byte-for-byte what it always was. The extra params are appended
-  // AFTER the optional cursor pair so their indices don't shift with it.
   // ── The plan probe (§6.6) ─────────────────────────────────────────────────
-  // Two facts, one cheap round trip, both of which decide the SHAPE of the feed
-  // query rather than a value inside it — so both must be known before it is
-  // built. Postgres will not parallelise a plan whose expression tree contains
-  // a parallel-unsafe or parallel-restricted node ANYWHERE, so a branch that
-  // this feed can never take still costs it the parallel plan; the fix for that
-  // class is always to leave the branch out, never to make it cheaper.
+  // One fact, one cheap round trip, deciding the SHAPE of the feed query rather
+  // than a value inside it — so it must be known before the query is built.
+  // Postgres will not parallelise a plan whose expression tree contains a
+  // parallel-unsafe or parallel-restricted node ANYWHERE, so a branch this feed
+  // can never take still costs it the parallel plan; the fix for that class is
+  // always to leave the branch out, never to make it cheaper.
   //
-  //   sampling_mode — `random()` is PARALLEL RESTRICTED (`pg_proc.proparallel =
-  //     'r'`). Carried as one arm of a per-row CASE, it de-parallelised the
-  //     ranking pass for EVERY feed including the ~all of them that are
-  //     chronological. Measured on dev (717-source feed, ranking core, median
-  //     of 3): 280 ms with the CASE, 172 ms with the mode's own expression
-  //     spliced in and the other arms absent — `Gather Merge` + `Parallel Seq
-  //     Scan` come back. Splicing also drops two correlated scalar subqueries
-  //     per row.
+  //   has_links — the dedup block's `WITH RECURSIVE` is parallel-UNSAFE. Its
+  //     cost is real but conditional: at zero links the CTEs genuinely
+  //     short-circuit (`candidates` returns 0 rows in 0.081 ms) and the
+  //     recursion adds ~110 ms to the core, all of it the lost parallelism.
   //
-  //   has_links — the dedup block's `WITH RECURSIVE` is parallel-UNsafe, the
-  //     same class one step worse. Its cost is real but conditional: at zero
-  //     links the CTEs genuinely short-circuit (`candidates` returns 0 rows in
-  //     0.081 ms) and the recursion adds ~110 ms to the core, all of it the
-  //     lost parallelism — which is why removing it bought nothing until
-  //     `random()` went too, and why the two fixes are one fix.
+  // The probe used to read the feed's dominant sampling_mode too, because
+  // `random()` is PARALLEL RESTRICTED and carrying it as one arm of a per-row
+  // CASE de-parallelised the ranking pass for every feed including the ~all of
+  // them that never took that arm. That whole problem is now gone rather than
+  // avoided: sampling is per source, and its random arm is `hashtext`, which is
+  // PARALLEL SAFE (see source-selection.ts). There is no mode to probe for.
   //
-  // The mode read is the feed's dominant sampling_mode, unchanged in meaning
-  // from the `feed_mode` CTE it replaces: most common across non-muted source
-  // rows, alphabetical tiebreak. No row (every source muted) → chronological,
-  // exactly as the old CASE's ELSE did.
+  // The probe binds ONLY what it reads. It used to carry the feed id as `$2`
+  // for the sampling-mode half; leaving that bind in place once the half was
+  // deleted made every feed page answer "could not determine data type of
+  // parameter $2" — Postgres refuses a bind carrying more parameters than the
+  // statement uses, the same rule this file already observes for the dedup
+  // confidence push below. Nothing that tests the SQL BUILDERS can see it: the
+  // fault is in what the route hands them.
   const minConfidence = await dedupMinConfidence();
   const {
     rows: [plan],
-  } = await pool.query<{ sampling_mode: string | null; has_links: boolean }>(
-    `SELECT (${FEED_SAMPLING_MODE_SQL}) AS sampling_mode,
-            ${dedupApplicableExistsSql(3)} AS has_links`,
-    [readerId, feedId, minConfidence],
+  } = await db.query<{ has_links: boolean }>(
+    `SELECT ${dedupApplicableExistsSql(2)} AS has_links`,
+    [readerId, minConfidence],
   );
   const dedupOn = plan?.has_links === true;
-  const samplingMode = plan?.sampling_mode ?? "chronological";
 
-  // The blend only ever fed the 'scored' arm, so a non-scored feed no longer
-  // loads it — and MUST not, now that its four params are pushed only when the
-  // expression that reads them is actually spliced in.
-  const blend =
-    resonanceRankingEnabled() && samplingMode === "scored"
-      ? await loadProofBlendParams()
-      : null;
-  let alphaCte = "";
-  let scoredModeExpr = `COALESCE(fi.score, 0)::float8 * m.weight`;
-  // The blend's age term is scored "as of" one pinned instant: page 1 mints it,
-  // the cursor carries it forward (§0i.2 — see proofBlendScoreSql). A 3-part
-  // pre-deploy cursor has no asOf; falling back to now() decays that one
-  // paginator exactly as before, once.
-  const asOfSecs = cursor?.asOf ?? Date.now() / 1000;
-  if (blend) {
-    // α is the constant following value since the reach source kind was
-    // retired (migration 177) — a feed's carrying reach:explore was the only
-    // explore-surface discriminator, so the §9.12 A/B needs a new one before
-    // feed_alpha_explore can matter again (see feedAlphaCte).
-    const alpha = params.push(blend.alphaFollowing);
-    const gravity = params.push(blend.gravity);
-    const floor = params.push(blend.floor);
-    const asOf = params.push(asOfSecs);
-    alphaCte = `${feedAlphaCte(alpha)},`;
-    scoredModeExpr = proofBlendScoreSql(gravity, floor, asOf);
-  }
+  // α and the proof floor are read on every page now, not behind a brake: they
+  // are the TOP criterion, which is a per-source reader choice rather than a
+  // claim the platform makes. α is the constant following value since the reach
+  // source kind was retired (migration 177) — see feedAlphaCte.
+  const blend = await loadProofBlendParams();
+  const alphaParam = params.push(blend.alphaFollowing);
+  const floorParam = params.push(blend.floor);
 
   // Pushed only on the branch that reads it: Postgres refuses a bind carrying
   // more parameters than the statement uses, so an unconditional push would
   // error on every feed page that has no dedup block.
-  const dedupCtesFragment = dedupOn
-    ? `${dedupCtes(params.push(minConfidence))},`
-    : "";
+  //
+  // The fragment is handed to the selection builder rather than concatenated
+  // after it, because dedup has to resolve BEFORE the per-source cut — a winner
+  // picked out of the post-cut set changes from page to page, and then one post
+  // appears twice. See lib/source-selection.ts › WHY DEDUP SITS IN THE MIDDLE.
+  const dedupCtesFragment = dedupOn ? dedupCtes(params.push(minConfidence)) : "";
 
-  // One arm, not a CASE over three. `random()` re-rolls per row exactly as it
-  // did — a random feed still pays the serial plan, because that is what
-  // random ordering costs; every other feed no longer pays it for a branch it
-  // cannot take.
-  const effectiveScoreExpr =
-    samplingMode === "scored"
-      ? scoredModeExpr
-      : samplingMode === "random"
-        ? `random() * m.weight`
-        : `EXTRACT(EPOCH FROM fi.published_at)::float8 * m.weight`;
+  const windowStartParam =
+    opts.windowStart !== undefined ? params.push(opts.windowStart) : undefined;
 
-  const result = await pool.query<any>(
-    `
-    WITH${dedupOn ? " RECURSIVE" : ""} ${alphaCte}
-    -- One UNION ALL branch per source_type, each an index-friendly equijoin,
-    -- then GROUP BY to collapse multi-source matches (MAX weight / bool_or
-    -- allow_replies — a writer subscribed via two sources gets the louder).
-    -- (The reach:following / reach:explore arms were retired with the reach
-    -- source kind, migration 177 — §9.16.)
-    -- This used to be a single join whose ON was the OR of all arms; an
-    -- OR-of-arms join has no hashable key, so the planner brute-forced
+  const selectionCtes = sourceSelectionCtes({
+    alphaParam,
+    floorParam,
+    cursor: cursorParams,
+    dedupCtes: dedupCtesFragment,
+    windowStartParam,
+  });
+
+  const sql = `
+    WITH${dedupOn ? " RECURSIVE" : ""} ${feedAlphaCte(alphaParam)},
+    -- Per-source selection, ending in "matched" (fi_id) — the relation the
+    -- ranking pass below expects. The Slice 8 dedup CTEs are inside this list,
+    -- not after it: the winner has to be picked before the cut. One UNION ALL branch per source_type, each an index-friendly
+    -- equijoin: this used to be a single join whose ON was the OR of all arms,
+    -- and an OR-of-arms join has no hashable key, so the planner brute-forced
     -- feed_items × feed_sources — 24.9M pair evaluations (~4.5s) for one page
     -- of a 717-source follow-import feed (EXPLAIN'd 2026-07-25). The branches
     -- ride idx_feed_items_author / idx_feed_items_source /
-    -- idx_feed_items_article and take the same page to milliseconds.
-    matched AS (
-      SELECT fi_id, MAX(weight)::float8 AS weight, bool_or(allow) AS allow_replies
-      FROM (
-        SELECT fi.id AS fi_id, fs.weight, NOT fs.exclude_replies AS allow
-          FROM feed_sources fs
-          JOIN feed_items fi ON fi.author_id = fs.account_id
-         WHERE fs.feed_id = $2 AND fs.muted_at IS NULL AND fs.source_type = 'account'
-           AND fi.deleted_at IS NULL
-        UNION ALL
-        SELECT fi.id, fs.weight, NOT fs.exclude_replies
-          FROM feed_sources fs
-          JOIN articles a ON a.publication_id = fs.publication_id
-          JOIN feed_items fi ON fi.article_id = a.id
-         WHERE fs.feed_id = $2 AND fs.muted_at IS NULL AND fs.source_type = 'publication'
-           AND fi.deleted_at IS NULL
-        UNION ALL
-        SELECT fi.id, fs.weight, NOT fs.exclude_replies
-          FROM feed_sources fs
-          JOIN feed_items fi ON fi.source_id = fs.external_source_id
-         WHERE fs.feed_id = $2 AND fs.muted_at IS NULL AND fs.source_type = 'external_source'
-           AND fi.deleted_at IS NULL
-        UNION ALL
-        SELECT fi.id, fs.weight, NOT fs.exclude_replies
-          FROM feed_sources fs
-          JOIN tags t_join ON t_join.name = fs.tag_name
-          JOIN article_tags at_join ON at_join.tag_id = t_join.id
-          JOIN feed_items fi ON fi.article_id = at_join.article_id
-         WHERE fs.feed_id = $2 AND fs.muted_at IS NULL AND fs.source_type = 'tag'
-           AND fi.deleted_at IS NULL
-      ) arms
-      GROUP BY fi_id
-    ),
-    -- ── Slice 8 P1: cross-source dedup ──────────────────────────────────────
-    -- linked_sources / candidates / suppressed CTEs (page-independent winner +
-    -- whole-candidate-set suppression). Factored into lib/dedup-sql.ts so the
-    -- integration test runs the exact same SQL — see that module for the design.
-    ${dedupCtesFragment}
-    -- Rank-then-project: score, filter, sort and LIMIT over a SLIM row (id +
-    -- effective_score + the columns the visibility predicates need), then join
+    -- idx_feed_items_article. (The reach:following / reach:explore arms were
+    -- retired with the reach source kind, migration 177 — §9.16.)
+    ${selectionCtes},
+    -- Rank-then-project: filter, sort and LIMIT over a SLIM row (id + the
+    -- cursor pair + the columns the visibility predicates need), then join
     -- the heavy FEED_SELECT/POST_SELECT projection — with its correlated
     -- subqueries (tag_names, reply/quote post-id derivation) and six LEFT
     -- JOINs — onto the ≤$3 winners only. Before this split the full projection
@@ -389,12 +514,10 @@ async function sourceFilteredItems(
     -- because its WHERE reads them.
     ranked AS (
       SELECT * FROM (
-        SELECT fi.id AS fi_id,
-          (${effectiveScoreExpr})::float8 AS effective_score
+        SELECT fi.id AS fi_id, fi.published_at, m.joined_at
         FROM feed_items fi
         JOIN matched m ON m.fi_id = fi.id
         LEFT JOIN notes n ON n.id = fi.note_id
-        LEFT JOIN external_items ei ON ei.id = fi.external_item_id
         WHERE fi.deleted_at IS NULL
           -- No self-exclusion here (unlike the explore queries): membership in a
           -- composable feed is explicit — nothing enters without a feed_sources
@@ -402,32 +525,72 @@ async function sourceFilteredItems(
           -- admits them (themselves as a source, their publication, a tag they
           -- post under). The old "not self" clause was inherited from explore
           -- semantics and silently overrode an explicit self-source.
-          AND NOT EXISTS (
-            SELECT 1 FROM blocks WHERE blocker_id = $1 AND blocked_id = fi.author_id
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM mutes WHERE muter_id = $1 AND muted_id = fi.author_id
-          )
+          -- HIDING IS SYMMETRIC (CA-B9, 2026-09-29): a block runs between a
+          -- PAIR, so a member who blocked the reader is hidden from them just
+          -- as one they blocked is. This spelled blocker_id = $1 alone — one
+          -- direction — beside its own mute clause; the one home carries both
+          -- and the mute with them, so the arm cannot drift back on its own.
+          AND NOT ${hiddenFromViewerSql("$1", "fi.author_id")}
+          -- WHAT IS STILL FILTERED HERE, AND WHY IT IS THE REST. Anything that
+          -- decides whether an ITEM can appear at all now runs inside the
+          -- selection arms, so that the throughput percentile is taken over a
+          -- population that can actually arrive (source-selection.ts). Three
+          -- things stay:
+          --   · blocks and mutes, which are facts about the READER rather than
+          --     the item, and whose dilution is a handful of rows against a
+          --     cost that would be paid over the whole arm set;
+          --   · the native note-reply filter, which is 0 rows on the dev corpus
+          --     — nothing to recover, and it would cost every arm a join to
+          --     the notes table. It is about notes.reply_to_event_id, a
+          --     column no live write path sets: a NATIVE REPLY is a
+          --     kind-1111 comments row, which since migration 232 arrives
+          --     as its own item_type = 'comment' card and is gated by
+          --     exclude_replies in the arms like every other reply;
+          --   · nothing else. The per-source reply gate, is_context_only and
+          --     the Slice 8 suppression all moved up.
           AND (fi.item_type != 'note' OR n.reply_to_event_id IS NULL)
-          AND (fi.item_type != 'external' OR ei.is_context_only IS NOT TRUE)
-          -- Per-source "no replies": drop reply items unless at least one
-          -- matching source still admits replies (migration 107).
-          AND (fi.is_reply IS NOT TRUE OR m.allow_replies)
-          -- Slice 8 P1: drop the loser of a cross-source duplicate pair.
-          ${dedupOn ? DEDUP_SUPPRESS_FILTER : ""}
       ) s
-      WHERE TRUE ${cursorClause}
-      ORDER BY effective_score DESC, fi_id DESC
+      -- No cursor predicate here: the selection builder owns both halves of it
+      -- — a bucket-granular bound on each source's measurement window (so the
+      -- cursor's own week arrives WHOLE and the cut inside it is a fact about
+      -- the post rather than about the page) and the exact keyset applied to
+      -- the matched CTE, after the cut. Everything reaching this pass is already
+      -- both selected and below the reader's position.
+      ORDER BY published_at DESC, fi_id DESC
       LIMIT $3
-    )
+    )`;
+  return { sql, params, dedupOn };
+}
+
+async function sourceFilteredItems(
+  readerId: string,
+  feedId: string,
+  rawCursor: string | undefined,
+  limit: number,
+  db: Db = pool,
+): Promise<{ items: Post[]; nextCursor: string | undefined }> {
+  const decoded = decodeFeedCursor(rawCursor);
+  const cursor = decoded?.kind === "ts" ? decoded : undefined;
+  const { sql: selectedSql, params, dedupOn } = await selectedSlimSql(
+    db,
+    readerId,
+    feedId,
+    limit,
+    { cursor },
+  );
+
+  const result = await db.query<any>(
+    `
+    ${selectedSql}
     -- Provenance ("ALSO ON BLUESKY · MASTODON"): display-only on the returned
     -- page, so compute it AFTER the cursor/ORDER/LIMIT — over the ≤$3 survivors
     -- actually returned, not every survivor pre-LIMIT (the lateral references
     -- only scored.fi_id, which FEED_SELECT projects).
-    -- effective_score/fi_id stay in scored.* for the JS cursor.
+    -- The cursor pair stays in scored.* for the JS below.
     SELECT scored.*, ${dedupOn ? "prov.also_on" : "NULL::text[] AS also_on"}
     FROM (
-      SELECT ${FEED_SELECT}${POST_SELECT}, r.effective_score
+      SELECT ${FEED_SELECT}${POST_SELECT},
+        r.fi_id AS cursor_fi_id, ${feedCursorEpoch("r.published_at", "cursor_secs")}
       FROM ranked r
       JOIN feed_items fi ON fi.id = r.fi_id
       ${FEED_JOINS}${POST_JOINS}
@@ -435,7 +598,7 @@ async function sourceFilteredItems(
     ${dedupOn ? DEDUP_PROVENANCE_LATERAL : ""}
     -- Re-impose order: the lateral join doesn't preserve the subquery's ORDER,
     -- and the JS reads the last row for nextCursor (below). Cheap — ≤$3 rows.
-    ORDER BY effective_score DESC, fi_id DESC
+    ORDER BY cursor_secs DESC, cursor_fi_id DESC
   `,
     params,
   );
@@ -447,24 +610,63 @@ async function sourceFilteredItems(
   //
   // Emits the unified Post[] (shared feedItemToPost) so the workspace consumes the
   // same shape every other surface does — no client-side legacy-item→Post adapter.
-  // Ranking stays the composed-vessel effective_score (weight × sampling_mode); the
-  // §5 hotness number is NOT applied here (FEED-RETIREMENT-PLAN Slice 6 item 4) —
-  // in 'scored' mode the numerator is fi.score, or the D6 proof blend when
-  // RESONANCE_RANKING_ENABLED is on.
+  // The order is the composed vessel's timeline; the §5 hotness number is NOT
+  // applied here (FEED-RETIREMENT-PLAN Slice 6 item 4), and since migration 202
+  // neither is any other ranking — what the volume bar decides is WHICH posts
+  // are here, never where they sit.
   const items = result.rows.map(feedItemToPost);
+  await stampLockedConversations(readerId, result.rows, items);
   const lastRow = result.rows[result.rows.length - 1];
   const nextCursor = lastRow
     ? encodeFeedCursor({
-        kind: "scored",
-        score: Number(lastRow.effective_score),
-        id: lastRow.fi_id,
-        // Only the blend decays with time, so only blend-on cursors pin asOf —
-        // flag-off cursors keep the pre-existing 3-part wire shape.
-        ...(blend ? { asOf: asOfSecs } : {}),
+        kind: "ts",
+        ts: Number(lastRow.cursor_secs),
+        id: lastRow.cursor_fi_id,
       })
     : undefined;
 
-  return { items, nextCursor };
+  // A member's cross-post that came back is drawn as their note (rung B3);
+  // the cursor above is the ROWS', so paging is untouched.
+  return { items: await drawEchoesAsNotes(readerId, items), nextCursor };
+}
+
+// THE ONE VIEWER-DEPENDENT FACT ON A CARD, STAMPED WHERE THE VIEWER IS KNOWN.
+//
+// A native reply reaches a feed as a card of its own (migration 232), and its
+// conversation may hang off a paywalled article this reader cannot open. The
+// conversation is public and stays public (ARTICLE-HEADED-CONVERSATIONS-ADR
+// D3) — what the card needs is `rootLocked`, so it draws no reply/quote/vote
+// control it would only have refused (D6). `feedItemToPost` cannot answer it:
+// it takes no viewer and must not learn to, which is why this runs after the
+// mapping rather than inside it — the same division `GET /author/:id/replies`
+// already makes.
+//
+// SET-BASED, and ABSENT IS NOT FALSE. `resolveLockedRoots` answers the whole
+// page in two reads (one for an anonymous viewer, who can read none of them),
+// where a call per card would be ~3 sequential round trips each. A card whose
+// root is not a paywalled article is left untouched rather than stamped
+// `false`: readers key on `=== true`, and "nobody asked" is the truth about
+// every THING on the page.
+async function stampLockedConversations(
+  readerId: string,
+  rows: any[],
+  items: Post[],
+): Promise<void> {
+  const rootEventIds = [
+    ...new Set(
+      rows
+        .filter((r) => r.item_type === "comment" && r.cm_target_event_id)
+        .map((r) => r.cm_target_event_id as string),
+    ),
+  ];
+  if (rootEventIds.length === 0) return;
+  const locked = await resolveLockedRoots(readerId, rootEventIds);
+  if (locked.size === 0) return;
+  rows.forEach((r, i) => {
+    if (r.item_type === "comment" && locked.has(r.cm_target_event_id)) {
+      items[i].rootLocked = true;
+    }
+  });
 }
 
 // The empty-vessel fallback. Deliberately NOT converted to the D6 proof blend
@@ -506,12 +708,8 @@ async function placeholderExploreItems(
       AND fi.published_at > now() - INTERVAL '48 hours'
       AND fi.item_type IN ('article', 'note')
       AND fi.author_id != $1
-      AND NOT EXISTS (
-        SELECT 1 FROM blocks WHERE blocker_id = $1 AND blocked_id = fi.author_id
-      )
-      AND NOT EXISTS (
-        SELECT 1 FROM mutes WHERE muter_id = $1 AND muted_id = fi.author_id
-      )
+      -- Symmetric, through the one home (CA-B9) — see the composed arm.
+      AND NOT ${hiddenFromViewerSql("$1", "fi.author_id")}
       AND (fi.item_type != 'note' OR n.reply_to_event_id IS NULL)
       ${cursorClause}
     ORDER BY fi.score DESC, fi.published_at DESC, fi.id DESC

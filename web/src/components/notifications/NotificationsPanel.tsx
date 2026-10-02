@@ -6,6 +6,20 @@ import { useAuth } from '../../stores/auth'
 import { useUnreadCounts } from '../../stores/unread'
 import { notifications as notificationsApi, type Notification } from '../../lib/api'
 import { routeToOverlay } from '../../lib/workspace/overlays'
+import { openProfileHref } from '../ui/ProfileLink'
+import { getDest } from '../../lib/notifications/dest'
+import {
+  EXTERNAL_LABEL,
+  crossPostFailedSentence,
+  externalNetworkSuffix,
+  notificationActorName,
+  notificationLabel,
+  replyVerb,
+  NOTIFICATIONS_EMPTY,
+  NOTIFICATIONS_LOAD_FAILED,
+} from '../../content/notifications'
+import { SETTINGS_RETRY } from '../../content/settings'
+import { prefetchProfileOverlay } from '../workspace/prefetchProfile'
 import { timeAgo } from '../../lib/format'
 import { Avatar } from '../ui/Avatar'
 
@@ -18,82 +32,16 @@ import { Avatar } from '../ui/Avatar'
 // the root `className` (height); auth gating is the caller's concern (the
 // overlay only mounts when authenticated). The standalone /notifications route
 // is a redirect shim into the merged Messages overlay.
+//
+// Where a row leads is `lib/notifications/dest.ts` and what it says is
+// `content/notifications.ts`, both pure and shared with modernhaus.
 // =============================================================================
 
-function getDestUrl(n: Notification): string {
-  switch (n.type) {
-    case 'new_follower':
-    case 'new_subscriber':
-      return n.actor?.username ? `/${n.actor.username}` : '#'
-    case 'new_reply':
-      if (n.article?.slug) {
-        return n.comment?.id
-          ? `/article/${n.article.slug}#reply-${n.comment.id}`
-          : `/article/${n.article.slug}`
-      }
-      // Reply to a note — go to the actor's profile
-      return n.actor?.username ? `/${n.actor.username}` : '#'
-    case 'new_quote':
-    case 'new_mention':
-      if (n.article?.slug) return `/article/${n.article.slug}`
-      // Note-based quote/mention — go to the actor's profile
-      return n.actor?.username ? `/${n.actor.username}` : '#'
-    case 'commission_request':
-    case 'drive_funded':
-    case 'pledge_fulfilled':
-      return '/reader?overlay=dashboard&tab=proposals'
-    case 'new_message':
-      return n.conversationId
-        ? `/reader?overlay=messages&conversation=${n.conversationId}`
-        : '/reader?overlay=messages'
-    case 'pub_article_submitted':
-    case 'pub_article_published':
-      return n.article?.slug ? `/article/${n.article.slug}` : '#'
-    case 'tribute_offer_received':
-      // Open the piece — the Tributes apparatus there carries Accept / Decline.
-      return n.article?.slug ? `/article/${n.article.slug}` : '#'
-    case 'pub_invite_received':
-      return '/reader?overlay=dashboard'
-    case 'subscription_offer':
-      // The gift itself. Null once revoked (the gateway withholds the code), in
-      // which case there is nowhere useful to go — the writer's profile is the
-      // honest fallback, not a /subscribe URL that 404s.
-      return n.offer?.code
-        ? `/subscribe/${n.offer.code}`
-        : n.actor?.username
-          ? `/${n.actor.username}`
-          : '#'
-    case 'pub_new_subscriber':
-    case 'pub_member_joined':
-    case 'pub_member_left':
-      return n.actor?.username ? `/${n.actor.username}` : '#'
-    default:
-      return '#'
-  }
-}
 
 function NotificationRow({ n, onActivate }: { n: Notification; onActivate: (n: Notification) => void }) {
-  const actorName = n.actor?.displayName ?? n.actor?.username ?? 'Someone'
+  const ext = n.external ?? null
+  const actorName = notificationActorName(n)
   const isUnread = !n.read
-
-  const labels: Partial<Record<Notification['type'], string>> = {
-    new_follower: 'followed you',
-    new_subscriber: 'subscribed to your content',
-    new_quote: 'quoted you',
-    new_mention: 'mentioned you',
-    commission_request: 'sent you a commission request',
-    drive_funded: 'your pledge drive reached its goal',
-    pledge_fulfilled: 'a pledge drive you backed was published',
-    new_message: 'sent you a message',
-    pub_article_submitted: 'submitted an article for review',
-    pub_article_published: 'published your article',
-    pub_new_subscriber: 'subscribed to your publication',
-    pub_invite_received: 'invited you to a publication',
-    pub_member_joined: 'joined your publication',
-    pub_member_left: 'left your publication',
-    tribute_offer_received: 'wants to share earnings with you',
-    subscription_offer: 'sent you a gift subscription',
-  }
 
   return (
     <div
@@ -105,8 +53,8 @@ function NotificationRow({ n, onActivate }: { n: Notification; onActivate: (n: N
     >
       <span className="flex flex-shrink-0 mt-0.5">
         <Avatar
-          src={n.actor?.avatar}
-          name={n.actor?.displayName ?? n.actor?.username ?? '?'}
+          src={ext ? ext.authorAvatar : n.actor?.avatar}
+          name={ext ? actorName : n.actor?.displayName ?? n.actor?.username ?? '?'}
           size={40}
         />
       </span>
@@ -114,19 +62,60 @@ function NotificationRow({ n, onActivate }: { n: Notification; onActivate: (n: N
       <div className="min-w-0 flex-1">
         {n.type === 'new_reply' ? (
           <>
+            {/* TWO PEOPLE ARE TOLD ABOUT A NESTED REPLY AND THEY ARE NOT TOLD
+                THE SAME THING. `parentComment` is bound only on the row whose
+                recipient is the author of the remark being answered (migration
+                230), and without reading it both rows render "replied to <the
+                piece>" — true for the writer, and the wrong sentence for
+                somebody who left a comment under somebody else's article. It
+                still NAMES the piece where there is one: which conversation
+                this happened in is the other half of what makes the row
+                findable. Same rule as the pub_* labels (content/notifications.ts) — a row that now
+                survives beside another must say what distinguishes it. */}
             <p className={`text-sm leading-snug ${isUnread ? 'text-black font-semibold' : 'text-grey-600'}`}>
               <span className={isUnread ? 'font-semibold' : 'font-medium'}>{actorName}</span>
-              {' replied'}
-              {n.article?.title && <>{' to '}<span className="italic">{n.article.title}</span></>}
+              {replyVerb(n).verb}
+              {n.article?.title && (
+                <>
+                  {replyVerb(n).joiner}
+                  <span className="italic">{n.article.title}</span>
+                </>
+              )}
             </p>
             {n.comment?.content && (
               <p className="text-sm text-grey-600 mt-1 line-clamp-2 leading-snug">{n.comment.content}</p>
             )}
           </>
+        ) : ext && EXTERNAL_LABEL[n.type] ? (
+          <>
+            {/* Somebody on another network (rung C). Named from the post,
+                with the network said, because the name alone is a stranger's
+                and the reader needs to know where to answer them. */}
+            <p className={`text-sm leading-snug ${isUnread ? 'text-black font-semibold' : 'text-grey-600'}`}>
+              <span className={isUnread ? 'font-semibold' : 'font-medium'}>{actorName}</span>
+              {' '}{EXTERNAL_LABEL[n.type]}
+              {externalNetworkSuffix(n)}
+            </p>
+            {ext.excerpt && (
+              <p className="text-sm text-grey-600 mt-1 line-clamp-2 leading-snug">{ext.excerpt}</p>
+            )}
+          </>
+        ) : n.type === 'cross_post_failed' ? (
+          <>
+            {/* The member's own post, so no actor name: the sentence is about
+                where it did NOT go, and the reason is what they act on
+                (usually "reconnect"). A7. */}
+            <p className={`text-sm leading-snug ${isUnread ? 'text-black font-semibold' : 'text-grey-600'}`}>
+              {crossPostFailedSentence(n)}
+            </p>
+            {(n.crossPostFailures ?? []).filter(f => f.error).map((f, i) => (
+              <p key={i} className="text-sm text-grey-600 mt-1 line-clamp-2 leading-snug">{f.error}</p>
+            ))}
+          </>
         ) : (
           <p className={`text-sm leading-snug ${isUnread ? 'text-black font-semibold' : 'text-grey-600'}`}>
             <span className={isUnread ? 'font-semibold' : 'font-medium'}>{actorName}</span>
-            {' '}{labels[n.type] ?? 'sent you a notification'}
+            {' '}{notificationLabel(n)}
           </p>
         )}
         <p className="text-xs text-grey-600 mt-1">{timeAgo(n.createdAt)}</p>
@@ -157,8 +146,13 @@ export function NotificationsPanel({
   const { user } = useAuth()
   const router = useRouter()
   const refreshUnread = useUnreadCounts((s) => s.fetch)
+  const noteRead = useUnreadCounts((s) => s.noteRead)
   const [items, setItems] = useState<Notification[]>([])
   const [dataLoading, setDataLoading] = useState(true)
+  // A list that could not be read is not an empty list (CA-E1): the catch
+  // below used to log and leave `items` empty, and the branch read "No
+  // notifications yet" through every outage.
+  const [loadFailed, setLoadFailed] = useState(false)
   const [nextCursor, setNextCursor] = useState<string | null>(null)
   const [loadingMore, setLoadingMore] = useState(false)
 
@@ -166,7 +160,7 @@ export function NotificationsPanel({
 
   const fetchPage = useCallback(async (cursor?: string) => {
     const isInitial = !cursor
-    if (isInitial) setDataLoading(true)
+    if (isInitial) { setDataLoading(true); setLoadFailed(false) }
     else setLoadingMore(true)
 
     try {
@@ -183,6 +177,7 @@ export function NotificationsPanel({
       setNextCursor(data.nextCursor)
     } catch (err) {
       console.error('Failed to load notifications', err)
+      if (isInitial) setLoadFailed(true)
     } finally {
       setDataLoading(false)
       setLoadingMore(false)
@@ -191,9 +186,20 @@ export function NotificationsPanel({
 
   useEffect(() => { if (user) void fetchPage() }, [user, fetchPage])
 
+  // Most rows in this list lead to a person, and a person is a pane opening in
+  // the place of this one — so the chunk is warmed while the list is being read
+  // rather than inside the click (the handoff rule, part 2).
+  useEffect(() => { prefetchProfileOverlay() }, [])
+
   async function handleActivate(n: Notification) {
-    const href = getDestUrl(n)
-    // Optimistic mark-read, then sync the shared badge count.
+    const dest = getDest(n, user?.username)
+    // Optimistic mark-read — the ROW and the BADGE together, then the
+    // round-trip to make it true. Leaving the count to the round-trip alone
+    // made it a fact that lagged the screen, and `restore()` reads it to
+    // decide whether to put the inbox back when this pane closes: open the
+    // LAST unread notification, close the pane inside that round-trip, and
+    // the reader was handed an empty inbox they had just finished with.
+    if (!n.read) noteRead()
     setItems(prev => prev.map(x => x.id === n.id ? { ...x, read: true } : x))
     notificationsApi.markRead(n.id)
       .then(() => refreshUnread())
@@ -206,12 +212,33 @@ export function NotificationsPanel({
       return
     }
 
-    if (href === '#') return
+    if (dest.kind === 'none') return
+
+    // A PERSON OPENS AS A PANE, IN THE PLACE OF THIS ONE — and this branch
+    // closes nothing on the way. Glasshouse's one-at-a-time invariant
+    // supersedes the inbox from the profile's own mount effect, so the two
+    // cross in a single commit; closing here would take the inbox down before
+    // the code-split profile chunk has landed, leaving the gap the handoff rule
+    // exists to prevent. If the chunk is slow, the inbox holds the screen.
+    // `returnTo` is the other half of not closing: the inbox is superseded
+    // rather than closed, so it is the PROFILE's close that has to put it back
+    // — and only if there is anything left unread to come back to. A reader
+    // working down a list should find the list; a reader who has just read the
+    // last of them should find the workspace.
+    if (
+      dest.kind === 'profile' &&
+      openProfileHref(dest.href, null, {
+        focus: dest.focus,
+        returnTo: 'messages',
+      })
+    )
+      return
+
     // A workspace-overlay target opens in place (we're already on /reader);
     // anything else is a real navigation.
-    const openedOverlay = routeToOverlay(href)
+    const openedOverlay = routeToOverlay(dest.href)
     onClose?.()
-    if (!openedOverlay) router.push(href)
+    if (!openedOverlay) router.push(dest.href)
   }
 
   async function handleReadAll() {
@@ -231,7 +258,7 @@ export function NotificationsPanel({
       <div className={`flex items-baseline justify-between mb-6 ${inOverlay ? 'pr-10' : ''}`}>
         <div>
           <h1 className="font-sans text-2xl font-medium text-black tracking-tight">Notifications</h1>
-          <p className="text-ui-sm text-grey-600 mt-1">Your activity log</p>
+          <p className="text-ui-sm text-grey-600 mt-1">When someone replies to you, mentions you, follows you or writes to you, it shows up here.</p>
         </div>
         <button
           type="button"
@@ -239,7 +266,7 @@ export function NotificationsPanel({
           disabled={!hasUnread}
           className="label-ui text-grey-600 enabled:hover:text-black disabled:opacity-50"
         >
-          Mark all read
+          Mark all as read
         </button>
       </div>
 
@@ -256,9 +283,16 @@ export function NotificationsPanel({
               </div>
             ))}
           </div>
+        ) : loadFailed ? (
+          <div className="py-20 text-center">
+            <p className="text-ui-sm text-grey-600">
+              {NOTIFICATIONS_LOAD_FAILED}{' '}
+              <button onClick={() => void fetchPage()} className="btn-text-muted">{SETTINGS_RETRY}</button>
+            </p>
+          </div>
         ) : items.length === 0 ? (
           <div className="py-20 text-center">
-            <p className="text-ui-sm text-grey-600">No notifications yet</p>
+            <p className="text-ui-sm text-grey-600">{NOTIFICATIONS_EMPTY}</p>
           </div>
         ) : (
           <div>

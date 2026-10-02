@@ -1,10 +1,21 @@
 'use client'
 
 import { useState, useEffect } from 'react'
+import { useRouter } from 'next/navigation'
 import { readingLog, type ReadingLogEntry } from '../../lib/api'
-import { useReader } from '../../stores/reader'
 import { useLibraryOverlay } from '../../stores/libraryOverlay'
 import { useWriterName } from '../../hooks/useWriterName'
+import { LoadFailed } from '../ui/LoadFailed'
+import { openPostInReader, canOpenPostInReader } from '../../lib/workspace/open-post'
+import {
+  RECENT_READING_LOAD_FAILED_WHAT,
+  recentReadingEmpty,
+  RECENT_READING_EMPTY_HINT,
+  RECENT_READING_SHOW_MORE,
+  RECENT_READING_UNTITLED,
+  RECENT_READING_NO_LINK,
+  RECENT_READING_NATIVE_BYLINE_FALLBACK,
+} from '../../content/library'
 
 const PAGE_SIZE = 20
 
@@ -32,6 +43,13 @@ const PAGE_SIZE = 20
 export function RecentReading({ inOverlay = false }: { inOverlay?: boolean }) {
   const [items, setItems] = useState<ReadingLogEntry[]>([])
   const [loading, setLoading] = useState(true)
+  const [failed, setFailed] = useState(false)
+  // The retention window, read from the server rather than typed: the empty
+  // state's whole subject IS the window, and "seven days" was a literal that
+  // would have gone on saying seven the day `reading_log_retention_days` was
+  // retuned. Null until the first response — the sentence falls back to a
+  // vaguer form rather than naming a figure it does not have.
+  const [retentionDays, setRetentionDays] = useState<number | null>(null)
   const [loadingMore, setLoadingMore] = useState(false)
   const [hasMore, setHasMore] = useState(false)
   const [requested, setRequested] = useState(0)
@@ -51,11 +69,17 @@ export function RecentReading({ inOverlay = false }: { inOverlay?: boolean }) {
       // anywhere in a page ended the log early and said nothing.
       setHasMore(data.hasMore)
       setRequested(offset + PAGE_SIZE)
+      setRetentionDays(data.retentionDays ?? null)
+      setFailed(false)
     } catch {
-      // A dead gateway shows an empty tab, not a broken one. Note the shape,
-      // though: this is exactly the swallow that hid the predecessor's 500 for
-      // its whole life, so this tab must be proved by driving it and asserting
-      // a row — never by its silence.
+      // A dead gateway is an outage, not an empty tab — the swallow that used
+      // to sit here is exactly the one that hid the predecessor's 500 for its
+      // whole life, and the sentence it left on screen ("Nothing read in the
+      // last seven days") is a claim about the reader that nothing had checked.
+      // A failed FIRST page says so; a failed later page keeps what is on
+      // screen and stops offering more.
+      if (offset === 0) setFailed(true)
+      setHasMore(false)
     }
     finally { setLoading(false); setLoadingMore(false) }
   }
@@ -64,12 +88,16 @@ export function RecentReading({ inOverlay = false }: { inOverlay?: boolean }) {
 
   if (loading) return <div className="h-12 animate-pulse bg-glasshouse-well" />
 
+  if (failed) return <LoadFailed what={RECENT_READING_LOAD_FAILED_WHAT} />
+
   if (items.length === 0) {
     return (
       <div className="py-20 text-center">
-        <p className="text-ui-sm text-grey-400">Nothing read in the last seven days.</p>
+        <p className="text-ui-sm text-grey-400">
+          {recentReadingEmpty(retentionDays)}
+        </p>
         <p className="label-ui text-grey-300 mt-2">
-          Anything you open in a reader appears here.
+          {RECENT_READING_EMPTY_HINT}
         </p>
       </div>
     )
@@ -93,7 +121,7 @@ export function RecentReading({ inOverlay = false }: { inOverlay?: boolean }) {
             disabled={loadingMore}
             className="btn-text underline underline-offset-4"
           >
-            {loadingMore ? 'Loading…' : 'Show more'}
+            {loadingMore ? 'Loading…' : RECENT_READING_SHOW_MORE}
           </button>
         </div>
       )}
@@ -108,27 +136,20 @@ function RecentReadingRow({
   entry: ReadingLogEntry
   inOverlay: boolean
 }) {
+  const router = useRouter()
   const { post, openedAt } = entry
   const isNative = post.origin.protocol === 'nostr'
 
   function open() {
     useLibraryOverlay.getState().close()
-    if (isNative && post.dTag) {
-      useReader.getState().openNative(post.dTag, {
-        postId: post.id,
-        preview: { title: post.body.title, summary: post.body.summary },
-      })
-    } else if (post.origin.uri) {
-      useReader.getState().openExternal(post.origin.uri, {
-        postId: post.id,
-        title: post.body.title,
-        siteName: post.origin.sourceName,
-      })
-    }
+    openPostInReader(post, router)
   }
 
-  const openable = isNative ? !!post.dTag : !!post.origin.uri
-  const title = post.body.title || post.body.summary || post.body.text || 'Untitled'
+  // Openability is the helper's question too: an external row whose origin URI
+  // is a non-URL RSS guid has no permalink to read, and offering the title as a
+  // button that does nothing is worse than printing it as text.
+  const openable = canOpenPostInReader(post)
+  const title = post.body.title || post.body.summary || post.body.text || RECENT_READING_UNTITLED
 
   return (
     <div className="flex items-center gap-3 px-6 py-4">
@@ -148,6 +169,10 @@ function RecentReadingRow({
           <RowByline post={post} />
           {' · '}
           {new Date(openedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}
+          {/* Said on the row (walkthrough A2): without it the unclickable title
+              sits beside clickable ones with nothing saying why. Covers a
+              native item with no dTag as well as the RSS guid case. */}
+          {!openable && RECENT_READING_NO_LINK}
         </p>
       </div>
       {/* The whole web, not only ours — so the row says which. A native piece
@@ -176,5 +201,5 @@ function RowByline({ post }: { post: ReadingLogEntry['post'] }) {
 
 function NativeByline({ pubkey }: { pubkey: string }) {
   const info = useWriterName(pubkey)
-  return <>{info?.displayName ?? (info?.username ? `@${info.username}` : 'all.haus')}</>
+  return <>{info?.displayName ?? (info?.username ? `@${info.username}` : RECENT_READING_NATIVE_BYLINE_FALLBACK)}</>
 }

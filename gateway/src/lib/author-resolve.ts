@@ -2,7 +2,9 @@ import { pool } from "@platform-pub/shared/db/client.js";
 import { nip19 } from "nostr-tools";
 import { getProfile } from "./atproto-resolve.js";
 import { fetchActorProfile } from "./activitypub-resolve.js";
+import { fetchMastodonAccountByActorUri } from "@platform-pub/shared/lib/mastodon-api.js";
 import logger from "@platform-pub/shared/lib/logger.js";
+import { viewerRelation, type ViewerRelation } from "./blocks.js";
 
 // =============================================================================
 // Shared author resolution — UNIVERSAL-POST-ADR §4.4 / §9
@@ -53,6 +55,10 @@ export interface AuthorCardResponse {
     // feed-derived Follow affordance. Null when no source row exists yet.
     sourceId?: string | null;
   };
+  // What the VIEWER has done to this author — present exactly when a
+  // `followTarget` of type "user" is (a native account, a viewer, not
+  // themselves), omitted otherwise. One direction only: `lib/blocks.ts`.
+  viewerRelation?: ViewerRelation;
   // Slice 8 P2/P3 — cross-source identity links for THIS author, "the same
   // person, also over there", rendered as unlinkable chips. Two origins, merged:
   // the viewer's own `user_asserted` rows (P2) and global automated links the P3
@@ -244,7 +250,7 @@ export async function resolveNativeAuthor(
 
   const account = rows[0];
 
-  const [followerResult, followingResult, articleResult, isFollowingResult] =
+  const [followerResult, followingResult, articleResult, isFollowingResult, relation] =
     await Promise.all([
       pool.query<{ count: string }>(
         `SELECT COUNT(*) AS count FROM follows WHERE followee_id = $1`,
@@ -270,6 +276,7 @@ export async function resolveNativeAuthor(
             [viewerId, userId],
           )
         : null,
+      viewerId && viewerId !== userId ? viewerRelation(viewerId, userId) : null,
     ]);
 
   return {
@@ -293,6 +300,7 @@ export async function resolveNativeAuthor(
             id: userId,
             isFollowing: isFollowingResult!.rows[0].exists,
           },
+    ...(relation ? { viewerRelation: relation } : {}),
   };
 }
 
@@ -318,10 +326,7 @@ export async function fetchBlueskyProfile(
 
 // ActivityPub actor profile (+ Mastodon REST count fallback when the actor
 // document omits follower/following counts).
-export async function fetchAPProfile(
-  authorUri: string,
-  sourceItemUri: string,
-): Promise<{
+export async function fetchAPProfile(authorUri: string): Promise<{
   displayName: string | null;
   handle: string | null;
   avatar: string | null;
@@ -339,65 +344,27 @@ export async function fetchAPProfile(
     ) {
       return actorProfile;
     }
-    const restCounts = await fetchMastodonAccountCounts(
-      authorUri,
-      sourceItemUri,
-    );
+    const restCounts = await fetchMastodonAccountCounts(authorUri);
     return { ...actorProfile, ...restCounts };
   }
 
   return null;
 }
 
-async function fetchMastodonAccountCounts(
-  authorUri: string,
-  sourceItemUri: string,
-): Promise<{
+// The actor's own instance, addressed by whatever the actor URI carries
+// (`/@name`, `/users/name`, `/ap/users/<id>`) through the one home — never a
+// bare local part looked up on the ITEM's host, which names that host's own
+// `name` rather than this author whenever the two hosts differ.
+async function fetchMastodonAccountCounts(authorUri: string): Promise<{
   followersCount?: number;
   followingCount?: number;
   postsCount?: number;
 }> {
-  try {
-    let host: string;
-    try {
-      host = new URL(sourceItemUri).hostname;
-    } catch {
-      host = new URL(authorUri).hostname;
-    }
-
-    const handle = authorUri.match(/\/@([^/]+)/)?.[1];
-    if (!handle) return {};
-
-    const { safeFetch } = await import(
-      "@platform-pub/shared/lib/http-client.js"
-    );
-    const res = await safeFetch(
-      `https://${host}/api/v1/accounts/lookup?acct=${encodeURIComponent(handle)}`,
-      { headers: { Accept: "application/json" } },
-    );
-
-    if (!res.ok) return {};
-    const data = JSON.parse(res.text) as {
-      followers_count?: number;
-      following_count?: number;
-      statuses_count?: number;
-    };
-
-    return {
-      followersCount:
-        typeof data.followers_count === "number"
-          ? data.followers_count
-          : undefined,
-      followingCount:
-        typeof data.following_count === "number"
-          ? data.following_count
-          : undefined,
-      postsCount:
-        typeof data.statuses_count === "number"
-          ? data.statuses_count
-          : undefined,
-    };
-  } catch {
-    return {};
-  }
+  const account = await fetchMastodonAccountByActorUri(authorUri);
+  if (!account) return {};
+  return {
+    followersCount: account.followersCount ?? undefined,
+    followingCount: account.followingCount ?? undefined,
+    postsCount: account.statusesCount ?? undefined,
+  };
 }

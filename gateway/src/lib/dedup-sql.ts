@@ -4,10 +4,16 @@
 // Factored out of feeds/items.ts so the integration test (gateway/tests/
 // dedup-integration.test.ts) exercises the *exact same* SQL the live feed query
 // runs — there is no second copy to drift. The host query is responsible for the
-// `matched` CTE (the feed's pre-LIMIT candidate item set, projecting `fi_id` +
-// `allow_replies`), a ranking pass whose WHERE takes DEDUP_SUPPRESS_FILTER, and
-// a final page relation aliased `scored` projecting `fi_id` (which the
+// `source_pool` CTE (the feed's DELIVERABLE candidate item set, projecting
+// `fi_id` + `allow_replies`), a pass whose WHERE takes dedupSuppressFilter(),
+// and a final page relation aliased `scored` projecting `fi_id` (which the
 // provenance lateral keys on); the fragments below slot in between and after.
+//
+// `source_pool` must be taken BEFORE any sampling the host does. The live feed
+// cuts each source down to a `throughput` fraction whose membership shifts from
+// page to page, and a winner drawn from the post-cut set is a winner that
+// changes with the page — the one thing this design exists to rule out. See
+// lib/source-selection.ts › WHY DEDUP SITS IN THE MIDDLE.
 //
 // Param contract: `$1` is the reader id (already threaded through
 // sourceFilteredItems); the confidence floor's param INDEX is an argument,
@@ -28,13 +34,15 @@
 // =============================================================================
 import { getPlatformConfig } from "./platform-config.js";
 
-// The dedup CTEs. Slot between `matched` and `scored`:
-//   WITH RECURSIVE feed_mode AS (…), matched AS (…), ${DEDUP_CTES}, scored AS (…)
+// The dedup CTEs. Slot between `source_pool` and whatever consumes `suppressed`:
+//   WITH RECURSIVE feed_alpha AS (…), source_arms AS (…), source_pool AS (…),
+//                  ${DEDUP_CTES}, source_windowed AS (…), …
 //
-// Two cross-posted copies carry different effective_score, so they are not
-// page-adjacent — in-page dedup leaks the twin. Instead we pick a
-// page-independent winner per fingerprint and suppress losers across the whole
-// candidate set (`matched`, pre-LIMIT).
+// Two cross-posted copies never sort adjacently — one copy can be on page 1 and
+// its twin on page 3 — so in-page dedup leaks the twin. Instead we pick a winner
+// per fingerprint that depends neither on the page nor on the sort key, and
+// suppress the losers across the whole candidate set (`source_pool`, pre-cut and
+// pre-LIMIT).
 //
 // WHAT THIS ACTUALLY MATCHES, because the header used to claim more (§6.5). The
 // fingerprint (migration 123) prefers a canonical URL and falls back to a hash
@@ -178,20 +186,45 @@ export function dedupCtes(confParam: number): string {
              ei.dedup_fingerprint AS fp, sc.comp,
              (CASE fi.biddability_tier
                 WHEN 'A' THEN 0 WHEN 'B' THEN 1 WHEN 'C' THEN 2 ELSE 3 END) AS tprio
-        FROM matched m
+        FROM source_pool m
         JOIN feed_items fi ON fi.id = m.fi_id
         JOIN external_items ei ON ei.id = fi.external_item_id   -- external only
-        JOIN source_component sc ON sc.sid = fi.source_id       -- linked sources only (the guard) + tag its component
+        -- Linked sources only (the guard) + tag the component. Asked of every
+        -- source that SERVES the item (CA-C4, external_item_sources), not only
+        -- the one that wrote it first — a shared item reaches the feed through
+        -- all of them. MIN picks one component deterministically where two
+        -- unlinked components both serve it.
+        JOIN LATERAL (
+          SELECT MIN(sc.comp) AS comp
+            FROM external_item_sources eis
+            JOIN source_component sc ON sc.sid = eis.source_id
+           WHERE eis.external_item_id = fi.external_item_id
+        ) sc ON sc.comp IS NOT NULL
         WHERE ei.dedup_fingerprint IS NOT NULL
-          -- Mirror the host's post-suppression visibility predicates (items.ts
-          -- scored WHERE) so a row that will be FILTERED can never be the dedup
-          -- winner: otherwise a context-only or reply-suppressed twin could
-          -- suppress its visible sibling and then be filtered itself, hiding BOTH
-          -- copies (M11 — the exact SLICE-8 failure the candidate universe must
-          -- prevent). These match the external-applicable filters at
-          -- items.ts:281 (is_context_only) and :284 (is_reply / allow_replies).
+          -- M11 — A ROW THAT CANNOT RENDER MUST NOT BE THE WINNER, or it
+          -- suppresses its visible sibling and is then filtered itself, hiding
+          -- BOTH copies. So every predicate the host applies AFTER suppression
+          -- is mirrored here. The fragment carries them itself rather than
+          -- trusting the caller to have filtered: a host that hands over an
+          -- unfiltered pool must still get a deliverable winner.
+          --
+          -- The first two are belt-and-braces against the live host, which
+          -- since migration 202 applies both inside its selection arms (a
+          -- context-only or reply row is not in source_pool at all). They stay
+          -- because the test and EXPLAIN hosts build their own pool.
           AND ei.is_context_only IS NOT TRUE
           AND (fi.is_reply IS NOT TRUE OR m.allow_replies)
+          -- Blocks and mutes are NOT mirrored anywhere else: the live host
+          -- applies them in the ranking pass, downstream of suppression, and
+          -- until this pair was added a blocked author's copy could win and
+          -- take its visible twin down with it. Cheap here: candidates is
+          -- already narrowed to fingerprinted items on linked sources.
+          AND NOT EXISTS (
+            SELECT 1 FROM blocks WHERE blocker_id = $1 AND blocked_id = fi.author_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM mutes WHERE muter_id = $1 AND muted_id = fi.author_id
+          )
     ),
     -- A candidate loses when another candidate in the SAME component with the same
     -- fingerprint ranks ahead under the total order tprio (A→0…D→3) ASC,
@@ -211,8 +244,15 @@ export function dedupCtes(confParam: number): string {
     )`;
 }
 
-// Drop the loser of a cross-source duplicate pair. Goes in the `scored` WHERE.
-export const DEDUP_SUPPRESS_FILTER = `AND fi.id NOT IN (SELECT fi_id FROM suppressed)`;
+// Drop the loser of a cross-source duplicate pair.
+//
+// Takes the host's spelling of the item id because the two hosts spell it
+// differently and one spelling in one place is the point: the live feed applies
+// it inside `source_windowed`, where the column is a bare `fi_id`, while the
+// test/EXPLAIN hosts apply it in a pass that has `feed_items` joined as `fi`.
+export function dedupSuppressFilter(idExpr: string): string {
+  return `AND ${idExpr} NOT IN (SELECT fi_id FROM suppressed)`;
+}
 
 // Provenance ("ALSO ON BLUESKY · MASTODON"): computed only for survivors (a
 // handful of post-filter rows) — the other component members carrying the same

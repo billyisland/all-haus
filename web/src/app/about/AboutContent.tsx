@@ -1,6 +1,8 @@
 'use client'
 
 import type { ReactNode } from 'react'
+import { ABOUT_HEADLINE, ABOUT_TERMS_INTRO, aboutSections } from '../../content/about'
+import type { PublishedFigures } from '../../lib/published-figures'
 import { PublicShell } from '../../components/public/PublicShell'
 import {
   PublicVessel,
@@ -41,8 +43,8 @@ import { GAP, PAD, WALL, usePublicPalette } from '../../components/public/palett
 // then "Writers post Articles… Readers follow for free". That was the old
 // positioning. `/` has since moved to readers-first and its metadata went with
 // it; About was the last surface still leading with the author. Every FACT
-// below is carried over from the previous copy unchanged — the 8% cut, the £5
-// of starting credit, the Tab, the Stripe settlement, the key pair in the
+// below is carried over from the previous copy unchanged — the platform's cut, the
+// starting credit, the Tab, the Stripe settlement, the key pair in the
 // locker, the Articles/Notes distinction. Nothing new is claimed. What changed
 // is the order of address: the reader is the subject of the first three
 // paragraphs and the writer arrives as someone the reader is paying, which is
@@ -51,49 +53,29 @@ import { GAP, PAD, WALL, usePublicPalette } from '../../components/public/palett
 // The feed paragraph reuses `/`'s approved framing rather than paraphrasing it,
 // so a visitor who reads both doesn't meet two accounts of the same feature.
 //
+// THE WORDS THEMSELVES LIVE IN `content/about.ts`, which modernhaus's About
+// renders too — edit them there. The cut and the allowance are no longer typed:
+// both are dials, read by whoever renders this (`figures`) and interpolated
+// there; null drops the number from the sentence.
+//
 // The metadata in ./page.tsx MUST be kept in step with this — it still carried
 // the writer-first description at the time of the restyle.
 // =============================================================================
 
-const HEADLINE = 'all.haus is a reading platform that pays the people you read.'
-
-const SECTIONS: { heading?: string; paragraphs: string[] }[] = [
-  {
-    paragraphs: [
-      'Build omnivorous feeds that pull the whole open social web — Bluesky, Mastodon, Substack, plain old RSS — into one place, and sort them with rules you set rather than rules set on you. A feed is a tool: you need the right one for each job, so you can make as many as you like.',
-      'When something is worth reading, pay a few pence to unlock it. No subscription, no bundle, no commitment you’ll forget to cancel. If you read someone often, you can subscribe to them monthly instead and unlock everything they put behind a paywall — but you never have to.',
-      'Charges accumulate on a Tab, the way a bar tab does, and settle through Stripe. The money goes to whoever wrote the piece; they’re paid in batches, once the balance is big enough that transaction fees won’t eat it.',
-    ],
-  },
-  {
-    heading: 'If you write as well as read',
-    paragraphs: [
-      'You post Articles, which can be paywalled, and Notes, which can’t. You set your own terms. People can follow you for nothing and pay only for the pieces they actually open, which means the thing you’re being paid for is the writing rather than the attention.',
-    ],
-  },
-  {
-    heading: 'Built on open ground',
-    paragraphs: [
-      'all.haus runs on Nostr, an open-source, peer-to-peer messaging protocol popular with privacy advocates, libertarians and Bitcoin enthusiasts. You don’t need to be any of those things to like what it makes possible.',
-      'By default, all.haus hosts your content and manages your payments, taking an 8% cut to cover running costs. But your account, your content, your follows, and your reading permissions are all genuinely portable. Your identity is a cryptographic key pair held in a secure locker that all.haus can’t read. You can move it to another custodian, a browser extension, or a piece of paper whenever you like. If you don’t like what all.haus is doing, leave for another host — or run your own — taking your followers, your payment receipts, and your self-respect with you.',
-    ],
-  },
-  {
-    heading: 'You don’t need to think about any of that',
-    paragraphs: [
-      'Log in with Google if you like, and use what looks and feels like a straightforward web app. Your account comes with £5 of credit to get started. When it runs out, connect a payment method and carry on — safe in the knowledge that your all.haus account is genuinely yours.',
-    ],
-  },
-]
-
-export function AboutContent({ inOverlay = false }: { inOverlay?: boolean }) {
+export function AboutContent({
+  figures,
+  inOverlay = false,
+}: {
+  figures: PublishedFigures | null
+  inOverlay?: boolean
+}) {
   const cards = (
     <>
       <PublicCard>
-        <PublicTitle size={30}>{HEADLINE}</PublicTitle>
+        <PublicTitle size={30}>{ABOUT_HEADLINE}</PublicTitle>
       </PublicCard>
 
-      {SECTIONS.map((section, i) => (
+      {aboutSections(figures).map((section, i) => (
         <PublicCard key={i}>
           {section.heading && (
             <div style={{ marginBottom: 14 }}>
@@ -111,6 +93,58 @@ export function AboutContent({ inOverlay = false }: { inOverlay?: boolean }) {
           </div>
         </PublicCard>
       ))}
+
+      {/* THE FOUR DOCUMENTS, from the one public page that explains the
+          platform. There is no footer to put them in — the register bans
+          bottom chrome — and the nav bar holds the single accent, so About is
+          where a visitor who wants the terms before signing up can find them.
+          NEW TAB in both registers: in the overlay a same-tab navigation is
+          the escape the Glasshouse rules forbid, and having one behaviour
+          rather than two is the two-registers rule (a seam, not a fork). */}
+      <PublicCard>
+        <div style={{ marginBottom: 14 }}>
+          <PublicTitle as="h2" size={20}>
+            The terms
+          </PublicTitle>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: GAP }}>
+          <PublicBody>{ABOUT_TERMS_INTRO}</PublicBody>
+          <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
+            <a
+              href="/terms"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn-text"
+            >
+              Terms of Service
+            </a>
+            <a
+              href="/privacy"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn-text"
+            >
+              Privacy Policy
+            </a>
+            <a
+              href="/reader-terms"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn-text"
+            >
+              Reader Terms
+            </a>
+            <a
+              href="/writer-agreement"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn-text"
+            >
+              Writer Agreement
+            </a>
+          </div>
+        </div>
+      </PublicCard>
     </>
   )
 

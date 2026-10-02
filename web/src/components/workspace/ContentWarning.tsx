@@ -7,14 +7,26 @@ interface ContentWarningProps {
   warningText: string;
   palette: VesselPalette;
   children: ReactNode;
+  /** Offer SHOW CONTENT. Off, the label stands in place of the text with
+   *  nothing to reveal it (a queue preview row, WORKSPACE-QUEUE-ADR §VII.5). */
+  revealable?: boolean;
 }
 
 export function ContentWarning({
   warningText,
   palette,
   children,
+  revealable = true,
 }: ContentWarningProps) {
   const [revealed, setRevealed] = useState(false);
+
+  if (!revealable) {
+    return (
+      <span className="label-ui" style={{ color: palette.cardMeta }}>
+        {warningText}
+      </span>
+    );
+  }
 
   return (
     <div>

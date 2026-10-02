@@ -33,7 +33,6 @@ import { useDashboardOverlay } from "../../stores/dashboardOverlay";
 import { useLedgerOverlay } from "../../stores/ledgerOverlay";
 import { useSettingsOverlay } from "../../stores/settingsOverlay";
 import { useLibraryOverlay } from "../../stores/libraryOverlay";
-import { useNetworkOverlay } from "../../stores/networkOverlay";
 import { useProfile } from "../../stores/profileOverlay";
 import { useSurfaceOverlay } from "../../stores/surfaceOverlay";
 import { useEditorOverlay } from "../../stores/editorOverlay";
@@ -99,15 +98,6 @@ export function LazyLibraryOverlay() {
   return isOpen ? <LibraryOverlayDyn /> : null;
 }
 
-const NetworkOverlayDyn = dynamic(
-  () => import("./NetworkOverlay").then((m) => m.NetworkOverlay),
-  { ssr: false },
-);
-export function LazyNetworkOverlay() {
-  const isOpen = useNetworkOverlay((s) => s.isOpen);
-  return isOpen ? <NetworkOverlayDyn /> : null;
-}
-
 // --- Layout-shell overlays (were in LayoutShell, in every page bundle) ------
 
 const ProfileOverlayDyn = dynamic(
@@ -141,10 +131,11 @@ const ComposeOverlayDyn = dynamic(
   () => import("../compose/ComposeOverlay").then((m) => m.ComposeOverlay),
   { ssr: false },
 );
-// Compose has no `isOpen`-only render guard caller-side (LayoutShell already
-// gates it on `!chromeless`); gate the *chunk* on the compose store's isOpen so
-// it loads on first compose, while leaving the caller's `!chromeless` guard to
-// decide whether the global compose surface participates at all.
+// Gate the *chunk* on the compose store's isOpen so it loads on first compose.
+// LayoutShell's own `composeMounted` (platform mode, no pane overlay open, and
+// the store open) decides whether the global compose surface participates at
+// all — the same value that drops `PublicNavBar` for it, since the composer is
+// an immersive pane.
 export function LazyComposeOverlay() {
   const isOpen = useCompose((s) => s.isOpen);
   return isOpen ? <ComposeOverlayDyn /> : null;

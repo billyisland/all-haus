@@ -10,10 +10,22 @@ import {
   type AuthorCardType,
 } from "../../hooks/useAuthorCard";
 import { workspaceFeeds } from "../../lib/api";
+import { failureSentence } from "../../lib/api/client";
 import { openProfileHref, isModifiedClick } from "../ui/ProfileLink";
 import { useEscapeShield } from "../../hooks/useEscapeShield";
+import { safeHttpUrl } from "../../lib/external-links";
 import { useLightbox } from "../../stores/lightbox";
 import { useFollows } from "../../stores/follows";
+import {
+  useFeedFollow,
+  isFeedFollowable,
+  matchFeedSource,
+  feedFollowAddInput,
+  reportFollowState,
+  type FeedFollowTarget,
+} from "../../hooks/useFeedFollow";
+import { FeedFollowMenu } from "./FeedFollowMenu";
+import { Pointer } from "../ui/Pointer";
 import { useExplain } from "../../stores/explain";
 import { SourceVolume } from "./SourceVolume";
 import type { FeedScheme } from "../workspace/tokens";
@@ -36,11 +48,14 @@ interface AuthorModalProps {
   // Stacking override for callers that open the modal above a frosted overlay
   // (the FeedComposer Glasshouse sits at z-56, above this modal's default 50).
   zIndex?: number;
-  // The workspace feed this byline was hovered in. External "Follow" = add the
-  // source to THIS feed; absent ⇒ no feed context, so the external Follow
-  // affordance is omitted. Native Follow is the global graph toggle AND — with
-  // feed context, since the reach retirement (§9.16) — writes the concrete
-  // `account` source into this feed too (without it, only the graph toggles).
+  // The workspace feed this byline was hovered in — the context that decides
+  // where a follow lands. Present ⇒ one press adds/removes the source in THIS
+  // feed (and, for a native writer, the graph row beside it). ABSENT ⇒ the
+  // surface is feed-less (the article page, /read/:postId, /tag, a profile
+  // log, the reader), nothing can decide for the reader, and the button
+  // becomes the same "Follow ▾" feed picker the profile bar carries (§9.16).
+  // It used to hide external follow outright here and toggle native follow
+  // into no feed at all.
   feedId?: string;
   // Native author's 64-hex pubkey (from the feed-card byline) — lets the panel
   // host the per-feed VOLUME control for followed native authors. Absent for
@@ -72,6 +87,12 @@ export function AuthorModal({
 }: AuthorModalProps) {
   const { data, loading } = useAuthorCard(type, id, true);
   const modalRef = useRef<HTMLDivElement>(null);
+  // The in-panel feed picker's open state, lifted because it changes how the
+  // PANEL dismisses: hover-close would snatch the menu away the moment the
+  // pointer crossed one of its rows, and Escape has to close the menu before
+  // the panel. The picker renders inside `modalRef`, so outside-pointerdown
+  // and the click-swallow already cover it.
+  const [pickerOpen, setPickerOpen] = useState(false);
   const [position, setPosition] = useState<{
     top: number;
     left: number;
@@ -95,7 +116,15 @@ export function AuthorModal({
   // lightbox ABOVE at z-[70] — its listener shares this `document` node where
   // registration order wins, so stopPropagation can't arbitrate that pair
   // (§0f-15); the yield does.
-  useEscapeShield(true, onClose, () => useLightbox.getState().isOpen);
+  // Yield to the picker as well as the lightbox: both listeners sit on
+  // `document`, this one registers first (the panel mounts before the menu
+  // opens), so it must stand aside or one Escape would close the whole panel
+  // out from under an open menu. Two Escapes, two surfaces.
+  useEscapeShield(
+    true,
+    onClose,
+    () => useLightbox.getState().isOpen || pickerOpen,
+  );
 
   // Outside-pointerdown dismissal (the anchor is excluded so a click on the
   // trigger toggles rather than close-then-reopen).
@@ -128,14 +157,25 @@ export function AuthorModal({
 
   if (!position) return null;
 
+  // The above/below decision is taken once against a ~320px budget, so a panel
+  // that grows (the picker) must be bounded rather than allowed to run off the
+  // viewport. Capping against the SAME anchor the panel is positioned by keeps
+  // it on screen either way; the `above` case already grew upward safely.
   const style: React.CSSProperties = {
     position: "fixed",
     left: position.left,
     width: 300,
     zIndex,
+    overflowY: "auto",
     ...(position.below
-      ? { top: position.top }
-      : { bottom: window.innerHeight - position.top }),
+      ? {
+          top: position.top,
+          maxHeight: Math.max(160, window.innerHeight - position.top - 8),
+        }
+      : {
+          bottom: window.innerHeight - position.top,
+          maxHeight: Math.max(160, position.top - 8),
+        }),
   };
 
   return createPortal(
@@ -145,7 +185,14 @@ export function AuthorModal({
       className="bg-white shadow-lg p-4"
       onMouseEnter={onMouseEnter}
       onMouseLeave={
-        onMouseLeave ?? (dismissOnMouseLeave ? onClose : undefined)
+        // `dismissOnMouseLeave`'s first real use as false (it has been
+        // declared and never passed since it was written): while the picker is
+        // open the panel is click-dismissed, not hover-dismissed. Both arms
+        // are suppressed — the bridge's own handler re-ARMS the close timer,
+        // so leaving only `onClose` out would still lose the menu.
+        pickerOpen
+          ? undefined
+          : (onMouseLeave ?? (dismissOnMouseLeave ? onClose : undefined))
       }
       onClick={(e) => e.stopPropagation()}
     >
@@ -157,10 +204,11 @@ export function AuthorModal({
           feedId={feedId}
           pubkey={pubkey}
           frameScheme={frameScheme}
+          onPickerOpenChange={setPickerOpen}
         />
       )}
       {!data && !loading && (
-        <p className="text-ui-xs text-grey-400">Could not load profile</p>
+        <p className="text-ui-xs text-grey-400">Couldn’t load this profile.</p>
       )}
     </div>,
     document.body,
@@ -189,12 +237,14 @@ function ModalContent({
   feedId,
   pubkey,
   frameScheme,
+  onPickerOpenChange,
 }: {
   data: AuthorCardData;
   onClose: () => void;
   feedId?: string;
   pubkey?: string;
   frameScheme?: FeedScheme | null;
+  onPickerOpenChange: (open: boolean) => void;
 }) {
   if (data.tier === "D") {
     return (
@@ -206,13 +256,13 @@ function ModalContent({
           <p className="text-ui-xs text-grey-600">{data.sourceName}</p>
         )}
         <p className="label-ui text-grey-400 mt-2">
-          LIMITED INFO FROM THIS SOURCE
+          This source doesn’t say much about who wrote it
         </p>
         {data.followTarget && (
           <FollowButton
             target={data.followTarget}
-            onClose={onClose}
             feedId={feedId}
+            onPickerOpenChange={onPickerOpenChange}
           />
         )}
       </div>
@@ -250,8 +300,8 @@ function ModalContent({
         {data.followTarget && (
           <FollowButton
             target={data.followTarget}
-            onClose={onClose}
             feedId={feedId}
+            onPickerOpenChange={onPickerOpenChange}
           />
         )}
         <SourceVolume data={data} feedId={feedId} pubkey={pubkey} />
@@ -308,11 +358,12 @@ function ModalContent({
               </p>
             ))}
           {data.handle &&
-            (data.externalUrl ? (
+            (safeHttpUrl(data.externalUrl) ? (
               // The handle links out to the author's profile on the origin
-              // platform (Bluesky / Fediverse / Nostr).
+              // platform (Bluesky / Fediverse / Nostr) — through `safeHttpUrl`,
+              // like every href that leaves all.haus (CA-E15).
               <a
-                href={data.externalUrl}
+                href={safeHttpUrl(data.externalUrl)}
                 target="_blank"
                 rel="noopener noreferrer"
                 onClick={(e) => e.stopPropagation()}
@@ -367,7 +418,7 @@ function ModalContent({
         <div className="flex flex-col gap-1 mt-2">
           {data.website && (
             <a
-              href={data.website}
+              href={safeHttpUrl(data.website)}
               target="_blank"
               rel="noopener noreferrer"
               onClick={(e) => e.stopPropagation()}
@@ -385,14 +436,14 @@ function ModalContent({
       )}
 
       {data.partial && (
-        <p className="label-ui text-grey-300 mt-2">SOME DATA UNAVAILABLE</p>
+        <p className="label-ui text-grey-300 mt-2">Some details couldn’t be loaded</p>
       )}
 
       {data.followTarget && (
         <FollowButton
           target={data.followTarget}
-          onClose={onClose}
           feedId={feedId}
+          onPickerOpenChange={onPickerOpenChange}
         />
       )}
 
@@ -403,204 +454,266 @@ function ModalContent({
   );
 }
 
-// Protocols the workspace addSource path can service (email is ingest-only —
-// no Follow affordance until it's wired). Mirrors AddWorkspaceFeedSourceInput.
-const FOLLOWABLE_PROTOCOLS = new Set([
-  "rss",
-  "atproto",
-  "activitypub",
-  "nostr_external",
-]);
+// -----------------------------------------------------------------------------
+// The hover panel's follow affordance — TWO SHAPES, decided by whether the
+// context already answers "into which feed?" (§9.16).
+//
+//   feedId present  → FeedScopedFollowButton. The byline was hovered inside a
+//                     vessel, so the feed IS the answer: one press, no menu.
+//   feedId absent   → PickerFollowButton. The article page, /read/:postId,
+//                     /tag, a profile log, the reader — nothing here decides,
+//                     so the reader is asked, with the same picker the profile
+//                     bar carries. Before this the panel hid external follow
+//                     outright on those surfaces and toggled native follow
+//                     into no feed at all, which is the whole complaint.
+//
+// The matching and add rules are NOT restated here: both shapes take
+// `matchFeedSource` / `feedFollowAddInput` from `useFeedFollow`, so a feed
+// press and a menu tick cannot come to mean different things.
+// -----------------------------------------------------------------------------
 
 function FollowButton({
   target,
-  onClose,
+  feedId,
+  onPickerOpenChange,
+}: {
+  target: FeedFollowTarget;
+  feedId?: string;
+  onPickerOpenChange: (open: boolean) => void;
+}) {
+  return feedId ? (
+    <FeedScopedFollowButton target={target} feedId={feedId} />
+  ) : (
+    <PickerFollowButton
+      target={target}
+      onPickerOpenChange={onPickerOpenChange}
+    />
+  );
+}
+
+const BUTTON_CLASS =
+  "mt-3 w-full py-1.5 text-ui-xs font-medium transition-colors";
+
+function buttonTone(following: boolean): string {
+  return following
+    ? "bg-grey-100 text-grey-600 hover:bg-grey-200"
+    : "bg-black text-white hover:bg-grey-800";
+}
+
+function FeedScopedFollowButton({
+  target,
   feedId,
 }: {
-  target: NonNullable<AuthorCardData["followTarget"]>;
-  onClose: () => void;
-  feedId?: string;
+  target: FeedFollowTarget;
+  feedId: string;
 }) {
-  const isSource = target.type === "source";
-  // External follow is feed-derived: "follow" means the source sits in THIS
-  // feed (a feed_sources row). Without a feed context, or for a protocol we
-  // can't add, there's no external Follow affordance.
-  const externalFollowable =
-    isSource &&
-    !!feedId &&
-    (!target.protocol || FOLLOWABLE_PROTOCOLS.has(target.protocol));
+  const native = target.type === "user";
+  const followable = isFeedFollowable(target);
 
-  // Seed the label from the server snapshot — `isFollowing` is the global
-  // subscription state, which is the right initial guess for the common case
-  // (a source is followed from the feed you're hovering in). For external
-  // sources the authoritative state is per-feed, so we confirm it below; until
-  // then the button is held disabled (`resolved`) so the label can't be acted
-  // on while it's still a guess (avoids both the FOLLOW→FOLLOWING flicker and a
-  // fast click firing the wrong path against an unresolved feedSourceId).
+  // ONE CODE PATH FOR BOTH KINDS, and the label is about THIS FEED. It used to
+  // fork: external read per-feed membership, native read the global graph
+  // store. That disagreed with what the press did the moment a native follow
+  // became feed-derived — press FOLLOWING on a writer who also sits in another
+  // feed and the row leaves this one while the global label stays put, so the
+  // button reads as inert. Per-feed for both is what "one Follow button, one
+  // meaning, either side of the seam" actually requires. A native card can
+  // also reach a feed through a TAG source, where the author is no account
+  // source of this feed and the button honestly reads FOLLOW: pressing it
+  // puts them in, which is exactly what it says.
+  //
+  // Seeded from the server snapshot so the first paint is usually right, held
+  // disabled until resolved so the label can't be acted on while it is a
+  // guess (avoids both the FOLLOW→FOLLOWING flicker and a fast click firing
+  // the wrong path against an unresolved row id).
   const [following, setFollowing] = useState(target.isFollowing);
-  const [resolved, setResolved] = useState(!isSource);
+  const [resolved, setResolved] = useState(false);
   const [busy, setBusy] = useState(false);
-  // The feed_sources row id for the source in THIS feed, used to remove it.
-  const [feedSourceId, setFeedSourceId] = useState<string | null>(null);
-  // Native follow state from the shared store (external stays per-feed local).
-  const nativeFollowing = useFollows((s) => s.ids.has(target.id));
+  const [rowId, setRowId] = useState<string | null>(null);
+  // A failed press SAYS so (web-foundations › a press that fails), and a
+  // membership that failed to load asserts nothing: no FOLLOW label that
+  // would be a guess, just the failure and a Retry, which bumps `attempt`.
+  const [error, setError] = useState<string | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
 
-  // Native follow is resolved from the server snapshot directly. External
-  // membership is per-feed, so resolve it from the feed's own source list
-  // (matched on the external_sources id) rather than the global isFollowing.
+  // The shared store still matters here even though this label no longer
+  // reads it: a press must update every OTHER mounted follow affordance for
+  // this writer, and `prime` keeps the pre-hydration snapshot honest.
   useEffect(() => {
-    if (!isSource) {
-      // Native follow state is owned by the shared store; seed it with the
-      // server snapshot (pre-hydration only) and ensure it's hydrated.
+    if (native) {
       useFollows.getState().prime(target.id, target.isFollowing);
       void useFollows.getState().hydrate();
-      setResolved(true);
-      return;
     }
-    if (!externalFollowable || !feedId) {
+  }, [native, target.id, target.isFollowing]);
+
+  useEffect(() => {
+    if (!followable) {
       setFollowing(false);
-      setFeedSourceId(null);
+      setRowId(null);
       setResolved(true);
       return;
     }
     let cancelled = false;
     setResolved(false);
+    setLoadFailed(false);
     void workspaceFeeds
       .listSources(feedId)
       .then(({ sources }) => {
         if (cancelled) return;
-        const row = target.sourceId
-          ? sources.find(
-              (s) =>
-                s.sourceType === "external_source" &&
-                s.externalSourceId === target.sourceId,
-            )
-          : undefined;
-        setFollowing(!!row);
-        setFeedSourceId(row?.id ?? null);
+        const id = matchFeedSource(sources, target);
+        setFollowing(!!id);
+        setRowId(id);
         setResolved(true);
       })
       .catch(() => {
         if (cancelled) return;
-        setFollowing(false);
-        setFeedSourceId(null);
-        setResolved(true);
+        setRowId(null);
+        setLoadFailed(true);
       });
     return () => {
       cancelled = true;
     };
-  }, [
-    isSource,
-    externalFollowable,
-    feedId,
-    target.sourceId,
-    target.isFollowing,
-  ]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [followable, feedId, target.type, target.id, target.sourceId, attempt]);
 
   const handleClick = useCallback(
     async (e: React.MouseEvent) => {
       e.stopPropagation();
-      if (busy) return;
+      if (busy || !resolved) return;
       setBusy(true);
-
+      setError(null);
+      const prev = following;
+      setFollowing(!prev);
       try {
-        if (!isSource) {
-          // Native follow lives in the shared store — optimistic update,
-          // revert, and author-card cache bust all happen there — so a toggle
-          // here live-updates every other follow affordance for this writer.
-          //
-          // Since the reach retirement (migration 177, §9.16) the graph row
-          // alone has no feed consequence, so with feed context the same
-          // gesture also writes/removes the concrete `account` source for
-          // THIS feed — converging with the external branch below: one Follow
-          // button, one meaning, on either side of the native/external seam.
-          // Best-effort: the graph toggle is the primary action and stands
-          // even if the source write fails (DUPLICATE — already a source
-          // here — lands in the same catch by design).
-          if (nativeFollowing) {
-            await useFollows.getState().unfollow(target.id);
-            if (feedId) {
-              try {
-                const { sources } = await workspaceFeeds.listSources(feedId);
-                const row = sources.find(
-                  (s) => s.sourceType === "account" && s.accountId === target.id,
-                );
-                if (row) {
-                  await workspaceFeeds.removeSource(feedId, row.id);
-                  invalidateAuthorCardCache();
-                }
-              } catch {
-                /* source row stays; removable by hand in the FeedComposer */
-              }
-            }
-          } else {
-            await useFollows.getState().follow(target.id);
-            if (feedId) {
-              try {
-                await workspaceFeeds.addSource(feedId, {
-                  sourceType: "account",
-                  accountId: target.id,
-                });
-                invalidateAuthorCardCache();
-              } catch {
-                /* already a source here, or a transient failure — the follow stood */
-              }
-            }
-          }
-        } else if (feedId) {
-          const prev = following;
-          setFollowing(!prev);
-          try {
-            if (prev) {
-              // Remove the source from this feed; the gateway tears down the
-              // derived subscription when it leaves the owner's last feed.
-              if (!feedSourceId) throw new Error("missing feed source id");
-              await workspaceFeeds.removeSource(feedId, feedSourceId);
-              setFeedSourceId(null);
-            } else if (target.protocol && target.sourceUri) {
-              const { source } = await workspaceFeeds.addSource(feedId, {
-                sourceType: "external_source",
-                protocol: target.protocol as
-                  | "rss"
-                  | "atproto"
-                  | "activitypub"
-                  | "nostr_external",
-                sourceUri: target.sourceUri,
-              });
-              setFeedSourceId(source.id);
-            }
-            // Drop the shared author-card cache so the next hover re-derives.
-            invalidateAuthorCardCache();
-          } catch {
-            setFollowing(prev);
-          }
+        if (prev) {
+          // Removal needs only the row id — never gate it on
+          // protocol/sourceUri, or an unfollow of an already-followed source
+          // silently no-ops when those are absent. The gateway tears down the
+          // derived subscription, and for an account source the native
+          // follow, when this was the owner's last feed holding it.
+          if (!rowId) throw new Error("missing feed source id");
+          const res = await workspaceFeeds.removeSource(feedId, rowId);
+          setRowId(null);
+          reportFollowState(native ? target.id : null, res.following);
+        } else {
+          const input = feedFollowAddInput(target);
+          if (!input) throw new Error("nothing to add");
+          const res = await workspaceFeeds.addSource(feedId, input);
+          setRowId(res.source.id);
+          reportFollowState(native ? target.id : null, res.following);
         }
+        // Drop the shared author-card cache so the next hover re-derives.
+        invalidateAuthorCardCache();
+      } catch (err) {
+        setFollowing(prev);
+        // The route's refusals (a dead source, a blocked account) are
+        // sentences worth reading; otherwise say what did not happen.
+        setError(
+          failureSentence(
+            err,
+            prev
+              ? "Couldn’t take this out of the channel. Nothing has changed."
+              : "Couldn’t add this to the channel. Nothing has changed.",
+          ),
+        );
       } finally {
         setBusy(false);
       }
     },
-    [isSource, target, following, busy, feedId, feedSourceId, nativeFollowing],
+    [native, target, following, busy, resolved, feedId, rowId],
   );
 
-  // External byline with no feed context (e.g. a profile overlay) has no
-  // follow gesture; native follow is unaffected.
-  if (isSource && !externalFollowable) return null;
+  // A protocol we can't add (e.g. email) has no follow gesture at all.
+  if (!followable) return null;
 
-  // Native reads the live store; external uses the per-feed local state.
-  const displayFollowing = isSource ? following : nativeFollowing;
+  if (loadFailed) {
+    return (
+      <p role="alert" className="mt-3 text-ui-xs text-crimson">
+        Couldn’t check whether this is in the channel.{" "}
+        <button
+          className="btn-text"
+          onClick={(e) => {
+            e.stopPropagation();
+            setAttempt((n) => n + 1);
+          }}
+        >
+          Retry
+        </button>
+      </p>
+    );
+  }
 
   return (
-    <button
-      onClick={handleClick}
-      disabled={busy || !resolved}
-      className={`mt-3 w-full py-1.5 text-ui-xs font-medium transition-colors ${
-        displayFollowing
-          ? "bg-grey-100 text-grey-600 hover:bg-grey-200"
-          : "bg-black text-white hover:bg-grey-800"
-      }`}
-    >
-      {displayFollowing ? "FOLLOWING" : "FOLLOW"}
-    </button>
+    <>
+      <button
+        onClick={handleClick}
+        disabled={busy || !resolved}
+        className={`${BUTTON_CLASS} ${buttonTone(following)}`}
+      >
+        {following ? "FOLLOWING" : "FOLLOW"}
+      </button>
+      {error && (
+        <p role="alert" className="mt-1.5 text-ui-xs text-crimson">
+          {error}
+        </p>
+      )}
+    </>
+  );
+}
+
+function PickerFollowButton({
+  target,
+  onPickerOpenChange,
+}: {
+  target: FeedFollowTarget;
+  onPickerOpenChange: (open: boolean) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const state = useFeedFollow(target, open);
+
+  // The panel has to know: while the menu is up it stops dismissing on
+  // mouse-leave and stands aside on Escape. Reported on unmount too, so a
+  // panel closed with its menu open doesn't leave the flag stuck.
+  useEffect(() => {
+    onPickerOpenChange(open);
+    return () => onPickerOpenChange(false);
+  }, [open, onPickerOpenChange]);
+
+  // One Escape closes the menu, the next closes the panel. This listener
+  // registers when the menu opens — after the panel's — and the panel's yields
+  // to it, so order and arbitration agree.
+  useEscapeShield(
+    open,
+    () => setOpen(false),
+    () => useLightbox.getState().isOpen,
+  );
+
+  if (!state.followable) return null;
+
+  return (
+    <div onClick={(e) => e.stopPropagation()}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className={`${BUTTON_CLASS} ${buttonTone(state.following)}`}
+      >
+        {state.following ? "FOLLOWING" : "FOLLOW"}{" "}
+        <Pointer direction="down" size="sm" className="ml-1" />
+      </button>
+
+      {/* IN FLOW, NOT PORTALLED (§9.16's positioning ruling). The panel's own
+          outside-pointerdown test is `modalRef.contains(target)`, so a menu
+          rendered inside it inherits the dismissal, the hover bridge and the
+          click-swallow for nothing; a separately-portalled layer would sit
+          outside that node, read as "outside", and close the whole panel on
+          its own first click. The list is capped and scrolls so the panel
+          stays near the ~320px budget its above/below decision was taken
+          against — and the panel now carries its own maxHeight as a backstop. */}
+      {open && (
+        <div className="mt-2">
+          <FeedFollowMenu state={state} register="panel" maxListHeight={132} />
+        </div>
+      )}
+    </div>
   );
 }
 

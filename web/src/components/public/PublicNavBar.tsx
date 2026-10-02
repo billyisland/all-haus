@@ -226,10 +226,21 @@ export function PublicNavBar() {
             className="btn-accent btn-sm btn-bar"
             // The one size override, and it is padding, not colour: with the
             // lockup, "Log in" AND this CTA sharing ~360px, the button's own
-            // horizontal padding is the only thing left that can yield.
+            // horizontal padding is the only thing left that can yield. Past
+            // ~344px even that has bottomed out, which is what the short
+            // spelling below is for.
             style={{ paddingLeft: 'clamp(8px, 2vw, 16px)', paddingRight: 'clamp(8px, 2vw, 16px)' }}
           >
-            Join the waiting list
+            {/* TWO SPELLINGS OF ONE CONTROL, switched by a media query in
+                globals.css §1b-bis — which carries the measurements and why
+                the label is what gives rather than the mark or a way in. Both
+                are in the DOM; the inactive one is `display: none`, so the
+                accessible name is whichever is on screen and never both. The
+                class names are LITERALS, since Tailwind tree-shakes the
+                components layer and an assembled one would ship the rules
+                stripped and the control with both labels stacked. */}
+            <span className="ah-cta-long">Join the waiting list</span>
+            <span className="ah-cta-short">Sign up</span>
           </Link>
         )}
       </div>

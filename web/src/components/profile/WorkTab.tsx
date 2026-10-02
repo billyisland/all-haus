@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { PostCardInteractive } from "../post/PostCardInteractive";
 import { ProfileDriveCard } from "./ProfileDriveCard";
 import { FEED_LOG_STYLE } from "./ProfileChrome";
+import { LoadFailed } from "../ui/LoadFailed";
 import type { CardContext } from "../post/chassis";
 import {
   DEFAULT_DENSITY,
@@ -13,10 +14,10 @@ import {
   type VesselPalette,
 } from "../workspace/tokens";
 import { authorPosts } from "../../lib/api/post";
+import { request, failureSentence } from "../../lib/api/client";
 import type { Post } from "../../lib/post/types";
-import { quotePreviewContent } from "../../lib/post/quote-preview";
+import { openPostInReader } from "../../lib/workspace/open-post";
 import type { WriterProfile, PledgeDrive } from "../../lib/api";
-import { useCompose } from "../../stores/compose";
 import { pledgesEnabled } from "../../lib/featureFlags";
 
 // =============================================================================
@@ -69,6 +70,7 @@ export function WorkTab({
   const router = useRouter();
   const [items, setItems] = useState<WorkItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
   const CTX: CardContext = {
     density: DEFAULT_DENSITY,
     palette,
@@ -82,20 +84,18 @@ export function WorkTab({
       try {
         const [postsRes, articlesRes, drivesRes] = await Promise.all([
           authorPosts(writer.id, undefined, "article", 50),
-          fetch(`/api/v1/writers/${username}/articles?limit=50`, {
-            credentials: "include",
-          })
-            .then((r) => (r.ok ? r.json() : { articles: [] }))
-            .catch(() => ({ articles: [] })),
+          // Pin metadata only — the articles themselves are `authorPosts`, so
+          // this leg failing costs the pins, never the list.
+          request<{ articles?: DbArticleMeta[] }>(
+            `/writers/${username}/articles?limit=50`,
+          ).catch(() => ({ articles: [] as DbArticleMeta[] })),
           // Pledge drives parked behind PLEDGES_ENABLED (2026-07-13) — skip the
           // fetch entirely when off so no drive cards appear on the profile.
           pledgesEnabled()
-            ? fetch(`/api/v1/drives/by-user/${writer.id}`, {
-                credentials: "include",
-              })
-                .then((r) => (r.ok ? r.json() : { drives: [] }))
-                .catch(() => ({ drives: [] }))
-            : Promise.resolve({ drives: [] }),
+            ? request<{ drives?: PledgeDrive[] }>(`/drives/by-user/${writer.id}`).catch(
+                () => ({ drives: [] as PledgeDrive[] }),
+              )
+            : Promise.resolve({ drives: [] as PledgeDrive[] }),
         ]);
         if (cancelled) return;
 
@@ -127,8 +127,11 @@ export function WorkTab({
           });
         }
         setItems(work);
+        setFailed(false);
       } catch {
-        /* silently fail */
+        // An outage is not an empty body of work: swallowed, this printed
+        // "No articles yet." over a writer with a full archive.
+        if (!cancelled) setFailed(true);
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -139,43 +142,48 @@ export function WorkTab({
     };
   }, [username, writer.id]);
 
-  const handleTogglePin = useCallback(async (articleId: string) => {
+  // A refused pin SAYS so, beside the button it belongs to (web-foundations ›
+  // a press that fails), and a second press waits for the first.
+  const [pinError, setPinError] = useState<{ articleId: string; message: string } | null>(null);
+  const [pinBusy, setPinBusy] = useState<string | null>(null);
+
+  const handleTogglePin = useCallback(async (articleId: string, wasPinned: boolean) => {
+    setPinBusy(articleId);
+    setPinError(null);
     try {
-      const res = await fetch(`/api/v1/articles/${articleId}/pin`, {
-        method: "POST",
-        credentials: "include",
+      const { pinned } = await request<{ pinned: boolean }>(
+        `/articles/${articleId}/pin`,
+        { method: "POST" },
+      );
+      setItems((prev) =>
+        prev.map((item) =>
+          item.kind === "article" && item.articleId === articleId
+            ? { ...item, pinned }
+            : item,
+        ),
+      );
+    } catch (err) {
+      setPinError({
+        articleId,
+        message: failureSentence(
+          err,
+          wasPinned
+            ? "Couldn’t unpin this. It’s still pinned."
+            : "Couldn’t pin this. Your profile is as it was.",
+        ),
       });
-      if (res.ok) {
-        const { pinned } = await res.json();
-        setItems((prev) =>
-          prev.map((item) =>
-            item.kind === "article" && item.articleId === articleId
-              ? { ...item, pinned }
-              : item,
-          ),
-        );
-      }
-    } catch {
-      /* silently fail */
+    } finally {
+      setPinBusy(null);
     }
   }, []);
 
+  // Reader pane inside the workspace, standalone route outside it — one home,
+  // because a bare push from an overlay body is the escape ban (lib/workspace/
+  // open-post.ts).
   const openReader = useCallback(
-    (p: Post) => {
-      if (p.dTag) router.push(`/article/${p.dTag}`);
-    },
+    (p: Post) => openPostInReader(p, router),
     [router],
   );
-
-  const replyFromPost = useCallback((p: Post) => {
-    if (!p.author.pubkey) return;
-    useCompose.getState().open("reply", {
-      eventId: p.version ?? p.id,
-      eventKind: p.type === "article" ? 30023 : 1,
-      authorPubkey: p.author.pubkey,
-      previewContent: quotePreviewContent(p),
-    });
-  }, []);
 
   if (loading) {
     return (
@@ -183,10 +191,12 @@ export function WorkTab({
         className="py-10 text-center text-ui-sm"
         style={{ color: palette.cardMeta }}
       >
-        Loading...
+        Loading…
       </div>
     );
   }
+
+  if (failed) return <LoadFailed what="these articles" color={palette.cardMeta} />;
 
   if (items.length === 0) {
     return (
@@ -216,16 +226,21 @@ export function WorkTab({
           level="feed"
           ctx={CTX}
           onOpenReader={openReader}
-          onReply={post.author.pubkey ? () => replyFromPost(post) : undefined}
         />
         {isOwnProfile && articleId && (
           <div className="px-6 pb-3 -mt-1">
             <button
-              onClick={() => handleTogglePin(articleId)}
+              onClick={() => void handleTogglePin(articleId, item.pinned)}
+              disabled={pinBusy === articleId}
               className="btn-text-muted transition-colors"
             >
               {item.pinned ? "Unpin from profile" : "Pin to profile"}
             </button>
+            {pinError?.articleId === articleId && (
+              <p role="alert" className="mt-1 text-ui-xs text-crimson">
+                {pinError.message}
+              </p>
+            )}
           </div>
         )}
       </div>

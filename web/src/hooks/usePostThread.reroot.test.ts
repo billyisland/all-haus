@@ -108,3 +108,51 @@ describe("reroot-failed reverts", () => {
     expect(s.rootId).toBe("quoted");
   });
 });
+
+// =============================================================================
+// A refresh is a MERGE, not a reset — the reducer half of the addressed tick.
+//
+// The wiring (which thread refetches, decided by whether its pool holds the
+// reply's target) is browser-verified like the rest of this file; what the
+// reducer can be asked directly is the OTHER half of the fix: that folding a
+// refetched thread in with `merge` leaves the reader's own position alone,
+// where `init-start` + `ingest root:true` — what the global tick used to do —
+// throws it away.
+//
+// MUTATION LOG: dispatch `init-start` before the merge (the old path)
+//   ⇒ "a refresh keeps a re-rooted focal" fails with focalId back at "host",
+//     which on screen is the conversation snapping to its root, flashing
+//     "Loading…", and re-firing the scroll-in that pans the floor.  DETECTED
+// =============================================================================
+
+describe("a refresh folds in without resetting the reader's position", () => {
+  it("keeps a re-rooted focal, and the root it belongs to", () => {
+    // Opened on "host", re-rooted onto "reply" — the reader is reading a node
+    // inside the conversation.
+    const rerooted = reducer(openedOnHost(), { kind: "set-focal", id: "reply" });
+    expect(rerooted.focalId).toBe("reply");
+
+    // Somebody's reply lands and the thread refetches in place.
+    const merged = reducer(rerooted, {
+      kind: "merge",
+      res: res("host", [post("host"), post("reply"), post("new-reply")]),
+    });
+
+    expect(merged.focalId).toBe("reply");
+    expect(merged.rootId).toBe(rerooted.rootId);
+    expect(merged.loading).toBe(false);
+    // And the new node really did arrive — a merge that kept the position by
+    // doing nothing would pass every assertion above.
+    expect(merged.pool.has("new-reply")).toBe(true);
+  });
+
+  it("the reset path is what it replaced", () => {
+    // Stated as a control rather than left implicit: this IS the behaviour the
+    // global tick had, so the test says out loud what the fix gave up.
+    const rerooted = reducer(openedOnHost(), { kind: "set-focal", id: "reply" });
+    const reset = reducer(rerooted, { kind: "init-start" });
+    expect(reset.focalId).toBeNull();
+    expect(reset.pool.size).toBe(0);
+    expect(reset.loading).toBe(true);
+  });
+});

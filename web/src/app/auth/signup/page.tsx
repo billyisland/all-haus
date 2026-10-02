@@ -1,10 +1,11 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, Suspense } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
 import { auth } from '../../../lib/api'
+import { startGoogleAuth } from '../../../lib/google-oauth'
 import { useAuth } from '../../../stores/auth'
-import { ApiError } from '../../../lib/api/client'
+import { ApiError, apiErrorMessage } from '../../../lib/api/client'
 import { PublicShell } from '../../../components/public/PublicShell'
 import {
   PublicVessel,
@@ -14,11 +15,24 @@ import {
 } from '../../../components/public/PublicVessel'
 import {
   TextField,
+  DateOfBirthField,
   PublicButton,
   PublicLink,
   FormError,
   OrDivider,
 } from '../../../components/public/Field'
+import {
+  AUTH_TRY_AGAIN,
+  SIGNUP_TITLE,
+  signupIntro,
+  SIGNUP_NAME_LABEL,
+  SIGNUP_NAME_PLACEHOLDER,
+  SIGNUP_SUBMIT,
+  SIGNUP_BEEN_HERE,
+  SIGNUP_EMAIL_TAKEN,
+  SIGNUP_ACCOUNT_RACE,
+  LINK_LOG_IN,
+} from '../../../content/auth'
 
 // =============================================================================
 // /auth/signup — the way in.
@@ -29,9 +43,9 @@ import {
 // this ADR describes had a missing first step that no decision mentioned —
 // which is how it went missing from the list of what to build.
 //
-// TWO FIELDS, AND THE THIRD IS DERIVED. Email and display name; the username is
-// minted server-side by the same `deriveUsername` the Google path has always
-// used. A stranger stopped mid-article has a fixed amount of patience and has
+// THE USERNAME IS DERIVED, NOT ASKED. Email, display name and date of birth;
+// the username is minted server-side by the same `deriveUsername` the Google
+// path has always used. A stranger stopped mid-article has a fixed amount of patience and has
 // already spent most of it on the piece, and a username field spends what is
 // left on a decision they have no basis for making — they have not seen a
 // profile, a byline or another member. Its failure mode is a REJECTION (23505
@@ -39,6 +53,16 @@ import {
 // us where a rejection costs the most. And the Google button never showed that
 // field at all, so leaving it here put two offers on the same page at visibly
 // different prices, with the cheaper one handing the account to a third party.
+//
+// THE DATE OF BIRTH IS THE ONE FIELD THAT WAS ADDED (L6.1, decision A1), and
+// it is the one field the argument above does not apply to. Everything else
+// here was cut because a stranger's patience is finite and a decision they
+// have no basis for making spends it; a date of birth is a fact they already
+// know and can give in one gesture. It is asked HERE rather than later because
+// the platform runs a tab against a card and carries direct messages from the
+// first session, and a gate that admits somebody and asks afterwards has
+// already admitted them. No client-side age arithmetic: `shared/lib/age.ts` is
+// the one home, and a refusal comes back from the route in its own words.
 //
 // The handle is a DEFAULT, not a decision taken away: the first change is free
 // and immediate (`username_changed_at` starts NULL, so the 30-day cooldown has
@@ -59,7 +83,7 @@ import {
 // rather than showing a raw error, exactly as the Google callback does.
 // =============================================================================
 
-export default function SignupPage() {
+function SignupPageBody() {
   const searchParams = useSearchParams()
   const router = useRouter()
   const fetchMe = useAuth((s) => s.fetchMe)
@@ -68,6 +92,7 @@ export default function SignupPage() {
 
   const [email, setEmail] = useState('')
   const [displayName, setDisplayName] = useState('')
+  const [dateOfBirth, setDateOfBirth] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [closed, setClosed] = useState(false)
@@ -75,6 +100,16 @@ export default function SignupPage() {
   useEffect(() => {
     if (closed) router.replace('/waitlist?from=beta')
   }, [closed, router])
+
+  // See the twin in `/auth`: the Google handoff mints a browser binding first
+  // (MIRROR-AUDIT §2.5), so it is a button rather than a link, and a browser
+  // that cannot mint one is told so instead of being sent on.
+  function handleGoogle() {
+    setError(null)
+    void startGoogleAuth(arrival).catch(() => {
+      setError('Google sign-in couldn’t start in this browser. Try the email link.')
+    })
+  }
 
   async function handleSignup(e: React.FormEvent) {
     e.preventDefault()
@@ -84,6 +119,7 @@ export default function SignupPage() {
       await auth.signup({
         email,
         displayName,
+        dateOfBirth,
         arrivalDTag: arrival ?? undefined,
       })
       await fetchMe()
@@ -114,12 +150,17 @@ export default function SignupPage() {
         // the client has to read.
         setError(
           err.body?.error === 'email_taken'
-            ? 'There is already an account with that email. Try logging in instead.'
-            : 'Something went wrong setting up your account. Please try again.',
+            ? SIGNUP_EMAIL_TAKEN
+            : SIGNUP_ACCOUNT_RACE,
         )
         return
       }
-      setError('Something went wrong. Please try again.')
+      // A 400 here is the age refusal or a malformed date, and the server's
+      // sentence is the one to show — the rule lives there and the web keeps
+      // no second copy of it to paraphrase from.
+      setError(
+        apiErrorMessage(err) ?? AUTH_TRY_AGAIN,
+      )
     } finally {
       setLoading(false)
     }
@@ -131,12 +172,10 @@ export default function SignupPage() {
     <PublicShell>
       <PublicVessel>
         <PublicCard>
-          <PublicTitle>Make an account</PublicTitle>
+          <PublicTitle>{SIGNUP_TITLE}</PublicTitle>
           <div style={{ marginTop: 10 }}>
             <PublicBody>
-              {arrival
-                ? 'Two things, and then the piece you were reading.'
-                : 'Two things, and no password to remember.'}
+              {signupIntro(!!arrival)}
             </PublicBody>
           </div>
         </PublicCard>
@@ -144,11 +183,7 @@ export default function SignupPage() {
         {error && <FormError>{error}</FormError>}
 
         <PublicCard>
-          <PublicButton
-            variant="outline"
-            full
-            href={`/api/v1/auth/google${arrival ? `?arrival=${encodeURIComponent(arrival)}` : ''}`}
-          >
+          <PublicButton variant="outline" full onClick={handleGoogle}>
             Continue with Google
           </PublicButton>
 
@@ -172,25 +207,40 @@ export default function SignupPage() {
             />
             <TextField
               id="signup-name"
-              label="Your name"
+              label={SIGNUP_NAME_LABEL}
               required
               autoComplete="name"
               value={displayName}
               onChange={setDisplayName}
-              placeholder="What people should call you"
+              placeholder={SIGNUP_NAME_PLACEHOLDER}
+            />
+            <DateOfBirthField
+              idPrefix="signup-dob"
+              required
+              onChange={setDateOfBirth}
             />
             <PublicButton type="submit" full disabled={loading}>
-              {loading ? 'Working…' : 'Make my account'}
+              {loading ? 'Making your account…' : SIGNUP_SUBMIT}
             </PublicButton>
           </form>
         </PublicCard>
 
         <PublicCard>
           <PublicBody>
-            Been here before? <PublicLink href="/auth">Log in</PublicLink>
+            {SIGNUP_BEEN_HERE} <PublicLink href="/auth">{LINK_LOG_IN}</PublicLink>
           </PublicBody>
         </PublicCard>
       </PublicVessel>
     </PublicShell>
+  )
+}
+
+// useSearchParams() bails this subtree out to client rendering; the boundary
+// keeps that bail-out to the page instead of the whole route (CA-F13).
+export default function SignupPage() {
+  return (
+    <Suspense fallback={null}>
+      <SignupPageBody />
+    </Suspense>
   )
 }

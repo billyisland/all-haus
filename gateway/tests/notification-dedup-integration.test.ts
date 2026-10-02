@@ -319,6 +319,227 @@ describe.skipIf(!DB_URL)("idx_notifications_dedup", () => {
     });
   });
 
+  // ---------------------------------------------------------------------------
+  // Migration 198 — publication_id, and the pub_* family that bound nothing.
+  //
+  // Six types bound only (recipient, actor), so the dedup index could not tell
+  // two PUBLICATIONS apart. The one that hurts most is `pub_invite_received`:
+  // an invitation is a thing you accept, and a second publication inviting the
+  // same person from the same inviter was silently dropped.
+  // ---------------------------------------------------------------------------
+  describe("publication_id (migration 198)", () => {
+    async function publication(slug: string): Promise<string> {
+      const uniq = process.hrtime.bigint().toString(16);
+      const { rows } = await client.query<{ id: string }>(
+        `INSERT INTO publications (slug, name, nostr_pubkey, nostr_privkey_enc)
+         VALUES ($1, $2, $3, 'fixture-enc') RETURNING id`,
+        [`fixture-${slug}-${uniq}`, slug, `fixture-pub-${uniq}`],
+      );
+      return rows[0].id;
+    }
+
+    /** The route's own statement shape: bare ON CONFLICT DO NOTHING. */
+    async function invite(publicationId: string | null): Promise<number> {
+      const res = await client.query(
+        `INSERT INTO notifications (recipient_id, actor_id, type, publication_id)
+         VALUES ($1, $2, 'pub_invite_received', $3)
+         ON CONFLICT DO NOTHING`,
+        [reader, writer, publicationId],
+      );
+      return res.rowCount ?? 0;
+    }
+
+    it("two publications inviting one person are two notifications", async () => {
+      // Mutant: drop COALESCE(publication_id, …) from the index — the second
+      // insert returns 0 and this fails, which is the shipped behaviour before
+      // 198 and the reason the second invitation was never seen.
+      expect(await invite(await publication("first-paper"))).toBe(1);
+      expect(await invite(await publication("second-paper"))).toBe(1);
+
+      const { rows } = await client.query<{ cnt: string }>(
+        `SELECT COUNT(*) AS cnt FROM notifications
+          WHERE recipient_id = $1 AND type = 'pub_invite_received'`,
+        [reader],
+      );
+      expect(parseInt(rows[0].cnt, 10)).toBe(2);
+    });
+
+    it("the SAME publication inviting twice still collapses to one", async () => {
+      // The index is doing real work rather than being disabled by the new
+      // column — the failure mode that "fixing" a dedup index usually has.
+      const only = await publication("one-paper");
+      expect(await invite(only)).toBe(1);
+      expect(await invite(only)).toBe(0);
+    });
+
+    it("still dedups a pub_* row that carries no publication at all", async () => {
+      // The sentinel COALESCE keeps the pre-198 behaviour for any row written
+      // by an older process mid-deploy: two publication-less rows of one
+      // (recipient, actor, type) remain one.
+      expect(await invite(null)).toBe(1);
+      expect(await invite(null)).toBe(0);
+    });
+
+    it("a hard-deleted publication leaves its notification standing", async () => {
+      // ON DELETE SET NULL, matching drive_id and NOT the offer/article
+      // columns: "you were invited to a publication that has since gone" still
+      // reads sensibly, and a notification list that silently loses rows is
+      // worse than one holding a dangling reference.
+      const doomed = await publication("about-to-go");
+      await invite(doomed);
+      await client.query(`DELETE FROM publications WHERE id = $1`, [doomed]);
+
+      const { rows } = await client.query<{ cnt: string; publication_id: string | null }>(
+        `SELECT COUNT(*) AS cnt, MIN(publication_id::text) AS publication_id
+           FROM notifications WHERE recipient_id = $1 AND type = 'pub_invite_received'`,
+        [reader],
+      );
+      expect(parseInt(rows[0].cnt, 10)).toBe(1);
+      expect(rows[0].publication_id).toBeNull();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Migration 198's other half — `new_mention` binds the COMMENT it is in.
+  //
+  // The column was already in the index; only the insert was missing it. Bound
+  // to the article alone, two mentions of the same person by the same author in
+  // two different comments on ONE article were a single notification.
+  // ---------------------------------------------------------------------------
+  describe("new_mention binds its comment", () => {
+    async function article(slug: string): Promise<string> {
+      const uniq = process.hrtime.bigint().toString(16);
+      const { rows } = await client.query<{ id: string }>(
+        `INSERT INTO articles (writer_id, nostr_event_id, nostr_d_tag, title, slug, content_free)
+         VALUES ($1, $2, $3, $4, $3, '') RETURNING id`,
+        [writer, `fixture-ev-${uniq}`, `fixture-${slug}-${uniq}`, slug],
+      );
+      return rows[0].id;
+    }
+
+    async function comment(): Promise<string> {
+      const uniq = process.hrtime.bigint().toString(16);
+      const { rows } = await client.query<{ id: string }>(
+        `INSERT INTO comments (author_id, target_event_id, target_kind, content, nostr_event_id, published_at)
+         VALUES ($1, $2, 30023, 'hello @someone', $3, now()) RETURNING id`,
+        [writer, `fixture-target-${uniq}`, `fixture-cev-${uniq}`],
+      );
+      return rows[0].id;
+    }
+
+    async function mention(articleId: string, commentId: string | null): Promise<number> {
+      const res = await client.query(
+        `INSERT INTO notifications (recipient_id, actor_id, type, article_id, note_id, comment_id)
+         VALUES ($1, $2, 'new_mention', $3, NULL, $4)
+         ON CONFLICT DO NOTHING`,
+        [reader, writer, articleId, commentId],
+      );
+      return res.rowCount ?? 0;
+    }
+
+    it("two mentions in two comments on ONE article are two notifications", async () => {
+      const piece = await article("one-piece");
+      expect(await mention(piece, await comment())).toBe(1);
+      expect(await mention(piece, await comment())).toBe(1);
+    });
+
+    it("the same comment notified twice still collapses to one", async () => {
+      const piece = await article("another-piece");
+      const only = await comment();
+      expect(await mention(piece, only)).toBe(1);
+      expect(await mention(piece, only)).toBe(0);
+    });
+  });
+
+  // ===========================================================================
+  // Migration 230 — the two people one nested reply is about.
+  //
+  // `POST /replies` now writes TWO rows for a reply to a comment: one to the
+  // parent comment's author ("replied to your comment") and one to the root's
+  // author ("replied to <the piece>"). They share actor, type, article and
+  // `comment_id` — on both, `comment_id` is the NEW reply — so what keeps them
+  // apart is `recipient_id`, which the index has always carried. That is the
+  // claim the route is built on and only Postgres can settle it.
+  //
+  // `parent_comment_id` is deliberately NOT in the index, and the second test
+  // is why that is safe rather than merely untested.
+  // ===========================================================================
+  describe("a nested reply's two recipients (migration 230)", () => {
+    let third: string;
+    beforeEach(async () => {
+      third = await account("notif-dedup-third");
+    });
+
+    async function replyComment(): Promise<string> {
+      const uniq = process.hrtime.bigint().toString(16);
+      const { rows } = await client.query<{ id: string }>(
+        `INSERT INTO comments (author_id, target_event_id, target_kind, content, nostr_event_id, published_at)
+         VALUES ($1, $2, 30023, 'a remark', $3, now()) RETURNING id`,
+        [third, `fixture-root-${uniq}`, `fixture-rev-${uniq}`],
+      );
+      return rows[0].id;
+    }
+
+    /** The route's own statement, both rows. */
+    async function replyNotify(
+      recipient: string,
+      newReply: string,
+      parent: string | null,
+    ): Promise<number> {
+      const res = await client.query(
+        `INSERT INTO notifications (recipient_id, actor_id, type, article_id, note_id, comment_id, parent_comment_id)
+         VALUES ($1, $2, 'new_reply', NULL, NULL, $3, $4)
+         ON CONFLICT DO NOTHING`,
+        [recipient, third, newReply, parent],
+      );
+      return res.rowCount ?? 0;
+    }
+
+    it("both people are told, and neither row eats the other", async () => {
+      const newReply = await replyComment();
+      // Mutant: make the route send one row instead of two, or drop
+      // recipient_id from the index, and this is what fails.
+      expect(await replyNotify(writer, newReply, null)).toBe(1);
+      expect(await replyNotify(reader, newReply, newReply)).toBe(1);
+
+      const { rows } = await client.query<{ cnt: string }>(
+        `SELECT COUNT(*) AS cnt FROM notifications
+          WHERE comment_id = $1 AND type = 'new_reply'`,
+        [newReply],
+      );
+      expect(parseInt(rows[0].cnt, 10)).toBe(2);
+    });
+
+    it("the SAME row redelivered still collapses, parent bound or not", async () => {
+      // Leaving parent_comment_id out of the index is only safe if the rest of
+      // the tuple still identifies a notification. It does: comment_id is the
+      // new reply, one per reply per recipient. A test that only checked the
+      // two rows coexist would pass against an index that had stopped deduping.
+      const newReply = await replyComment();
+      expect(await replyNotify(reader, newReply, newReply)).toBe(1);
+      expect(await replyNotify(reader, newReply, newReply)).toBe(0);
+      expect(await replyNotify(writer, newReply, null)).toBe(1);
+      expect(await replyNotify(writer, newReply, null)).toBe(0);
+    });
+
+    it("deleting the PARENT keeps the notification and nulls the pointer", async () => {
+      // ON DELETE SET NULL, unlike comment_id's CASCADE beside it: the parent
+      // going away does not take the reply, so the row survives and degrades
+      // to the root's sentence rather than vanishing from the log.
+      const parent = await replyComment();
+      const newReply = await replyComment();
+      await replyNotify(reader, newReply, parent);
+      await client.query(`DELETE FROM comments WHERE id = $1`, [parent]);
+
+      const { rows } = await client.query<{ parent_comment_id: string | null }>(
+        `SELECT parent_comment_id FROM notifications WHERE comment_id = $1`,
+        [newReply],
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0].parent_comment_id).toBeNull();
+    });
+  });
+
   it("a hard-deleted offer takes its notification with it", async () => {
     // ON DELETE CASCADE, matching the other reference columns: offers are
     // normally revoked (soft), so this only fires on a genuine delete, where a

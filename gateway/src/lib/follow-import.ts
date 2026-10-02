@@ -1,5 +1,5 @@
 import { nip19 } from "nostr-tools";
-import { pool } from "@platform-pub/shared/db/client.js";
+import { pool, withAdvisoryLock } from "@platform-pub/shared/db/client.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 import { safeFetch } from "@platform-pub/shared/lib/http-client.js";
 import { ADVISORY_LOCKS } from "@platform-pub/shared/lib/advisory-locks.js";
@@ -20,6 +20,7 @@ import {
   type MastodonApiAccount,
   type MastodonFollowingRead,
 } from "./activitypub-resolve.js";
+import { mastodonRefFromActorUri } from "@platform-pub/shared/lib/mastodon-api.js";
 import { decryptJson } from "@platform-pub/shared/lib/crypto.js";
 import { fetchNostrContacts } from "./nostr-relay.js";
 import { getDefaultProfileRelays } from "./nostr-search.js";
@@ -67,11 +68,18 @@ export const FOLLOW_IMPORT_CAP = 1000;
 const BATCH_SIZE = 25;
 
 // §6.5 — an imported feed above this many sources defaults to sampled volume:
-// weight 1.0 = volume step 3 (from the shared VOLUME_WEIGHTS scale) instead of
-// the show-everything default 4.0. A 500-source feed at full volume is
+// throughput 0.6 = volume step 3 (the shared VOLUME_THROUGHPUT scale) instead
+// of the show-everything default 1.0. A 500-source feed at full volume is
 // unreadable and would read as a bug.
+//
+// This is now literally true rather than approximately so. Under the old scale
+// these were 1.0 and 4.0 — a ranking MULTIPLIER, where "sampled" meant the
+// source's posts sorted a quarter of the way down an epoch rather than a
+// quarter of them arriving. Migration 202 made the number mean what this
+// comment has always said it meant, so a large import now really does show
+// three posts in five from each source.
 const VOLUME_SAMPLE_THRESHOLD = 50;
-const SAMPLED_WEIGHT = 1.0;
+const SAMPLED_THROUGHPUT = 0.6;
 
 // §6.4b spacing — now shared with formula redemption, the second bulk-add
 // path. Defined in routes/feeds/shared.ts, imported below.
@@ -166,7 +174,7 @@ export async function readFollowGraph(
         return {
           ok: false,
           reason: "unsupported",
-          message: "Importing fediverse follows is not enabled yet",
+          message: "Importing follows from Mastodon and the fediverse isn't switched on yet.",
         };
       }
       return readActivityPubGraph(originIdentity.trim(), opts.accountId);
@@ -176,7 +184,7 @@ export async function readFollowGraph(
       return {
         ok: false,
         reason: "unsupported",
-        message: "RSS subscriptions import from an OPML file — upload one instead",
+        message: "To bring in RSS feeds, please upload an OPML file from your feed reader.",
       };
     default:
       return {
@@ -196,7 +204,7 @@ async function readAtprotoGraph(input: string): Promise<FollowGraphResult> {
     return {
       ok: false,
       reason: "unreachable",
-      message: "No account found for this identity on the AT Protocol network",
+      message: "We couldn't find that account on Bluesky.",
     };
   }
   const read = await getFollows(profile.did, FOLLOW_IMPORT_CAP);
@@ -204,7 +212,7 @@ async function readAtprotoGraph(input: string): Promise<FollowGraphResult> {
     return {
       ok: false,
       reason: "unreachable",
-      message: "Could not read the follow list from the AT Protocol network",
+      message: "Couldn't read that account's follows from Bluesky. Please try again.",
     };
   }
   const identities: ImportIdentity[] = read.follows.map((f) => ({
@@ -258,7 +266,7 @@ async function readNostrGraph(input: string): Promise<FollowGraphResult> {
       return {
         ok: false,
         reason: "unreachable",
-        message: `Could not resolve ${input} as a NIP-05 identifier`,
+        message: `Couldn't find a Nostr account at ${input}.`,
       };
     }
     pubkey = resolved.pubkey;
@@ -270,7 +278,7 @@ async function readNostrGraph(input: string): Promise<FollowGraphResult> {
     return {
       ok: false,
       reason: "malformed",
-      message: "Expected an npub, nprofile, 64-hex pubkey, or NIP-05 address",
+      message: "That doesn't look like a Nostr account. Try an npub or a Nostr address (name@domain).",
     };
   }
 
@@ -355,6 +363,20 @@ async function readActivityPubGraph(
   accountId?: string,
 ): Promise<FollowGraphResult> {
   // 1. Whatever the user pasted → a full user@domain acct.
+  //
+  // THE ACTOR URI IS THE FORM THE UI ACTUALLY SENDS, and it used to be the one
+  // that failed. `FollowImportSection` and `FeedComposer` hand this function
+  // the resolver's canonical `sourceUri` — an actor URI — and the old code
+  // recovered the acct from it by FETCHING THE ACTOR DOCUMENT, purely to read
+  // back a username the URI already spells. That is a wasted round trip on the
+  // happy path and a dead end on an instance in secure mode, where the actor
+  // document is exactly what we cannot read: pasting `@Gargron@mastodon.social`
+  // worked while the button built on top of it did not.
+  //
+  // `mastodonRefFromActorUri` derives the acct from the path and host, so the
+  // ordinary shapes cost no network at all. The actor fetch stays as the
+  // fallback for a URI whose path we do not recognise — and it now has the
+  // client-API fallback underneath it.
   let acct: string | null = null;
   try {
     const url = new URL(input);
@@ -362,23 +384,24 @@ async function readActivityPubGraph(
       return {
         ok: false,
         reason: "malformed",
-        message: "Fediverse profile URLs must use https://",
+        message: "Please use the account's https:// address.",
       };
     }
     const extracted = extractFromMastodonUrl(url);
+    const derived = mastodonRefFromActorUri(input);
     if (extracted?.acct) {
       acct = extracted.acct;
+    } else if (derived?.kind === "acct") {
+      acct = derived.acct;
     } else {
-      // Actor-shaped (or unrecognised) URL — the actor document names its
-      // own acct via preferredUsername + host.
-      const profile = await fetchActorProfile(
-        extracted?.actorUri ?? input,
-      );
+      // Unrecognised path (or an id-addressed `/ap/users/<id>` actor, which
+      // carries no username) — the actor document names its own acct.
+      const profile = await fetchActorProfile(extracted?.actorUri ?? input);
       if (!profile?.handle) {
         return {
           ok: false,
           reason: "unreachable",
-          message: "This URL did not resolve to a fediverse account",
+          message: "We couldn't find a Mastodon or fediverse account at that address.",
         };
       }
       acct = profile.handle;
@@ -406,7 +429,7 @@ async function readActivityPubGraph(
     return {
       ok: false,
       reason: "unreachable",
-      message: `Could not resolve @${acct} via WebFinger`,
+      message: `Couldn't find @${acct}. Please check the handle and try again.`,
     };
   }
   let apiOrigin: string;
@@ -416,7 +439,7 @@ async function readActivityPubGraph(
     return {
       ok: false,
       reason: "unreachable",
-      message: `@${acct} resolved to an invalid actor URI`,
+      message: `@${acct}'s server sent back an address we can't use, so we can't import from it.`,
     };
   }
 
@@ -497,7 +520,7 @@ async function readActivityPubGraph(
       return {
         ok: false,
         reason: "unreachable",
-        message: "Could not read the follow list from this instance",
+        message: "Couldn't read that account's follows from its server.",
       };
     }
     accessToken = undefined;
@@ -522,12 +545,28 @@ async function finishActivityPubGraph(
   // §5.3: hide_collections yields an empty list, not an error — only the
   // count betrays it. The authed self-call bypasses the hide, so this can
   // only fire on the public leg.
-  if (fetched.accounts.length === 0 && !authed && (followingCount ?? 0) > 0) {
+  //
+  // A NULL COUNT MEANS THE LOOKUP DID NOT ANSWER, NEVER THAT THE ACCOUNT
+  // FOLLOWS NOBODY. `(followingCount ?? 0) > 0` collapsed those two, so an
+  // unknown count plus an empty public list fell through to `ok: true` with no
+  // identities — which the route reports as `empty_graph`, i.e. "this account
+  // doesn't follow anyone we can import". That is the one reading we know to
+  // be unsafe: it is a confident claim about the remote account built on our
+  // own failure to read it. With the count unknown, hidden and empty are
+  // genuinely indistinguishable from out here, and the ambiguous answer is the
+  // one that points at the fix.
+  const countUnknown = followingCount === null;
+  if (
+    fetched.accounts.length === 0 &&
+    !authed &&
+    (countUnknown || followingCount > 0)
+  ) {
     return {
       ok: false,
       reason: "hidden",
-      message:
-        "This account's follows are hidden — link the account under Reach other networks to import them",
+      message: countUnknown
+        ? "We couldn't read this account's follow list — if it's yours, link the account under Reach other networks to import it"
+        : "This account's follows are hidden — link the account under Reach other networks to import them",
     };
   }
 
@@ -880,15 +919,34 @@ async function processRun(run: FollowImportRow): Promise<void> {
 
   // Completion. Volume default first (§6.5): above the threshold the feed
   // defaults to sampled volume — a post-import bulk UPDATE, guarded to rows
-  // still at the 4.0 default so a re-run never clobbers user tuning. Initial
+  // still at the schema default so a re-run never clobbers user tuning. Initial
   // imports only: by sync time the feed's volume character is the user's.
+  //
+  // THE PREDICATE IS THE SENTINEL AND IT MUST TRACK THE SCHEMA DEFAULT. It says
+  // "nobody has touched this", and it can only say that because addSource's
+  // INSERT omits the column, so every freshly added source lands on exactly the
+  // DEFAULT. If the default moves and this literal does not, the UPDATE matches
+  // zero rows — in silence, since nothing here inspects rowCount — and a
+  // 500-source import ships at full volume. Migration 202 moved it from 4.0 to
+  // 1.0; `rowCount` is now returned to the caller's log precisely so that
+  // failure has a witness. THE LOG IS THE WHOLE WITNESS — the test cannot be,
+  // because the suite mocks the pool and a mock's rowCount is the mock's
+  // opinion, not the database's. It asserts the params and pins the sentinel
+  // literal structurally; an operator reading the zero-rows line is what
+  // actually catches a default that moved.
   if (run.kind !== "sync" && identities.length > VOLUME_SAMPLE_THRESHOLD) {
-    await pool.query(
+    const { rowCount } = await pool.query(
       `UPDATE feed_sources
-          SET weight = $2
+          SET throughput = $2
         WHERE feed_id = $1 AND source_type = 'external_source'
-          AND weight = 4.0`,
-      [run.feed_id, SAMPLED_WEIGHT],
+          AND throughput = 1.0`,
+      [run.feed_id, SAMPLED_THROUGHPUT],
+    );
+    logger.info(
+      { feedId: run.feed_id, sampled: rowCount, sources: identities.length },
+      rowCount === 0
+        ? "follow-import: volume sampling matched no sources — is the sentinel still the schema default?"
+        : "follow-import: large feed defaulted to sampled volume",
     );
   }
   // The snapshot IS a sync — stamp the binding so "Sync now" (Phase 2) has a
@@ -910,26 +968,10 @@ async function processRun(run: FollowImportRow): Promise<void> {
 
 // Fire the sweep immediately (best-effort) after POST /follow-imports creates
 // a run, instead of waiting up to 60s for the scheduler tick. Same try-lock
-// discipline as index.ts's withAdvisoryLock — if the scheduler (or another
+// (shared withAdvisoryLock) as the scheduler's — if the scheduler (or another
 // kick) holds the lock, skip; the pending row is picked up by the running
 // sweep's claim loop or the next tick.
 export async function kickFollowImportSweep(): Promise<void> {
   if (!followImportEnabled()) return;
-  const client = await pool.connect();
-  try {
-    const { rows } = await client.query<{ locked: boolean }>(
-      "SELECT pg_try_advisory_lock($1) AS locked",
-      [ADVISORY_LOCKS.FOLLOW_IMPORT],
-    );
-    if (!rows[0].locked) return;
-    try {
-      await runFollowImportSweep();
-    } finally {
-      await client.query("SELECT pg_advisory_unlock($1)", [
-        ADVISORY_LOCKS.FOLLOW_IMPORT,
-      ]);
-    }
-  } finally {
-    client.release();
-  }
+  await withAdvisoryLock(ADVISORY_LOCKS.FOLLOW_IMPORT, runFollowImportSweep);
 }

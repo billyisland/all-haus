@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import Fastify from "fastify";
-import { createHmac, randomBytes } from "crypto";
+import { createHash, createHmac, randomBytes } from "crypto";
 
 // =============================================================================
 // POST /auth/google/exchange — the closed-beta account-creation gate.
@@ -35,24 +35,33 @@ process.env.APP_URL = "https://test.all.haus";
 
 const STATE_SECRET = "test-state-secret";
 
+/** The raw browser binding every exchange in this file carries (§2.5). */
+const BIND = "ab".repeat(32);
+
 /**
  * Mint a state the route's own verifySignedState will accept.
  *
- * FOUR SEGMENTS SINCE PAYWALL-ARRIVAL §5: the third carries the arrival intent,
- * base64url-encoded, and is EMPTY for an ordinary sign-in — a fixed shape rather
- * than an optional extra, because an optional segment would mean two payload
- * forms signing to two different strings and the shorter one verifying against
- * neither. The d-tag is INSIDE the signed payload because it decides how much
- * money a new account is granted, so a tamperable one would be a free-money
- * endpoint reached through a third party's redirect.
+ * FIVE SEGMENTS: the fourth carries the arrival intent (PAYWALL-ARRIVAL §5),
+ * base64url-encoded, and is EMPTY for an ordinary sign-in; the second is the
+ * sha256 of the browser binding (MIRROR-AUDIT §2.5) and is never empty. A fixed
+ * shape rather than optional extras, because an optional segment would mean two
+ * payload forms signing to two different strings and the shorter one verifying
+ * against neither. Both are INSIDE the signed payload: the d-tag decides how
+ * much money a new account is granted, so a tamperable one would be a free-money
+ * endpoint reached through a third party's redirect, and a tamperable binding
+ * would let a forwarder re-point it at a preimage they hold.
+ *
+ * This file is about the closed-beta gate, so it always mints a state that
+ * BINDS — `google-oauth-state.test.ts` owns the binding's own behaviour.
  */
 function signedState(arrivalDTag: string | null = null): string {
   const nonce = randomBytes(16).toString("hex");
+  const bind = createHash("sha256").update(BIND, "utf8").digest("hex");
   const timestamp = Math.floor(Date.now() / 1000);
   const arrival = arrivalDTag
     ? Buffer.from(arrivalDTag, "utf8").toString("base64url")
     : "";
-  const payload = `${nonce}.${timestamp}.${arrival}`;
+  const payload = `${nonce}.${bind}.${timestamp}.${arrival}`;
   const sig = createHmac("sha256", STATE_SECRET).update(payload).digest("hex");
   return `${payload}.${sig}`;
 }
@@ -152,7 +161,7 @@ async function exchangeAs(email: string) {
   const res = await app.inject({
     method: "POST",
     url: "/api/v1/auth/google/exchange",
-    payload: { code: "stub-code", state: signedState() },
+    payload: { code: "stub-code", state: signedState(), bind: BIND },
   });
   await app.close();
   return res;

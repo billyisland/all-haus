@@ -27,8 +27,16 @@ interface FollowsState {
   hydrating: boolean
 
   hydrate: () => Promise<void>
-  follow: (id: string) => Promise<void>
+  // No `follow`. A native follow is made by putting somebody in a feed, so the
+  // INSERT belongs to `POST /workspace/feeds/:id/sources` and to nothing else
+  // (§9.16 as amended 2026-09-18) — a client-side follow writer is how the
+  // graph-only row this store used to produce came to exist. Surfaces report
+  // what the route did with `setLocal`.
   unfollow: (id: string) => Promise<void>
+  /** Reflect a follow the SERVER made or dropped as part of a feed-source
+   *  write. Local only — it issues no request and is not a writer; it is the
+   *  set catching up with a fact that is already true. */
+  setLocal: (id: string, following: boolean) => void
   // Seed a known follow state from a per-surface server snapshot. No-op once
   // hydrated — the authoritative full list wins, so a stale snapshot rendered
   // before a toggle elsewhere can never clobber the live set.
@@ -55,28 +63,12 @@ export const useFollows = create<FollowsState>((set, get) => ({
     }
   },
 
-  // POST/DELETE /follows are idempotent, so these are unconditional toggles —
-  // never gated on current store membership (which may be unhydrated). The set
-  // update is optimistic and reverts on error.
-  follow: async (id) => {
-    set((s) => {
-      const ids = new Set(s.ids)
-      ids.add(id)
-      return { ids }
-    })
-    try {
-      await followsApi.follow(id)
-      invalidateAuthorCardCache()
-    } catch (e) {
-      set((s) => {
-        const ids = new Set(s.ids)
-        ids.delete(id)
-        return { ids }
-      })
-      throw e
-    }
-  },
-
+  // DELETE /follows is idempotent, so this is an unconditional toggle — never
+  // gated on current store membership (which may be unhydrated). The set
+  // update is optimistic and reverts on error. It survives the move of the
+  // INSERT to the feed-source route because it is the LEGACY EXIT: a
+  // pre-convergence follow has no source to remove, so there is nothing for
+  // `removeSource` to drop, and `unfollowEverywhere` ends here.
   unfollow: async (id) => {
     set((s) => {
       const ids = new Set(s.ids)
@@ -95,6 +87,15 @@ export const useFollows = create<FollowsState>((set, get) => ({
       throw e
     }
   },
+
+  setLocal: (id, following) =>
+    set((s) => {
+      if (s.ids.has(id) === following) return s
+      const ids = new Set(s.ids)
+      if (following) ids.add(id)
+      else ids.delete(id)
+      return { ids }
+    }),
 
   prime: (id, following) =>
     set((s) => {

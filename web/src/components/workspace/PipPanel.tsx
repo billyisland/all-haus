@@ -7,7 +7,6 @@ import { TrustPip } from '../ui/TrustPip'
 import { trustEnabled } from '../../lib/featureFlags'
 import {
   trust as trustApi,
-  follows as followsApi,
   workspaceFeeds as workspaceFeedsApi,
   type AuthorVolume,
 } from '../../lib/api'
@@ -21,14 +20,25 @@ import type {
   VouchVisibility,
 } from '../../lib/api/trust'
 import type { PipStatus } from '../../lib/ndk'
+import { failureSentence } from '../../lib/api/client'
 
 // PipPanel — popover surface opened by tapping a TrustPip on a vessel card.
 // Slice 12: native authors only (notes + articles). External cards' pips stay
 // inert because external authors don't have a platform user id and the trust
 // route keys on user id.
 //
+// THE FOLLOW TOGGLE IS GONE FROM HERE (2026-09-18). It had already been
+// superseded — the author actions this panel used to host moved to the byline
+// hover panel when the pip was parked (PostByline) — and what it left behind
+// was a second follow writer with its own local `following` state, which is
+// both the stale-label bug the shared store exists to prevent and, since a
+// native follow became a chosen feed source, a way to make a follow with no
+// feed behind it. A dormant surface is not a safe place to leave one: it is
+// mounted, and reviving the trigger would revive this too. Follow lives in
+// `AuthorModal` / `ProfileFollowControl`; do not put one back here.
+//
 // Per CARDS-AND-PIP-PANEL-HANDOFF.md §"The pip panel": header (large pip +
-// author name + chevron link to profile + right-aligned FOLLOW), bio line,
+// author name + chevron link to profile), bio line,
 // TRUST section, VOLUME section, footer (SUBSCRIBE if offered).
 //
 // This slice ships a first cut: trust section renders the existing Layer 1
@@ -36,8 +46,12 @@ import type { PipStatus } from '../../lib/ndk'
 // questions described in the handoff (the polling backend is a future system
 // per ADR-OMNIBUS §III.7 and the trust-system spec proper). Slice 14 wired
 // the VOLUME bar against feed_sources rows; slice 15 added the polling-
-// questions row; slice 16 made weight/sampling_mode actually load-bearing in
-// the items query.
+// questions row; slice 16 made sampling load-bearing in the items query.
+// Migration 202 then replaced `weight` — a multiplier on the feed's shared
+// sort key, i.e. a mute dressed as a sample — with per-source `throughput`,
+// and moved `sampling_mode` from a feed-wide majority vote to the source it
+// belongs to. This panel's volume bar is dormant with the rest of it; the
+// live control is `components/feed/SourceVolume.tsx`.
 
 // Every colour here is in the INVERTING family (`ink`/`white`/`bone`/greys),
 // with two deliberate exceptions. The scrim must DARKEN in both modes, so it
@@ -46,7 +60,7 @@ import type { PipStatus } from '../../lib/ndk'
 // through the `html.dark` inversion — and a never-inverting foreground on top
 // of one (`ink-925` on `white` = 26 26 24 on 30 29 26, a contrast ratio of
 // 1.03:1) is invisible. Foreground and ground must be in the SAME inversion
-// family; see web/CLAUDE.md › Global light/dark mode.
+// family; see `.claude/rules/web-theme.md` › Global light/dark mode.
 //
 // `meta` was the same miss one shade lighter: `stone-600` (registry: "light-
 // mode standfirst", never inverts) sat at ≈2.6:1 on the inverted panel — above
@@ -104,10 +118,14 @@ interface PipPanelProps {
   pipStatus?: PipStatus
   // Page coordinates of the tapped pip — used to anchor the popover.
   anchorRect: { top: number; left: number; bottom: number; right: number } | null
-  initialIsFollowing: boolean
+  /** @deprecated Unread since the follow toggle left this panel. */
+  initialIsFollowing?: boolean
   // Slice 14: when set, the volume bar is wired against this feed.
   feedId?: string
   onClose: () => void
+  /** @deprecated The panel no longer follows anybody — see the header. Kept
+   *  as a prop so `WorkspaceView`'s wiring does not need unpicking for a
+   *  dormant surface; it is never called. */
   onFollowChanged?: (pubkey: string, following: boolean) => void
   onVolumeChanged?: (feedId: string) => void
 }
@@ -125,10 +143,8 @@ export function PipPanel({
   pubkey,
   pipStatus = 'unknown',
   anchorRect,
-  initialIsFollowing,
   feedId,
   onClose,
-  onFollowChanged,
   onVolumeChanged,
 }: PipPanelProps) {
   const { user } = useAuth()
@@ -136,14 +152,7 @@ export function PipPanel({
   const [trustProfile, setTrustProfile] = useState<TrustProfileResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [following, setFollowing] = useState(initialIsFollowing)
-  const [followBusy, setFollowBusy] = useState(false)
   const panelRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    if (!open) return
-    setFollowing(initialIsFollowing)
-  }, [open, initialIsFollowing])
 
   // Fetch writer meta + trust profile on open. Sequenced because the trust
   // route keys on the writer's user id which we don't have until the writer
@@ -161,9 +170,10 @@ export function PipPanel({
         const writerRes = await fetch(`/api/v1/writers/by-pubkey/${pubkey}`, {
           credentials: 'include',
         })
-        if (!writerRes.ok) {
-          throw new Error('Writer not found')
-        }
+        // Only a 404 means there is no such writer. Anything else is a fault,
+        // and a TypeError takes failureSentence's fallback below.
+        if (writerRes.status === 404) throw new Error('We couldn’t find that writer.')
+        if (!writerRes.ok) throw new TypeError('writer lookup failed')
         const wd = await writerRes.json()
         if (cancelled) return
         const writerMeta: WriterMeta = {
@@ -188,7 +198,7 @@ export function PipPanel({
         }
       } catch (err) {
         if (cancelled) return
-        setError(err instanceof Error ? err.message : 'Failed to load.')
+        setError(failureSentence(err, 'Couldn’t load this writer. Please try again.'))
       } finally {
         if (!cancelled) setLoading(false)
       }
@@ -249,26 +259,6 @@ export function PipPanel({
   const showTrust = trustEnabled()
   const showFraming = showTrust && !isOwn && !loading && !error && writer !== null
 
-  async function handleFollowToggle() {
-    if (!writer || !user || isOwn || followBusy) return
-    setFollowBusy(true)
-    try {
-      if (following) {
-        await followsApi.unfollow(writer.id)
-        setFollowing(false)
-        onFollowChanged?.(pubkey, false)
-      } else {
-        await followsApi.follow(writer.id)
-        setFollowing(true)
-        onFollowChanged?.(pubkey, true)
-      }
-    } catch {
-      // Silent — the visible state stays as-is on failure.
-    } finally {
-      setFollowBusy(false)
-    }
-  }
-
   return (
     <div
       ref={panelRef}
@@ -281,7 +271,7 @@ export function PipPanel({
         width: PANEL_W,
         maxWidth: 'calc(100vw - 24px)',
         background: TOKENS.panelBg,
-        border: `1px solid ${TOKENS.panelBorder}`,
+        border: `2px solid ${TOKENS.panelBorder}`,
         boxShadow: '0 12px 32px rgba(0, 0, 0, 0.18)',
         zIndex: 70,
       }}
@@ -336,23 +326,6 @@ export function PipPanel({
               {writer.displayName || writer.username}
               <span style={{ color: TOKENS.hint, marginLeft: 6 }}>›</span>
             </ProfileLink>
-            {!isOwn && user && (
-              <button
-                type="button"
-                onClick={handleFollowToggle}
-                disabled={followBusy}
-                className="label-ui"
-                style={{
-                  background: 'transparent',
-                  border: 'none',
-                  cursor: followBusy ? 'default' : 'pointer',
-                  color: following ? TOKENS.meta : TOKENS.fg,
-                  padding: 0,
-                }}
-              >
-                {following ? 'FOLLOWING ›' : 'FOLLOW ›'}
-              </button>
-            )}
           </div>
 
           {/* Slice 19 — pip-status subtitle. Italic Literata, hint colour;
@@ -446,7 +419,6 @@ export function PipPanel({
               style={{
                 marginTop: 20,
                 paddingTop: 16,
-                borderTop: `1px solid ${TOKENS.rule}`,
                 textAlign: 'right',
               }}
             >
@@ -476,11 +448,12 @@ export function PipPanel({
 // (no row) reads as "passive" (default ranking, no commit). Steps:
 //   0 = mute (suppress the author from this feed)
 //   1..5 = quieter → louder
-// Step 3 is the default weight (1.0); rates either side bracket it.
+// Step 5 (everything) is the default; each step down is a fifth less.
 //
-// The items query already honours `muted_at` on the underlying feed_sources
-// row (slice 4); weight ordering is the eventual ranking story and not yet
-// observable. The bar is honest about this in its hint copy.
+// The items query honours `muted_at` on the underlying feed_sources row and,
+// since migration 202, the throughput and sampling mode too — the step is the
+// fraction of this author's posts that reach this feed. (This panel itself is
+// dormant: the card's TrustPip is a decorative dot that opens nothing.)
 function VolumeBar({
   feedId,
   pubkey,
@@ -562,7 +535,7 @@ function VolumeBar({
     setBusy(true)
     try {
       await workspaceFeedsApi.clearAuthorVolume(feedId, pubkey)
-      setState({ ...state!, step: null, muted: false, sampling: 'random' })
+      setState({ ...state!, step: null, muted: false, sampling: 'top' })
       onChanged?.()
     } finally {
       setBusy(false)
@@ -641,7 +614,7 @@ function VolumeBar({
               style={{
                 background: sampling === mode ? TOKENS.fg : 'transparent',
                 color: sampling === mode ? 'var(--ah-white)' : TOKENS.meta,
-                border: `1px solid ${sampling === mode ? TOKENS.fg : TOKENS.rule}`,
+                border: `2px solid ${sampling === mode ? TOKENS.fg : TOKENS.rule}`,
                 cursor: busy ? 'default' : 'pointer',
                 padding: '4px 10px',
               }}
@@ -662,10 +635,10 @@ function VolumeBar({
         }}
       >
         {currentStep === null
-          ? 'Default — no commitment yet. Pick a step to set how much of this author you want in this feed.'
+          ? 'Default — no commitment yet. Pick a step to set how much of this author you want in this channel.'
           : currentStep === 0
-            ? 'Muted in this feed.'
-            : 'Weight applied to this feed’s ranking.'}
+            ? 'Muted in this channel.'
+            : 'Weight applied to this channel’s ranking.'}
       </p>
     </div>
   )
@@ -773,7 +746,7 @@ function PollQuestions({
               style={{
                 background: slot.viewerAnswer === 'yes' ? TOKENS.fg : 'transparent',
                 color: slot.viewerAnswer === 'yes' ? 'var(--ah-white)' : TOKENS.meta,
-                border: `1px solid ${slot.viewerAnswer === 'yes' ? TOKENS.fg : TOKENS.rule}`,
+                border: `2px solid ${slot.viewerAnswer === 'yes' ? TOKENS.fg : TOKENS.rule}`,
                 cursor: isBusy ? 'default' : 'pointer',
                 padding: '3px 8px',
               }}
@@ -788,7 +761,7 @@ function PollQuestions({
               style={{
                 background: slot.viewerAnswer === 'no' ? TOKENS.crimson : 'transparent',
                 color: slot.viewerAnswer === 'no' ? 'var(--ah-white)' : TOKENS.meta,
-                border: `1px solid ${slot.viewerAnswer === 'no' ? TOKENS.crimson : TOKENS.rule}`,
+                border: `2px solid ${slot.viewerAnswer === 'no' ? TOKENS.crimson : TOKENS.rule}`,
                 cursor: isBusy ? 'default' : 'pointer',
                 padding: '3px 8px',
               }}
@@ -826,9 +799,10 @@ function PollQuestions({
 // Visibility decision: aggregate (count-only, attestor not surfaced) rather
 // than public. The panel's privacy ethos matches the polling section — your
 // own gesture is editable, totals are what other people see. A reader who
-// wants to publicly endorse "I've met X" can still do so via the full
-// vouch surface at /network. This keeps the panel gesture lightweight and
-// matches the slice-15 polling-as-aggregate-only contract.
+// wants to publicly endorse "I've met X" can still do so via the full vouch
+// surface (a Settings section, behind the parked trust flag). This keeps the
+// panel gesture lightweight and matches the slice-15
+// polling-as-aggregate-only contract.
 function EncounterRow({
   subjectUserId,
   initialAffirmCount,
@@ -889,7 +863,6 @@ function EncounterRow({
       style={{
         marginTop: 14,
         paddingTop: 12,
-        borderTop: `1px solid ${TOKENS.rule}`,
         display: 'flex',
         alignItems: 'center',
         gap: 10,
@@ -913,7 +886,7 @@ function EncounterRow({
         style={{
           background: youMet ? TOKENS.fg : 'transparent',
           color: youMet ? 'var(--ah-white)' : TOKENS.fg,
-          border: `1px solid ${youMet ? TOKENS.fg : TOKENS.rule}`,
+          border: `2px solid ${youMet ? TOKENS.fg : TOKENS.rule}`,
           cursor: busy ? 'default' : 'pointer',
           padding: '4px 10px',
         }}

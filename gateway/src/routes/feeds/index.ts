@@ -5,6 +5,7 @@ import { registerFeedSourcesRoutes } from "./sources.js";
 import { registerAuthorVolumeRoutes } from "./author-volume.js";
 import { registerFeedBootstrapRoutes } from "./bootstrap.js";
 import { registerFeedFormulaRoutes } from "./formulas.js";
+import { registerFeedSeenRoutes } from "./seen.js";
 
 // =============================================================================
 // Workspace feeds (slices 3 + 4)
@@ -19,10 +20,12 @@ import { registerFeedFormulaRoutes } from "./formulas.js";
 // POST   /workspace/feeds                       — create { name }
 // PATCH  /workspace/feeds/:id                   — rename { name }
 // DELETE /workspace/feeds/:id                   — delete (cascade removes feed_sources)
-// GET    /workspace/feeds/:id/items             — feed contents
+// GET    /workspace/feeds/:id/items             — feed contents (+ `asOf`)
+// GET    /workspace/feeds/:id/seen              — reading-count window (WORKSPACE-QUEUE-ADR §IV)
+// POST   /workspace/feeds/:id/seen              — { asOf }: record a look, answer the new window
 // GET    /workspace/feeds/:id/sources           — list source rows (slice 4)
 // POST   /workspace/feeds/:id/sources           — add a source (slice 4)
-// PATCH  /workspace/feeds/:id/sources/:sid      — update weight/sampling/muted
+// PATCH  /workspace/feeds/:id/sources/:sid      — update throughput/sampling/muted
 // DELETE /workspace/feeds/:id/sources/:sid      — remove a source (slice 4)
 // GET    /workspace/feeds/:id/formula/preview   — recipient's-eye view, pre-freeze (formulas)
 // POST   /workspace/feeds/:id/formula           — freeze this composition (formulas)
@@ -30,7 +33,11 @@ import { registerFeedFormulaRoutes } from "./formulas.js";
 // Slice 3 shipped schema + CRUD + an empty-sources placeholder for /items:
 // when a feed has no feed_sources rows the route falls back to the caller's
 // explore stream. Slice 4 wires source authoring + makes /items honour rows.
-// Weight + sampling_mode are still ignored — the ranking story comes later.
+// `throughput` and `sampling_mode` are live and per source since migration 202
+// (`lib/source-selection.ts`); `weight` is gone, and with it the feed-wide
+// majority vote that used to decide one sampling mode for every source in a
+// feed. What the volume bar decides is WHICH posts arrive, never where they
+// sit — the composed feed is a timeline.
 //
 // Authz: feeds are private to the owner. Every read and write asserts
 // ownership before touching the row. There is no public-feed concept on this
@@ -46,6 +53,7 @@ import { registerFeedFormulaRoutes } from "./formulas.js";
 export async function feedsRoutes(app: FastifyInstance) {
   registerFeedCrudRoutes(app);
   registerFeedItemsRoutes(app);
+  registerFeedSeenRoutes(app);
   registerFeedSourcesRoutes(app);
   registerAuthorVolumeRoutes(app);
   registerFeedBootstrapRoutes(app);

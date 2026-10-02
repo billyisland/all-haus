@@ -1,6 +1,7 @@
 import type { PoolClient } from "pg";
 import type { NormalisedEmailItem } from "../adapters/email.js";
 import { truncatePreview } from "@platform-pub/shared/lib/text.js";
+import { recordServed } from "./item-membership.js";
 
 // =============================================================================
 // Email dual-write — external_items + feed_items with cross-source dedup.
@@ -44,7 +45,14 @@ export async function insertEmailItem(
       SELECT 1 FROM external_items ei
       JOIN external_subscriptions es ON es.source_id = ei.source_id
       WHERE ei.title = $1
-        AND ei.published_at BETWEEN $2 - interval '1 hour' AND $2 + interval '1 hour'
+        -- $2 is CAST (S17). node-postgres sends parameters untyped, so
+        -- Postgres infers $2 from its first use, "$2 - interval '1 hour'",
+        -- which resolves to interval MINUS interval — and the comparison then
+        -- fails to parse: "operator does not exist: timestamp with time zone
+        -- >= interval". Every issue that reached this branch (a title, and no
+        -- "view in browser" link to dedup on) threw instead of ingesting.
+        AND ei.published_at BETWEEN $2::timestamptz - interval '1 hour'
+                                AND $2::timestamptz + interval '1 hour'
         AND es.subscriber_id IN (
           SELECT subscriber_id FROM external_subscriptions WHERE source_id = $3
         )
@@ -82,7 +90,16 @@ export async function insertEmailItem(
       source.id,
       item.sourceItemUri,
       item.title,
-      item.authorName || source.display_name || null,
+      // The item's own author name or NULL — never the source's (migration
+      // 184, BYLINE-AND-PROVENANCE D9 ⟂; MIRROR-AUDIT §3, S17). Unlike nostr
+      // and atproto, an email source is a PUBLICATION and not a person: the
+      // newsletter's display_name standing in for a missing From is D9's exact
+      // trap, and it reached further here than a byline — the identity
+      // trigger's tier-C arm mints `<source_id>#<name>` from this column, so a
+      // From-less issue minted an "author" named after the newsletter. Byte for
+      // byte the feed_items expression below, or feed_items_author_refresh
+      // rewrites a row every night that re-ingest puts back.
+      item.authorName || null,
       item.authorHandle,
       item.contentText,
       item.contentHtml,
@@ -91,6 +108,11 @@ export async function insertEmailItem(
       item.publishedAt,
     ],
   );
+
+  // This source served it, new row or not (CA-C4): one issue of a newsletter
+  // reaching two members' ingest addresses is one Message-ID, and the second
+  // member's feed must carry it too.
+  await recordServed(client, source.id, "email", [item.sourceItemUri]);
 
   if (!rowCount || rowCount === 0) return false;
 
@@ -116,8 +138,8 @@ export async function insertEmailItem(
     `,
     [
       rows[0].id,
-      // The author's own name or NULL — never the source's (migration 184,
-      // BYLINE-AND-PROVENANCE D9 ⟂). normaliseEmail yields '' with no From.
+      // The same expression external_items got, byte for byte (S17).
+      // normaliseEmail yields '' with no From.
       item.authorName || null,
       source.avatar_url,
       item.title,

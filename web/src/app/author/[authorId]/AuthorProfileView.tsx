@@ -1,6 +1,8 @@
 "use client";
 
 import { Fragment, useCallback, useEffect, useState, type ReactNode } from "react";
+import { ReportButton } from "../../../components/ui/ReportButton";
+import { MuteBlockControls } from "../../../components/social/MuteBlockControls";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { PostCardInteractive } from "../../../components/post/PostCardInteractive";
@@ -31,8 +33,7 @@ import {
   type AuthorProfile,
 } from "../../../lib/api/post";
 import type { Post } from "../../../lib/post/types";
-import { quotePreviewContent } from "../../../lib/post/quote-preview";
-import { useCompose } from "../../../stores/compose";
+import { openPostInReader } from "../../../lib/workspace/open-post";
 import { ProfileFollowControl } from "../../../components/profile/ProfileFollowControl";
 import { IdentityLinkControl } from "../../../components/profile/IdentityLinkControl";
 import { ApiError } from "../../../lib/api/client";
@@ -231,27 +232,13 @@ export function AuthorProfileView({
   }, []);
 
   // Article → its addressable reader page (no overlay is mounted off-workspace).
+  // Reader pane inside the workspace, standalone route outside it — one home,
+  // because a bare push from an overlay body is the escape ban (lib/workspace/
+  // open-post.ts, which also gates the external target on a real origin URL).
   const openReader = useCallback(
-    (p: Post) => {
-      if (p.author.pubkey) {
-        if (p.dTag) router.push(`/article/${p.dTag}`);
-      } else {
-        router.push(`/read/${p.id}`);
-      }
-    },
+    (p: Post) => openPostInReader(p, router),
     [router],
   );
-
-  // Native reply via the global compose overlay (mounted in app/layout).
-  const replyFromPost = useCallback((p: Post) => {
-    if (!p.author.pubkey) return;
-    useCompose.getState().open("reply", {
-      eventId: p.version ?? p.id,
-      eventKind: p.type === "article" ? 30023 : 1,
-      authorPubkey: p.author.pubkey,
-      previewContent: quotePreviewContent(p),
-    });
-  }, []);
 
   if (loading) {
     return frame(
@@ -267,7 +254,7 @@ export function AuthorProfileView({
   if (notFound) {
     return frame(
       <p className="font-sans text-ui-sm py-12" style={{ color: palette.cardMeta }}>
-        This author isn&apos;t available.{" "}
+        This author isn&rsquo;t available.{" "}
         <Link href="/reader" className="btn-text">
           Back to workspace
         </Link>
@@ -289,7 +276,7 @@ export function AuthorProfileView({
   if (error || !profile) {
     return frame(
       <p className="font-sans text-ui-sm py-12" style={{ color: palette.cardMeta }}>
-        Something went wrong loading this profile.
+        Something went wrong while loading this profile. Please try again.
       </p>,
     );
   }
@@ -376,7 +363,8 @@ export function AuthorProfileView({
           // BOTH the name and the handle go to this person's page on their own
           // network. That out-link is what the "VIA BLUESKY" strap above the
           // name used to gesture at without offering, and dropping the strap
-          // takes a line back off tier 1 (web/CLAUDE.md › Profile chassis).
+          // takes a line back off tier 1 (`.claude/rules/web-profile.md` ›
+          // Profile chassis).
           handleHref={profile.externalUrl}
           nameHref={profile.externalUrl}
           identityControl={
@@ -396,12 +384,49 @@ export function AuthorProfileView({
             ) : undefined
           }
           actions={
-            profile.followTarget ? (
-              <ProfileFollowControl
-                target={profile.followTarget}
-                palette={palette}
-              />
-            ) : undefined
+            // The follow control and the report control are both "actions" in
+            // the bar's sense, and a profile with no follow target still has a
+            // person behind it to report (L6.3; D1 §9.2). So the slot is a row
+            // rather than one control — it was one control, which is why a
+            // profile was the one surface on this site with no report route at
+            // all.
+            <div className="flex items-center gap-3">
+              {profile.followTarget && (
+                <ProfileFollowControl
+                  target={profile.followTarget}
+                  palette={palette}
+                />
+              )}
+              {/* ONLY WHERE THERE IS AN ACCOUNT BEHIND IT.
+                  `moderation_reports.target_profile_id` references
+                  `accounts(id)`, so an EXTERNAL author — who by definition has
+                  no all.haus account — cannot be the subject of a profile
+                  report, and offering the control there would be a button that
+                  400s. The remedy for an external identity is the npub or
+                  source block (D7 §5/§7), which an operator reaches from a
+                  report filed on one of their POSTS — and every card carries
+                  that control. `followTarget.type === "user"` is the one field
+                  on this payload that means "a native account", and its id is
+                  that account's. */}
+              {/* Mute and Block ride the same gate (W2), narrowed to a
+                  viewer by the payload itself: `viewerRelation` is present
+                  exactly when there is somebody to act on the relationship. */}
+              {profile.followTarget?.type === "user" && profile.viewerRelation && (
+                <MuteBlockControls
+                  userId={profile.followTarget.id}
+                  name={profile.displayName ?? "this person"}
+                  initial={profile.viewerRelation}
+                  triggerClassName="font-mono text-mono-xs uppercase tracking-[0.02em] hover:opacity-80"
+                />
+              )}
+              {profile.followTarget?.type === "user" && (
+                <ReportButton
+                  targetProfileId={profile.followTarget.id}
+                  label="Report"
+                  triggerClassName="font-mono text-mono-xs uppercase tracking-[0.02em] hover:opacity-80"
+                />
+              )}
+            </div>
           }
           onClose={onClose}
         />
@@ -420,7 +445,7 @@ export function AuthorProfileView({
           className="label-ui py-12 text-center"
           style={{ color: palette.cardMeta }}
         >
-          {hydrating ? "FETCHING RECENT POSTS FROM THE NETWORK…" : "NO POSTS YET"}
+          {hydrating ? "LOADING…" : "NO POSTS YET"}
         </div>
       ) : (
         // The feed's own rhythm, which is the column gap PLUS the card's own
@@ -439,9 +464,6 @@ export function AuthorProfileView({
                 onExpand={() => toggleExpand(post.id)}
                 onQuoteOpen={(qid) => expandQuote(post.id, qid)}
                 onOpenReader={openReader}
-                onReply={
-                  post.author.pubkey ? () => replyFromPost(post) : undefined
-                }
               />
             );
             if (root === undefined || post.type === "article")
@@ -460,7 +482,6 @@ export function AuthorProfileView({
                   rootPostId={root}
                   ctx={CTX}
                   onCollapse={() => collapseExpand(post.id)}
-                  onReply={replyFromPost}
                   onOpenReader={openReader}
                 />
               </Fragment>

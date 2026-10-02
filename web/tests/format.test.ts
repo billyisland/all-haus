@@ -103,8 +103,12 @@ describe('truncateText', () => {
 
   it('truncates at word boundary', () => {
     const result = truncateText('the quick brown fox jumps over the lazy dog', 20)
-    expect(result).toMatch(/\.\.\.$/,)
-    expect(result.length).toBeLessThanOrEqual(23) // 20 + "..."
+    // The house ellipsis is one glyph, not three periods — see
+    // web/tests/ellipsis-house-style.test.ts. Asserting the ASCII form here
+    // would hold that spelling in place from the one place nobody looks.
+    expect(result).toMatch(/\u2026$/)
+    expect(result).not.toMatch(/\.\.\.$/)
+    expect(result.length).toBeLessThanOrEqual(21) // 20 + "…"
   })
 
   it('handles exact-length text', () => {

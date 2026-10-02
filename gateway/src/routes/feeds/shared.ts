@@ -207,25 +207,44 @@ export function tagged(
   return e;
 }
 
-// Slice 14 — five-step volume bar mapping. Step 0 is muted (handled via
-// muted_at, not weight). feed_sources.weight DEFAULTs to 4.0 = step 5, and
-// every add path inherits it (addSource's INSERT omits weight): a source you
-// just chose arrives at full volume, deliberately. Do NOT change the schema
-// default — weight multiplies live ranking (feed-rank.ts), so a new default
-// silently re-ranks every source on the platform, and follow-import's
-// post-import sampling guard hard-codes `weight = 4.0` as its "operator has
-// not touched this" sentinel (follow-import.ts).
-const VOLUME_WEIGHTS = [1.0, 0.25, 0.5, 1.0, 2.0, 4.0];
-export function stepToWeight(step: number): number {
-  return VOLUME_WEIGHTS[Math.max(0, Math.min(5, step))] ?? 1.0;
+// The five-step volume bar, as a THROUGHPUT FRACTION (migration 202): the share
+// of that source's posts that reach the feed. Step 5 = 1.0 = everything, which
+// is the schema default, and every add path inherits it (addSource's INSERT
+// omits the column) — a source you just chose arrives at full volume,
+// deliberately.
+//
+// It is NOT a ranking multiplier any more. The old scale (0.25 .. 4.0) was
+// multiplied into the feed's sort key, which in a chronological feed meant
+// multiplying a Unix epoch: one step down sorted a post published today as if
+// published in 1998. Selection is now per source and the feed is a timeline
+// throughout (lib/source-selection.ts).
+//
+// Index 0 is the mute placeholder, and it is INERT — but that had to be made
+// true rather than asserted. It must satisfy the `throughput > 0` CHECK, so it
+// is 1.0, which is also "everything"; both write paths used to store it on a
+// mute, so muting a source set to 20% reset it to full volume and the reader
+// met that on unmute. Neither path writes throughput at step 0 now (sources.ts
+// PATCH skips the SET, author-volume PUT keeps the stored value on conflict) —
+// mute rides `muted_at`, the read-back returns step 0 from that column alone,
+// and the level is what the source comes back to. Do not reintroduce a write
+// of this index on the argument that the UI always names a level on unmute:
+// it does today, and the PATCH API has always accepted a bare `muted: false`.
+//
+// Changing these five numbers changes what every existing source means, since
+// the stored value IS the fraction. The web carries its own copy (there is no
+// gateway→web import path); `web/tests/volume-scale-parity.test.ts` is what
+// stops the two drifting.
+export const VOLUME_THROUGHPUT = [1.0, 0.2, 0.4, 0.6, 0.8, 1.0];
+export function stepToThroughput(step: number): number {
+  return VOLUME_THROUGHPUT[Math.max(0, Math.min(5, step))] ?? 1.0;
 }
-export function weightToStep(weight: number): number {
-  // Inverse — picks the closest committed step. Used only for read-back so
-  // a hand-edited weight in the DB still reads back as a sensible bar position.
-  let bestStep = 3;
+export function throughputToStep(throughput: number): number {
+  // Inverse — picks the closest committed step. Used only for read-back so a
+  // hand-edited value in the DB still reads back as a sensible bar position.
+  let bestStep = 5;
   let bestDelta = Infinity;
   for (let s = 1; s <= 5; s++) {
-    const d = Math.abs(VOLUME_WEIGHTS[s] - weight);
+    const d = Math.abs(VOLUME_THROUGHPUT[s] - throughput);
     if (d < bestDelta) {
       bestDelta = d;
       bestStep = s;

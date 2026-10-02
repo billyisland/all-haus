@@ -3,6 +3,7 @@
 import React, { useState, useEffect } from 'react'
 import Link from 'next/link'
 import { publications as pubApi } from '../../lib/api'
+import { useConfirm } from '../ui/ConfirmDialog'
 import { useReader } from '../../stores/reader'
 import { useDashboardOverlay } from '../../stores/dashboardOverlay'
 import { useEditorOverlay } from '../../stores/editorOverlay'
@@ -20,12 +21,13 @@ export function PublicationArticlesTab({ publicationId, publicationSlug, canPubl
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [statusFilter, setStatusFilter] = useState<string>('')
+  const { ask, dialog } = useConfirm()
 
   useEffect(() => {
     setLoading(true)
     pubApi.listArticles(publicationId, { status: statusFilter || undefined })
       .then(res => setArticles(res.articles))
-      .catch(() => setError('Failed to load articles.'))
+      .catch(() => setError('Couldn’t load this publication’s articles. Please try again.'))
       .finally(() => setLoading(false))
   }, [publicationId, statusFilter])
 
@@ -33,14 +35,23 @@ export function PublicationArticlesTab({ publicationId, publicationSlug, canPubl
     try {
       await pubApi.publishArticle(publicationId, articleId)
       setArticles(prev => prev.map(a => a.id === articleId ? { ...a, status: 'published' } : a))
-    } catch { setError('Failed to publish.') }
+    } catch { setError('Couldn’t publish this article. Please try again.') }
   }
 
-  async function handleUnpublish(articleId: string) {
+  // Confirmed: this takes a live article off the site. It is reversible —
+  // which is exactly why the wording says so rather than warning — but a
+  // one-press ✕ beside a row of articles is not a decision anyone has made.
+  async function handleUnpublish(e: React.MouseEvent<HTMLElement>, articleId: string) {
+    const ok = await ask(e.currentTarget, {
+      title: 'Unpublish this article?',
+      body: 'It comes off the site and returns to the publication\u2019s unpublished list. It can be published again.',
+      confirmLabel: 'Unpublish',
+    })
+    if (!ok) return
     try {
       await pubApi.unpublishArticle(publicationId, articleId)
       setArticles(prev => prev.map(a => a.id === articleId ? { ...a, status: 'unpublished' } : a))
-    } catch { setError('Failed to unpublish.') }
+    } catch { setError('Couldn’t unpublish this article. Please try again.') }
   }
 
   if (loading) return <div className="space-y-3">{[1,2,3].map(i => <div key={i} className="h-10 animate-pulse bg-glasshouse-well" />)}</div>
@@ -48,6 +59,7 @@ export function PublicationArticlesTab({ publicationId, publicationSlug, canPubl
 
   return (
     <div>
+      {dialog}
       <div className="flex items-center gap-2 mb-4">
         {['', 'submitted', 'published', 'unpublished'].map(s => (
           <button
@@ -123,7 +135,7 @@ export function PublicationArticlesTab({ publicationId, publicationSlug, canPubl
                           </button>
                         )}
                         {a.status === 'published' && canPublish && (
-                          <button onClick={() => handleUnpublish(a.id)} className="text-grey-300 hover:text-black">
+                          <button onClick={(e) => handleUnpublish(e, a.id)} className="text-grey-300 hover:text-black">
                             Unpublish
                           </button>
                         )}

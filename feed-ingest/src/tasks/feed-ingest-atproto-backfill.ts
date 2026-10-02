@@ -2,11 +2,14 @@ import type { Task } from "graphile-worker";
 import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
 import { safeFetch } from "@platform-pub/shared/lib/http-client.js";
 import logger from "@platform-pub/shared/lib/logger.js";
+import { isSourceBlocked } from "@platform-pub/shared/lib/platform-blocks.js";
 import {
+  detectAtprotoRepostFromReason,
   normaliseAtprotoPost,
   type BskyPostRecord,
 } from "../adapters/atproto.js";
 import { insertAtprotoItem } from "../lib/atproto-ingest.js";
+import { recordRepostEdge } from "../lib/repost-edge.js";
 import { getPlatformConfig } from "../lib/platform-config.js";
 
 // =============================================================================
@@ -80,7 +83,9 @@ interface FeedViewPost {
     replyCount?: number;
     repostCount?: number;
   };
-  reason?: { $type: string }; // e.g. reasonRepost — skip these
+  // `reasonRepost`: the entry is the author BOOSTING `post`, not writing it —
+  // an edge to the boosted THING, recorded by `detectAtprotoRepostFromReason`.
+  reason?: { $type?: string; by?: { did?: string }; indexedAt?: string };
 }
 
 interface AuthorFeedResponse {
@@ -99,6 +104,15 @@ export const ATPROTO_ENRICH_FAILED_ERROR =
 
 export const feedIngestAtprotoBackfill: Task = async (payload, helpers) => {
   const { sourceId } = payload as { sourceId: string };
+  // THE OPERATOR'S REFUSAL (L6.5, D7 §7). Checked per fetch rather than only at
+  // the poll selector, because a job can be enqueued from several places (the
+  // poll, a re-add, a backfill) and the guard has to sit where the work
+  // actually happens. One indexed lookup against an HTTP fetch we are about to
+  // spend.
+  if (await isSourceBlocked(sourceId)) {
+    logger.info({ sourceId }, "Source is blocked platform-wide — skipping fetch");
+    return;
+  }
 
   const {
     rows: [source],
@@ -129,14 +143,22 @@ export const feedIngestAtprotoBackfill: Task = async (payload, helpers) => {
   // no profile inline), and it also repairs any historical items that were
   // ingested before the handle was known (the "EXTERNAL" byline bug). Best
   // effort — a fetch failure just leaves enrichment to a later run — but a
-  // failure on a source that STILL has no handle is recorded on the source
-  // (error_count/last_error) instead of being wiped by the completion UPDATE
-  // below: that wipe made a permanently-unresolvable DID (deleted account)
-  // look "healthy, fetched a minute ago" forever while the listener's 60s
-  // self-heal re-enqueued this task unbounded (2026-07-06 audit residual).
-  // The listener's enrichment filter backs off on error_count.
+  // failure is recorded on the source (error_count/last_error) instead of
+  // being wiped by the completion UPDATE below: that wipe made a
+  // permanently-unresolvable DID (deleted account) look "healthy, fetched a
+  // minute ago" forever while the listener's 60s self-heal re-enqueued this
+  // task unbounded (2026-07-06 audit residual). The listener's enrichment
+  // filter backs off on error_count.
+  //
+  // WHENEVER the profile is missing, not only while the handle is still null
+  // (CA-C9). The listener's filter names `last_error = ATPROTO_ENRICH_FAILED_ERROR`
+  // as its second retry class — the RENAME case (§0i.10), where an identity
+  // event's one-shot re-resolve hits a transient getProfile failure and the
+  // OLD handle stays in place — and that class was dead: the marker was only
+  // ever written for a source with no handle, which the NULL-handle clause
+  // already covered, so a rename that failed once was lost for good.
   const profile = await fetchAtprotoProfile(source.source_uri);
-  const enrichmentFailed = !profile && (!source.handle || source.handle.trim() === "");
+  const enrichmentFailed = !profile;
   if (profile) {
     source.handle = profile.handle;
     source.display_name = source.display_name ?? profile.displayName;
@@ -173,6 +195,7 @@ export const feedIngestAtprotoBackfill: Task = async (payload, helpers) => {
 
   let cursor: string | undefined;
   let inserted = 0;
+  let repostEdges = 0;
   let seen = 0;
   // Hard cap on pages so a pathological actor can't trap the worker.
   const MAX_PAGES = 5;
@@ -207,9 +230,43 @@ export const feedIngestAtprotoBackfill: Task = async (payload, helpers) => {
       let reachedCutoff = false;
       for (const entry of data.feed) {
         seen++;
-        // Skip reposts in backfill — they're handled via the listener's
-        // real-time feed once we ingest repost records (future work).
-        if (entry.reason) continue;
+        // A repost is an EDGE, not a THING (UNIVERSAL-POST §2.2): the entry is
+        // the author boosting `post`, and getAuthorFeed orders it by the boost.
+        // The listener records live repost commits; this is the same edge for
+        // the history a fresh subscription is given (CA-C14 — the detector sat
+        // unwired behind a "future work" skip). `recordRepostEdge` is
+        // `ON CONFLICT DO NOTHING` and the synthetic-origin index dedups a
+        // re-run, so a backfill repeated is a no-op here as everywhere else.
+        if (entry.reason) {
+          const repost = detectAtprotoRepostFromReason({
+            reason: entry.reason,
+            postUri: entry.post?.uri,
+            fallbackDate: new Date(
+              Date.parse(entry.post?.indexedAt ?? "") || Date.now(),
+            ),
+          });
+          if (!repost) continue;
+          if (repost.boostedAt.getTime() < cutoff) {
+            reachedCutoff = true;
+            continue;
+          }
+          try {
+            const created = await withTransaction(async (client) =>
+              recordRepostEdge(client, repost),
+            );
+            if (created) repostEdges++;
+          } catch (err) {
+            logger.warn(
+              {
+                sourceId,
+                uri: entry.post?.uri,
+                err: err instanceof Error ? err.message : String(err),
+              },
+              "atproto backfill repost edge failed",
+            );
+          }
+          continue;
+        }
         const post = entry.post;
         if (!post?.record || post.record.$type !== "app.bsky.feed.post")
           continue;
@@ -246,7 +303,13 @@ export const feedIngestAtprotoBackfill: Task = async (payload, helpers) => {
           if (didInsert) {
             inserted++;
             if (item.sourceReplyUri || item.sourceQuoteUri) {
-              void helpers.addJob("external_parent_prefetch", {
+              // Awaited INSIDE the per-item try: a bare `void` here left the
+              // rejection unhandled, and feed-ingest registers no
+              // `unhandledRejection` handler, so one DB hiccup on the enqueue
+              // took the whole worker process down (CA-C10). The row is
+              // already committed; a lost prefetch costs a cold tile, not a
+              // post.
+              await helpers.addJob("external_parent_prefetch", {
                 sourceReplyUri: item.sourceReplyUri,
                 sourceQuoteUri: item.sourceQuoteUri,
                 protocol: "atproto",
@@ -261,7 +324,7 @@ export const feedIngestAtprotoBackfill: Task = async (payload, helpers) => {
               uri: post.uri,
               err: err instanceof Error ? err.message : String(err),
             },
-            "atproto backfill insert failed",
+            "atproto backfill insert or prefetch enqueue failed",
           );
         }
       }
@@ -302,7 +365,7 @@ export const feedIngestAtprotoBackfill: Task = async (payload, helpers) => {
 
     if (inserted > 0 || seen > 0) {
       logger.info(
-        { sourceId, inserted, seen, lookbackHours },
+        { sourceId, inserted, repostEdges, seen, lookbackHours },
         "atproto backfill complete",
       );
     }

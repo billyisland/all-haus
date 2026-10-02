@@ -3,6 +3,8 @@ import { postThread } from "../lib/api/post";
 import type { FeedScheme } from "../components/workspace/tokens";
 import type { MediaItem } from "../lib/post/types";
 import { claimOverlayEntry, popOverlayEntry } from "../lib/overlayHistory";
+import { originWebUrl } from "../lib/post/origin-url";
+import { sourcePageId } from "../lib/post/source-page";
 
 // =============================================================================
 // useReader — the unified reader-pane store (UNIVERSAL-POST-ADR §3.1 / Phase R)
@@ -46,6 +48,9 @@ export type ReaderTarget =
       kind: "native";
       dTag: string;
       postId: string | null;
+      // A comment (`comments.id`) the pane opened to — a notification's errand.
+      // The conversation at the article's foot pages it in and centres it.
+      focusCommentId?: string | null;
       // Instant preview seeded from the feed card's Post (performance audit #6):
       // the title + dek the card already holds, so the reader paints the
       // article's identity on the first frame instead of a blank skeleton while
@@ -61,6 +66,7 @@ export type ReaderNavEntry =
       kind: "native";
       postId: string | null;
       dTag: string;
+      focusCommentId?: string | null;
       preview?: { title: string | null; summary: string | null } | null;
     }
   | {
@@ -116,6 +122,7 @@ interface ReaderState {
       postId?: string | null;
       frameScheme?: FeedScheme | null;
       preview?: { title: string | null; summary: string | null } | null;
+      focusCommentId?: string | null;
     },
   ) => void;
   /** Reopen an external article from just its postId — the reload path for the
@@ -170,6 +177,7 @@ export const useReader = create<ReaderState>((set, get) => {
           kind: "native",
           dTag: entry.dTag,
           postId: entry.postId,
+          focusCommentId: entry.focusCommentId ?? null,
           preview: entry.preview ?? null,
         },
         frameScheme: frame.frameScheme,
@@ -223,6 +231,7 @@ export const useReader = create<ReaderState>((set, get) => {
           kind: "native",
           dTag,
           postId: opts?.postId ?? null,
+          focusCommentId: opts?.focusCommentId ?? null,
           preview: opts?.preview ?? null,
         },
         { frameScheme: opts?.frameScheme ?? null, nav: null },
@@ -230,23 +239,35 @@ export const useReader = create<ReaderState>((set, get) => {
     },
 
     openExternalById: async (postId) => {
+      // Every reader change replaces `target`, so an unchanged identity across
+      // the await is "nothing else was opened, and nothing was closed, while
+      // the thread resolved" (CA-E13d). A reader who moved on in that window —
+      // this runs off URL-restore and Back — is not handed this pane over the
+      // thing they chose.
+      const before = get().target;
       try {
         const { focalId, posts } = await postThread(postId);
+        if (get().target !== before) return;
         const focal = posts.find((p) => p.id === focalId);
         // External article only — a note expands inline, a native article lives
         // at /article/<dTag>. Anything else: leave the workspace as it is.
         if (
           !focal ||
           focal.type !== "article" ||
-          focal.origin.protocol === "nostr" ||
-          !focal.origin.uri
+          focal.origin.protocol === "nostr"
         )
           return;
-        get().openExternal(focal.origin.uri, {
+        // The reader's target is the resolved WEB url, never `origin.uri`
+        // verbatim: that column is the item's stable identity, which for RSS is
+        // `guid ?? link` and is very often not a URL at all (see
+        // lib/workspace/open-post.ts). No permalink, nothing to read.
+        const url = originWebUrl(focal);
+        if (!url) return;
+        get().openExternal(url, {
           postId,
           title: focal.body.title,
           siteName: focal.origin.sourceName,
-          sourceId: focal.externalSourceId ?? null,
+          sourceId: sourcePageId(focal),
           media: focal.body.media ?? null,
         });
       } catch {

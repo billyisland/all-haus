@@ -88,8 +88,8 @@ const uniq = () => process.hrtime.bigint().toString(16);
 // -----------------------------------------------------------------------------
 describe("freezeSource — the portability rules, without a database", () => {
   const base = {
-    weight: "4.0",
-    sampling_mode: "chronological",
+    throughput: "1.0",
+    sampling_mode: "scored",
     exclude_replies: false,
     tag_name: null,
     account_pubkey: null,
@@ -178,8 +178,8 @@ describe("the replay's suspended-protocol skip, without a database", () => {
     protocol: null,
     displayName: "The Quarterly",
     avatarUrl: null,
-    weight: "4.0",
-    samplingMode: "chronological",
+    throughput: "1.0",
+    samplingMode: "scored",
     excludeReplies: false,
   };
 
@@ -272,8 +272,8 @@ describe.skipIf(!DB_URL)("projection — what a feed would hand over", () => {
       ingest_address: `secret-alias-${uniq()}@in.all.haus`,
     });
     await client.query(
-      `INSERT INTO feed_sources (feed_id, source_type, account_id, created_at, weight, sampling_mode, exclude_replies)
-       VALUES ($1, 'account', $2, now() - INTERVAL '4 min', 2.0, 'scored', TRUE)`,
+      `INSERT INTO feed_sources (feed_id, source_type, account_id, created_at, throughput, sampling_mode, exclude_replies)
+       VALUES ($1, 'account', $2, now() - INTERVAL '4 min', 0.8, 'scored', TRUE)`,
       [feedId, m.id],
     );
     await client.query(
@@ -317,22 +317,26 @@ describe.skipIf(!DB_URL)("projection — what a feed would hand over", () => {
 
   it("names each source by portable identity, in composer order", async () => {
     const p = await project();
+    // Composer order is ALPHABETICAL by the label the recipient reads —
+    // "Fixture freeze-member", "#longform", "rss source" — and the fixture's
+    // ascending created_at (account, rss, tag) is a DIFFERENT order, so this
+    // fails if the projection ever slips back to insertion order.
     expect(p.sources.map((s) => [s.tagKind, s.sourceType])).toEqual([
       ["p", "account"],
-      ["r", "external_source"],
       ["t", "tag"],
+      ["r", "external_source"],
     ]);
     // The account travels as a PUBKEY, never as its local row id (D4).
     expect(p.sources[0].tagValue).toBe(memberPubkey);
     expect(p.sources[0].tagValue).not.toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
     );
-    expect(p.sources[2].tagValue).toBe("longform");
+    expect(p.sources[1].tagValue).toBe("longform");
   });
 
   it("carries the tuning, because the composition is the feed", async () => {
     const p = await project();
-    expect(Number(p.sources[0].weight)).toBe(2);
+    expect(Number(p.sources[0].throughput)).toBe(0.8);
     expect(p.sources[0].samplingMode).toBe("scored");
     expect(p.sources[0].excludeReplies).toBe(true);
   });
@@ -868,8 +872,8 @@ describe.skipIf(!DB_URL)("share links", () => {
     const f = await feed(author.id);
     const followee = await account("tune-followee");
     await client.query(
-      `INSERT INTO feed_sources (feed_id, source_type, account_id, weight, sampling_mode, exclude_replies)
-       VALUES ($1, 'account', $2, 0.5, 'scored', TRUE)`,
+      `INSERT INTO feed_sources (feed_id, source_type, account_id, throughput, sampling_mode, exclude_replies)
+       VALUES ($1, 'account', $2, 0.4, 'scored', TRUE)`,
       [f, followee.id],
     );
     const token = (await mint(f)).json().link.token as string;
@@ -882,16 +886,16 @@ describe.skipIf(!DB_URL)("share links", () => {
     });
     const { rows } = await client.query<{
       account_id: string;
-      weight: string;
+      throughput: string;
       sampling_mode: string;
       exclude_replies: boolean;
     }>(
-      `SELECT account_id, weight, sampling_mode, exclude_replies
+      `SELECT account_id, throughput, sampling_mode, exclude_replies
          FROM feed_sources WHERE feed_id = $1`,
       [res.json().feedId],
     );
     expect(rows[0].account_id).toBe(followee.id);
-    expect(Number(rows[0].weight)).toBe(0.5);
+    expect(Number(rows[0].throughput)).toBe(0.4);
     expect(rows[0].sampling_mode).toBe("scored");
     expect(rows[0].exclude_replies).toBe(true);
   });
@@ -969,15 +973,17 @@ describe.skipIf(!DB_URL)("share links", () => {
   });
 
   it("is idempotent about a composition naming the same target twice", async () => {
-    // Unreachable through a LIVE link — feed_sources_account_uniq means a feed
-    // cannot name the same account twice, so the projection never can either.
-    // It IS reachable through a seed's frozen rows, which are ordinary rows
-    // with no such constraint, so the core's DUPLICATE branch is driven there.
-    // The second add must be a silent no-op and NOT a reported failure: the
-    // source is on the feed either way, and calling it a failure would tell the
-    // member something is wrong when nothing is.
+    // Unreachable through a LIVE link — feed_sources' per-type unique indexes
+    // mean a feed cannot name one target twice, so the projection never can
+    // either. It IS reachable through a seed's frozen rows. Since migration
+    // 270 an ACCOUNT cannot be doubled there either
+    // (feed_formula_sources_account_uniq, the admit append's idempotency), so
+    // the core's DUPLICATE branch is driven with a TAG, which a seed can still
+    // name twice. The second add must be a silent no-op and NOT a reported
+    // failure: the source is on the feed either way, and calling it a failure
+    // would tell the member something is wrong when nothing is.
     const operator = await account("dupe-operator");
-    const followee = await account("dupe-followee");
+    const tag = `dupe-${uniq()}`;
     const { rows: seed } = await client.query<{ id: string }>(
       `INSERT INTO feed_formulas
          (author_id, kind, name, appearance, token, source_count, excluded_count)
@@ -986,8 +992,8 @@ describe.skipIf(!DB_URL)("share links", () => {
     );
     await client.query(
       `INSERT INTO feed_formula_sources (formula_id, position, tag_kind, tag_value, source_type)
-       VALUES ($1, 0, 'p', $2, 'account'), ($1, 1, 'p', $2, 'account')`,
-      [seed[0].id, followee.pubkey],
+       VALUES ($1, 0, 't', $2, 'tag'), ($1, 1, 't', $2, 'tag')`,
+      [seed[0].id, tag],
     );
 
     const member = await account("dupe-member");

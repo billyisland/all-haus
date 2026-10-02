@@ -151,10 +151,10 @@ describe.skipIf(!DB_URL)("the arrival statement", () => {
     const debit = rows.find((r) => r.type === "debit");
     expect(gift?.amount_pence).toBe(price);
     expect(debit?.amount_pence).toBe(price);
-    // 'Starting credit' is the DIAL alone, not the enlarged grant. Left whole
+    // 'Starting allowance' is the DIAL alone, not the enlarged grant. Left whole
     // it would tell a reader who has spent nothing that their gift is already a
     // third drained.
-    const start = rows.find((r) => r.description === "Starting credit");
+    const start = rows.find((r) => r.description === "Starting allowance");
     expect(start?.amount_pence).toBe(DIAL);
   });
 

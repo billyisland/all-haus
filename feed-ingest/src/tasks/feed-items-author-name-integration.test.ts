@@ -35,6 +35,12 @@ import {
 //     npx vitest run src/tasks/feed-items-author-name-integration.test.ts
 // =============================================================================
 
+// Both passes run DB-WIDE, twice each, by design (the statement under test is
+// the nightly one). On a populated dev database (~270k feed_items) that is
+// ~3s alone and over the 5s default once the rest of the suite shares the
+// database — a timeout, not a finding. CI's database is empty.
+const DB_WIDE_TIMEOUT_MS = 30_000;
+
 const DB_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
 
 const SOURCE_NAME = "Simon Willison's Weblog";
@@ -139,7 +145,7 @@ describe.skipIf(!DB_URL)("feed_items.author_name never takes the source's name (
     const before = await authorNames();
     await client.query(RECONCILE_EXTERNAL_DRIFT_SQL);
     expect(await authorNames()).toEqual(before);
-  });
+  }, DB_WIDE_TIMEOUT_MS);
 
   it("refresh pass 2: repairs a source-named row to NULL and leaves the named row alone", async () => {
     await seedPre184Rows();
@@ -149,5 +155,5 @@ describe.skipIf(!DB_URL)("feed_items.author_name never takes the source's name (
     const before = await authorNames();
     await client.query(REFRESH_EXTERNAL_AUTHOR_SQL);
     expect(await authorNames()).toEqual(before);
-  });
+  }, DB_WIDE_TIMEOUT_MS);
 });

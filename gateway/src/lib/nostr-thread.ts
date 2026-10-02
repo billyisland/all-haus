@@ -4,6 +4,7 @@
 // the relay-free identity encoding and the NIP-10 tag walk — can be unit-tested
 // in isolation without the DB / WebSocket import chain.
 import { nip19 } from "nostr-tools";
+import { httpUrlOrNull } from "@platform-pub/shared/lib/sanitize.js";
 
 // The fields we read off a raw relay EVENT payload.
 export interface RawNostrEvent {
@@ -84,6 +85,41 @@ export function decodeNostrEventId(
   return null;
 }
 
+// The NIP-01 tag that REFERENCES whatever we stored as a source_item_uri
+// (MIRROR-AUDIT §3, S17).
+//
+// An external nostr item's source_item_uri is a relay-free `nevent`/`naddr`
+// (the relay-free identity invariant: relay hints would mint two post_ids for
+// one event). An `e` tag's value is the 64-char hex event id and nothing else,
+// so putting the bech32 string straight into one — which both outbound routes
+// in external-items/interactions.ts did — produces an event every relay accepts
+// and no client can resolve: the like and the reply attach to nothing.
+//
+// A parameterised-replaceable event (kind 30023 long-form) has no event id to
+// point at in the first place; it is addressed by coordinate, so the correct
+// tag is `a` with `kind:pubkey:d-tag` (NIP-01, and NIP-25 for a reaction).
+//
+// Returns null when the uri is neither — the caller must refuse rather than
+// emit a reference nothing can follow.
+export function nostrTargetTag(
+  sourceItemUri: string,
+  marker?: string,
+): string[] | null {
+  const hex = decodeNostrEventId(sourceItemUri);
+  if (hex) return marker ? ["e", hex, "", marker] : ["e", hex];
+  try {
+    const decoded = nip19.decode(sourceItemUri);
+    if (decoded.type === "naddr") {
+      const { kind, pubkey, identifier } = decoded.data;
+      const coord = `${kind}:${pubkey}:${identifier}`;
+      return marker ? ["a", coord, "", marker] : ["a", coord];
+    }
+  } catch {
+    // not a nip-19 string — fall through
+  }
+  return null;
+}
+
 // NIP-10: the thread root is the `e` tag marked "root", else the first `e` tag
 // (positional convention), else the event is itself a root.
 export function nostrRootId(event: RawNostrEvent): string {
@@ -120,7 +156,9 @@ export function parseNostrProfile(content: string): NostrProfile {
       picture: typeof p.picture === "string" ? p.picture : null,
       nip05: typeof p.nip05 === "string" ? p.nip05 : null,
       about: str(p.about),
-      website: str(p.website),
+      // Rendered as an `href` on the byline hover card, so a non-http(s)
+      // scheme is refused here rather than persisted (httpUrlOrNull's header).
+      website: httpUrlOrNull(str(p.website)),
       lud16: str(p.lud16),
     };
   } catch {

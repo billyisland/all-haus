@@ -168,8 +168,11 @@ export async function publishToPublication(
 
     // Notify members with can_publish
     await pool.query(
-      `INSERT INTO notifications (recipient_id, actor_id, type, article_id)
-       SELECT pm.account_id, $1, 'pub_article_submitted', $2
+      // `article_id` already distinguishes these by construction, but the
+      // publication is bound too so the whole pub_* family is one shape rather
+      // than two (migration 198).
+      `INSERT INTO notifications (recipient_id, actor_id, type, article_id, publication_id)
+       SELECT pm.account_id, $1, 'pub_article_submitted', $2, $3
        FROM publication_members pm
        WHERE pm.publication_id = $3 AND pm.can_publish = TRUE
          AND pm.removed_at IS NULL AND pm.account_id != $1
@@ -491,10 +494,12 @@ export async function approveAndPublishArticle(
 
     // Notify the author
     await client.query(
-      `INSERT INTO notifications (recipient_id, actor_id, type, article_id)
-       VALUES ($1, $2, 'pub_article_published', $3)
+      // Publication bound alongside the article for the family's one shape
+      // (migration 198); the article already distinguishes these.
+      `INSERT INTO notifications (recipient_id, actor_id, type, article_id, publication_id)
+       VALUES ($1, $2, 'pub_article_published', $3, $4)
        ON CONFLICT DO NOTHING`,
-      [article.writer_id, editorId, articleId],
+      [article.writer_id, editorId, articleId, publicationId],
     );
 
     await enqueueRelayPublish(client, {

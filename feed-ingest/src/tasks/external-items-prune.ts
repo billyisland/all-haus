@@ -5,9 +5,20 @@ import logger from '@platform-pub/shared/lib/logger.js'
 // =============================================================================
 // external_items_prune — daily cleanup of old external items
 //
-// Deletes items older than the retention period, but preserves items still
-// referenced (a native reply's parent, a citation edge, a vote) so pruning
-// never breaks a thread or fails on a foreign key.
+// Deletes items no source has SERVED within the retention period (CA-G10b:
+// `external_item_sources.last_seen_at`, stamped per source by every ingest
+// writer and by the RSS poll's window on a 200 and a 304 — so an evergreen item
+// still in its feed is kept rather than pruned and re-inserted as a new row;
+// never `published_at`, which would prune an old post first ingested
+// yesterday). An item with no membership — a context row nothing served —
+// ages on its insert date, as before; the stamp lives on the membership since
+// CA-C4, so a shared item is kept while ANY source still serves it. It
+// preserves items still
+// referenced (a native reply's parent, a citation edge, a linked-account
+// notification — migration 236, which CASCADEs) so pruning never breaks a
+// thread or fails on a foreign key. (A votes guard stood here and could never
+// match: a vote's target resolves through articles/comments/notes only, never
+// an external item's uuid — CA-I12.)
 //
 // Three prior defects (M15, 2026-07-16 deep audit):
 //   • The "reply thread" guard was `NOT EXISTS (… WHERE FALSE)` — dead code, so
@@ -37,13 +48,18 @@ export const EXTERNAL_ITEMS_PRUNE_SQL = `
       SELECT ei.id FROM external_items ei
       WHERE ei.created_at < now() - ($1 || ' days')::interval
         AND NOT EXISTS (
+          SELECT 1 FROM external_item_sources m
+           WHERE m.external_item_id = ei.id
+             AND m.last_seen_at >= now() - ($1 || ' days')::interval
+        )
+        AND NOT EXISTS (
           SELECT 1 FROM notes n WHERE n.external_parent_id = ei.id
         )
         AND NOT EXISTS (
           SELECT 1 FROM citation_edges ce WHERE ce.source_external_item_id = ei.id
         )
         AND NOT EXISTS (
-          SELECT 1 FROM votes v WHERE v.target_nostr_event_id = ei.id::text
+          SELECT 1 FROM notifications nt WHERE nt.external_item_id = ei.id
         )
       LIMIT $2
     )

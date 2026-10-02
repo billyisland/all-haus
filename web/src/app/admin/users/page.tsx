@@ -5,6 +5,7 @@ import { adminDashboard, type AdminUsers } from '../../../lib/api'
 import { formatPence } from '../../../lib/format'
 import { AdminShell } from '../../../components/admin/AdminShell'
 import { StatCard, StatGrid, StatSection } from '../../../components/admin/Stat'
+import { MemberRoster } from '../../../components/admin/MemberRoster'
 import { ProfileLink } from '../../../components/ui/ProfileLink'
 
 export default function AdminUsersPage() {
@@ -15,7 +16,7 @@ export default function AdminUsersPage() {
     adminDashboard
       .users()
       .then(setData)
-      .catch(() => setError('Failed to load user metrics.'))
+      .catch(() => setError('Couldn’t load user metrics. Please reload the page to try again.'))
   }, [])
 
   return (
@@ -49,13 +50,30 @@ export default function AdminUsersPage() {
                 warn={data.totals.cardActionRequired > 0}
                 detail="Settlement declines awaiting re-auth"
               />
+              {/* WHO THE TWO TERMS REFUSALS ACTUALLY TURN AWAY — not "who has
+                  not accepted", which is most of the membership and means
+                  nothing. Each of these is somebody who will meet a wall at
+                  their next paid act and can clear it themselves in one press,
+                  which is why they warn rather than merely report. */}
+              <StatCard
+                label="Reader Terms outstanding"
+                value={data.totals.readerTermsOutstanding}
+                warn={data.totals.readerTermsOutstanding > 0}
+                detail="Card-holders asked at their next paid read"
+              />
+              <StatCard
+                label="Writer Agreement outstanding"
+                value={data.totals.writerTermsOutstanding}
+                warn={data.totals.writerTermsOutstanding > 0}
+                detail="Paid writers asked at their next publish"
+              />
             </StatGrid>
           </StatSection>
 
           <StatSection label="Growth">
             <StatGrid>
-              <StatCard label="Signups, 7 days" value={data.growth.signupsLast7d} />
-              <StatCard label="Signups, 30 days" value={data.growth.signupsLast30d} />
+              <StatCard label="Sign-ups, 7 days" value={data.growth.signupsLast7d} />
+              <StatCard label="Sign-ups, 30 days" value={data.growth.signupsLast30d} />
             </StatGrid>
           </StatSection>
 
@@ -116,12 +134,14 @@ export default function AdminUsersPage() {
             )}
           </StatSection>
 
-          <p className="text-ui-xs text-grey-600">
-            Account search and suspension live on the Reports tab (via reported content) — a
-            standalone account search is a follow-on.
-          </p>
         </>
       )}
+
+      {/* Outside the aggregates' gate on purpose. The roster fetches its own
+          rows, and it is the half of this page an operator reaches for when
+          something is wrong — hiding it behind a failed metrics query would
+          take the roster away in exactly the moment it is wanted. */}
+      <MemberRoster />
     </AdminShell>
   )
 }

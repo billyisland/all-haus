@@ -106,17 +106,25 @@ function comment(
 }
 
 function scriptedQuery(sql: string, params: unknown[] = []) {
-  if (sql.includes("WHERE fi.post_id = $1")) {
-    if (params[0] === ROOT_POST_ID) {
-      return Promise.resolve({ rows: [articleRow()], rowCount: 1 });
-    }
-    return Promise.resolve({ rows: [], rowCount: 0 });
-  }
-  if (sql.includes("SELECT target_event_id") && sql.includes("FROM comments")) {
+  // The comment's conversation root, read through its own feed_items card
+  // (CA-G5). Matched first: its SQL also carries `WHERE fi.post_id = $1`.
+  if (sql.includes("SELECT c.target_event_id") && sql.includes("fi.comment_id")) {
     return Promise.resolve({
       rows: [{ target_event_id: ROOT_EVENT_ID }],
       rowCount: 1,
     });
+  }
+  if (sql.includes("WHERE fi.post_id = $1")) {
+    // The fixture's one THING is an article, so a read that asks for a note
+    // (the projector's "is this a note answering an external post?" probe,
+    // CROSS-NETWORK-ROUNDTRIP-ADR A2) gets nothing — answered from the SQL.
+    if (sql.includes("fi.item_type = 'note'")) {
+      return Promise.resolve({ rows: [], rowCount: 0 });
+    }
+    if (params[0] === ROOT_POST_ID) {
+      return Promise.resolve({ rows: [articleRow()], rowCount: 1 });
+    }
+    return Promise.resolve({ rows: [], rowCount: 0 });
   }
   if (sql.includes("SELECT post_id FROM feed_items")) {
     return Promise.resolve({ rows: [{ post_id: ROOT_POST_ID }], rowCount: 1 });

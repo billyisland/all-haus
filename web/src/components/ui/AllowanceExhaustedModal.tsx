@@ -2,6 +2,7 @@
 
 import { usePublicPalette } from '../public/palette'
 import { PublicButton } from '../public/Field'
+import { ALLOWANCE_SPENT_LEAD, ALLOWANCE_SPENT_NEXT, paywallCardLink } from '../../content/paywall'
 
 // =============================================================================
 // AllowanceExhaustedModal — the bookend to the arrival welcome.
@@ -44,7 +45,7 @@ export function AllowanceExhaustedModal({ onClose }: AllowanceExhaustedModalProp
       onClick={onClose}
       role="dialog"
       aria-modal="true"
-      aria-label="Your free reading credit"
+      aria-label="Your free reading allowance"
     >
       <div
         className="w-full max-w-md"
@@ -61,9 +62,7 @@ export function AllowanceExhaustedModal({ onClose }: AllowanceExhaustedModalProp
               margin: 0,
             }}
           >
-            That was the last of your free reading credit — the writers&rsquo;
-            welcome to the house, and it was a gift, so there is nothing to
-            settle.
+            {ALLOWANCE_SPENT_LEAD}
           </p>
         </div>
 
@@ -79,15 +78,13 @@ export function AllowanceExhaustedModal({ onClose }: AllowanceExhaustedModalProp
               margin: 0,
             }}
           >
-            From here, add a card and you pay only for what you actually read,
-            a piece at a time, collected in one go rather than a charge per
-            article. Nearly all of it goes to the person who wrote the thing.
+            {ALLOWANCE_SPENT_NEXT}
           </p>
         </div>
 
         <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 12 }}>
           <PublicButton full href="/reader?overlay=settings">
-            Add a payment card
+            {paywallCardLink(false)}
           </PublicButton>
           <PublicButton variant="outline" full onClick={onClose}>
             Not now

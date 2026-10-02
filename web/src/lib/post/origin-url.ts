@@ -8,6 +8,16 @@ import type { Post } from "./types";
 // Used for the origin tag's link-out and to embed a clickable reference when
 // quoting an external post (migration 102).
 export function originWebUrl(post: Post): string | null {
+  // The ingester's own answer wins where it has one. `origin.uri` is the
+  // item's stable IDENTITY, and for RSS that is `guid ?? link` — a guid being
+  // under no obligation to be a URL — so deriving from it can only ever be a
+  // fallback. It is a good one: it is exactly right for atproto, nostr and
+  // activitypub, and for the majority of RSS feeds whose guid IS the link,
+  // which is what keeps every row ingested before the column was carried
+  // working unchanged.
+  const canonical = post.origin.webUrl;
+  if (canonical && /^https?:\/\//.test(canonical)) return canonical;
+
   const uri = post.origin.uri;
   if (!uri) return null;
   const at = uri.match(/^at:\/\/([^/]+)\/app\.bsky\.feed\.post\/([^/]+)$/);

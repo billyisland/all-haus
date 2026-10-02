@@ -4,6 +4,7 @@ import {
   isPrivateIpv6,
   parseIpv6,
   pinnedWebSocketOptions,
+  WS_MAX_PAYLOAD_BYTES,
 } from "../src/lib/http-client.js";
 
 describe("isPrivateIpv4", () => {
@@ -192,5 +193,64 @@ describe("pinnedWebSocketOptions — platform-relay exemption (C1)", () => {
     await expect(
       pinnedWebSocketOptions("ws://127.0.0.1:7777", { allowHosts: ["strfry"] }),
     ).rejects.toThrow(/private IP/);
+  });
+});
+
+describe("pinnedWebSocketOptions — the frame cap (MIRROR-AUDIT §3, S16)", () => {
+  it("returns a maxPayload alongside the pin", async () => {
+    // `ws` defaults to 100 MiB and buffers a frame WHOLE before any handler sees
+    // it, so a relay could hand a worker that much resident memory per message —
+    // and relay URLs are user-steerable. The cap lives in the returned options
+    // beside `lookup` for the reason the pin does: a caller cannot open a socket
+    // through this module and forget it.
+    const opts = await pinnedWebSocketOptions("ws://127.0.0.1:7777", {
+      allowHosts: ["127.0.0.1"],
+    });
+    expect(opts.maxPayload).toBe(WS_MAX_PAYLOAD_BYTES);
+  });
+
+  it("caps well below the library default and above our own event size", () => {
+    // strfry accepts events up to 524288 bytes (relay/strfry.conf), so a cap at
+    // or below that would refuse frames we ourselves would have produced.
+    expect(WS_MAX_PAYLOAD_BYTES).toBeGreaterThan(524288);
+    expect(WS_MAX_PAYLOAD_BYTES).toBeLessThan(100 * 1024 * 1024);
+  });
+});
+
+describe("bracketed IPv6 literals (MIRROR-AUDIT §4, S20)", () => {
+  // `new URL('ws://[::1]/').hostname` is `[::1]` — WITH the brackets, which is
+  // what every caller hands `resolveAndValidateHost`. `net.isIPv6('[::1]')` is
+  // false, so a bracketed literal used to fall through to DNS, resolve to
+  // nothing, and be refused. Right answer for `[::1]`; WRONG answer for a
+  // public address in the one URL form IPv6 has. The guard's own comment
+  // claimed brackets were already handled, which is the part worth pinning:
+  // this fails closed, so nothing ever looked broken.
+  it("accepts a PUBLIC bracketed IPv6 literal and pins it", async () => {
+    const opts = await pinnedWebSocketOptions("ws://[2606:4700:4700::1111]:443");
+    expect(opts.maxPayload).toBe(WS_MAX_PAYLOAD_BYTES);
+  });
+
+  it("still refuses a PRIVATE bracketed IPv6 literal, as a private IP", async () => {
+    // And with the private-IP message, not a DNS failure: the two are different
+    // diagnoses, and only one of them says the guard did its job.
+    await expect(pinnedWebSocketOptions("ws://[::1]:7777")).rejects.toThrow(
+      /private IP/,
+    );
+  });
+
+  it("refuses a bracketed IPv4-mapped loopback", async () => {
+    await expect(
+      pinnedWebSocketOptions("ws://[::ffff:127.0.0.1]:7777"),
+    ).rejects.toThrow(/private IP/);
+  });
+
+  it("honours allowHosts for a bracketed literal, matching on the URL's own form", async () => {
+    // `allowHosts` is compared against `parsed.hostname`, which keeps its
+    // brackets — so an operator's allow entry must be written the same way, and
+    // this says so rather than leaving it to be discovered.
+    const opts = await pinnedWebSocketOptions("ws://[::1]:7777", {
+      allowHosts: ["[::1]"],
+    });
+    expect(opts.maxPayload).toBe(WS_MAX_PAYLOAD_BYTES);
   });
 });

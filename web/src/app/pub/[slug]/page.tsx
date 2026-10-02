@@ -1,7 +1,7 @@
 import { notFound } from 'next/navigation'
 import type { Metadata } from 'next'
 import { PublicationMasthead } from '../../../components/publication/PublicationMasthead'
-import { LoadFailed } from '../../../components/publication/article-shared'
+import { LoadFailed } from '../../../components/ui/LoadFailed'
 import { PubHomepage } from '../../../components/publication/pub-sections'
 import { PublicPage } from '../../../components/public/PublicPage'
 
@@ -24,7 +24,7 @@ const GATEWAY = process.env.GATEWAY_INTERNAL_URL ?? process.env.GATEWAY_URL ?? '
 const SITE_URL = process.env.APP_URL ?? 'https://all.haus'
 
 async function getPublication(slug: string) {
-  const res = await fetch(`${GATEWAY}/api/v1/publications/${slug}/public`, {
+  const res = await fetch(`${GATEWAY}/api/v1/publications/${encodeURIComponent(slug)}/public`, {
     next: { revalidate: 60 },
   })
   if (!res.ok) return null
@@ -33,7 +33,7 @@ async function getPublication(slug: string) {
 
 /** null means the fetch FAILED — distinct from a publication with no articles. */
 async function getArticles(slug: string) {
-  const res = await fetch(`${GATEWAY}/api/v1/publications/by-slug/${slug}/articles?limit=20`, {
+  const res = await fetch(`${GATEWAY}/api/v1/publications/by-slug/${encodeURIComponent(slug)}/articles?limit=20`, {
     next: { revalidate: 60 },
   })
   if (!res.ok) return null

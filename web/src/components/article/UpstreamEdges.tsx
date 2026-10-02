@@ -440,8 +440,9 @@ function TributeRow({
   const { target } = tribute
   const name = target.displayName ?? target.username ?? 'an unnamed source'
   const isChild = tribute.depth > 0
-  // The share is a conditional offer until accepted — the verb must say so
-  // (compliance: the public line never asserts the money is already theirs).
+  // The share is a conditional offer until accepted — the verb must say so:
+  // the public line never asserts the money is already theirs, and the wording
+  // is a constraint rather than a preference (docs/adr/LEGAL-BRAKES.md).
   const earningsVerb =
     tribute.status === 'live' ? 'goes to' : tribute.status === 'proposed' ? 'will go to' : 'was offered to'
   // A child redirects a share of its PARENT'S slice (rendered directly above in

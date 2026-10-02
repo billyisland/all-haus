@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { pool } from '@platform-pub/shared/db/client.js'
 import { zodValidationError } from '@platform-pub/shared/lib/validation.js'
 import { requireAuth } from '../middleware/auth.js'
+import { readingLogRetentionDays } from '../workers/reading-log-sweep.js'
 
 // =============================================================================
 // Reading-position routes
@@ -39,7 +40,12 @@ const UpsertSchema = z.object({
 })
 
 const PreferencesSchema = z.object({
-  alwaysOpenAtTop: z.boolean(),
+  // OPTIONAL, symmetrically with the switch below, and for the same reason.
+  // It was required, so the settings screen's logging toggle had to resend a
+  // local copy of it — and sent `?? false` when it had none, which turned "the
+  // preferences fetch has not returned yet" into a positive write of OFF.
+  // A dial a caller does not mention is a dial it must not be able to move.
+  alwaysOpenAtTop: z.boolean().optional(),
   // D1's stop-logging switch, which lives beside the resume toggle because
   // both are facts about the reader rather than about the screen. Optional so
   // a client that knows only about resume can still PUT one without silently
@@ -55,8 +61,9 @@ export async function readingPositionRoutes(app: FastifyInstance) {
       const userId = req.session!.sub
       const { postId } = req.params
 
+      // A path id answers 404, never 400 (security.md).
       if (!POST_ID_RE.test(postId)) {
-        return reply.status(400).send({ error: 'Invalid postId (expected a 64-char hex post_id)' })
+        return reply.status(404).send({ error: "We couldn't find that post." })
       }
 
       const parsed = UpsertSchema.safeParse(req.body)
@@ -83,8 +90,9 @@ export async function readingPositionRoutes(app: FastifyInstance) {
       const userId = req.session!.sub
       const { postId } = req.params
 
+      // The answer a well-formed post_id with no stored position gets.
       if (!POST_ID_RE.test(postId)) {
-        return reply.status(400).send({ error: 'Invalid postId (expected a 64-char hex post_id)' })
+        return reply.status(200).send({ position: null })
       }
 
       const { rows } = await pool.query<{ scroll_ratio: number; updated_at: Date }>(
@@ -117,11 +125,16 @@ export async function readingPositionRoutes(app: FastifyInstance) {
       [userId]
     )
     if (rows.length === 0) {
-      return reply.status(404).send({ error: 'Account not found' })
+      return reply.status(404).send({ error: "We couldn't find that account." })
     }
+    // `retentionDays` rides here for Settings' sentence about the log ("lists
+    // everything you open … for N days"), which was a literal week (walkthrough
+    // A11) — the same reader the sweep and `GET /reading-log` use, so the
+    // number the copy names is the number the sweep enforces.
     return reply.send({
       alwaysOpenAtTop: rows[0].always_open_articles_at_top,
       readingLogEnabled: rows[0].reading_log_enabled,
+      retentionDays: await readingLogRetentionDays(),
     })
   })
 
@@ -131,24 +144,27 @@ export async function readingPositionRoutes(app: FastifyInstance) {
       return reply.status(400).send(zodValidationError(parsed.error))
     }
     const userId = req.session!.sub
-    // COALESCE rather than two statements: an omitted `readingLogEnabled` must
-    // leave the column alone, and the alternative — defaulting it to true —
-    // would switch a member's logging back on every time they touched the
-    // resume toggle.
+    // COALESCE rather than two statements: an omitted field must leave its
+    // column alone, in BOTH directions — defaulting either one would move a
+    // dial the caller never mentioned every time they touched the other.
     const { rows } = await pool.query<{
       always_open_articles_at_top: boolean
       reading_log_enabled: boolean
     }>(
       `UPDATE accounts
-          SET always_open_articles_at_top = $1,
+          SET always_open_articles_at_top = COALESCE($1, always_open_articles_at_top),
               reading_log_enabled = COALESCE($2, reading_log_enabled),
               updated_at = now()
         WHERE id = $3
         RETURNING always_open_articles_at_top, reading_log_enabled`,
-      [parsed.data.alwaysOpenAtTop, parsed.data.readingLogEnabled ?? null, userId]
+      [
+        parsed.data.alwaysOpenAtTop ?? null,
+        parsed.data.readingLogEnabled ?? null,
+        userId,
+      ]
     )
     if (rows.length === 0) {
-      return reply.status(404).send({ error: 'Account not found' })
+      return reply.status(404).send({ error: "We couldn't find that account." })
     }
     return reply.send({
       ok: true,

@@ -1,7 +1,11 @@
 import type { FastifyInstance } from "fastify";
 import { pool } from "@platform-pub/shared/db/client.js";
 import { safeFetch } from "@platform-pub/shared/lib/http-client.js";
-import { sanitizeContent } from "@platform-pub/shared/lib/sanitize.js";
+import { blueskyInteractionData } from "@platform-pub/shared/lib/atproto-reply-refs.js";
+import {
+  httpUrlOrNull,
+  sanitizeContent,
+} from "@platform-pub/shared/lib/sanitize.js";
 import { requireAuth } from "../../middleware/auth.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 import {
@@ -17,7 +21,14 @@ import {
   stripHtmlTags,
   extractMastodonStatusId,
   ensureContextFeedItem,
+  CONTEXT_INTERACTION_MERGE_SQL,
 } from "../../lib/external-items-shared.js";
+import {
+  readMastodonStatus,
+  readMastodonStatusContext,
+  mastodonStatusIdentity,
+} from "@platform-pub/shared/lib/mastodon-api.js";
+import { isUuid } from "../../lib/request-inputs.js";
 
 interface ExternalThreadEntry {
   id: string;
@@ -68,6 +79,9 @@ export function registerThreadRoutes(app: FastifyInstance) {
     },
     async (req, reply) => {
       const { id } = req.params;
+      if (!isUuid(id)) {
+        return reply.status(404).send({ error: "We couldn't find that post." });
+      }
       // `focus` re-roots the thread on a source-platform node (a clicked
       // ancestor/descendant whose ExternalThreadEntry.id is a source URI/id, not
       // an all.haus id). The base item row scopes protocol + host, so there is
@@ -92,7 +106,7 @@ export function registerThreadRoutes(app: FastifyInstance) {
       );
 
       if (rows.length === 0) {
-        return reply.status(404).send({ error: "Item not found" });
+        return reply.status(404).send({ error: "We couldn't find that post." });
       }
 
       const item = focus ? deriveFocusItem(rows[0], focus) : rows[0];
@@ -172,7 +186,7 @@ async function persistBlueskyFocus(
         like_count = EXCLUDED.like_count,
         reply_count = EXCLUDED.reply_count,
         repost_count = EXCLUDED.repost_count,
-        interaction_data = EXCLUDED.interaction_data
+        ${CONTEXT_INTERACTION_MERGE_SQL}
       RETURNING id`,
       [
         sourceId,
@@ -184,7 +198,7 @@ async function persistBlueskyFocus(
         post.record.text ?? null,
         JSON.stringify(media),
         parentReplyUri,
-        JSON.stringify({ uri: post.uri, cid: post.cid }),
+        JSON.stringify(blueskyInteractionData(post)),
         post.likeCount ?? 0,
         post.replyCount ?? 0,
         post.repostCount ?? 0,
@@ -312,17 +326,11 @@ async function fetchMastodonThread(
 
   try {
     const host = new URL(item.source_item_uri).hostname;
-    const res = await safeFetch(
-      `https://${host}/api/v1/statuses/${statusId}/context`,
-      {
-        headers: { Accept: "application/json" },
-        timeout: NEIGHBOURHOOD_FETCH_TIMEOUT_MS,
-      },
-    );
+    const res = await readMastodonStatusContext(`https://${host}`, statusId, { timeout: NEIGHBOURHOOD_FETCH_TIMEOUT_MS });
 
     if (!res.ok) return null;
 
-    const data = JSON.parse(res.text) as {
+    const data = res.body as {
       ancestors: MastodonStatus[];
       descendants: MastodonStatus[];
     };
@@ -377,16 +385,10 @@ async function persistMastodonFocus(
   sourceId: string,
 ): Promise<ParentItem | null> {
   try {
-    const res = await safeFetch(
-      `https://${host}/api/v1/statuses/${statusId}`,
-      {
-        headers: { Accept: "application/json" },
-        timeout: NEIGHBOURHOOD_FETCH_TIMEOUT_MS,
-      },
-    );
+    const res = await readMastodonStatus(`https://${host}`, statusId, { timeout: NEIGHBOURHOOD_FETCH_TIMEOUT_MS });
     if (!res.ok) return null;
 
-    const status = JSON.parse(res.text) as {
+    const status = res.body as {
       id: string;
       url: string;
       uri: string;
@@ -411,6 +413,20 @@ async function persistMastodonFocus(
       }>;
     };
 
+    // The canonical id is the ActivityPub `uri`, NEVER the human `url`
+    // (MIRROR-AUDIT §3, S17). Every other writer of an activitypub row
+    // stores `uri || url` — the ingester (adapters/activitypub.ts's note
+    // `id`), external-parent-prefetch, author-timeline-hydration and
+    // parent.ts all agree — and (protocol, source_item_uri) is the dedup
+    // key. Preferring `url` here minted a SECOND row for a status the
+    // source's own poll had already ingested, with its own post_id, so the
+    // thread re-rooted onto a twin the feed did not know about.
+    // …and it may claim that id only on the origin that answered (CA-A10):
+    // `mastodonStatusIdentity` refuses a status or an author naming another
+    // host, so nothing below squats a key or overwrites an author.
+    const identity = mastodonStatusIdentity(status, `https://${host}`);
+    if (!identity) return null;
+    const canonicalUri = identity.uri;
     const authorName = status.account.display_name || status.account.acct;
     const media = (status.media_attachments ?? []).map((m) => ({
       type:
@@ -426,33 +442,39 @@ async function persistMastodonFocus(
 
     const ins = await pool.query(
       `INSERT INTO external_items (
-        source_id, protocol, tier, source_item_uri,
+        source_id, protocol, tier, source_item_uri, canonical_url,
         author_name, author_handle, author_avatar_url, author_uri,
         content_html, media, source_reply_uri, interaction_data,
         like_count, reply_count, repost_count,
         published_at, is_context_only
-      ) VALUES ($1, 'activitypub', 'tier3', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, TRUE)
+        -- canonical_url: the permalink the object declares, distinct from the
+        -- id. The conflict arm STAYS as it is -- the RETURNING clause is what
+        -- tells the caller this row is NEW, and widening it would hand back
+        -- pre-existing rows as fresh and mint duplicate feed_items.
+      ) VALUES ($1, 'activitypub', 'tier3', $2, $15, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, TRUE)
       ON CONFLICT (protocol, source_item_uri) DO UPDATE SET
         like_count = EXCLUDED.like_count,
         reply_count = EXCLUDED.reply_count,
         repost_count = EXCLUDED.repost_count,
-        interaction_data = EXCLUDED.interaction_data
+        ${CONTEXT_INTERACTION_MERGE_SQL}
       RETURNING id`,
       [
         sourceId,
-        status.url || status.uri,
+        canonicalUri,
         authorName,
         status.account.acct,
         status.account.avatar ?? null,
-        status.account.uri ?? status.account.url,
+        identity.authorUri,
         contentHtml,
         JSON.stringify(media),
         null,
-        JSON.stringify({ id: status.uri, webUrl: status.url }),
+        JSON.stringify({ id: identity.uri, webUrl: status.url }),
         status.favourites_count ?? 0,
         status.replies_count ?? 0,
         status.reblogs_count ?? 0,
         new Date(status.created_at),
+        // The permalink the object declares, distinct from the id.
+        httpUrlOrNull(status.url),
       ],
     );
 
@@ -465,11 +487,11 @@ async function persistMastodonFocus(
     return {
       id: ins.rows[0].id,
       sourceProtocol: "activitypub",
-      sourceItemUri: status.url || status.uri,
+      sourceItemUri: canonicalUri,
       authorName,
       authorHandle: status.account.acct,
       authorAvatarUrl: status.account.avatar ?? null,
-      authorUri: status.account.uri ?? status.account.url,
+      authorUri: identity.authorUri,
       contentText: stripHtmlTags(status.content ?? ""),
       contentHtml,
       title: null,

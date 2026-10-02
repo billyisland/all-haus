@@ -11,6 +11,14 @@ import {
   copyPendingOrReveal,
   pendingClipboardWriter,
 } from "../../hooks/useCopyLink";
+import {
+  FEED_SHARE,
+  FEED_SHARE_COPIED,
+  FEED_SHARE_ERROR_MINT,
+  FEED_SHARE_ERROR_STOP,
+  FEED_SHARE_STOP,
+  feedShareCaveat,
+} from "../../content/feed-settings";
 
 // =============================================================================
 // FeedFormulaSection — the FeedComposer's share control
@@ -111,25 +119,6 @@ function Action({
   );
 }
 
-/**
- * What a recipient would meet, in one line — or nothing.
- *
- * The refusal outranks the excluded count: an author whose link nobody can use
- * needs to hear that before they hear how many sources stayed behind.
- */
-function caveat(s: FeedLinkStatus): string | null {
-  if (s.refusal === "empty")
-    return s.excludedCount > 0
-      ? "None of this feed’s sources can travel, so nobody can add it yet."
-      : "Nobody can add this yet — add a source.";
-  if (s.refusal === "too_large")
-    return `Too many sources to share — trim it to ${s.maxSources}.`;
-  if (s.excludedCount === 1)
-    return "One source can’t travel: a newsletter’s address is yours alone.";
-  if (s.excludedCount > 1)
-    return `${s.excludedCount} sources can’t travel: a newsletter’s address is yours alone.`;
-  return null;
-}
 
 export function FeedFormulaSection({
   feedId,
@@ -228,7 +217,7 @@ export function FeedFormulaSection({
         setRevealed(outcome.url);
       }
     } catch (err) {
-      setError(apiErrorMessage(err) ?? "Couldn’t make a link for this feed.");
+      setError(apiErrorMessage(err) ?? FEED_SHARE_ERROR_MINT);
     } finally {
       setBusy(false);
     }
@@ -246,7 +235,7 @@ export function FeedFormulaSection({
       setCopied(false);
       setRevealed(null);
     } catch (err) {
-      setError(apiErrorMessage(err) ?? "Couldn’t stop sharing this feed.");
+      setError(apiErrorMessage(err) ?? FEED_SHARE_ERROR_STOP);
     } finally {
       setBusy(false);
     }
@@ -254,7 +243,7 @@ export function FeedFormulaSection({
 
   // Only once a link is actually out there: before that nothing has been
   // shared, so there is nothing to caveat.
-  const line = status?.link ? caveat(status) : null;
+  const line = status?.link ? feedShareCaveat(status) : null;
   // D11 — a designated seed cannot be withdrawn. Unreachable here (a link is
   // never a seed; the schema says so), and kept because that is what makes it
   // unreachable.
@@ -264,11 +253,11 @@ export function FeedFormulaSection({
     <div style={{ marginTop: 20 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <Action disabled={busy} onClick={() => void share()}>
-          {copied ? "Share link copied" : busy ? "…" : "Share feed"}
+          {copied ? FEED_SHARE_COPIED : busy ? "…" : FEED_SHARE}
         </Action>
         {canStop && (
           <Action tone="quiet" disabled={busy} onClick={() => void stop()}>
-            Stop sharing
+            {FEED_SHARE_STOP}
           </Action>
         )}
       </div>

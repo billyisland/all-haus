@@ -37,7 +37,11 @@ let protocols: Array<{
   protocol: string;
   active_sources: number;
   last_fetched_at: Date | null;
+  refused_sources?: number;
+  refused_since?: Date | null;
 }> = [];
+/** The per-protocol SQL as issued, for the structural pin below. */
+let protocolsSql: string | null = null;
 
 // Dead-job fixtures (§8.15). Rows are shaped as the SQL returns them, since
 // what is under test here is the route's handling and not the query.
@@ -65,6 +69,7 @@ function query(sql: string) {
     });
   }
   if (sql.includes("FROM external_sources") && sql.includes("GROUP BY protocol")) {
+    protocolsSql = sql;
     return Promise.resolve({ rows: protocols, rowCount: protocols.length });
   }
   // Every other panel on this route. One empty object, not zero rows: the
@@ -122,6 +127,7 @@ beforeEach(() => {
   heartbeat = null;
   alertSeconds = null;
   protocols = [];
+  protocolsSql = null;
   deadJobRows = [];
   deadJobsFails = false;
   deadJobWindow = null;
@@ -289,5 +295,77 @@ describe("dead background jobs", () => {
       deadJobWindow = junk;
       expect((await jobs()).windowHours).toBe(24);
     }
+  });
+});
+
+// =============================================================================
+// HOW MUCH OF THE FEDIVERSE WE CANNOT CURRENTLY READ (§0aa.2)
+//
+// A source refused for want of a signature the instance will accept stays
+// ACTIVE, stays on schedule, and delivers nothing — for ever. Every other
+// figure on this page reads that as healthy: the worker is up, the source is
+// active, `last_fetched_at` is seconds old, because we DO keep fetching. From
+// the outside it is indistinguishable from authors who have stopped posting,
+// which is exactly how 381 dead sources sat unnoticed for three months.
+//
+// TWO KINDS OF ASSERTION, and the difference is stated on purpose. The count
+// itself is a `COUNT(*) FILTER (…)` that only Postgres evaluates, so the mock
+// cannot derive it and the case below is a STRUCTURAL PIN on the SQL — it
+// proves the query still asks, never that Postgres answers correctly. What the
+// route does with the answer IS derivable, and is asserted behaviourally.
+// =============================================================================
+
+describe("unreadable sources", () => {
+  it("STRUCTURAL PIN: the per-protocol query asks for the refusal count and its oldest date", async () => {
+    // Not a behavioural test. `COUNT(*) FILTER (WHERE …)` and `MIN(…)` are
+    // Postgres's to evaluate; what can be checked here is that the route has
+    // not stopped asking — which is the whole failure mode for a figure nobody
+    // looks at until it matters.
+    await ingest();
+    expect(protocolsSql).toMatch(/signed_fetch_refused_at IS NOT NULL/);
+    expect(protocolsSql).toMatch(/MIN\(signed_fetch_refused_at\)/);
+    // And it is still scoped to ACTIVE sources: a deactivated source is not one
+    // we are being refused, it is one we have given up on.
+    expect(protocolsSql).toMatch(/WHERE is_active = TRUE/);
+  });
+
+  it("carries the count and the oldest refusal per protocol", async () => {
+    const since = new Date("2026-06-01T00:00:00.000Z");
+    protocols = [
+      {
+        protocol: "activitypub",
+        active_sources: 412,
+        last_fetched_at: new Date(),
+        refused_sources: 31,
+        refused_since: since,
+      },
+      {
+        protocol: "rss",
+        active_sources: 90,
+        last_fetched_at: new Date(),
+        refused_sources: 0,
+        refused_since: null,
+      },
+    ];
+    const i = await ingest();
+    const ap = i.protocols.find((p: any) => p.protocol === "activitypub");
+    expect(ap.refusedSources).toBe(31);
+    expect(ap.refusedSince).toBe(since.toISOString());
+    // The control: zero is a real answer and must not borrow the other row's.
+    const rss = i.protocols.find((p: any) => p.protocol === "rss");
+    expect(rss.refusedSources).toBe(0);
+    expect(rss.refusedSince).toBeNull();
+  });
+
+  it("a protocol with nothing refused reports 0, never null", async () => {
+    // `num()` over an absent column must land on 0 rather than on undefined:
+    // the web adds these up, and one `undefined` turns the platform-wide total
+    // into NaN — a number that renders, means nothing, and alarms nobody.
+    protocols = [
+      { protocol: "nostr_external", active_sources: 7, last_fetched_at: null },
+    ];
+    const i = await ingest();
+    expect(i.protocols[0].refusedSources).toBe(0);
+    expect(i.protocols[0].refusedSince).toBeNull();
   });
 });

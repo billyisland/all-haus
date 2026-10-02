@@ -13,6 +13,10 @@ Nostr, Bluesky, and Mastodon into one workspace.
 echo "POSTGRES_PASSWORD=password" > .env
 
 docker compose up -d postgres strfry blossom   # schema.sql loads on first boot
+# ^ these three only. A bare `docker compose up` fails here: the compose file
+# also describes the payment service and nginx, neither of which is mirrored.
+# schema.sql is a pg_dump that opens with `\restrict`, so loading it by hand
+# needs psql 16.10 or later (the postgres:16 image above is fine).
 
 npm install && (cd web && npm install)   # web is not an npm workspace
 
@@ -31,6 +35,10 @@ The Stripe payment service and the migration history live only in the private
 repository — `schema.sql` here is the complete, current schema and boots a
 fresh database whole. Without the payment service, paid flows (settlement,
 payouts) are out of reach; reading, writing, feeds, and auth all run.
+
+The private repository's `scripts/` directory (dev seeding, CI guards, ops
+one-offs) is not mirrored either, so the root `npm run seed` / `seed:clean`
+and the `knip.json` entries that point at it are not runnable from here.
 
 ## Licence
 

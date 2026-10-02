@@ -129,7 +129,7 @@ describe("DELETE /feeds/:id", () => {
     const res = await del();
 
     expect(res.statusCode).toBe(409);
-    expect(res.json()).toEqual({ error: "Cannot delete your only feed" });
+    expect(res.json()).toEqual({ error: "You can't delete your only channel." });
     expect(removeSourceMock).not.toHaveBeenCalled();
     expect(indexOfSql("DELETE FROM feeds")).toBe(-1);
   });
@@ -161,6 +161,6 @@ describe("DELETE /feeds/:id", () => {
     const res = await del();
 
     expect(res.statusCode).toBe(404);
-    expect(res.json()).toEqual({ error: "Feed not found" });
+    expect(res.json()).toEqual({ error: "We couldn't find that channel." });
   });
 });

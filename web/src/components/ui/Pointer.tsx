@@ -1,5 +1,5 @@
 // =============================================================================
-// Pointer — the caret family (web/CLAUDE.md › Pointers)
+// Pointer — the caret family (`.claude/rules/web-foundations.md` › Pointers)
 //
 // A solid isosceles triangle drawn from borders, for any affordance meaning
 // "there is more THAT way". One home for the direction-to-class mapping, so the

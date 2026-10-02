@@ -2,9 +2,21 @@ import type { Task } from "graphile-worker";
 import type { PoolClient } from "pg";
 import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
 import { safeFetch } from "@platform-pub/shared/lib/http-client.js";
-import { sanitizeContent } from "@platform-pub/shared/lib/sanitize.js";
+import {
+  blueskyInteractionData,
+  type AtprotoReplyRefs,
+} from "@platform-pub/shared/lib/atproto-reply-refs.js";
+import {
+  httpUrlOrNull,
+  sanitizeContent,
+} from "@platform-pub/shared/lib/sanitize.js";
 import { truncatePreview } from "@platform-pub/shared/lib/text.js";
 import logger from "@platform-pub/shared/lib/logger.js";
+import {
+  extractMastodonStatusId,
+  readMastodonStatus,
+  mastodonStatusIdentity,
+} from "@platform-pub/shared/lib/mastodon-api.js";
 
 // =============================================================================
 // external_parent_prefetch — eagerly fetch neighbourhood context (parent posts
@@ -104,7 +116,7 @@ interface BlueskyPost {
   record: {
     text?: string;
     createdAt?: string;
-    reply?: { parent: { uri: string }; root: { uri: string } };
+    reply?: AtprotoReplyRefs;
   };
   likeCount?: number;
   replyCount?: number;
@@ -331,10 +343,8 @@ async function insertBlueskyParent(
   grandparent: { authorName: string; authorHandle: string } | null,
 ): Promise<void> {
   const parentReplyUri = post.record.reply?.parent.uri ?? null;
-  const interactionData: Record<string, unknown> = {
-    uri: post.uri,
-    cid: post.cid,
-  };
+  const interactionData: Record<string, unknown> =
+    blueskyInteractionData(post);
   if (grandparent) interactionData.grandparent = grandparent;
 
   const authorName = post.author.displayName || post.author.handle;
@@ -397,7 +407,9 @@ async function insertBlueskyParent(
   }
 }
 
-async function prefetchMastodonParent(
+// Exported for the routed-mock test (CA-A10): whether a hostile answer reaches
+// the INSERT is only visible through the real function.
+export async function prefetchMastodonParent(
   parentUri: string,
   sourceId: string,
 ): Promise<void> {
@@ -406,13 +418,11 @@ async function prefetchMastodonParent(
 
   try {
     const host = new URL(parentUri).hostname;
-    const res = await safeFetch(`https://${host}/api/v1/statuses/${statusId}`, {
-      headers: { Accept: "application/json" },
-    });
+    const res = await readMastodonStatus(`https://${host}`, statusId);
 
     if (!res.ok) return;
 
-    const status = JSON.parse(res.text) as {
+    const status = res.body as {
       id: string;
       url: string;
       uri: string;
@@ -437,6 +447,11 @@ async function prefetchMastodonParent(
       }>;
     };
 
+    // §2.9 on this door too (CA-A10): the status may claim only ids on the
+    // origin that answered; a refusal writes nothing and is logged.
+    const identity = mastodonStatusIdentity(status, `https://${host}`);
+    if (!identity) return;
+
     const media = (status.media_attachments ?? []).map((m) => ({
       type:
         m.type === "image" ? "image" : m.type === "video" ? "video" : "link",
@@ -454,7 +469,7 @@ async function prefetchMastodonParent(
     }
 
     const interactionData: Record<string, unknown> = {
-      id: status.uri,
+      id: identity.uri,
       webUrl: status.url,
     };
     if (grandparent) interactionData.grandparent = grandparent;
@@ -464,17 +479,23 @@ async function prefetchMastodonParent(
     // ingestion stores source_item_uri/source_reply_uri as note.id/note.inReplyTo
     // (the `uri` form), so keying on `url` forks the (protocol, source_item_uri)
     // dedup and breaks the ancestor/quote re-root walk (audit D2; matches b2f64ac).
-    const sourceItemUri = status.uri || status.url || parentUri;
+    // The id is the AUTHORITATIVE one — never a web-url fallback (CA-A10).
+    const sourceItemUri = identity.uri;
     const publishedAt = new Date(status.created_at);
     await withTransaction(async (client) => {
       const { rows, rowCount } = await client.query<{ id: string }>(
         `INSERT INTO external_items (
-          source_id, protocol, tier, source_item_uri,
+          source_id, protocol, tier, source_item_uri, canonical_url,
           author_name, author_handle, author_avatar_url, author_uri,
           content_html, content_text, media, source_reply_uri, interaction_data,
           like_count, reply_count, repost_count,
           published_at, is_context_only
-        ) VALUES ($1, $2, 'tier3', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, TRUE)
+        ) VALUES ($1, $2, 'tier3', $3, $17, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, TRUE)
+        -- STAYS DO NOTHING: rowCount below means "this row is new", and the
+        -- context dual-write keys off it. A DO UPDATE here would return every
+        -- pre-existing row as though it were fresh and mint a duplicate
+        -- feed_item -- the same trap the rss poll's comment names. Healing an
+        -- existing row's permalink is migration 229's job, not this insert's.
         ON CONFLICT (protocol, source_item_uri) DO NOTHING
         RETURNING id`,
         [
@@ -487,9 +508,9 @@ async function prefetchMastodonParent(
           // Canonical actor URI (matches activitypub-ingest.ts's actor.id),
           // not the human web `url`: the identity trigger derives stable_handle
           // from author_uri, so the web URL mints a doppelgänger author that
-          // promotion never rewrites (H12). Fall back to `url` only if a
-          // non-Mastodon server omits `uri`.
-          status.account.uri ?? status.account.url,
+          // promotion never rewrites (H12). Authoritative for the host that
+          // answered, or this function returned above — no url fallback.
+          identity.authorUri,
           sanitizeContent(status.content),
           null,
           JSON.stringify(media),
@@ -499,6 +520,8 @@ async function prefetchMastodonParent(
           status.replies_count ?? 0,
           status.reblogs_count ?? 0,
           publishedAt,
+          // The permalink the object declares, distinct from the id above.
+          httpUrlOrNull(status.url),
         ],
       );
       if (!rowCount) return; // dedupe hit — twin already exists
@@ -560,13 +583,17 @@ export function extractBlueskyViewMedia(embed: unknown): QuoteMedia[] {
           });
       }
     } else if (t.startsWith("app.bsky.embed.external") && v.external?.uri) {
-      out.push({
-        type: "link",
-        url: v.external.uri,
-        thumbnail: v.external.thumb,
-        title: v.external.title || undefined,
-        description: v.external.description || undefined,
-      });
+      // The preview target is rendered as an `href`; refuse a non-http(s)
+      // scheme here rather than storing it (see httpUrlOrNull's header).
+      const uri = httpUrlOrNull(v.external.uri);
+      if (uri)
+        out.push({
+          type: "link",
+          url: uri,
+          thumbnail: v.external.thumb,
+          title: v.external.title || undefined,
+          description: v.external.description || undefined,
+        });
     } else if (t.startsWith("app.bsky.embed.video") && v.playlist) {
       out.push({ type: "video", url: v.playlist, thumbnail: v.thumbnail });
     }
@@ -583,9 +610,13 @@ export function extractBlueskyViewMedia(embed: unknown): QuoteMedia[] {
 export function mastodonCardToMedia(card: any): QuoteMedia | null {
   if (!card?.url) return null;
   if (card.type && card.type !== "link") return null;
+  // Rendered as an `href`, so a non-http(s) scheme is refused rather than
+  // stored (see httpUrlOrNull's header).
+  const url = httpUrlOrNull(card.url);
+  if (!url) return null;
   return {
     type: "link",
-    url: card.url,
+    url,
     thumbnail: card.image ?? undefined,
     title: card.title || undefined,
     description: card.description || undefined,
@@ -628,7 +659,7 @@ async function insertBlueskyQuote(
           post.author.did,
           post.record.text ?? null,
           JSON.stringify(media),
-          JSON.stringify({ uri: post.uri, cid: post.cid }),
+          JSON.stringify(blueskyInteractionData(post)),
           post.likeCount ?? 0,
           post.replyCount ?? 0,
           post.repostCount ?? 0,
@@ -659,7 +690,8 @@ async function insertBlueskyQuote(
   }
 }
 
-async function prefetchMastodonQuote(
+// Exported for the routed-mock test (CA-A10/C12).
+export async function prefetchMastodonQuote(
   quoteUri: string,
   sourceId: string,
 ): Promise<void> {
@@ -668,13 +700,11 @@ async function prefetchMastodonQuote(
 
   try {
     const host = new URL(quoteUri).hostname;
-    const res = await safeFetch(`https://${host}/api/v1/statuses/${statusId}`, {
-      headers: { Accept: "application/json" },
-    });
+    const res = await readMastodonStatus(`https://${host}`, statusId);
 
     if (!res.ok) return;
 
-    const status = JSON.parse(res.text) as {
+    const status = res.body as {
       id: string;
       url: string;
       uri: string;
@@ -699,6 +729,10 @@ async function prefetchMastodonQuote(
       card?: any;
     };
 
+    // §2.9 on this door too (CA-A10) — see `mastodonStatusIdentity`.
+    const identity = mastodonStatusIdentity(status, `https://${host}`);
+    if (!identity) return;
+
     const media: QuoteMedia[] = (status.media_attachments ?? []).map((m) => ({
       type: (m.type === "image"
         ? "image"
@@ -713,18 +747,23 @@ async function prefetchMastodonQuote(
     if (link) media.push(link);
 
     const authorName = status.account.display_name || status.account.acct;
-    // Federated `uri`, not web `url` — see the parent-prefetch note above (D2).
-    const sourceItemUri = status.uri || status.url || quoteUri;
+    // Federated `uri`, not web `url` — see the parent-prefetch note above (D2);
+    // and the AUTHORITATIVE one, never a fallback (CA-A10).
+    const sourceItemUri = identity.uri;
     const publishedAt = new Date(status.created_at);
     await withTransaction(async (client) => {
+      // `canonical_url` is written here as the parent writer above writes it
+      // (CA-C12): an activitypub row declares a permalink and must store it —
+      // this INSERT named no such column, the ingest rule's 58,686-row class
+      // one writer over. NULL where the status declares none.
       const { rows, rowCount } = await client.query<{ id: string }>(
         `INSERT INTO external_items (
-          source_id, protocol, tier, source_item_uri,
+          source_id, protocol, tier, source_item_uri, canonical_url,
           author_name, author_handle, author_avatar_url, author_uri,
           content_html, content_text, media, interaction_data,
           like_count, reply_count, repost_count,
           published_at, is_context_only
-        ) VALUES ($1, $2, 'tier3', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, TRUE)
+        ) VALUES ($1, $2, 'tier3', $3, $16, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, TRUE)
         ON CONFLICT (protocol, source_item_uri) DO NOTHING
         RETURNING id`,
         [
@@ -737,17 +776,19 @@ async function prefetchMastodonQuote(
           // Canonical actor URI (matches activitypub-ingest.ts's actor.id),
           // not the human web `url`: the identity trigger derives stable_handle
           // from author_uri, so the web URL mints a doppelgänger author that
-          // promotion never rewrites (H12). Fall back to `url` only if a
-          // non-Mastodon server omits `uri`.
-          status.account.uri ?? status.account.url,
+          // promotion never rewrites (H12). Authoritative for the host that
+          // answered, or this function returned above — no url fallback.
+          identity.authorUri,
           sanitizeContent(status.content),
           null,
           JSON.stringify(media),
-          JSON.stringify({ id: status.uri, webUrl: status.url }),
+          JSON.stringify({ id: identity.uri, webUrl: status.url }),
           status.favourites_count ?? 0,
           status.replies_count ?? 0,
           status.reblogs_count ?? 0,
           publishedAt,
+          // The permalink the object declares, distinct from the id above.
+          httpUrlOrNull(status.url),
         ],
       );
       if (!rowCount) return; // dedupe hit — twin already exists
@@ -779,13 +820,11 @@ async function fetchMastodonGrandparentTag(
   statusId: string,
 ): Promise<{ authorName: string; authorHandle: string } | null> {
   try {
-    const res = await safeFetch(`https://${host}/api/v1/statuses/${statusId}`, {
-      headers: { Accept: "application/json" },
-    });
+    const res = await readMastodonStatus(`https://${host}`, statusId);
 
     if (!res.ok) return null;
 
-    const status = JSON.parse(res.text) as {
+    const status = res.body as {
       account: { acct: string; display_name: string };
     };
 
@@ -798,13 +837,3 @@ async function fetchMastodonGrandparentTag(
   }
 }
 
-function extractMastodonStatusId(uri: string): string | null {
-  try {
-    const parts = new URL(uri).pathname.split("/").filter(Boolean);
-    const last = parts[parts.length - 1];
-    if (last && /^\d+$/.test(last)) return last;
-    return null;
-  } catch {
-    return null;
-  }
-}

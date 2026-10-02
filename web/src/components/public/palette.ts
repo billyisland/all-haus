@@ -48,8 +48,6 @@ export function usePublicPalette(): VesselPalette {
 
 /** Side-wall thickness. The workspace vessel's wall (Vessel.tsx). */
 export const WALL = 8
-/** The workspace lattice square. Equal to WALL by design (WORKSPACE-DESIGN-SPEC). */
-export const GRID = 8
 /** Vessel interior padding. */
 export const PAD = 16
 /** Inter-card gap inside a vessel. */

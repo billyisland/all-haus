@@ -1,18 +1,4 @@
-// Framer Motion config primitives shared by vessel gestures and the
-// ∀→H→⊔ ceremonial animations.
-
-import type { Transition } from "framer-motion";
-
-export const VESSEL_DRAG_TRANSITION: Transition = {
-  type: "spring",
-  stiffness: 600,
-  damping: 40,
-  mass: 0.6,
-};
-
-export const VESSEL_DRAG_TRANSITION_REDUCED: Transition = {
-  duration: 0,
-};
+// Motion primitives for the ∀→H→⊔ ceremonial animations.
 
 export function prefersReducedMotion(): boolean {
   if (typeof window === "undefined") return false;
@@ -71,18 +57,6 @@ export const CEREMONY_TIMINGS: Record<
     settle: 150,
   },
 };
-
-export function ceremonyTotal(t: CeremonyTiming): number {
-  return (
-    t.forallIn +
-    t.forallHold +
-    t.partToH +
-    t.hHold +
-    t.crossbarDrop +
-    t.cardsSnap +
-    t.settle
-  );
-}
 
 // Reduced-motion fallback per ADR §2: a brief fade rather than the full
 // transformation. The ceremony component swaps to this when the user has

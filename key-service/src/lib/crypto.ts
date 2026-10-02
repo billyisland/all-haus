@@ -1,6 +1,11 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "crypto";
 import { xchacha20poly1305 } from "@noble/ciphers/chacha";
 
+// The GCM tag is always 16 bytes here. Without `authTagLength` Node accepts a
+// 4–16 byte tag on decrypt, so a truncated stored blob would verify against a
+// weaker tag than the one written; pinned, a short tag throws (CA-F14c).
+const GCM_TAG = { authTagLength: 16 } as const;
+
 // =============================================================================
 // Article Encryption
 //
@@ -80,7 +85,7 @@ export function decryptArticleBody(
   const authTag = combined.subarray(12, 28);
   const ciphertext = combined.subarray(28);
 
-  const decipher = createDecipheriv("aes-256-gcm", contentKeyBytes, iv);
+  const decipher = createDecipheriv("aes-256-gcm", contentKeyBytes, iv, GCM_TAG);
   decipher.setAuthTag(authTag);
 
   const decrypted = Buffer.concat([

@@ -6,7 +6,7 @@ import {
 } from "./atproto-resolve.js";
 import {
   resolveWebFinger,
-  fetchActorProfile,
+  fetchActorProfileWithVerdict,
   isAcctShape,
 } from "./activitypub-resolve.js";
 import {
@@ -138,6 +138,16 @@ async function verifyRss(sourceUri: string): Promise<SourceLiveness> {
   if (!res.ok)
     return unreachable(`The feed URL returned HTTP ${res.status}`);
 
+  // The source is the url the feed was SERVED at (CA-C4, the mitigation
+  // half). `external_sources` is unique on (protocol, source_uri) and items
+  // on (protocol, source_item_uri), and the dual-write keys off the item
+  // INSERT's RETURNING — so two spellings of one feed (http/https, a
+  // redirecting host, `/feed` and `/feed/`) were two sources sharing guids,
+  // and the second never received an item. Canonicalising at verify time
+  // folds the redirect class; a category feed that re-serves the same guids
+  // is a different feed and stays the design call the audit named.
+  const servedAt = res.url || sourceUri;
+
   const text = res.text;
   const contentType = res.headers.get("content-type") ?? "";
   if (contentType.includes("json") || text.trimStart().startsWith("{")) {
@@ -145,7 +155,7 @@ async function verifyRss(sourceUri: string): Promise<SourceLiveness> {
     if (jsonFeed)
       return {
         ok: true,
-        sourceUri,
+        sourceUri: servedAt,
         displayName: jsonFeed.title,
         description: jsonFeed.description,
       };
@@ -156,7 +166,7 @@ async function verifyRss(sourceUri: string): Promise<SourceLiveness> {
     const feed = await parser.parseString(text);
     return {
       ok: true,
-      sourceUri,
+      sourceUri: servedAt,
       displayName: feed.title ?? undefined,
       description: feed.description ?? undefined,
     };
@@ -227,7 +237,17 @@ async function verifyNostr(
         pubkey = decoded.data;
       } else if (decoded.type === "nprofile") {
         pubkey = decoded.data.pubkey;
-        hintRelays = [...hintRelays, ...(decoded.data.relays ?? [])];
+        // Sliced to the same 5 the route caps a caller's explicit hints at
+        // (S7), for the same reason and one level in: an nprofile is a string
+        // the member pasted and its relay TLVs are unbounded, so an unsliced
+        // union here could both fan out arbitrarily and — since hints come
+        // first — evict every default relay from the probe, which is how a
+        // hostile hint list turns from noise into silence. `fetchNostrProfile`
+        // caps the union again at 8; this is what leaves room in it.
+        hintRelays = [
+          ...hintRelays,
+          ...(decoded.data.relays ?? []).slice(0, 5),
+        ];
       }
     } catch {
       // falls through to malformed
@@ -297,11 +317,28 @@ async function verifyActivityPub(sourceUri: string): Promise<SourceLiveness> {
   // normalisation — but the confirmatory actor-document probe is skipped.
   if (!livenessEnforced()) return { ok: true, sourceUri: actorUri! };
 
-  const profile = await fetchActorProfile(actorUri!);
-  if (!profile)
+  const { profile, signedFetchRefused } =
+    await fetchActorProfileWithVerdict(actorUri!);
+  if (!profile) {
+    // A CAPABILITY WE LACK IS NOT A FACT ABOUT THE SOURCE, AND THE MEMBER IS
+    // TOLD WHICH IT IS. Both answers are a 422 — there is nothing the member
+    // can do either way — but "this address doesn't exist" and "this server
+    // won't let us read it" send them to two different places. Until now the
+    // liveness probe KNEW (it saw the 401, it had already tried a signature
+    // and the client API) and said the first of the two, so a member adding
+    // one account from a hardened instance and another from an ordinary one
+    // got the same sentence for opposite reasons, and the one that was our
+    // fault read as theirs.
+    if (signedFetchRefused)
+      return unreachable(
+        "That server only answers requests it can attribute, and it would not " +
+          "accept ours. This is a limitation at our end, not a problem with " +
+          "the account — try another instance, or ask us to look at it.",
+      );
     return unreachable(
       "The address did not return an ActivityPub actor document",
     );
+  }
   return {
     ok: true,
     sourceUri: profile.actorUri,

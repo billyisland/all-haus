@@ -53,7 +53,8 @@ export function EmptyFeedTile({
           className="text-ui-xs mb-4"
           style={{ color: palette.cardStandfirst }}
         >
-          Add feeds, accounts, or publications to fill this vessel.
+          Nice channel! Add social media handles, RSS feeds or topic tags to fill it up.
+          Press the cog button to change its basic settings.
         </p>
         {onAddSources && (
           <button type="button" className="btn-accent" onClick={onAddSources}>
@@ -77,12 +78,12 @@ export function EmptyFeedTile({
   return (
     <div className="px-6 py-8 text-center">
       <p className="label-ui mb-2" style={{ color: palette.cardMeta }}>
-        NO ITEMS YET
+        NOTHING YET
       </p>
       <p className="text-ui-xs mb-4" style={{ color: palette.cardStandfirst }}>
-        No new items. Add more sources or check back later.
+        Nothing new. Add a source or come back later.
       </p>
-      {onAddSources && <MutedAction palette={palette} onClick={onAddSources}>ADD MORE</MutedAction>}
+      {onAddSources && <MutedAction palette={palette} onClick={onAddSources}>ADD SOURCES</MutedAction>}
     </div>
   );
 }
@@ -125,8 +126,8 @@ function CaughtUpTile({
       onMouseLeave={start}
     >
       <p className="text-ui-xs mb-3" style={{ color: palette.cardStandfirst }}>
-        You&rsquo;re caught up. Add new sources or strengthen current ones to see
-        more.
+        That&rsquo;s the lot. To see more, add a new source (or increase the volume
+        on some existing ones, if you&rsquo;ve turned any down).
       </p>
       <div className="flex items-center justify-center gap-4">
         {onAddSources && (

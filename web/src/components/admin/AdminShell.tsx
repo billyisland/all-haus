@@ -67,7 +67,7 @@ export function AdminShell({
       title={title}
       action={
         <Link href="/reader" className="btn-text-muted">
-          ← Workspace
+          ← Back to the workspace
         </Link>
       }
     >

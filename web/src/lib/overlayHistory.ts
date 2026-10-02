@@ -29,8 +29,16 @@
 // pushes an unmarked entry, so the next overlay open correctly PUSHES over that
 // page instead of replacing (clobbering) it.
 //
-// Next merges its own keys (`__NA`, the internals tree) into whatever state we
-// pass, so a bare marker object is enough and must not try to preserve them.
+// NEXT MERGES ITS OWN KEYS INTO A PUSH AND NOT INTO A REPLACE, which this
+// comment had wrong in both directions until it was measured (2026-09-16): a
+// raw `pushState({mine:true})` comes back carrying `mine`, `__NA` and
+// `__PRIVATE_NEXTJS_INTERNALS_TREE`, while a `replaceState` of a bare object
+// leaves the entry with `[]`. An entry stripped of the internals tree is one
+// the app router cannot reconcile on the way back, so it answers with a full
+// document navigation — every in-memory surface on the page gone, and nothing
+// anywhere saying why. So the marker is MERGED into whatever is already on the
+// entry rather than replacing it; the tree stays correct across the write,
+// because the document has not navigated.
 // =============================================================================
 
 /** The shared marker. Deliberately NOT per-overlay: the point is that any of
@@ -59,11 +67,14 @@ export function overlayEntryIsCurrent(): boolean {
 export function claimOverlayEntry(targetUrl: string): void {
   if (typeof window === "undefined") return;
   try {
-    const state = { [OVERLAY_ENTRY]: true };
     if (overlayEntryIsCurrent()) {
-      window.history.replaceState(state, "", targetUrl);
+      window.history.replaceState(
+        { ...window.history.state, [OVERLAY_ENTRY]: true },
+        "",
+        targetUrl,
+      );
     } else {
-      window.history.pushState(state, "", targetUrl);
+      window.history.pushState({ [OVERLAY_ENTRY]: true }, "", targetUrl);
     }
   } catch {
     /* a history quota / opaque-origin failure leaves the overlay un-addressed,

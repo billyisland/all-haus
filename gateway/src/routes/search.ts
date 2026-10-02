@@ -1,7 +1,10 @@
 import type { FastifyInstance } from "fastify";
-import { pool } from "@platform-pub/shared/db/client.js";
+import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
 import { publicationsEnabled } from "@platform-pub/shared/lib/env.js";
 import { optionalAuth } from "../middleware/auth.js";
+import { hiddenFromViewerSql } from "../lib/blocks.js";
+import { accountArrivedSql } from "../lib/account-arrived.js";
+import { parseLimit, parseOffset } from "../lib/request-inputs.js";
 
 // =============================================================================
 // Search Routes
@@ -40,15 +43,22 @@ export async function searchRoutes(app: FastifyInstance) {
       if (query.length < 2) {
         return reply
           .status(400)
-          .send({ error: "Search query must be at least 2 characters" });
+          .send({ error: "Please type at least two characters to search." });
       }
 
       const type = req.query.type ?? "articles";
-      const limit = Math.min(parseInt(req.query.limit ?? "20", 10), 50);
-      const offset = Math.min(parseInt(req.query.offset ?? "0", 10) || 0, 1000);
+      const limit = parseLimit(req.query.limit, 20, 50);
+      const offset = parseOffset(req.query.offset, 1000);
+      // THE VIEWER IS READ (CA-B10, 2026-09-29). `optionalAuth` ran and the
+      // session was never looked at, so a member's own mutes and the blocks
+      // either side of them were honoured on every surface but this one.
+      // Search is public — a stranger sees what a stranger sees — so this is
+      // the hide the viewer is owed, not enforcement: a signed-in member does
+      // not meet in search the people they will not meet in a feed.
+      const viewerId = req.session?.sub ?? null;
 
       if (type === "writers") {
-        return searchWriters(query, limit, offset, reply);
+        return searchWriters(query, limit, offset, viewerId, reply);
       }
       if (type === "publications") {
         // Publications suspended 2026-08-31 (shared/src/lib/env.ts). This leg
@@ -66,9 +76,17 @@ export async function searchRoutes(app: FastifyInstance) {
         return searchPublications(query, limit, offset, reply);
       }
 
-      return searchArticles(query, limit, offset, reply);
+      return searchArticles(query, limit, offset, viewerId, reply);
     },
   );
+}
+
+/** The viewer's hide as a WHERE clause over `authorExpr`, or nothing for a
+ *  stranger. `$5` is the viewer parameter a search statement binds fifth —
+ *  and binds ONLY when this clause is emitted, since a parameter no
+ *  placeholder names is a bind error rather than an unused value. */
+function viewerHideClause(viewerId: string | null, authorExpr: string): string {
+  return viewerId ? `AND NOT ${hiddenFromViewerSql("$5", authorExpr)}` : "";
 }
 
 // ---------------------------------------------------------------------------
@@ -83,40 +101,56 @@ async function searchArticles(
   query: string,
   limit: number,
   offset: number,
+  viewerId: string | null,
   reply: any,
 ) {
-  const { rows } = await pool.query<{
-    id: string;
-    nostr_event_id: string;
-    nostr_d_tag: string;
-    title: string;
-    summary: string | null;
-    word_count: number | null;
-    access_mode: string;
-    published_at: Date;
-    writer_username: string;
-    writer_display_name: string | null;
-    similarity: number;
-  }>(
-    `SELECT a.id, a.nostr_event_id, a.nostr_d_tag, a.title, a.summary,
-            a.word_count, a.access_mode, a.published_at,
-            w.username AS writer_username,
-            w.display_name AS writer_display_name,
-            similarity(a.title, $1) AS similarity
-     FROM articles a
-     JOIN accounts w ON w.id = a.writer_id
-     WHERE a.published_at IS NOT NULL
-       AND a.deleted_at IS NULL
-       AND w.status = 'active'
-       AND (
-         similarity(a.title, $1) > 0.1
-         OR a.title ILIKE $2
-         OR a.content_free ILIKE $2
-       )
-     ORDER BY similarity DESC, a.published_at DESC
-     LIMIT $3 OFFSET $4`,
-    [query, `%${escapeLike(query)}%`, limit, offset],
-  );
+  // `a.title % $1`, not `similarity(a.title, $1) > 0.1` (CA-G6b): only the
+  // operator is indexable, and with it every arm of the OR can use a trigram
+  // GIN (idx_articles_title_trgm, idx_articles_content_free_trgm) instead of
+  // the whole table being scanned. `%` reads its cut-off from
+  // pg_trgm.similarity_threshold (0.3 unless set), so the query's own 0.1 is
+  // set LOCAL to this transaction — never on the pooled session, where it
+  // would outlive the request.
+  const { rows } = await withTransaction(async (client) => {
+    await client.query(
+      "SELECT set_config('pg_trgm.similarity_threshold', '0.1', true)",
+    );
+    return client.query<{
+      id: string;
+      nostr_event_id: string;
+      nostr_d_tag: string;
+      title: string;
+      summary: string | null;
+      word_count: number | null;
+      access_mode: string;
+      published_at: Date;
+      writer_username: string;
+      writer_display_name: string | null;
+      similarity: number;
+    }>(
+      `SELECT a.id, a.nostr_event_id, a.nostr_d_tag, a.title, a.summary,
+              a.word_count, a.access_mode, a.published_at,
+              w.username AS writer_username,
+              w.display_name AS writer_display_name,
+              similarity(a.title, $1) AS similarity
+       FROM articles a
+       JOIN accounts w ON w.id = a.writer_id
+       WHERE a.published_at IS NOT NULL
+         AND a.deleted_at IS NULL
+         AND w.status = 'active'
+         AND (
+           a.title % $1
+           OR a.title ILIKE $2
+           OR a.content_free ILIKE $2
+         )
+         ${viewerHideClause(viewerId, "a.writer_id")}
+       ORDER BY similarity DESC, a.published_at DESC
+       LIMIT $3 OFFSET $4`,
+      // The viewer binds fifth only when the clause that reads $5 is emitted —
+      // a bound parameter no placeholder names is a Postgres error, not a no-op.
+      [query, `%${escapeLike(query)}%`, limit, offset, ...(viewerId ? [viewerId] : [])],
+    );
+  });
 
   const results = rows.map((r) => ({
     id: r.id,
@@ -148,6 +182,7 @@ async function searchWriters(
   query: string,
   limit: number,
   offset: number,
+  viewerId: string | null,
   reply: any,
 ) {
   const { rows } = await pool.query<{
@@ -164,15 +199,19 @@ async function searchWriters(
             (SELECT COUNT(*) FROM articles WHERE writer_id = a.id AND published_at IS NOT NULL AND deleted_at IS NULL) AS article_count
      FROM accounts a
      WHERE a.status = 'active'
+       -- An account admit created is not found until its owner arrives
+       -- (lib/account-arrived.ts): its name is a placeholder from an email.
+       AND ${accountArrivedSql("a")}
        AND (
          a.username ILIKE $1
          OR a.display_name ILIKE $1
        )
+       ${viewerHideClause(viewerId, "a.id")}
      ORDER BY
        CASE WHEN a.username ILIKE $2 THEN 0 ELSE 1 END,
        a.display_name
      LIMIT $3 OFFSET $4`,
-    [`%${escapeLike(query)}%`, `${escapeLike(query)}%`, limit, offset],
+    [`%${escapeLike(query)}%`, `${escapeLike(query)}%`, limit, offset, ...(viewerId ? [viewerId] : [])],
   );
 
   const results = rows.map((r) => ({

@@ -51,9 +51,11 @@ import { useSearchParams } from "next/navigation";
 import type { WriterProfile } from "../../lib/api";
 import type { VesselPalette } from "../workspace/tokens";
 import { WorkTab } from "./WorkTab";
+import { useProfile, type ProfileFocus } from "../../stores/profileOverlay";
 import { SocialLog } from "./SocialLog";
 import { FollowersTab } from "./FollowersTab";
 import { FollowingTab } from "./FollowingTab";
+import { useAuth } from "../../stores/auth";
 
 type ProfileView =
   | "articles"
@@ -98,6 +100,15 @@ interface WriterActivityProps {
   // may carry and drive view state internally (`select` still reflects it onto
   // the URL).
   inOverlay?: boolean;
+  /** The conversation the pane was opened ON (a notification row): it decides
+   *  which view opens, and the log pins it at the top. */
+  focus?: ProfileFocus | null;
+  /** THE VIEW A RETIRED ADDRESS NAMED. `/following` and `/social` were views,
+   *  not pages, and the pane deliberately ignores the ambient workspace `?tab`
+   *  — so without a seed they redirect to the profile FRONT DOOR and silently
+   *  drop the thing the link was about. Same vocabulary as the standalone
+   *  page's `?tab=`, legacy spellings included. */
+  tab?: string | null;
 }
 
 export function WriterActivity({
@@ -106,8 +117,12 @@ export function WriterActivity({
   isOwnProfile,
   palette,
   inOverlay = false,
+  focus = null,
+  tab = null,
 }: WriterActivityProps) {
   const searchParams = useSearchParams();
+  // Only an admitted writer is invited to publish an article from the empty state.
+  const canWrite = useAuth((st) => st.user?.canWrite === true);
 
   // A count the gateway did not send is `undefined` — the view is offered — and
   // is NOT the same fact as 0, which hides the button. Nothing else reads these.
@@ -119,14 +134,41 @@ export function WriterActivity({
     following: writer.followingCount,
   };
 
-  const views = VIEW_ORDER.filter((v) => counts[v] !== 0);
+  // A VIEW WE ARE HOLDING A POST FROM IS NOT EMPTY, whatever the count says.
+  // The count gate exists to hide a log with nothing in it; here we have
+  // positive evidence to the contrary — a post_id the notification handed us —
+  // and hiding a log that is there is the worse failure (the same reasoning
+  // that makes an ABSENT count offer its view rather than hide it).
+  const views = VIEW_ORDER.filter(
+    (v) => counts[v] !== 0 || v === focus?.view,
+  );
 
-  const rawTab = inOverlay ? null : searchParams.get("tab");
+  const rawTab = inOverlay ? tab : searchParams.get("tab");
   const requested = rawTab ? (LEGACY_TAB[rawTab] ?? rawTab) : null;
-  const initialView: ProfileView =
+  const wanted =
     requested && views.includes(requested as ProfileView)
       ? (requested as ProfileView)
-      : (views[0] ?? "articles");
+      : null;
+
+  // WHO OUTRANKS WHOM DEPENDS ON WHO IS SPEAKING, and the two registers have
+  // different answers.
+  //
+  // On the STANDALONE page `?tab=` is an address, and an errand outranks it:
+  // a pane opened ON a conversation opens where that conversation is.
+  //
+  // In the OVERLAY the tab is the READER'S OWN most recent statement — the
+  // pane reports every view change to the store (`setTab`) — so it outranks
+  // the errand, because a resumed pane is a REMOUNT and without this the
+  // reader who switched to REPLIES, expanded a conversation and replied from
+  // it came back on the errand's original view with everything they had done
+  // since discarded. A seeded tab (`/following`, `/social`) reaches the same
+  // slot and there is no errand beside it, so one rule covers both.
+  const initialView: ProfileView =
+    inOverlay && wanted
+      ? wanted
+      : focus && views.includes(focus.view)
+        ? focus.view
+        : (wanted ?? views[0] ?? "articles");
 
   const [activeView, setActiveView] = useState<ProfileView>(initialView);
   // A writer's first article makes the Articles button appear; if the row has
@@ -138,6 +180,11 @@ export function WriterActivity({
 
   function select(next: ProfileView) {
     setActiveView(next);
+    // Tell the store, so a pane that is SUSPENDED and resumed comes back on
+    // the view the reader chose rather than on the one it opened with. Overlay
+    // register only — the standalone page's view lives in its own URL, which
+    // `replaceState` below is already keeping current.
+    if (inOverlay) useProfile.getState().setTab(next);
     const url = new URL(window.location.href);
     // Articles is the default view, so it is the ABSENCE of the param — a
     // canonical /username stays a bare /username.
@@ -163,6 +210,10 @@ export function WriterActivity({
       case "replies":
         return (
           <SocialLog
+            // The pin belongs to the view the post is IN. Switch away and it
+            // is gone, which is the honest reading of having navigated away
+            // from the thing you were sent to.
+            focusPostId={focus?.view === view ? focus.postId : null}
             kind={view === "posts" ? "notes" : "replies"}
             writer={writer}
             isOwnProfile={isOwnProfile}
@@ -194,7 +245,9 @@ export function WriterActivity({
     return (
       <p className="text-ui-sm py-10" style={{ color: palette.cardMeta }}>
         {isOwnProfile
-          ? "Nothing here yet — publish an article or post a note to fill this in."
+          ? canWrite
+            ? "Nothing here yet. Post a note or publish an article to change that."
+            : "Nothing here yet. Post a note to change that."
           : "Nothing here yet."}
       </p>
     );
@@ -254,10 +307,17 @@ export function WriterActivity({
         </a>
       </div>
 
+      {/* FOLLOWING carries an Explain leaf and its four siblings do not, which
+          is not an oversight: the sentence it holds is the feed-derived
+          external-follow invariant told from the reader's side, and it is said
+          nowhere else on the site. It was the Network panel's `following` tab
+          copy, and moved here when that panel dissolved (2026-09-15) rather
+          than being lost with the surface. */}
       <div
         role="tabpanel"
         id={`profile-panel-${view}`}
         aria-labelledby={`profile-tab-${view}`}
+        data-explain={view === "following" ? "profile.following" : undefined}
       >
         {panel}
       </div>

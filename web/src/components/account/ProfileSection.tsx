@@ -11,7 +11,14 @@ import { useState, useRef } from 'react'
 import { useAuth } from '../../stores/auth'
 import { auth } from '../../lib/api'
 import { uploadImage } from '../../lib/media'
+import { failureSentence } from '../../lib/api/client'
 import { UsernameChange } from '../profile/UsernameChange'
+import {
+  PROFILE_PHOTO_LABEL, PROFILE_UPLOAD_PHOTO, PROFILE_UPLOADING, PROFILE_REMOVE_PHOTO,
+  PROFILE_DISPLAY_NAME_LABEL, PROFILE_BIO_LABEL, PROFILE_BIO_PLACEHOLDER,
+  PROFILE_SAVE, PROFILE_SAVED, PROFILE_PUBLIC_KEY_LABEL,
+  PROFILE_UPLOAD_FAILED, PROFILE_SAVE_FAILED, SETTINGS_SAVING,
+} from '../../content/settings'
 
 export function ProfileSection() {
   const { user, fetchMe } = useAuth()
@@ -36,8 +43,8 @@ export function ProfileSection() {
     try {
       const result = await uploadImage(file)
       setAvatar(result.url)
-    } catch (err: any) {
-      setError(err.message ?? 'Upload failed')
+    } catch (err) {
+      setError(failureSentence(err, PROFILE_UPLOAD_FAILED))
     } finally {
       setUploading(false)
     }
@@ -57,8 +64,8 @@ export function ProfileSection() {
       await fetchMe()
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
-    } catch (err: any) {
-      setError(err.message ?? 'Save failed')
+    } catch (err) {
+      setError(failureSentence(err, PROFILE_SAVE_FAILED))
     } finally {
       setSaving(false)
     }
@@ -71,7 +78,7 @@ export function ProfileSection() {
         <form onSubmit={handleSave} className="space-y-8">
           {/* Avatar */}
           <div>
-            <label className="block label-ui text-grey-600 mb-3">Photo</label>
+            <label className="block label-ui text-grey-600 mb-3">{PROFILE_PHOTO_LABEL}</label>
             <div className="flex items-center gap-4">
               {avatar ? (
                 <img src={avatar} alt="" className="h-16 w-16 rounded-full object-cover flex-shrink-0" />
@@ -97,7 +104,7 @@ export function ProfileSection() {
                   disabled={uploading}
                   className="btn-soft py-1.5 px-4 text-ui-xs disabled:opacity-50"
                 >
-                  {uploading ? 'Uploading…' : 'Upload photo'}
+                  {uploading ? PROFILE_UPLOADING : PROFILE_UPLOAD_PHOTO}
                 </button>
                 {avatar && (
                   <button
@@ -105,7 +112,7 @@ export function ProfileSection() {
                     onClick={() => setAvatar(null)}
                     className="text-ui-xs text-grey-300 hover:text-grey-400 transition-colors"
                   >
-                    Remove
+                    {PROFILE_REMOVE_PHOTO}
                   </button>
                 )}
               </div>
@@ -115,7 +122,7 @@ export function ProfileSection() {
           {/* Display name */}
           <div>
             <label htmlFor="displayName" className="block label-ui text-grey-600 mb-2">
-              Display name
+              {PROFILE_DISPLAY_NAME_LABEL}
             </label>
             <input
               id="displayName"
@@ -131,7 +138,7 @@ export function ProfileSection() {
           {/* Bio */}
           <div>
             <label htmlFor="bio" className="block label-ui text-grey-600 mb-2">
-              Bio
+              {PROFILE_BIO_LABEL}
             </label>
             <textarea
               id="bio"
@@ -139,7 +146,7 @@ export function ProfileSection() {
               onChange={(e) => setBio(e.target.value)}
               maxLength={500}
               rows={4}
-              placeholder="A few words about yourself"
+              placeholder={PROFILE_BIO_PLACEHOLDER}
               className="w-full bg-glasshouse-well px-4 py-2.5 text-sm text-black placeholder-grey-300 focus:outline-none resize-none"
             />
             <p className="text-[11px] text-grey-300 mt-1 text-right">{bio.length}/500</p>
@@ -155,9 +162,9 @@ export function ProfileSection() {
               disabled={saving || uploading}
               className="btn py-2 px-6 text-sm disabled:opacity-50"
             >
-              {saving ? 'Saving…' : 'Save changes'}
+              {saving ? SETTINGS_SAVING : PROFILE_SAVE}
             </button>
-            {saved && <span className="text-sm text-green-600">Saved</span>}
+            {saved && <span className="text-sm text-green-600">{PROFILE_SAVED}</span>}
           </div>
         </form>
 
@@ -168,7 +175,7 @@ export function ProfileSection() {
 
         {/* Public key (read-only) */}
         <div className="mt-8">
-          <label className="block label-ui text-grey-600 mb-2">Public key</label>
+          <label className="block label-ui text-grey-600 mb-2">{PROFILE_PUBLIC_KEY_LABEL}</label>
           <p className="text-ui-xs text-grey-300 truncate">{user.pubkey}</p>
         </div>
     </>

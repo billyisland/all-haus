@@ -1,7 +1,8 @@
 import { notFound } from 'next/navigation'
 import type { Metadata } from 'next'
 import { ExternalArticleReader } from '../../../components/article/ExternalArticleReader'
-import type { MediaItem } from '../../../lib/post/types'
+import type { MediaItem, Post } from '../../../lib/post/types'
+import { originWebUrl } from '../../../lib/post/origin-url'
 import { PublicPage } from '../../../components/public/PublicPage'
 import { ReadingScrollbar } from '../../../components/layout/ReadingScrollbar'
 
@@ -37,7 +38,10 @@ async function getExternalArticleTarget(postId: string): Promise<FocalTarget | n
   const res = await fetch(`${GATEWAY}/api/v1/thread/${encodeURIComponent(postId)}`, {
     next: { revalidate: 60 },
   })
-  if (!res.ok) return null
+  // Only a 404 is an absence (CA-E1): a 5xx used to render the 404 page, and a
+  // cached null kept it rendering after the outage. Throw to `error.tsx`.
+  if (res.status === 404) return null
+  if (!res.ok) throw new Error(`Thread lookup failed: ${res.status}`)
   const data = await res.json()
   const focal = Array.isArray(data?.posts)
     ? data.posts.find((p: { id?: string }) => p.id === data.focalId)
@@ -46,9 +50,16 @@ async function getExternalArticleTarget(postId: string): Promise<FocalTarget | n
   // External article only: a note expands inline, a native article lives at
   // /article/[dTag]. Both fall through to notFound.
   const isExternalArticle = focal.type === 'article' && focal.origin?.protocol !== 'nostr'
-  if (!isExternalArticle || !focal.origin?.uri) return null
+  if (!isExternalArticle) return null
+  // The resolved WEB url, never `origin.uri` verbatim — that column is the
+  // item's stable identity, which for RSS is `guid ?? link` and is very often
+  // not a URL at all (`urn:uuid:…`, `tag:…`, a bare integer). Handed one, the
+  // extractor answered "Could not extract" and a hostile guid would have been
+  // rendered as an href. One home: lib/post/origin-url.ts.
+  const url = originWebUrl(focal as Post)
+  if (!url) return null
   return {
-    url: focal.origin.uri,
+    url,
     title: focal.body?.title ?? null,
     sourceName: focal.origin?.sourceName ?? null,
     media: Array.isArray(focal.body?.media) ? (focal.body.media as MediaItem[]) : null,

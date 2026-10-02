@@ -1,9 +1,11 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
-import { pool, withTransaction } from '@platform-pub/shared/db/client.js'
+import { pool, withTransaction, loadConfig } from '@platform-pub/shared/db/client.js'
 import { requireAuth } from '../../middleware/auth.js'
+import { requireWriter } from '../../lib/writer-gate.js'
 import { requirePublicationPermission } from '../../middleware/publication-auth.js'
-import { readNetSql } from '@platform-pub/shared/lib/per-read-net.js'
+import { readNetSql, readFeeBpsSql } from '@platform-pub/shared/lib/per-read-net.js'
+import { zodValidationError } from '@platform-pub/shared/lib/validation.js'
 
 // =============================================================================
 // Publication revenue — rate card, payroll (standing shares + per-article
@@ -36,6 +38,23 @@ const ArticleShareSchema = z.object({
   shareType: z.enum(['revenue_bps', 'flat_fee_pence']),
   shareValue: z.number().int().min(0),
 })
+
+/**
+ * The per-article share upsert. Exported so the DB-backed test executes the
+ * statement the route runs: whether a refused DO UPDATE reports `rowCount = 0`
+ * (rather than 1, which would turn the 409 into a lie) and how EXCLUDED reads
+ * inside a DO UPDATE's WHERE are Postgres's answers, and a mocked `pool.query`
+ * dispatching on query text agrees with whatever the fixture says.
+ *
+ * `paid_out` is deliberately absent from the SET list — see the call site.
+ */
+export const ARTICLE_SHARE_UPSERT_SQL = `INSERT INTO publication_article_shares (publication_id, article_id, account_id, share_type, share_value)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (article_id, account_id) DO UPDATE SET
+           share_type = EXCLUDED.share_type,
+           share_value = EXCLUDED.share_value
+         WHERE publication_article_shares.paid_out = FALSE
+            OR EXCLUDED.share_type <> 'flat_fee_pence'`
 
 export async function publicationRevenueRoutes(app: FastifyInstance) {
   // ---------------------------------------------------------------------------
@@ -74,10 +93,10 @@ export async function publicationRevenueRoutes(app: FastifyInstance) {
 
   app.patch<{ Params: { id: string } }>(
     '/publications/:id/rate-card',
-    { preHandler: [requireAuth, requirePublicationPermission('can_manage_finances')] },
+    { preHandler: [requireAuth, requireWriter, requirePublicationPermission('can_manage_finances')] },
     async (req, reply) => {
       const parsed = RateCardSchema.safeParse(req.body)
-      if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() })
+      if (!parsed.success) return reply.status(400).send(zodValidationError(parsed.error))
       const { subscriptionPricePence, annualDiscountPct, defaultArticlePricePence, articlePriceMode } = parsed.data
 
       const sets: string[] = []
@@ -175,10 +194,10 @@ export async function publicationRevenueRoutes(app: FastifyInstance) {
 
   app.patch<{ Params: { id: string } }>(
     '/publications/:id/payroll',
-    { preHandler: [requireAuth, requirePublicationPermission('can_manage_finances')] },
+    { preHandler: [requireAuth, requireWriter, requirePublicationPermission('can_manage_finances')] },
     async (req, reply) => {
       const parsed = UpdatePayrollSchema.safeParse(req.body)
-      if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() })
+      if (!parsed.success) return reply.status(400).send(zodValidationError(parsed.error))
       const { shares } = parsed.data
 
       const { id } = req.params
@@ -235,10 +254,10 @@ export async function publicationRevenueRoutes(app: FastifyInstance) {
 
   app.patch<{ Params: { id: string; articleId: string } }>(
     '/publications/:id/payroll/article/:articleId',
-    { preHandler: [requireAuth, requirePublicationPermission('can_manage_finances')] },
+    { preHandler: [requireAuth, requireWriter, requirePublicationPermission('can_manage_finances')] },
     async (req, reply) => {
       const parsed = ArticleShareSchema.safeParse(req.body)
-      if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() })
+      if (!parsed.success) return reply.status(400).send(zodValidationError(parsed.error))
       const { accountId, shareType, shareValue } = parsed.data
       const { id, articleId } = req.params
 
@@ -272,16 +291,38 @@ export async function publicationRevenueRoutes(app: FastifyInstance) {
         }
       }
 
-      // Upsert the share
-      await pool.query(
-        `INSERT INTO publication_article_shares (publication_id, article_id, account_id, share_type, share_value)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (article_id, account_id) DO UPDATE SET
-           share_type = EXCLUDED.share_type,
-           share_value = EXCLUDED.share_value,
-           paid_out = FALSE`,
+      // Upsert the share.
+      //
+      // `paid_out` is a ONE-SHOT and is never reset here (S14). A flat fee is
+      // paid once: the payout cycle stamps `paid_out = TRUE` inside the reserve
+      // transaction and `computePublicationSplits` then skips the share for
+      // ever (`shareType === 'flat_fee_pence' && !share.paidOut`). The old
+      // `paid_out = FALSE` in this DO UPDATE handed that money back to the next
+      // cycle on ANY edit — including a re-save of the same value — so a £50
+      // fee paid in March and re-priced to £60 in April paid out £110.
+      //
+      // A paid flat fee is therefore not re-priceable, and the refusal is a
+      // 409 rather than a silent no-op: with the reset gone the write would
+      // change nothing an editor can see, and "your edit did nothing and
+      // nothing said so" is the failure this repo keeps re-learning. Switching
+      // a paid share to `revenue_bps` IS allowed — `paid_out` means nothing to
+      // the bps arm — and the flag stays TRUE, so switching back later is
+      // refused by the same guard rather than re-paying.
+      //
+      // The guard is the DO UPDATE's own WHERE, not a read-then-write: the
+      // conflicting row is held under this statement's lock, so a payout cycle
+      // stamping `paid_out` cannot interleave between a check and the write.
+      const upserted = await pool.query(
+        ARTICLE_SHARE_UPSERT_SQL,
         [id, articleId, accountId, shareType, shareValue]
       )
+
+      if (upserted.rowCount === 0) {
+        return reply.status(409).send({
+          error: 'share_already_paid',
+          message: 'This flat fee has already been paid out and cannot be re-priced. Set a revenue share instead, or agree a fee on another article.',
+        })
+      }
 
       return reply.send({ ok: true })
     }
@@ -297,11 +338,16 @@ export async function publicationRevenueRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const { id } = req.params
 
-      // Load platform fee from config
-      const { rows: feeRows } = await pool.query<{ value: string }>(
-        `SELECT value FROM platform_config WHERE key = 'platform_fee_bps'`
-      )
-      const feeBps = feeRows.length > 0 ? parseInt(feeRows[0].value, 10) : 800
+      // THE PLATFORM FEE COMES FROM `loadConfig()`, NEVER FROM A SECOND READ.
+      // This had its own SELECT and its own in-code fallback of 800 — a third
+      // copy of the dial, outside the parity trio that checks the fallbacks
+      // against `config-defaults.sql`, and outside the loader's cache. So a
+      // retuned fee would move every other money surface and leave THIS one
+      // reporting the old figure, with nothing anywhere disagreeing out loud;
+      // and a malformed row that the loader now reports would be substituted
+      // here in silence. A dial has one reader for the same reason it has one
+      // home.
+      const { platformFeeBps: feeBps } = await loadConfig()
 
       // Summary totals: gross reads for publication articles, net after platform fee.
       // Keyed on the denormalised r.publication_id — the same column the payout
@@ -317,11 +363,11 @@ export async function publicationRevenueRoutes(app: FastifyInstance) {
       }>(
         `SELECT
            COALESCE(SUM(r.chargeable_pence), 0) AS gross_pence,
-           COALESCE(SUM(${readNetSql('r.chargeable_pence', '$2')}), 0) AS net_pence,
+           COALESCE(SUM(${readNetSql('r.chargeable_pence', readFeeBpsSql('r.', '$2'))}), 0) AS net_pence,
            COALESCE(SUM(CASE WHEN r.state = 'platform_settled'
-             THEN ${readNetSql('r.chargeable_pence', '$2')} ELSE 0 END), 0) AS pending_pence,
+             THEN ${readNetSql('r.chargeable_pence', readFeeBpsSql('r.', '$2'))} ELSE 0 END), 0) AS pending_pence,
            COALESCE(SUM(CASE WHEN r.state = 'writer_paid'
-             THEN ${readNetSql('r.chargeable_pence', '$2')} ELSE 0 END), 0) AS paid_pence,
+             THEN ${readNetSql('r.chargeable_pence', readFeeBpsSql('r.', '$2'))} ELSE 0 END), 0) AS paid_pence,
            COUNT(r.id) AS read_count
          FROM read_events r
          WHERE r.publication_id = $1
@@ -357,7 +403,7 @@ export async function publicationRevenueRoutes(app: FastifyInstance) {
         `SELECT
            a.id AS article_id, a.title, a.slug, a.published_at,
            COUNT(r.id) AS read_count,
-           COALESCE(SUM(${readNetSql('r.chargeable_pence', '$2')}), 0) AS net_pence
+           COALESCE(SUM(${readNetSql('r.chargeable_pence', readFeeBpsSql('r.', '$2'))}), 0) AS net_pence
          FROM articles a
          LEFT JOIN read_events r ON r.article_id = a.id
            AND r.publication_id = $1

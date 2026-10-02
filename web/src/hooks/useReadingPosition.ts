@@ -81,14 +81,36 @@ interface Options {
    * pane's own scrolling div inside a Glasshouse.
    */
   scrollRef?: RefObject<HTMLElement | null>
+  /**
+   * The piece was opened on an errand further down it (a notification's
+   * comment) — the same reason a `#hash` skips the restore, carried where the
+   * reader pane has no hash to carry it.
+   */
+  skipRestore?: boolean
 }
 
-export function useReadingPosition({ postId, enabled, scrollRef }: Options) {
+export function useReadingPosition({ postId, enabled, scrollRef, skipRestore }: Options) {
   const restoredRef = useRef(false)
   const lastSavedRef = useRef(0)
 
   useEffect(() => {
     if (!enabled || !postId) return
+
+    // BOTH REFS ARE FACTS ABOUT THIS PIECE, NOT ABOUT THIS MOUNT, so they are
+    // reset here rather than at their declaration. The reader pane keeps one
+    // component instance across a skip (the ears, ←/→, a swipe) — same element,
+    // same scroller, new `postId` — so the refs used to arrive carrying the
+    // PREVIOUS piece's state. Two consequences, both silent. `restoredRef`
+    // stayed true, so `scheduleSave` was live from the first frame: one wheel
+    // tick before the new piece's restore resolves PUT a ratio computed from
+    // the OLD piece's scrollTop against the NEW piece's post_id, overwriting a
+    // real saved position with a fabricated one. And `lastSavedRef` carried the
+    // old ratio, so a genuine save at a similar depth fell inside the 0.005
+    // dead-band and was dropped. The pane resets its own `scrollTop` on the
+    // same change (ReaderOverlay), which is the other half: without that the
+    // new piece opens at the old one's offset.
+    restoredRef.current = false
+    lastSavedRef.current = 0
 
     // Resolved once per mount: the parent's DOM ref is attached during commit,
     // which precedes every effect, so a ref that is null here will not become
@@ -101,16 +123,15 @@ export function useReadingPosition({ postId, enabled, scrollRef }: Options) {
     const target: EventTarget = el ?? window
 
     let cancelled = false
-    const controller = new AbortController()
 
     async function maybeRestore() {
-      if (window.location.hash) {
+      if (skipRestore || window.location.hash) {
         restoredRef.current = true
         return
       }
       try {
         const [{ alwaysOpenAtTop }, { position }] = await Promise.all([
-          readingPreferences.get(),
+          readingPreferences.getCached(),
           readingPositions.get(postId!),
         ])
         if (cancelled) return
@@ -141,16 +162,26 @@ export function useReadingPosition({ postId, enabled, scrollRef }: Options) {
     void maybeRestore()
 
     let saveTimer: ReturnType<typeof setTimeout> | null = null
+    // The last ratio MEASURED while the node was attached (CA-E13b). The
+    // unmount cleanup cannot measure — passive cleanup runs after the node is
+    // detached and `computeScrollRatio` answers null — so a save still pending
+    // at unmount sends this instead of being dropped with its timer.
+    let lastMeasured: number | null = null
+
+    function save(ratio: number | null) {
+      if (ratio === null) return
+      if (Math.abs(ratio - lastSavedRef.current) < 0.005) return
+      lastSavedRef.current = ratio
+      readingPositions.upsert(postId!, ratio).catch(() => {})
+    }
 
     function scheduleSave() {
       if (!restoredRef.current) return
+      lastMeasured = computeScrollRatio(el) ?? lastMeasured
       if (saveTimer) clearTimeout(saveTimer)
       saveTimer = setTimeout(() => {
-        const ratio = computeScrollRatio(el)
-        if (ratio === null) return
-        if (Math.abs(ratio - lastSavedRef.current) < 0.005) return
-        lastSavedRef.current = ratio
-        readingPositions.upsert(postId!, ratio).catch(() => {})
+        saveTimer = null
+        save(computeScrollRatio(el))
       }, SAVE_DEBOUNCE_MS)
     }
 
@@ -180,11 +211,13 @@ export function useReadingPosition({ postId, enabled, scrollRef }: Options) {
 
     return () => {
       cancelled = true
-      controller.abort()
-      if (saveTimer) clearTimeout(saveTimer)
+      if (saveTimer) {
+        clearTimeout(saveTimer)
+        save(lastMeasured)
+      }
       target.removeEventListener('scroll', scheduleSave)
       window.removeEventListener('pagehide', flushOnHide)
       document.removeEventListener('visibilitychange', onVisibility)
     }
-  }, [postId, enabled, scrollRef])
+  }, [postId, enabled, scrollRef, skipRestore])
 }

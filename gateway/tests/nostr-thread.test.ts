@@ -4,6 +4,7 @@ import {
   nostrEventUri,
   nostrAddrUri,
   decodeNostrEventId,
+  nostrTargetTag,
   nostrRootId,
   nostrReplyTargetId,
   parseNostrProfile,
@@ -77,6 +78,52 @@ describe("decodeNostrEventId", () => {
     expect(decodeNostrEventId("not-a-nip19-string")).toBeNull();
     // an naddr is not an event id
     expect(decodeNostrEventId(nostrAddrUri(30023, PUBKEY, "slug"))).toBeNull();
+  });
+});
+
+describe("nostrTargetTag — an outbound reference to a stored uri (S17)", () => {
+  // An external nostr item's source_item_uri is a relay-free nevent/naddr (the
+  // relay-free identity invariant). An `e` tag's value is the 64-char hex event
+  // id and nothing else, so the two outbound routes in external-items/
+  // interactions.ts, which put the bech32 string straight into one, produced a
+  // like and a reply every relay accepted and no client could resolve.
+  it("an nevent becomes an `e` tag carrying the HEX id, not the bech32", () => {
+    const uri = nostrEventUri(ID_A);
+    expect(uri.startsWith("nevent1")).toBe(true); // the shape that was shipped
+    expect(nostrTargetTag(uri)).toEqual(["e", ID_A]);
+  });
+
+  it("a marker is placed in NIP-10's fourth position, with the relay slot empty", () => {
+    expect(nostrTargetTag(nostrEventUri(ID_A), "root")).toEqual([
+      "e",
+      ID_A,
+      "",
+      "root",
+    ]);
+  });
+
+  it("an naddr becomes an `a` tag — an addressable event has no id to point at", () => {
+    // A kind-30023 long-form is addressed by coordinate (NIP-01; NIP-25 for a
+    // reaction), so `e` is not merely the wrong encoding, it is the wrong tag.
+    const uri = nostrAddrUri(30023, PUBKEY, "my-essay");
+    expect(nostrTargetTag(uri, "root")).toEqual([
+      "a",
+      `30023:${PUBKEY}:my-essay`,
+      "",
+      "root",
+    ]);
+  });
+
+  it("a bare hex id is accepted unchanged", () => {
+    expect(nostrTargetTag(ID_A)).toEqual(["e", ID_A]);
+  });
+
+  it("anything else returns null so the caller can REFUSE", () => {
+    // Emitting a reference nothing can follow is worse than declining: the
+    // member is told their like did not go out, rather than believing it did.
+    expect(nostrTargetTag("https://example.com/post/1")).toBeNull();
+    expect(nostrTargetTag(nip19.npubEncode(PUBKEY))).toBeNull();
+    expect(nostrTargetTag("")).toBeNull();
   });
 });
 
@@ -162,6 +209,26 @@ describe("parseNostrProfile (kind-0)", () => {
     expect(p.picture).toBe("https://cdn/a.jpg");
     expect(p.nip05).toBe("alice@example.com");
     expect(p.name).toBeNull();
+  });
+  // `website` is persisted verbatim and rendered as an `href` on the byline
+  // hover card (MIRROR-AUDIT-2026-09-08 §2.4). React 18 renders a
+  // `javascript:` href — it only logs that a future version will block it — so
+  // this refusal is the first of the two guards, the render-side
+  // `safeHttpUrl` being the second. Mutation: drop `httpUrlOrNull` here and
+  // the payload case fails.
+  it("refuses a non-http(s) website rather than persisting it", () => {
+    expect(
+      parseNostrProfile(JSON.stringify({ website: "javascript:alert(1)" }))
+        .website,
+    ).toBeNull();
+    expect(
+      parseNostrProfile(JSON.stringify({ website: "  not a url  " })).website,
+    ).toBeNull();
+    // An ordinary one still comes through, trimmed as it always was.
+    expect(
+      parseNostrProfile(JSON.stringify({ website: "  https://alice.example  " }))
+        .website,
+    ).toBe("https://alice.example");
   });
   it("returns all-null on malformed JSON", () => {
     expect(parseNostrProfile("{not json")).toEqual({

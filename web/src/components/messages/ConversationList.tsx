@@ -2,14 +2,28 @@
 
 import { type Conversation } from "../../lib/api";
 import { timeAgo } from "../../lib/format";
+import {
+  MESSAGES_TITLE,
+  MESSAGES_NEW,
+  MESSAGES_NO_CONVERSATIONS,
+  MESSAGES_LOAD_FAILED,
+  MESSAGES_UNREAD,
+  MESSAGES_CONVERSATION_FALLBACK,
+} from "../../content/messages";
+import { SETTINGS_RETRY } from "../../content/settings";
 
 export function ConversationList({
   conversations,
+  loadFailed = false,
+  onRetry,
   activeId,
   onSelect,
   onNewMessage,
 }: {
   conversations: Conversation[];
+  /** The list could not be read — not the same fact as an empty one (CA-E1). */
+  loadFailed?: boolean;
+  onRetry?: () => void;
   activeId: string | null;
   onSelect: (id: string) => void;
   onNewMessage: () => void;
@@ -18,22 +32,31 @@ export function ConversationList({
     <div className="flex flex-col h-full">
       <div className="flex items-center justify-between px-4 py-3">
         <p className="font-mono text-[12px] uppercase tracking-[0.04em] text-black">
-          Messages
+          {MESSAGES_TITLE}
         </p>
         <button
           onClick={onNewMessage}
           data-explain="messages.new"
           className="text-ui-xs font-sans text-crimson hover:text-crimson-dark"
         >
-          New
+          {MESSAGES_NEW}
         </button>
       </div>
 
       <div className="flex-1 overflow-y-auto">
-        {conversations.length === 0 ? (
+        {loadFailed ? (
           <div className="px-4 py-8 text-center">
             <p className="text-ui-xs font-sans text-grey-600">
-              No conversations yet.
+              {MESSAGES_LOAD_FAILED}{" "}
+              <button onClick={onRetry} className="btn-text-muted">
+                {SETTINGS_RETRY}
+              </button>
+            </p>
+          </div>
+        ) : conversations.length === 0 ? (
+          <div className="px-4 py-8 text-center">
+            <p className="text-ui-xs font-sans text-grey-600">
+              {MESSAGES_NO_CONVERSATIONS}
             </p>
           </div>
         ) : (
@@ -41,7 +64,7 @@ export function ConversationList({
             const otherMembers = conv.members.filter((m) => m.username);
             const displayName =
               otherMembers.map((m) => m.displayName ?? m.username).join(", ") ||
-              "Conversation";
+              MESSAGES_CONVERSATION_FALLBACK;
             const isActive = conv.id === activeId;
 
             return (
@@ -62,7 +85,7 @@ export function ConversationList({
                         />
                       )}
                       {conv.unreadCount > 0 && (
-                        <span className="sr-only">Unread</span>
+                        <span className="sr-only">{MESSAGES_UNREAD}</span>
                       )}
                       <p
                         className={`text-ui-sm font-sans truncate ${conv.unreadCount > 0 ? "font-semibold text-black" : "text-black"}`}
@@ -70,17 +93,10 @@ export function ConversationList({
                         {displayName}
                       </p>
                     </div>
-                    {conv.lastMessage && (
-                      <p className="text-ui-xs font-sans text-grey-600 truncate mt-0.5">
-                        {conv.lastMessage.content}
-                      </p>
-                    )}
                   </div>
-                  {conv.lastMessage && (
-                    <span className="font-mono text-[12px] text-grey-600 uppercase flex-shrink-0">
-                      {timeAgo(conv.lastMessage.createdAt, { compact: true })}
-                    </span>
-                  )}
+                  <span className="font-mono text-[12px] text-grey-600 uppercase flex-shrink-0">
+                    {timeAgo(conv.lastMessageAt ?? conv.createdAt, { compact: true })}
+                  </span>
                 </div>
               </button>
             );

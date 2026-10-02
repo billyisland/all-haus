@@ -24,8 +24,11 @@ export type RelayOutboxEntityType =
   | 'drive'
   | 'drive_deletion'
   | 'signing_passthrough'
-  | 'conversation_pulse'
   | 'account_deletion'
+  // `conversation_pulse` is still admitted by the table's CHECK and written by
+  // nothing: the kind-14 it carried named a DM's conversation on a relay whose
+  // reads are public, and nothing ever read it (walkthrough A8). Do not revive
+  // it — a DM's relay presence, if ever, is a NIP-17 gift wrap.
   // Nostr outbound interop — replaceable discovery events (NOSTR-OUTBOUND-INTEROP-ADR)
   | 'profile'       // kind 0  — profile metadata
   | 'follow_list'   // kind 3  — NIP-02 contact list

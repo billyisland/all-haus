@@ -33,8 +33,10 @@ import {
 // Two gates compose: the operator master switch DISCOVERY_PUBLISH_ENABLED=1
 // (ships the feature dark) AND the per-user opt-in accounts.discovery_enabled
 // (NETWORK-CONCIERGE-ADR §7). Both must be true before anything is published.
-// retractFollowList is the exception — it cleans up on opt-OUT, so it is gated
-// only by the master switch.
+// retractFollowList is the exception — it cleans up on opt-OUT, so it cannot
+// read the account's current flags (they are already off by then). It is gated
+// by the master switch and by the caller's statement of what those flags WERE,
+// which is the same question asked one moment earlier; see its own header.
 // =============================================================================
 
 interface DiscoveryAccountRow extends ProfileFields, RelayListFields {
@@ -170,10 +172,37 @@ export async function republishFollowList(
 }
 
 // Retract a previously-published follow list by publishing an empty kind 3.
-// Called when a user turns the publish_follow_graph setting off; bypasses the
-// opt-out guard above precisely because the account is now opted out.
-export async function retractFollowList(accountId: string): Promise<void> {
+// Called when a user turns publish_follow_graph — or discovery_enabled itself —
+// off; bypasses the opt-out guard above precisely because the account is now
+// opted out.
+//
+// THERE IS NOTHING TO RETRACT FOR AN ACCOUNT THAT NEVER PUBLISHED, AND
+// RETRACTING ANYWAY IS ITSELF A DISCLOSURE. Every path that publishes a follow
+// list gates on `discovery_enabled AND publish_follow_graph` (republishFollowList
+// above, and both sweep queries). So for an account with either flag off, no
+// kind 3 has ever gone out — and signing an empty one with their custodial key
+// and fanning it to the public relays announces the existence of a pubkey that
+// had deliberately stayed off the mesh. That fires on the ordinary shape of the
+// settings pane: `publish_follow_graph` defaults TRUE, so a member who never
+// opted into discovery at all and turns the follow-graph switch off gets
+// published to the public mesh by the act of asking for less. Identity
+// disclosure is opt-in in this house, and an opt-out path must not be the
+// exception.
+//
+// So the caller states what the account's flags were BEFORE its write, and the
+// order is load-bearing for the same reason it is in the presence-deprovision
+// transaction: both call sites have already flipped the column by the time they
+// get here, so the row can no longer answer the question. `wasPublishing` is a
+// test of the state that would have published, not a receipt that a publish
+// happened — a member who opted in and out inside one sweep cycle retracts
+// something that never went out, which costs one empty event for an account
+// that had already consented to being on the mesh.
+export async function retractFollowList(
+  accountId: string,
+  prior: { wasPublishing: boolean },
+): Promise<void> {
   if (!discoveryEnabled()) return;
+  if (!prior.wasPublishing) return;
   const account = await loadAccount(accountId);
   if (!account || account.status !== "active") return;
   await signAndEnqueue(accountId, "follow_list", buildFollowListEvent([]));
@@ -206,6 +235,20 @@ export async function markFollowListDirty(
 const DIRTY_BATCH = 200; // follow-list republishes per cycle
 const HEAL_BATCH = 25; // full (kind 0/3/10002) backfill/self-heal accounts per cycle
 const HEAL_INTERVAL = "7 days"; // re-publish each account's discovery events at least this often
+// A failed heal is retried after this, not on the next 60s tick (CA-D5): an
+// account that fails DETERMINISTICALLY (key-custody refusing that one key)
+// would otherwise sit at the head of `discovery_synced_at NULLS FIRST` for
+// ever, and 25 of them are the whole batch — nobody else is ever healed.
+const HEAL_RETRY_AFTER = "1 hour";
+
+export const HEAL_SELECT_SQL = `SELECT id FROM accounts
+       WHERE status = 'active' AND discovery_enabled AND nostr_pubkey IS NOT NULL
+         AND (discovery_synced_at IS NULL
+              OR discovery_synced_at < now() - ($2)::interval)
+         AND (discovery_attempted_at IS NULL
+              OR discovery_attempted_at < now() - ($3)::interval)
+       ORDER BY discovery_synced_at NULLS FIRST
+       LIMIT $1`;
 
 export async function runDiscoverySweep(): Promise<void> {
   if (!discoveryEnabled()) return;
@@ -252,31 +295,33 @@ export async function runDiscoverySweep(): Promise<void> {
          AND (discovery_enabled = FALSE OR publish_follow_graph = FALSE)`,
   );
 
-  // Phase B — backfill + self-heal: least-recently-synced opted-in accounts.
-  const { rows: heal } = await pool.query<{ id: string }>(
-    `SELECT id FROM accounts
-       WHERE status = 'active' AND discovery_enabled AND nostr_pubkey IS NOT NULL
-         AND (discovery_synced_at IS NULL
-              OR discovery_synced_at < now() - ($2)::interval)
-       ORDER BY discovery_synced_at NULLS FIRST
-       LIMIT $1`,
-    [HEAL_BATCH, HEAL_INTERVAL],
-  );
+  // Phase B — backfill + self-heal: least-recently-synced opted-in accounts,
+  // minus any attempted inside the retry window.
+  const { rows: heal } = await pool.query<{ id: string }>(HEAL_SELECT_SQL, [
+    HEAL_BATCH,
+    HEAL_INTERVAL,
+    HEAL_RETRY_AFTER,
+  ]);
+  let healFailed = 0;
   for (const { id } of heal) {
+    // The attempt is stamped whatever happens; `discovery_synced_at` only on
+    // success, because the marker must not claim a sync that failed.
+    await pool.query(`UPDATE accounts SET discovery_attempted_at = now() WHERE id = $1`, [id]);
     try {
       await republishProfile(id);
       await republishRelayList(id);
       await republishFollowList(id); // skips when opted out or empty
     } catch (err) {
       logger.warn({ err, accountId: id }, "discovery sweep: heal republish failed");
-      continue; // don't stamp synced_at — retry next cycle
+      healFailed++;
+      continue; // retried after HEAL_RETRY_AFTER
     }
     await pool.query(`UPDATE accounts SET discovery_synced_at = now() WHERE id = $1`, [id]);
   }
 
   if (dirty.length > 0 || heal.length > 0) {
     logger.info(
-      { dirty: dirty.length, healed: heal.length },
+      { dirty: dirty.length, healed: heal.length - healFailed, healFailed },
       "discovery sweep complete",
     );
   }

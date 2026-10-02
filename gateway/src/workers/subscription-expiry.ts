@@ -4,6 +4,7 @@ import { enqueueRelayPublish } from "@platform-pub/shared/lib/relay-outbox.js";
 import {
   sendSubscriptionRenewedEmail,
   sendSubscriptionExpiryWarningEmail,
+  sendSubscriptionLapsedNotForSaleEmail,
 } from "@platform-pub/shared/lib/subscription-emails.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 import { publicationsEnabled } from "@platform-pub/shared/lib/env.js";
@@ -42,17 +43,23 @@ export async function expireAndRenewSubscriptions(): Promise<number> {
     writer_standard_price: number | null;
     writer_annual_discount_pct: number | null;
     reader_stripe_customer_id: string | null;
+    reader_card_action_required_at: Date | null;
     period_anchor_day: number;
+    target_status: string | null;
+    writer_paid_access_withdrawn_at: Date | null;
   }>(
     `SELECT s.id, s.reader_id, s.writer_id, s.publication_id, s.price_pence,
             s.current_period_end, s.period_anchor_day,
+            w.paid_access_withdrawn_at AS writer_paid_access_withdrawn_at,
             r.stripe_customer_id AS reader_stripe_customer_id,
+            r.card_action_required_at AS reader_card_action_required_at,
             r.nostr_pubkey AS reader_pubkey,
             COALESCE(w.nostr_pubkey, p.nostr_pubkey) AS writer_pubkey,
             COALESCE(s.subscription_period, 'monthly') AS subscription_period,
             s.offer_periods_remaining,
             w.subscription_price_pence AS writer_standard_price,
-            w.annual_discount_pct AS writer_annual_discount_pct
+            w.annual_discount_pct AS writer_annual_discount_pct,
+            COALESCE(w.status::text, p.status) AS target_status
      FROM subscriptions s
      JOIN accounts r ON r.id = s.reader_id
      LEFT JOIN accounts w ON w.id = s.writer_id
@@ -101,6 +108,51 @@ export async function expireAndRenewSubscriptions(): Promise<number> {
       continue;
     }
 
+    // The thing subscribed to must still be LIVE at renewal (§3 money, S14).
+    // The renewable SELECT left-joins both targets and read neither's status,
+    // so a reader kept paying a writer whose account moderation had suspended
+    // or whose owner had deleted it — for a byline that publishes nothing and
+    // whose profile the rest of the site already refuses (`status = 'active'`
+    // is the site-wide predicate: author-resolve, search, follows, export).
+    // The writer's earning accrued all the same, so the money moved too.
+    //
+    // Expire rather than skip, for the reason spelled out in the publications
+    // gate above: a skip leaves the row 'active' and past its period end, so it
+    // is re-selected every hour forever and silently resumes charging the day
+    // the account comes back. NULL is included deliberately — a target row that
+    // is absent entirely is not a target we may charge for either. (The
+    // publication arm is dead while publications are suspended, since the gate
+    // above expires every publication subscription first; it is written now
+    // because it is the same defect one column over, and reinstatement must not
+    // have to rediscover it.)
+    if (sub.target_status !== "active") {
+      await pool
+        .query(
+          `UPDATE subscriptions
+           SET status = 'expired', auto_renew = FALSE, updated_at = now()
+           WHERE id = $1 AND status = 'active' AND current_period_end < now()`,
+          [sub.id],
+        )
+        .catch((err) =>
+          logger.error(
+            { err, subscriptionId: sub.id },
+            "Failed to expire subscription whose target is no longer active",
+          ),
+        );
+      logger.warn(
+        {
+          subscriptionId: sub.id,
+          readerId: sub.reader_id,
+          writerId: sub.writer_id,
+          publicationId: sub.publication_id,
+          targetStatus: sub.target_status,
+        },
+        "Subscription expired at renewal — the writer/publication is no longer active (not charged)",
+      );
+      processed++;
+      continue;
+    }
+
     // Collection gate (2026-07-06 audit P0): never renew-charge a reader with
     // no card on file — the charge would be uncollectible tab debt (settlement
     // skips card-less accounts) while the writer's earning became payable.
@@ -108,6 +160,45 @@ export async function expireAndRenewSubscriptions(): Promise<number> {
     // since; expire the subscription instead of charging (same terminal state
     // as a renewal that failed both attempts below). The period-end guard keeps
     // it idempotent against a concurrent cycle.
+    // Writer 9.3 — paid access to this writer's work is withdrawn (L5.6; §0z
+    // item 10). A renewal is a sale, so the subscription lapses at period end,
+    // NOT charged, and the reader is told why in the terms that are theirs to
+    // know. What they already unlocked stays unlocked (the gate pass's free
+    // path runs before its withdrawal check). Before the card checks: the
+    // reason this is not renewed is not the reader's card.
+    if (sub.writer_id && sub.writer_paid_access_withdrawn_at) {
+      await pool
+        .query(
+          `UPDATE subscriptions
+           SET status = 'expired', auto_renew = FALSE, updated_at = now()
+           WHERE id = $1 AND status = 'active' AND current_period_end < now()`,
+          [sub.id],
+        )
+        .catch((err) =>
+          logger.error(
+            { err, subscriptionId: sub.id },
+            "Failed to expire subscription to a writer whose paid access is withdrawn",
+          ),
+        );
+      sendSubscriptionLapsedNotForSaleEmail(sub.reader_id, sub.writer_id).catch((err) =>
+        logger.warn(
+          { err, subscriptionId: sub.id },
+          "Subscription-lapsed notice failed",
+        ),
+      );
+      logger.warn(
+        {
+          subscriptionId: sub.id,
+          readerId: sub.reader_id,
+          writerId: sub.writer_id,
+          withdrawnSince: sub.writer_paid_access_withdrawn_at,
+        },
+        "Subscription expired at renewal — the writer's paid access is withdrawn (Writer 9.3; not charged)",
+      );
+      processed++;
+      continue;
+    }
+
     if (!sub.reader_stripe_customer_id) {
       await pool
         .query(
@@ -125,6 +216,47 @@ export async function expireAndRenewSubscriptions(): Promise<number> {
       logger.warn(
         { subscriptionId: sub.id, readerId: sub.reader_id },
         "Subscription expired at renewal — reader has no card on file (charge would be uncollectible)",
+      );
+      processed++;
+      continue;
+    }
+
+    // Reader Terms 6.1, the renewal half. The card-less arm above catches a
+    // reader with no card at all; this one catches the reader whose card
+    // TERMINALLY DECLINED — settlement has backed off their tab since, so a
+    // renewal charge would be a debt we have already been told we cannot
+    // collect, landing on a reader who has been shown "your reading tab is
+    // paused". Expire rather than skip, for the reason the two arms above
+    // spell out: a skip leaves the row active and past its period end, so it is
+    // re-selected hourly for ever and resumes charging the day the flag clears
+    // — which for this flag is the day a NEW card arrives, at which point the
+    // reader has chosen nothing about a subscription that lapsed months ago.
+    //
+    // No email of its own: the reader already has the standing card-declined
+    // prompt on every money surface, which is the action that would fix this,
+    // and the expiry warning is phase 3's job for subscriptions ENDING on
+    // schedule. Same disposition as the two arms above, deliberately.
+    if (sub.reader_card_action_required_at) {
+      await pool
+        .query(
+          `UPDATE subscriptions
+           SET status = 'expired', auto_renew = FALSE, updated_at = now()
+           WHERE id = $1 AND status = 'active' AND current_period_end < now()`,
+          [sub.id],
+        )
+        .catch((err) =>
+          logger.error(
+            { err, subscriptionId: sub.id },
+            "Failed to expire subscription whose reader's card has declined",
+          ),
+        );
+      logger.warn(
+        {
+          subscriptionId: sub.id,
+          readerId: sub.reader_id,
+          cardActionRequiredSince: sub.reader_card_action_required_at,
+        },
+        "Subscription expired at renewal — the reader's card terminally declined (not charged)",
       );
       processed++;
       continue;

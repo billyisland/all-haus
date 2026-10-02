@@ -1,4 +1,3 @@
-import fs from "fs/promises";
 import type { FastifyInstance } from "fastify";
 import { safeFetch } from "@platform-pub/shared/lib/http-client.js";
 import { requireAuth, optionalAuth } from "../middleware/auth.js";
@@ -15,8 +14,6 @@ import logger from "@platform-pub/shared/lib/logger.js";
 // only what is about the REQUEST — multipart parsing, the declared MIME
 // allow-list, and status codes. See docs/adr/ADR-blossom-migration.md.
 // =============================================================================
-
-const MEDIA_DIR = process.env.MEDIA_DIR ?? "/app/media";
 
 /** MIME types this route accepts from a client — a claim ABOUT THE REQUEST,
  *  which is why it lives here and not in the bytes module. It is a cheap first
@@ -39,18 +36,7 @@ const OEMBED_PROVIDERS: Record<string, string> = {
   "open.spotify.com": "https://open.spotify.com/oembed",
 };
 
-// Ensure the media directory exists on startup
-async function ensureMediaDir() {
-  try {
-    await fs.mkdir(MEDIA_DIR, { recursive: true });
-  } catch (err) {
-    logger.error({ err, dir: MEDIA_DIR }, "Failed to create media directory");
-  }
-}
-
 export async function mediaRoutes(app: FastifyInstance) {
-  await ensureMediaDir();
-
   // ---------------------------------------------------------------------------
   // POST /media/upload — upload an image
   //
@@ -67,12 +53,12 @@ export async function mediaRoutes(app: FastifyInstance) {
       try {
         const data = await req.file();
         if (!data) {
-          return reply.status(400).send({ error: "No file uploaded" });
+          return reply.status(400).send({ error: "No file arrived. Please choose one and try again." });
         }
 
         if (!ALLOWED_IMAGE_TYPES.has(data.mimetype)) {
           return reply.status(400).send({
-            error: `Unsupported file type: ${data.mimetype}. Allowed: JPEG, PNG, GIF, WebP`,
+            error: `We can't use that kind of file (${data.mimetype}). Please upload a JPEG, PNG, GIF or WebP image.`,
           });
         }
 
@@ -105,10 +91,10 @@ export async function mediaRoutes(app: FastifyInstance) {
           if (err.failure === "undecodable") {
             return reply.status(400).send({ error: err.message });
           }
-          return reply.status(500).send({ error: "Upload failed" });
+          return reply.status(500).send({ error: "Couldn't upload that file. Please try again." });
         }
         logger.error({ err, uploaderId }, "Media upload error");
-        return reply.status(500).send({ error: "Upload failed" });
+        return reply.status(500).send({ error: "Couldn't upload that file. Please try again." });
       }
     },
   );
@@ -129,7 +115,7 @@ export async function mediaRoutes(app: FastifyInstance) {
 
       const oembedEndpoint = OEMBED_PROVIDERS[hostname];
       if (!oembedEndpoint) {
-        return reply.status(400).send({ error: "Unsupported embed provider" });
+        return reply.status(400).send({ error: "We can't embed links from that site." });
       }
 
       const oembedUrl = `${oembedEndpoint}?url=${encodeURIComponent(url)}&format=json&maxwidth=680`;
@@ -140,7 +126,7 @@ export async function mediaRoutes(app: FastifyInstance) {
       });
 
       if (!res.ok) {
-        return reply.status(res.status).send({ error: "oEmbed lookup failed" });
+        return reply.status(res.status).send({ error: "Couldn't load that embed. Please try again." });
       }
 
       const oembedData = JSON.parse(res.text);
@@ -161,7 +147,7 @@ export async function mediaRoutes(app: FastifyInstance) {
       });
     } catch (err) {
       logger.error({ err, url }, "oEmbed lookup error");
-      return reply.status(500).send({ error: "oEmbed lookup failed" });
+      return reply.status(500).send({ error: "Couldn't load that embed. Please try again." });
     }
   });
 }

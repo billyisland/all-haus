@@ -53,23 +53,62 @@ class VaultService {
     nostrDTag: string;
   }): Promise<VaultEncryptResult> {
     return withTransaction(async (client) => {
-      // Check if a key already exists (edit / re-publish)
-      const existingKey = await client.query<{
-        id: string;
-        content_key_enc: string;
-      }>(`SELECT id, content_key_enc FROM vault_keys WHERE article_id = $1`, [
-        params.articleId,
-      ]);
+      // ONE KEY PER ARTICLE, held by the schema (CA-F14(d), migration 268).
+      // This was read-then-insert with nothing between, so two first seals of
+      // one article in flight together (a retried publish while the first was
+      // still running) each minted a key; every later `WHERE article_id = $1`
+      // read then picked one of the two, and a reader could be issued the key
+      // the body was NOT encrypted with. Now the existing row is read FOR
+      // UPDATE (serialising edits), a fresh key is inserted ON CONFLICT DO
+      // NOTHING, and the loser of a race re-reads the winner's row and reuses
+      // it exactly as an edit would.
+      const readExisting = () =>
+        client.query<{
+          id: string;
+          content_key_enc: string;
+        }>(`SELECT id, content_key_enc FROM vault_keys WHERE article_id = $1 FOR UPDATE`, [
+          params.articleId,
+        ]);
 
-      let contentKeyBytes: Buffer;
-      let vaultKeyId: string;
+      let existingKey = await readExisting();
 
-      if (existingKey.rowCount && existingKey.rowCount > 0) {
+      let contentKeyBytes: Buffer | null = null;
+      let vaultKeyId = "";
+
+      if (!existingKey.rowCount) {
+        // New article — generate fresh key
+        const freshKey = generateContentKey();
+        const contentKeyEnc = encryptContentKey(freshKey);
+
+        const keyRow = await client.query<{ id: string }>(
+          `INSERT INTO vault_keys (article_id, nostr_article_event_id, content_key_enc, algorithm)
+           VALUES ($1, $2, $3, 'xchacha20poly1305')
+           ON CONFLICT (article_id) DO NOTHING
+           RETURNING id`,
+          [params.articleId, params.nostrArticleEventId, contentKeyEnc],
+        );
+        if (keyRow.rowCount) {
+          contentKeyBytes = freshKey;
+          vaultKeyId = keyRow.rows[0].id;
+          logger.info(
+            { articleId: params.articleId, vaultKeyId },
+            "Generated new vault key (xchacha20poly1305)",
+          );
+        } else {
+          // A concurrent seal inserted first; its key is the article's key.
+          existingKey = await readExisting();
+        }
+      }
+
+      if (!contentKeyBytes) {
+        const existing = existingKey.rows[0];
+        if (!existing) {
+          // Conflicted on article_id, yet no row: nothing else deletes these.
+          throw new Error("VAULT_KEY_VANISHED");
+        }
         // Reuse existing key — re-encrypt body with same key
         try {
-          contentKeyBytes = decryptContentKey(
-            existingKey.rows[0].content_key_enc,
-          );
+          contentKeyBytes = decryptContentKey(existing.content_key_enc);
         } catch (err) {
           logger.error(
             { err, articleId: params.articleId },
@@ -79,7 +118,7 @@ class VaultService {
             statusCode: 500,
           });
         }
-        vaultKeyId = existingKey.rows[0].id;
+        vaultKeyId = existing.id;
 
         // Keep nostr_article_event_id current for audit purposes;
         // ciphertext is updated below after re-encryption.
@@ -91,22 +130,6 @@ class VaultService {
         logger.info(
           { articleId: params.articleId, vaultKeyId },
           "Reusing existing vault key for article edit",
-        );
-      } else {
-        // New article — generate fresh key
-        contentKeyBytes = generateContentKey();
-        const contentKeyEnc = encryptContentKey(contentKeyBytes);
-
-        const keyRow = await client.query<{ id: string }>(
-          `INSERT INTO vault_keys (article_id, nostr_article_event_id, content_key_enc, algorithm)
-           VALUES ($1, $2, $3, 'xchacha20poly1305')
-           RETURNING id`,
-          [params.articleId, params.nostrArticleEventId, contentKeyEnc],
-        );
-        vaultKeyId = keyRow.rows[0].id;
-        logger.info(
-          { articleId: params.articleId, vaultKeyId },
-          "Generated new vault key (xchacha20poly1305)",
         );
       }
 
@@ -121,28 +144,18 @@ class VaultService {
       // Persist ciphertext in vault_keys so the gate-pass can serve it directly.
       // This decouples decryption from relay availability — readers no longer need
       // to find the ['payload', ...] tag on the NIP-23 event.
+      // `algorithm` travels WITH the ciphertext: a reused key row written
+      // before XChaCha carries 'aes-256-gcm', and re-encrypting its body
+      // without restamping the column made the piece undecryptable, since
+      // issueKey and decryptForAuthor branch on it (CA-A5). The content key
+      // itself is 32 bytes either way, so reusing it is sound.
       await client.query(
-        `UPDATE vault_keys SET ciphertext = $1 WHERE id = $2`,
-        [ciphertext, vaultKeyId],
+        `UPDATE vault_keys SET ciphertext = $1, algorithm = $2 WHERE id = $3`,
+        [ciphertext, algorithm, vaultKeyId],
       );
 
       return { ciphertext, algorithm, vaultKeyId };
     });
-  }
-
-  // ---------------------------------------------------------------------------
-  // updateVaultEventId — kept for backward-compat; now a no-op for new articles
-  // (new articles don't have a separate vault event to track)
-  // ---------------------------------------------------------------------------
-
-  async updateVaultEventId(
-    articleId: string,
-    vaultNostrEventId: string,
-  ): Promise<void> {
-    await pool.query(
-      `UPDATE articles SET vault_event_id = $1, updated_at = now() WHERE id = $2`,
-      [vaultNostrEventId, articleId],
-    );
   }
 
   // ---------------------------------------------------------------------------

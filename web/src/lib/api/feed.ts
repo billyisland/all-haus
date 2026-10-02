@@ -34,16 +34,4 @@ export const replies = {
 
   deleteReply: (replyId: string) =>
     request<{ ok: boolean }>(`/replies/${replyId}`, { method: 'DELETE' }),
-
-  toggleArticleReplies: (articleId: string, enabled: boolean) =>
-    request<{ ok: boolean }>(`/articles/${articleId}/replies`, {
-      method: 'PATCH',
-      body: JSON.stringify({ enabled }),
-    }),
-
-  toggleNoteReplies: (noteId: string, enabled: boolean) =>
-    request<{ ok: boolean }>(`/notes/${noteId}/replies`, {
-      method: 'PATCH',
-      body: JSON.stringify({ enabled }),
-    }),
 }

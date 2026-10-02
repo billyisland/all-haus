@@ -55,6 +55,7 @@ interface Row {
   admitted_at: Date | null;
   admitted_account_id: string | null;
   invited_at: Date | null;
+  invite_failed_at?: Date | null;
 }
 
 let waitlistRows: Row[] = [];
@@ -101,7 +102,8 @@ function holdReadsManually(): { arrived: Promise<void>; release: () => void } {
   return { arrived, release: open };
 }
 
-const provisionAccount = vi.fn(async (email: string) => {
+const appendAccountToSeed = vi.fn(async (_client: unknown, _p: unknown) => "appended" as string);
+const provisionAccount = vi.fn(async (email: string, _name?: string, _arrival?: unknown, _opts?: unknown) => {
   const account = {
     id: `acct-${accounts.length + 1}`,
     email,
@@ -131,12 +133,19 @@ function query(sql: string, params: unknown[] = []) {
               (r) => r.admitted_at !== null && r.invited_at === null,
             ).length,
           ),
+          invite_failed: String(
+            waitlistRows.filter(
+              (r) => r.admitted_at !== null && r.invited_at === null && r.invite_failed_at,
+            ).length,
+          ),
         },
       ],
       rowCount: 1,
     });
   }
-  if (/SELECT id, admitted_at, invited_at, admitted_account_id/.test(sql)) {
+  // Admit reads (id, admitted_at, admitted_account_id); invite reads the same
+  // plus invited_at. Both are the row lookup the race tests hold open.
+  if (/SELECT id, admitted_at,( invited_at,)? admitted_account_id/.test(sql)) {
     const read = () => {
       const row = waitlistRows.find((r) => r.email === params[0]);
       // A COPY, never the live row. Handing out the object itself lets one
@@ -195,6 +204,20 @@ function query(sql: string, params: unknown[] = []) {
       rows: row ? [{ admitted_at: row.admitted_at }] : [],
       rowCount: row ? 1 : 0,
     });
+  }
+  // Invite's allPending read — answered from the predicate it names, in the
+  // order it asks for, so a route that dropped a clause invites the wrong rows.
+  if (/SELECT email FROM waitlist/.test(sql)) {
+    const rows = waitlistRows
+      .filter(
+        (r) =>
+          (!/admitted_at IS NOT NULL/.test(sql) || r.admitted_at !== null) &&
+          (!/admitted_account_id IS NOT NULL/.test(sql) || r.admitted_account_id !== null) &&
+          (!/invited_at IS NULL/.test(sql) || r.invited_at === null),
+      )
+      .sort((a, b) => a.admitted_at!.getTime() - b.admitted_at!.getTime())
+      .map((r) => ({ email: r.email }));
+    return Promise.resolve({ rows, rowCount: rows.length });
   }
   if (sql.includes("FROM waitlist")) {
     const limit = Number(params[0] ?? 1000);
@@ -280,7 +303,15 @@ function query(sql: string, params: unknown[] = []) {
   }
   if (/UPDATE waitlist SET invited_at = NULL/.test(sql)) {
     const row = waitlistRows.find((r) => r.id === params[0]);
-    if (row) row.invited_at = null;
+    if (row) {
+      row.invited_at = null;
+      if (/invite_failed_at = now\(\)/.test(sql)) row.invite_failed_at = new Date();
+    }
+    return Promise.resolve({ rows: [], rowCount: row ? 1 : 0 });
+  }
+  if (/UPDATE waitlist SET invite_failed_at = NULL/.test(sql)) {
+    const row = waitlistRows.find((r) => r.id === params[0]);
+    if (row) row.invite_failed_at = null;
     return Promise.resolve({ rows: [], rowCount: row ? 1 : 0 });
   }
 
@@ -289,7 +320,16 @@ function query(sql: string, params: unknown[] = []) {
 
 vi.mock("@platform-pub/shared/db/client.js", () => ({
   pool: { query: (sql: string, params?: unknown[]) => query(sql, params) },
-  withTransaction: vi.fn(),
+  // The seed append runs in its own transaction; its SQL is the DB-backed
+  // suite's (seed-on-admit.test.ts). Here it is a seam: the route's contract is
+  // WHEN it asks and what it does with the answer.
+  withTransaction: (fn: (c: unknown) => unknown) => fn({ query }),
+}));
+
+vi.mock("../src/routes/feeds/seed-append.js", () => ({
+  appendAccountToSeed: (c: unknown, p: unknown) => appendAccountToSeed(c, p),
+  carryAdmittedIntoSeed: vi.fn(),
+  countCarryForFeed: vi.fn(),
 }));
 
 vi.mock("@platform-pub/shared/lib/logger.js", () => ({
@@ -301,8 +341,8 @@ vi.mock("@platform-pub/shared/lib/email.js", () => ({
 }));
 
 vi.mock("../src/lib/account-provision.js", () => ({
-  provisionAccount: (email: string, displayName: string) =>
-    provisionAccount(email, displayName),
+  provisionAccount: (email: string, displayName: string, arrival?: unknown, opts?: unknown) =>
+    provisionAccount(email, displayName, arrival, opts),
 }));
 
 vi.mock("../src/middleware/admin.js", () => ({
@@ -341,6 +381,8 @@ beforeEach(() => {
   selectBarrier = null;
   accounts = [];
   provisionAccount.mockClear();
+  appendAccountToSeed.mockReset();
+  appendAccountToSeed.mockImplementation(async () => "appended");
   sendWaitlistInviteEmail.mockClear();
   sendWaitlistInviteEmail.mockImplementation(async () => {});
   waitlistRows = [
@@ -393,6 +435,7 @@ describe("GET /admin/dashboard/waitlist", () => {
       joinedLast7d: 3,
       admitted: 0,
       admittedNotInvited: 0,
+      inviteFailed: 0,
     });
     // NOTHING about publish interest, in the totals or per row: the question
     // left the page on 2026-07-27 and its tile and column went with it. toEqual
@@ -521,50 +564,68 @@ describe("GET /admin/dashboard/waitlist", () => {
   });
 });
 
-const admit = (app: any, email: string) =>
+const admit = (app: any, emails: string | string[], reason = "October cohort") =>
   app.inject({
     method: "POST",
     url: "/admin/dashboard/waitlist/admit",
-    payload: { email },
+    payload: { emails: Array.isArray(emails) ? emails : [emails], reason },
   });
 
-/** Admit through the real route, asserting it worked — a fixture, not a test. */
+/** The one row of a single-address admit. */
+const only = (res: any) => res.json().results[0];
+
 async function admitVia(app: any, email: string) {
   const res = await admit(app, email);
   expect(res.statusCode).toBe(200);
+  expect(["admitted", "already_admitted"]).toContain(only(res).outcome);
 }
 
-describe("POST /admin/dashboard/waitlist/admit", () => {
+const invite = (app: any, body: { emails: string[] } | { allPending: true }) =>
+  app.inject({
+    method: "POST",
+    url: "/admin/dashboard/waitlist/invite",
+    payload: body,
+  });
 
-  it("requires admin — this one creates accounts and emails strangers", async () => {
+describe("POST /admin/dashboard/waitlist/admit", () => {
+  it("requires admin — this one creates accounts", async () => {
     adminAllowed = false;
     const app = await build();
     const res = await admit(app, "early@example.com");
     expect(res.statusCode).toBe(403);
     expect(provisionAccount).not.toHaveBeenCalled();
-    expect(sendWaitlistInviteEmail).not.toHaveBeenCalled();
     await app.close();
   });
 
-  it("creates the account, stamps the row, and sends the invitation", async () => {
+  it("creates the account, marks it, stamps the row, appends it to the seed — and sends NOTHING", async () => {
     const app = await build();
     const res = await admit(app, "early@example.com");
 
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toMatchObject({
+    expect(only(res)).toEqual({
       email: "early@example.com",
-      admitted: true,
+      outcome: "admitted",
       accountCreated: true,
       username: "early",
-      invited: true,
+      seed: "appended",
     });
-    expect(provisionAccount).toHaveBeenCalledTimes(1);
-    expect(sendWaitlistInviteEmail).toHaveBeenCalledWith("early@example.com");
+    expect(res.json()).toMatchObject({ admitted: 1, skipped: 0, seedAppended: 1 });
+    // The split (RESHAPE-PLAN-2026-10 §A.2.2): admitting is not telling.
+    expect(sendWaitlistInviteEmail).not.toHaveBeenCalled();
+    // Only an account ADMIT created is marked — the half of the "has not
+    // arrived" predicate the Google path must not set.
+    expect(provisionAccount.mock.calls[0][3]).toEqual({ byAdmit: true });
+    expect(appendAccountToSeed).toHaveBeenCalledTimes(1);
+    expect(appendAccountToSeed.mock.calls[0][1]).toEqual({
+      accountId: "acct-1",
+      actorId: "admin-id",
+      reason: "October cohort",
+    });
 
     const r = waitlistRows[0];
     expect(r.admitted_at).not.toBeNull();
     expect(r.admitted_account_id).toBe("acct-1");
-    expect(r.invited_at).not.toBeNull();
+    expect(r.invited_at).toBeNull();
     await app.close();
   });
 
@@ -576,52 +637,49 @@ describe("POST /admin/dashboard/waitlist/admit", () => {
     await app.close();
   });
 
-  it("links an existing member instead of minting a second account", async () => {
-    // The likely first real case: the operator joined their own waiting list
-    // while testing the form. accounts.email is unique, so a blind insert here
-    // would 500 — and a second account for one person is worse than the 500.
-    accounts.push({
-      id: "acct-existing",
-      email: "early@example.com",
-      username: "ed",
-    });
+  it("links an existing member instead of minting a second account, and appends them too", async () => {
+    accounts.push({ id: "acct-existing", email: "early@example.com", username: "ed" });
 
     const app = await build();
     const res = await admit(app, "early@example.com");
 
-    expect(res.statusCode).toBe(200);
-    expect(res.json()).toMatchObject({
+    expect(only(res)).toMatchObject({
+      outcome: "admitted",
       accountCreated: false,
       username: "ed",
-      invited: true,
+      seed: "appended",
     });
     expect(provisionAccount).not.toHaveBeenCalled();
     expect(waitlistRows[0].admitted_account_id).toBe("acct-existing");
     await app.close();
   });
 
-  it("refuses a second admit of an already-admitted-and-invited row", async () => {
+  it("re-admitting an admitted row RE-RUNS THE APPEND and creates nothing — the repair path", async () => {
     const app = await build();
-    await admit(app, "early@example.com");
-    sendWaitlistInviteEmail.mockClear();
+    appendAccountToSeed.mockRejectedValueOnce(new Error("db blip"));
+    const first = await admit(app, "early@example.com");
+    // The admission stands; the row says the append did not happen.
+    expect(only(first)).toMatchObject({ outcome: "admitted", seed: "error" });
     provisionAccount.mockClear();
 
-    const res = await admit(app, "early@example.com");
-    expect(res.statusCode).toBe(409);
-    expect(res.json().error).toBe("already_admitted");
+    const second = await admit(app, "early@example.com");
+    expect(only(second)).toMatchObject({
+      outcome: "already_admitted",
+      accountCreated: false,
+      username: "early",
+      seed: "appended",
+    });
     expect(provisionAccount).not.toHaveBeenCalled();
-    expect(sendWaitlistInviteEmail).not.toHaveBeenCalled();
+    expect(appendAccountToSeed).toHaveBeenCalledTimes(2);
+    expect(accounts).toHaveLength(1);
     await app.close();
   });
 
   it("absorbs a double-click: two reads before either claim make ONE account", async () => {
     // THE INTERLEAVING IS FORCED, NOT HOPED FOR. Left to the event loop the
     // first request runs to completion before the second issues a query, and
-    // the second then takes the plain already-admitted path — so this test
-    // passed against a route whose claim had no `admitted_at IS NULL` guard at
-    // all. Holding both reads open until both have arrived is the only
-    // arrangement in which the claim is what decides, and it kills that
-    // mutation.
+    // the second takes the plain already-admitted path — so this test passed
+    // against a route whose claim had no `admitted_at IS NULL` guard at all.
     holdReadsUntil(2);
 
     const app = await build();
@@ -630,154 +688,178 @@ describe("POST /admin/dashboard/waitlist/admit", () => {
       admit(app, "early@example.com"),
     ]);
 
-    expect([a.statusCode, b.statusCode].sort()).toEqual([200, 409]);
+    expect([only(a).outcome, only(b).outcome].sort()).toEqual(["admit_in_progress", "admitted"]);
     expect(provisionAccount).toHaveBeenCalledTimes(1);
     expect(accounts).toHaveLength(1);
-    expect(sendWaitlistInviteEmail).toHaveBeenCalledTimes(1);
     await app.close();
   });
 
-  it("sends no duplicate when a second click lands mid-admission", async () => {
-    // The other window, and the one the invite claim closes: the second click
-    // arrives AFTER the first has claimed the admission but BEFORE it has
-    // sent. Read naively that row says "admitted, never told" — the exact
-    // shape of a resend — so without a claim on the invitation too, the
-    // prospect gets two identical emails.
-    let release!: () => void;
-    const held = new Promise<void>((r) => (release = r));
-    provisionAccount.mockImplementationOnce(async (email: string) => {
-      await held;
-      const account = {
-        id: `acct-${accounts.length + 1}`,
-        email,
-        username: email.split("@")[0],
-      };
-      accounts.push(account);
-      return { accountId: account.id, username: account.username };
-    });
-
-    const app = await build();
-    const first = admit(app, "early@example.com");
-    await new Promise((r) => setTimeout(r, 0));
-    const second = admit(app, "early@example.com");
-    await new Promise((r) => setTimeout(r, 0));
-    release();
-    await Promise.all([first, second]);
-
-    expect(sendWaitlistInviteEmail).toHaveBeenCalledTimes(1);
-    expect(accounts).toHaveLength(1);
-    expect(waitlistRows[0].admitted_account_id).toBe("acct-1");
-    expect(waitlistRows[0].invited_at).not.toBeNull();
-    await app.close();
-  });
-
-  it("sends one email when two resends of the same row race", async () => {
-    // Two clicks on "Send invite" for a row that IS fully admitted and simply
-    // never heard. Both pass every check — the account exists, the invitation
-    // is outstanding — so the invite claim is the only thing standing between
-    // this prospect and two identical emails.
-    accounts.push({
-      id: "acct-existing",
-      email: "early@example.com",
-      username: "ed",
-    });
-    waitlistRows[0].admitted_at = T("2026-07-27T18:00:00Z");
-    waitlistRows[0].admitted_account_id = "acct-existing";
-    holdReadsUntil(2);
-
-    const app = await build();
-    const [a, b] = await Promise.all([
-      admit(app, "early@example.com"),
-      admit(app, "early@example.com"),
-    ]);
-
-    expect(sendWaitlistInviteEmail).toHaveBeenCalledTimes(1);
-    expect([a.statusCode, b.statusCode].sort()).toEqual([200, 409]);
-    expect(waitlistRows[0].invited_at).not.toBeNull();
-    await app.close();
-  });
-
-  it("refuses to invite a row stamped with no account behind it", async () => {
-    // The half-done state: admitted_at set, no account. Reachable only if a
-    // provisioning failure's release ALSO failed (which logs loudly), or
-    // momentarily while another click is mid-flight. Inviting here would send
-    // someone to a login page for an account that may not exist.
+  it("refuses to append for a row stamped with no account behind it", async () => {
+    // Reachable only if a provisioning failure's release ALSO failed (which
+    // logs loudly), or momentarily while another press is mid-flight.
     waitlistRows[0].admitted_at = T("2026-07-27T18:00:00Z");
 
     const app = await build();
     const res = await admit(app, "early@example.com");
 
-    expect(res.statusCode).toBe(409);
-    expect(res.json().error).toBe("admit_in_progress");
-    expect(sendWaitlistInviteEmail).not.toHaveBeenCalled();
+    expect(only(res)).toEqual({ email: "early@example.com", outcome: "admit_in_progress" });
+    expect(appendAccountToSeed).not.toHaveBeenCalled();
     await app.close();
   });
 
-  it("keeps the admission when the invitation fails, and says so", async () => {
-    sendWaitlistInviteEmail.mockRejectedValueOnce(new Error("postmark down"));
-    const app = await build();
-    const res = await admit(app, "early@example.com");
-
-    // The account is real and the person is a member — the courtesy failed,
-    // not the admission. A 500 here would invite a retry that double-creates.
-    expect(res.statusCode).toBe(200);
-    expect(res.json()).toMatchObject({ admitted: true, invited: false });
-    expect(waitlistRows[0].admitted_at).not.toBeNull();
-    expect(waitlistRows[0].admitted_account_id).toBe("acct-1");
-    expect(waitlistRows[0].invited_at).toBeNull();
-    await app.close();
-  });
-
-  it("resends to an admitted-but-never-told row without touching the account", async () => {
-    sendWaitlistInviteEmail.mockRejectedValueOnce(new Error("postmark down"));
-    const app = await build();
-    await admit(app, "early@example.com");
-    provisionAccount.mockClear();
-
-    const res = await admit(app, "early@example.com");
-    expect(res.statusCode).toBe(200);
-    expect(res.json()).toMatchObject({
-      invited: true,
-      accountCreated: false,
-      username: "early",
-    });
-    expect(provisionAccount).not.toHaveBeenCalled();
-    expect(accounts).toHaveLength(1);
-    expect(waitlistRows[0].invited_at).not.toBeNull();
-    await app.close();
-  });
-
-  it("releases the claim when provisioning fails, so a retry works", async () => {
+  it("releases the claim when provisioning fails, and the batch goes on", async () => {
     provisionAccount.mockRejectedValueOnce(new Error("key-custody down"));
     const app = await build();
 
-    const first = await admit(app, "early@example.com");
-    expect(first.statusCode).toBe(500);
-    // Not stuck at "admitted" with nothing behind it — that row would need a
-    // human with psql, which is the situation this panel exists to end.
+    const res = await admit(app, ["early@example.com", "middle@example.com"]);
+    expect(res.statusCode).toBe(200);
+    // A PARTIAL OUTCOME IS NOT A TOTAL ONE: the first row's failure is about
+    // that row, and the second is admitted — asserted by what it DID.
+    expect(res.json().results.map((r: any) => r.outcome)).toEqual(["error", "admitted"]);
+    expect(res.json()).toMatchObject({ admitted: 1, skipped: 1 });
+    expect(waitlistRows[1].admitted_account_id).not.toBeNull();
+    // Not stuck at "admitted" with nothing behind it.
     expect(waitlistRows[0].admitted_at).toBeNull();
+
+    const retry = await admit(app, "early@example.com");
+    expect(only(retry)).toMatchObject({ outcome: "admitted", accountCreated: true });
+    await app.close();
+  });
+
+  it("reports the seed's refusals per row rather than hiding them", async () => {
+    appendAccountToSeed.mockResolvedValueOnce("seed_full");
+    appendAccountToSeed.mockResolvedValueOnce("no_seed");
+    const app = await build();
+    const res = await admit(app, ["early@example.com", "middle@example.com"]);
+    expect(res.json().results.map((r: any) => r.seed)).toEqual(["seed_full", "no_seed"]);
+    expect(res.json()).toMatchObject({ admitted: 2, seedAppended: 0 });
+    await app.close();
+  });
+
+  it("answers an address that never joined per row, and admits the rest", async () => {
+    const app = await build();
+    const res = await admit(app, ["stranger@example.com", "early@example.com"]);
+    expect(res.json().results.map((r: any) => r.outcome)).toEqual(["not_on_list", "admitted"]);
+    expect(provisionAccount).toHaveBeenCalledTimes(1);
+    await app.close();
+  });
+
+  it("400s a malformed address, and a batch with no note", async () => {
+    const app = await build();
+    expect((await admit(app, "not-an-email")).statusCode).toBe(400);
+    expect((await admit(app, "early@example.com", "   ")).statusCode).toBe(400);
+    expect(provisionAccount).not.toHaveBeenCalled();
+    await app.close();
+  });
+});
+
+describe("POST /admin/dashboard/waitlist/invite", () => {
+  it("requires admin — this one emails strangers", async () => {
+    adminAllowed = false;
+    const app = await build();
+    const res = await invite(app, { emails: ["early@example.com"] });
+    expect(res.statusCode).toBe(403);
     expect(sendWaitlistInviteEmail).not.toHaveBeenCalled();
-
-    const second = await admit(app, "early@example.com");
-    expect(second.statusCode).toBe(200);
-    expect(second.json()).toMatchObject({ accountCreated: true, invited: true });
     await app.close();
   });
 
-  it("404s an address that never joined the list", async () => {
+  it("sends the invitation to an admitted row and stamps it", async () => {
     const app = await build();
-    const res = await admit(app, "stranger@example.com");
-    expect(res.statusCode).toBe(404);
-    expect(res.json().error).toBe("not_on_list");
-    expect(provisionAccount).not.toHaveBeenCalled();
+    await admitVia(app, "early@example.com");
+    const res = await invite(app, { emails: ["early@example.com"] });
+
+    expect(res.json()).toMatchObject({
+      results: [{ email: "early@example.com", outcome: "invited" }],
+      invited: 1,
+      skipped: 0,
+    });
+    expect(sendWaitlistInviteEmail).toHaveBeenCalledWith("early@example.com");
+    expect(waitlistRows[0].invited_at).not.toBeNull();
     await app.close();
   });
 
-  it("400s a malformed address rather than looking it up", async () => {
+  it("refuses a row that is not admitted, one mid-admission, and one already told", async () => {
+    waitlistRows[1].admitted_at = T("2026-07-27T18:00:00Z"); // no account
     const app = await build();
-    const res = await admit(app, "not-an-email");
-    expect(res.statusCode).toBe(400);
-    expect(provisionAccount).not.toHaveBeenCalled();
+    await admitVia(app, "throwaway@example.com");
+    await invite(app, { emails: ["throwaway@example.com"] });
+    sendWaitlistInviteEmail.mockClear();
+
+    const res = await invite(app, {
+      emails: ["early@example.com", "middle@example.com", "throwaway@example.com", "stranger@example.com"],
+    });
+    expect(res.json().results.map((r: any) => r.outcome)).toEqual([
+      "not_admitted",
+      "admit_in_progress",
+      "already_invited",
+      "not_on_list",
+    ]);
+    expect(sendWaitlistInviteEmail).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("a failed send is its OWN signal — stamped, not merely untold — and a good one clears it", async () => {
+    const app = await build();
+    await admitVia(app, "early@example.com");
+    sendWaitlistInviteEmail.mockRejectedValueOnce(new Error("postmark down"));
+
+    const failed = await invite(app, { emails: ["early@example.com"] });
+    expect(failed.json().results[0].outcome).toBe("send_failed");
+    expect(waitlistRows[0].invited_at).toBeNull();
+    expect(waitlistRows[0].invite_failed_at).not.toBeNull();
+
+    const list = (await app.inject({ method: "GET", url: "/admin/dashboard/waitlist" })).json();
+    expect(list.entries.find((e: any) => e.email === "early@example.com").inviteFailedAt).not.toBeNull();
+
+    const retried = await invite(app, { emails: ["early@example.com"] });
+    expect(retried.json().results[0].outcome).toBe("invited");
+    expect(waitlistRows[0].invited_at).not.toBeNull();
+    expect(waitlistRows[0].invite_failed_at).toBeNull();
+    await app.close();
+  });
+
+  it("sends one email when two invites of the same row race", async () => {
+    const app = await build();
+    await admitVia(app, "early@example.com");
+    holdReadsUntil(2);
+
+    const [a, b] = await Promise.all([
+      invite(app, { emails: ["early@example.com"] }),
+      invite(app, { emails: ["early@example.com"] }),
+    ]);
+
+    expect(sendWaitlistInviteEmail).toHaveBeenCalledTimes(1);
+    expect([a.json().results[0].outcome, b.json().results[0].outcome].sort()).toEqual([
+      "already_invited",
+      "invited",
+    ]);
+    await app.close();
+  });
+
+  it("allPending invites exactly the admitted rows nobody has told", async () => {
+    const app = await build();
+    await admitVia(app, "early@example.com");
+    await admitVia(app, "middle@example.com");
+    await invite(app, { emails: ["middle@example.com"] });
+    sendWaitlistInviteEmail.mockClear();
+
+    const res = await invite(app, { allPending: true });
+    expect(res.json().results).toEqual([{ email: "early@example.com", outcome: "invited" }]);
+    expect(sendWaitlistInviteEmail).toHaveBeenCalledTimes(1);
+    expect(sendWaitlistInviteEmail).toHaveBeenCalledWith("early@example.com");
+    await app.close();
+  });
+
+  it("one failed send does not stop the rest", async () => {
+    const app = await build();
+    await admitVia(app, "early@example.com");
+    await admitVia(app, "middle@example.com");
+    sendWaitlistInviteEmail.mockRejectedValueOnce(new Error("postmark down"));
+
+    const res = await invite(app, { emails: ["early@example.com", "middle@example.com"] });
+    expect(res.json().results.map((r: any) => r.outcome)).toEqual(["send_failed", "invited"]);
+    expect(res.json()).toMatchObject({ invited: 1, skipped: 1 });
+    expect(waitlistRows[1].invited_at).not.toBeNull();
     await app.close();
   });
 });
@@ -909,29 +991,26 @@ describe("POST /admin/dashboard/waitlist/remove", () => {
 
     release();
     const res = await admitting;
-    expect(res.statusCode).toBe(404);
-    expect(res.json().error).toBe("removed_meanwhile");
-    // Mutation-checked: return the old bare 409 from the claim-loss branch and
-    // this fails on both the code and the status.
+    expect(only(res)).toEqual({ email: "throwaway@example.com", outcome: "removed_meanwhile" });
+    // Mutation-checked: answer the claim-loss branch without the read-back and
+    // this fails on the outcome.
     expect(provisionAccount).not.toHaveBeenCalled();
     expect(sendWaitlistInviteEmail).not.toHaveBeenCalled();
     await app.close();
   });
 
-  it("still reports already_admitted when the claim loses to another ADMIT", async () => {
+  it("reports admit_in_progress, not removed, when the claim loses to another ADMIT", async () => {
     // The control for the test above: the same branch, the other cause. Both
     // read-backs have to be exercised or 'removed_meanwhile' could simply have
-    // replaced the 409 outright.
+    // replaced the other answer outright.
     const app = await build();
     holdReadsUntil(2);
     const [a, b] = await Promise.all([
       admit(app, "early@example.com"),
       admit(app, "early@example.com"),
     ]);
-    const codes = [a.statusCode, b.statusCode].sort();
-    expect(codes).toEqual([200, 409]);
-    const loser = a.statusCode === 409 ? a : b;
-    expect(loser.json().error).toBe("already_admitted");
+    const outcomes = [only(a).outcome, only(b).outcome].sort();
+    expect(outcomes).toEqual(["admit_in_progress", "admitted"]);
     expect(provisionAccount).toHaveBeenCalledTimes(1);
     await app.close();
   });

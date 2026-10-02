@@ -3,7 +3,8 @@
 import React, { useEffect, useState } from "react";
 import { externalItems, type ParentItem } from "../../lib/api/feeds";
 import { formatDateRelative, truncateText } from "../../lib/format";
-import { externalizeHtml } from "../../lib/external-links";
+import { externalizeHtml, safeHttpUrl } from "../../lib/external-links";
+import { EnlargeableImage } from "../ui/EnlargeableImage";
 import type { VesselPalette } from "./tokens";
 
 interface Props {
@@ -161,12 +162,11 @@ export function QuotedPostTile({ itemId, expanded, palette, onOpen }: Props) {
         </div>
       )}
       {image && (
-        <img
+        <EnlargeableImage
           src={image.url}
           alt={image.alt ?? ""}
-          loading="lazy"
-          referrerPolicy="no-referrer"
-          className="mt-2 w-full"
+          wrapperClassName="mt-2 w-full"
+          className="w-full"
           style={{
             display: "block",
             background: palette.quoteBg,
@@ -183,7 +183,7 @@ export function QuotedPostTile({ itemId, expanded, palette, onOpen }: Props) {
       )}
       {link && (
         <a
-          href={link.url}
+          href={safeHttpUrl(link.url)}
           target="_blank"
           rel="noopener noreferrer"
           onClick={(e) => e.stopPropagation()}

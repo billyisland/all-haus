@@ -247,7 +247,8 @@ export function AnchoredPopover({
   }, [open, measured]);
 
   // Escape via the shared shield, so it closes this menu and not the host
-  // Glasshouse under it (web/CLAUDE.md › Escape on a popover over a Glasshouse).
+  // Glasshouse under it (`.claude/rules/web-overlays.md` › Escape on a popover
+  // over a Glasshouse).
   useEscapeShield(open, onDismiss);
 
   // Outside pointerdown. The panel is no longer a DOM descendant of the anchor,

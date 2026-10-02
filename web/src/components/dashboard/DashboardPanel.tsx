@@ -17,8 +17,7 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import { myArticles, account as accountApi, auth, publications as pubApi, type MyArticle, type PublicationMembership } from '../../lib/api'
 import { loadDrafts, deleteDraft, scheduleDraft, unscheduleDraft } from '../../lib/drafts'
-import { KIND_DELETION } from '../../lib/ndk'
-import { signAndPublish } from '../../lib/sign'
+import { failureSentence } from '../../lib/api/client'
 import { GiftLinksPanel } from './GiftLinksPanel'
 import { ProposalsTab } from './ProposalsTab'
 import { PublicationArticlesTab } from './PublicationArticlesTab'
@@ -30,10 +29,13 @@ import { PublicationEarningsTab } from './PublicationEarningsTab'
 import { SubscribersTab } from './SubscribersTab'
 import { AnalyticsTab } from './AnalyticsTab'
 import { traffologyEnabled, publicationsEnabled } from '../../lib/featureFlags'
+import { toDateTimeLocalValue, formatDateInputEcho } from '../../lib/format'
 import { useDashboardOverlay } from '../../stores/dashboardOverlay'
 import { useLedgerOverlay } from '../../stores/ledgerOverlay'
 import { useReader } from '../../stores/reader'
 import { useEditorOverlay } from '../../stores/editorOverlay'
+import { useConfirm } from '../ui/ConfirmDialog'
+import * as C from '../../content/dashboard'
 
 type DashboardTab = 'articles' | 'subscribers' | 'proposals' | 'pricing' | 'analytics'
 
@@ -155,7 +157,7 @@ export function DashboardPanel({
       setShowNewPub(false); setNewPubName(''); setNewPubSlug('')
       switchContext(result.slug)
     } catch (err: any) {
-      setNewPubError(err?.body?.error ?? err?.message ?? 'Failed to create publication.')
+      setNewPubError(err?.body?.error ?? err?.message ?? 'Couldn’t create the publication. Please try again.')
     } finally { setNewPubSaving(false) }
   }
 
@@ -250,7 +252,7 @@ export function DashboardPanel({
           {newPubError && <p className="text-ui-xs text-red-600">{newPubError}</p>}
           <div className="flex items-center gap-3">
             <button type="submit" disabled={newPubSaving || !newPubName.trim() || !newPubSlug.trim()} className="btn disabled:opacity-50">
-              {newPubSaving ? 'Creating...' : 'Create'}
+              {newPubSaving ? 'Creating…' : 'Create'}
             </button>
             <button type="button" onClick={() => { setShowNewPub(false); setNewPubError(null) }} className="btn-text-muted">
               Cancel
@@ -318,7 +320,7 @@ export function DashboardPanel({
           <div className="flex items-center justify-between mb-10">
             <div className="flex gap-2">
               {personalTabs.map(tab => {
-                const label = tab === 'proposals' ? 'Proposals' : tab === 'pricing' ? 'Pricing' : tab === 'subscribers' ? 'Subscribers' : tab.charAt(0).toUpperCase() + tab.slice(1)
+                const label = C.DASHBOARD_TAB_LABEL[tab]
                 return (
                   <button key={tab} onClick={() => switchTab(tab)} className={`tab-pill ${activeTab === tab ? 'tab-pill-active' : 'tab-pill-inactive'}`}>{label}</button>
                 )
@@ -336,7 +338,7 @@ export function DashboardPanel({
                   }
                 }}
                 className="btn-text-muted underline underline-offset-4"
-              >View ledger</button>
+              >{C.DASHBOARD_VIEW_LEDGER}</button>
               {inOverlay ? (
                 <button
                   type="button"
@@ -345,14 +347,14 @@ export function DashboardPanel({
                     useEditorOverlay.getState().open()
                   }}
                   className="btn"
-                >New article</button>
+                >{C.DASHBOARD_NEW_ARTICLE}</button>
               ) : (
-                <Link href="/write" className="btn">New article</Link>
+                <Link href="/write" className="btn">{C.DASHBOARD_NEW_ARTICLE}</Link>
               )}
             </div>
           </div>
-          {activeTab === 'articles' && <ArticlesTab userId={user.id} pubkey={user.pubkey} inOverlay={inOverlay} />}
-          {activeTab === 'subscribers' && <SubscribersTab />}
+          {activeTab === 'articles' && <ArticlesTab userId={user.id} inOverlay={inOverlay} />}
+          {activeTab === 'subscribers' && <SubscribersTab onSetUpPricing={() => switchTab('pricing')} />}
           {activeTab === 'proposals' && <ProposalsTab userId={user.id} />}
           {activeTab === 'pricing' && <PricingTab stripeReady={user.stripeConnectKycComplete} />}
           {activeTab === 'analytics' && traffologyEnabled() && <AnalyticsTab />}
@@ -370,10 +372,23 @@ type ContentItem =
   | { kind: 'published'; data: MyArticle }
   | { kind: 'draft'; data: { draftId: string; title: string; autoSavedAt: string; scheduledAt: string | null } }
 
-function ArticlesTab({ userId, pubkey, inOverlay = false }: { userId: string; pubkey: string; inOverlay?: boolean }) {
+// What the count under "Settled reads" is (walkthrough A14). It was headed
+// "Reads" and invited reading as readership, while the gateway counts only
+// read_events in `platform_settled`/`writer_paid` (articles/manage.ts): the
+// money half is deliberate — it agrees with Earned and the Ledger to the
+// penny — so the heading moves, not the query. The sentence is
+// `C.SETTLED_READS_HINT` (content/dashboard.ts).
+
+function ArticlesTab({ userId, inOverlay = false }: { userId: string; inOverlay?: boolean }) {
   const [items, setItems] = useState<ContentItem[]>([])
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  // TWO ERRORS, NOT ONE. A failed LOAD has no table to show, so it takes the
+  // tab (an outage renders as an outage). A failed ROW write is a fact about
+  // that row: it used to go through the same state and swap the WHOLE table
+  // for its message, so one refused delete made every article vanish from the
+  // dashboard until a reload. It is said above the table instead, which stays.
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [giftLinksOpenId, setGiftLinksOpenId] = useState<string | null>(null)
   const [unpublishingId, setUnpublishingId] = useState<string | null>(null)
@@ -381,6 +396,7 @@ function ArticlesTab({ userId, pubkey, inOverlay = false }: { userId: string; pu
   const [schedulingId, setSchedulingId] = useState<string | null>(null)
   const [schedulePickerDraftId, setSchedulePickerDraftId] = useState<string | null>(null)
   const [scheduleDateTime, setScheduleDateTime] = useState('')
+  const { ask, dialog } = useConfirm()
 
   useEffect(() => {
     void (async () => {
@@ -394,12 +410,13 @@ function ArticlesTab({ userId, pubkey, inOverlay = false }: { userId: string; pu
         const draftItems: ContentItem[] = drafts.map((d: any) => ({ kind: 'draft', data: d }))
         // Drafts first, then published
         setItems([...draftItems, ...published])
-      } catch { setError('Failed to load articles.') }
+      } catch { setLoadError(C.ARTICLES_LOAD_FAILED) }
       finally { setLoading(false) }
     })()
   }, [userId])
 
   async function handleToggleReplies(id: string, on: boolean) {
+    setActionError(null)
     try {
       await myArticles.update(id, { repliesEnabled: on })
       setItems(p => p.map(item =>
@@ -407,50 +424,85 @@ function ArticlesTab({ userId, pubkey, inOverlay = false }: { userId: string; pu
           ? { ...item, data: { ...item.data, repliesEnabled: on } }
           : item
       ))
-    } catch { setError('Failed to update.') }
+    } catch { setActionError(C.ARTICLE_REPLIES_UPDATE_FAILED) }
   }
 
-  async function handleDeleteArticle(id: string) {
+  // Confirmed, because it is the LESS reversible of the two (MIRROR-AUDIT
+  // §2.15): Unpublish two functions below already confirms, and it only moves
+  // the piece back to drafts, while this soft-deletes it AND publishes a kind-5
+  // tombstone to the relay. The asymmetry was the whole finding — the
+  // destructive one was the side without the guard.
+  async function handleDeleteArticle(e: React.MouseEvent<HTMLElement>, id: string) {
+    const ok = await ask(e.currentTarget, {
+      title: C.DELETE_ARTICLE_CONFIRM_TITLE,
+      body: C.DELETE_ARTICLE_CONFIRM_BODY,
+      confirmLabel: C.DELETE_ARTICLE_CONFIRM_LABEL,
+    })
+    if (!ok) return
     setDeletingId(id)
+    setActionError(null)
     try {
-      const result = await myArticles.remove(id)
+      // NO CLIENT-SIDE KIND 5. `DELETE /articles/:id` signs the tombstone with
+      // the same two tags and enqueues it through `relay_outbox` inside its own
+      // transaction (articles/manage.ts) — which is the invariant's whole point:
+      // durably queued, retried by the worker, never lost to a relay blip. The
+      // second one this used to publish from the browser was a duplicate event
+      // on the relay and a second custodial signing call, and its `catch {}`
+      // meant it was believed to be doing something.
+      await myArticles.remove(id)
       setItems(p => p.filter(item => !(item.kind === 'published' && item.data.id === id)))
-      try {
-        await signAndPublish({
-          kind: KIND_DELETION,
-          content: '',
-          tags: [['e', result.nostrEventId], ['a', `30023:${pubkey}:${result.dTag}`]],
-        })
-      } catch { /* non-fatal */ }
     }
-    catch { setError('Failed to delete.') }
+    catch { setActionError(C.ARTICLE_DELETE_FAILED) }
     finally { setDeletingId(null) }
   }
 
-  async function handleDeleteDraft(draftId: string) {
+  async function handleDeleteDraft(e: React.MouseEvent<HTMLElement>, draftId: string) {
+    const ok = await ask(e.currentTarget, {
+      title: C.DELETE_DRAFT_CONFIRM_TITLE,
+      body: C.DELETE_DRAFT_CONFIRM_BODY,
+      confirmLabel: C.DELETE_DRAFT_CONFIRM_LABEL,
+    })
+    if (!ok) return
     setDeletingId(draftId)
+    setActionError(null)
     try {
       await deleteDraft(draftId)
       setItems(p => p.filter(item => !(item.kind === 'draft' && item.data.draftId === draftId)))
-    } catch { setError('Failed to delete draft.') }
+    } catch { setActionError(C.DRAFT_DELETE_FAILED) }
     finally { setDeletingId(null) }
   }
 
-  async function handleUnpublish(id: string) {
-    if (!confirm('Revert this article to draft? It will be removed from your public profile but not deleted.')) return
+  async function handleUnpublish(e: React.MouseEvent<HTMLElement>, id: string) {
+    const ok = await ask(e.currentTarget, {
+      title: C.UNPUBLISH_CONFIRM_TITLE,
+      body: C.UNPUBLISH_CONFIRM_BODY,
+      confirmLabel: C.UNPUBLISH_CONFIRM_LABEL,
+    })
+    if (!ok) return
     setUnpublishingId(id)
+    setActionError(null)
     try {
       await myArticles.unpublish(id)
-      setItems(p => p.filter(item => !(item.kind === 'published' && item.data.id === id)))
-      setUnpublishedMsg('Moved to drafts.')
-      setTimeout(() => setUnpublishedMsg(null), 3000)
-    } catch { setError('Failed to unpublish.') }
+      // Keep the row and mark it unpublished rather than removing it. It is not
+      // a draft — publish deletes the working draft and unpublish creates no new
+      // one — so dropping it here made the piece vanish from the dashboard until
+      // a reload, at which point /my/articles returned it looking published
+      // again and Unpublish 404'd on it.
+      setItems(p => p.map(item =>
+        item.kind === 'published' && item.data.id === id
+          ? { ...item, data: { ...item.data, publishedAt: null } }
+          : item
+      ))
+      setUnpublishedMsg(C.UNPUBLISH_DONE)
+      setTimeout(() => setUnpublishedMsg(null), 8000)
+    } catch { setActionError(C.ARTICLE_UNPUBLISH_FAILED) }
     finally { setUnpublishingId(null) }
   }
 
   async function handleSchedule(draftId: string) {
     if (!scheduleDateTime) return
     setSchedulingId(draftId)
+    setActionError(null)
     try {
       const result = await scheduleDraft(draftId, new Date(scheduleDateTime).toISOString())
       setItems(p => p.map(item =>
@@ -461,12 +513,13 @@ function ArticlesTab({ userId, pubkey, inOverlay = false }: { userId: string; pu
       setSchedulePickerDraftId(null)
       setScheduleDateTime('')
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to schedule.')
+      setActionError(failureSentence(err, C.DRAFT_SCHEDULE_FAILED))
     } finally { setSchedulingId(null) }
   }
 
   async function handleUnschedule(draftId: string) {
     setSchedulingId(draftId)
+    setActionError(null)
     try {
       await unscheduleDraft(draftId)
       setItems(p => p.map(item =>
@@ -474,18 +527,19 @@ function ArticlesTab({ userId, pubkey, inOverlay = false }: { userId: string; pu
           ? { ...item, data: { ...item.data, scheduledAt: null } }
           : item
       ))
-    } catch { setError('Failed to unschedule.') }
+    } catch { setActionError(C.DRAFT_UNSCHEDULE_FAILED) }
     finally { setSchedulingId(null) }
   }
 
   if (loading) return <div className="space-y-3">{[1,2,3].map(i => <div key={i} className="h-10 animate-pulse bg-glasshouse-well" />)}</div>
-  if (error) return <div className="bg-glasshouse-well px-4 py-3 text-ui-xs text-black">{error}</div>
-  if (items.length === 0) return <div className="py-20 text-center"><p className="text-ui-sm text-grey-600 mb-4">No articles or drafts yet.</p>{inOverlay ? <button type="button" onClick={() => { useDashboardOverlay.getState().close(); useEditorOverlay.getState().open() }} className="btn-text underline underline-offset-4">Write your first article</button> : <Link href="/write" className="btn-text underline underline-offset-4">Write your first article</Link>}</div>
+  if (loadError) return <div className="bg-glasshouse-well px-4 py-3 text-ui-xs text-black">{loadError}</div>
+  if (items.length === 0) return <div className="py-20 text-center"><p className="text-ui-sm text-grey-600 mb-4">{C.ARTICLES_EMPTY}</p>{inOverlay ? <button type="button" onClick={() => { useDashboardOverlay.getState().close(); useEditorOverlay.getState().open() }} className="btn-text underline underline-offset-4">{C.ARTICLES_WRITE_FIRST}</button> : <Link href="/write" className="btn-text underline underline-offset-4">{C.ARTICLES_WRITE_FIRST}</Link>}</div>
 
   return (
     <div data-explain="dashboard.articles" className="overflow-x-auto ah-scrollbar bg-glasshouse-well">
+      {actionError && <p role="alert" className="text-ui-xs text-crimson px-4 py-2">{actionError}</p>}
       <table className="w-full text-ui-xs">
-        <thead><tr className="border-b-2 border-grey-200"><th className="px-4 py-3 text-left label-ui text-grey-400">Title</th><th className="px-4 py-3 text-left label-ui text-grey-400">Status</th><th className="px-4 py-3 text-right label-ui text-grey-400">Reads</th><th className="px-4 py-3 text-right label-ui text-grey-400">Earned</th><th className="px-4 py-3 text-center label-ui text-grey-400">Replies</th><th className="px-4 py-3 text-right label-ui text-grey-400">Actions</th></tr></thead>
+        <thead><tr className="border-b-2 border-grey-200"><th className="px-4 py-3 text-left label-ui text-grey-400">{C.ARTICLES_COL_TITLE}</th><th className="px-4 py-3 text-left label-ui text-grey-400">{C.ARTICLES_COL_STATUS}</th><th className="px-4 py-3 text-left label-ui text-grey-400">{C.ARTICLES_COL_PRICE}</th><th className="px-4 py-3 text-right label-ui text-grey-400" title={C.SETTLED_READS_HINT}>{C.ARTICLES_COL_SETTLED_READS}</th><th className="px-4 py-3 text-right label-ui text-grey-400">{C.ARTICLES_COL_EARNED}</th><th className="px-4 py-3 text-center label-ui text-grey-400">{C.ARTICLES_COL_REPLIES}</th><th className="px-4 py-3 text-right label-ui text-grey-400">{C.ARTICLES_COL_ACTIONS}</th></tr></thead>
         <tbody>{items.map(item => {
           if (item.kind === 'draft') {
             const d = item.data
@@ -494,52 +548,75 @@ function ArticlesTab({ userId, pubkey, inOverlay = false }: { userId: string; pu
               <React.Fragment key={`draft-${d.draftId}`}>
               <tr className="border-b-2 border-grey-200 last:border-b-0">
                 <td className="px-4 py-3">
-                  {inOverlay ? <button type="button" onClick={() => { useDashboardOverlay.getState().close(); useEditorOverlay.getState().open({ draftId: d.draftId }) }} className="text-black hover:opacity-70 text-left">{d.title || 'Untitled'}</button> : <Link href={`/write?draft=${d.draftId}`} className="text-black hover:opacity-70">{d.title || 'Untitled'}</Link>}
-                  <p className="text-[11px] text-grey-300 mt-0.5">Saved {new Date(d.autoSavedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</p>
+                  {inOverlay ? <button type="button" onClick={() => { useDashboardOverlay.getState().close(); useEditorOverlay.getState().open({ draftId: d.draftId }) }} className="text-black hover:opacity-70 text-left">{d.title || C.ARTICLE_UNTITLED}</button> : <Link href={`/write?draft=${d.draftId}`} className="text-black hover:opacity-70">{d.title || C.ARTICLE_UNTITLED}</Link>}
+                  <p className="text-[11px] text-grey-300 mt-0.5">{C.draftSavedAt(new Date(d.autoSavedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }))}</p>
                 </td>
                 <td className="px-4 py-3">
                   {isScheduled ? (
-                    <span className="text-black">Scheduled {new Date(d.scheduledAt!).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}</span>
+                    <span className="text-black">{C.draftScheduledFor(new Date(d.scheduledAt!).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }))}</span>
                   ) : (
-                    <span className="text-grey-400">Draft</span>
+                    <span className="text-grey-400">{C.ARTICLE_STATUS_DRAFT}</span>
                   )}
                 </td>
+                <td className="px-4 py-3 text-grey-300">&mdash;</td>
                 <td className="px-4 py-3 text-right tabular-nums text-grey-300">&mdash;</td>
                 <td className="px-4 py-3 text-right tabular-nums text-grey-300">&mdash;</td>
                 <td className="px-4 py-3 text-center text-grey-300">&mdash;</td>
                 <td className="px-4 py-3 text-right">
                   <div className="flex items-center justify-end gap-3">
-                    {inOverlay ? <button type="button" onClick={() => { useDashboardOverlay.getState().close(); useEditorOverlay.getState().open({ draftId: d.draftId }) }} className="text-grey-400 hover:text-black">Edit</button> : <Link href={`/write?draft=${d.draftId}`} className="text-grey-400 hover:text-black">Edit</Link>}
+                    {inOverlay ? <button type="button" onClick={() => { useDashboardOverlay.getState().close(); useEditorOverlay.getState().open({ draftId: d.draftId }) }} className="text-grey-400 hover:text-black">{C.ARTICLE_EDIT}</button> : <Link href={`/write?draft=${d.draftId}`} className="text-grey-400 hover:text-black">{C.ARTICLE_EDIT}</Link>}
+                    {/* A NEW TAB, deliberately, from both registers. The
+                        preview is a full reading surface and the point of it is
+                        to see the piece the way a reader will — which a pane
+                        over the workspace is not — while a SAME-tab navigation
+                        from the dashboard overlay would be the escape the ban
+                        is about. Same call as the card's `→` and the reader
+                        bar's title: internal href, new tab, stated reason. */}
+                    <a
+                      href={`/preview/${d.draftId}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-grey-400 hover:text-black"
+                    >
+                      {C.ARTICLE_PREVIEW}
+                    </a>
                     {isScheduled ? (
                       <>
-                        <button onClick={() => { setSchedulePickerDraftId(d.draftId); setScheduleDateTime(d.scheduledAt!.slice(0, 16)) }} className="text-grey-400 hover:text-black">Reschedule</button>
-                        <button onClick={() => handleUnschedule(d.draftId)} disabled={schedulingId === d.draftId} className="text-grey-300 hover:text-black disabled:opacity-50">{schedulingId === d.draftId ? '...' : 'Unschedule'}</button>
+                        <button onClick={() => { setSchedulePickerDraftId(d.draftId); setScheduleDateTime(toDateTimeLocalValue(new Date(d.scheduledAt!))) }} className="text-grey-400 hover:text-black">{C.ARTICLE_RESCHEDULE}</button>
+                        <button onClick={() => handleUnschedule(d.draftId)} disabled={schedulingId === d.draftId} className="text-grey-300 hover:text-black disabled:opacity-50">{schedulingId === d.draftId ? '…' : C.ARTICLE_UNSCHEDULE}</button>
                       </>
                     ) : (
-                      <button onClick={() => setSchedulePickerDraftId(schedulePickerDraftId === d.draftId ? null : d.draftId)} className="text-grey-400 hover:text-black">Schedule</button>
+                      <button onClick={() => setSchedulePickerDraftId(schedulePickerDraftId === d.draftId ? null : d.draftId)} className="text-grey-400 hover:text-black">{C.ARTICLE_SCHEDULE}</button>
                     )}
-                    <button onClick={() => handleDeleteDraft(d.draftId)} disabled={deletingId === d.draftId} className="text-grey-300 hover:text-black disabled:opacity-50">{deletingId === d.draftId ? '...' : 'Delete'}</button>
+                    <button onClick={(e) => handleDeleteDraft(e, d.draftId)} disabled={deletingId === d.draftId} className="text-grey-300 hover:text-black disabled:opacity-50">{deletingId === d.draftId ? '…' : C.ARTICLE_DELETE}</button>
                   </div>
                 </td>
               </tr>
               {schedulePickerDraftId === d.draftId && (
-                <tr><td colSpan={6} className="bg-grey-50 border-b-2 border-grey-200 px-4 py-3">
+                <tr><td colSpan={7} className="bg-grey-50 border-b-2 border-grey-200 px-4 py-3">
                   <div className="flex items-center gap-3">
                     <input
                       type="datetime-local"
                       value={scheduleDateTime}
                       onChange={e => setScheduleDateTime(e.target.value)}
-                      min={new Date().toISOString().slice(0, 16)}
+                      min={toDateTimeLocalValue(new Date())}
                       className="bg-grey-100 px-3 py-1.5 text-sm focus:outline-none"
                     />
+                    {/* The widget draws the date in the BROWSER's order; the
+                        echo states it in this site's. */}
+                    {formatDateInputEcho(scheduleDateTime) && (
+                      <span className="text-mono-xs text-grey-600">
+                        {formatDateInputEcho(scheduleDateTime)}
+                      </span>
+                    )}
                     <button
                       onClick={() => handleSchedule(d.draftId)}
                       disabled={schedulingId === d.draftId || !scheduleDateTime}
                       className="btn text-sm disabled:opacity-50"
                     >
-                      {schedulingId === d.draftId ? '...' : isScheduled ? 'Update schedule' : 'Confirm schedule'}
+                      {schedulingId === d.draftId ? '…' : isScheduled ? C.ARTICLE_UPDATE_SCHEDULE : C.ARTICLE_CONFIRM_SCHEDULE}
                     </button>
-                    <button onClick={() => { setSchedulePickerDraftId(null); setScheduleDateTime('') }} className="text-ui-xs text-grey-300 hover:text-black">Cancel</button>
+                    <button onClick={() => { setSchedulePickerDraftId(null); setScheduleDateTime('') }} className="text-ui-xs text-grey-300 hover:text-black">{C.ARTICLE_SCHEDULE_CANCEL}</button>
                   </div>
                 </td></tr>
               )}
@@ -550,24 +627,29 @@ function ArticlesTab({ userId, pubkey, inOverlay = false }: { userId: string; pu
           return (
             <React.Fragment key={a.id}>
             <tr className="border-b-2 border-grey-200 last:border-b-0">
-              <td className="px-4 py-3">{inOverlay ? <button type="button" onClick={() => { useDashboardOverlay.getState().close(); useReader.getState().openNative(a.dTag) }} className="text-black hover:opacity-70 text-left">{a.title}</button> : <Link href={`/article/${a.dTag}`} className="text-black hover:opacity-70">{a.title}</Link>}</td>
-              <td className="px-4 py-3">{a.isPaywalled ? <span className="text-black">£{((a.pricePence??0)/100).toFixed(2)}</span> : <span className="text-grey-400">Free</span>}</td>
+              <td className="px-4 py-3">
+                {inOverlay ? <button type="button" onClick={() => { useDashboardOverlay.getState().close(); useReader.getState().openNative(a.dTag) }} className="text-black hover:opacity-70 text-left">{a.title}</button> : <Link href={`/article/${a.dTag}`} className="text-black hover:opacity-70">{a.title}</Link>}
+              </td>
+              <td className="px-4 py-3">{a.publishedAt === null ? <span className="text-grey-400">{C.ARTICLE_STATUS_UNPUBLISHED}</span> : <span className="text-black">{C.ARTICLE_STATUS_PUBLISHED}</span>}</td>
+              <td className="px-4 py-3">{a.isPaywalled ? <span className="text-black">£{((a.pricePence??0)/100).toFixed(2)}</span> : <span className="text-grey-400">{C.ARTICLE_PRICE_FREE}</span>}</td>
               <td className="px-4 py-3 text-right tabular-nums">{a.readCount}</td>
               <td className="px-4 py-3 text-right text-black tabular-nums">£{(a.netEarningsPence/100).toFixed(2)}</td>
-              <td className="px-4 py-3 text-center"><button onClick={() => handleToggleReplies(a.id, !a.repliesEnabled)} className={`text-ui-xs ${a.repliesEnabled ? 'text-crimson' : 'text-grey-300'}`}>{a.repliesEnabled ? 'On' : 'Off'}</button></td>
+              <td className="px-4 py-3 text-center"><button onClick={() => handleToggleReplies(a.id, !a.repliesEnabled)} className={`text-ui-xs ${a.repliesEnabled ? 'text-crimson' : 'text-grey-300'}`}>{a.repliesEnabled ? C.ARTICLE_REPLIES_ON : C.ARTICLE_REPLIES_OFF}</button></td>
               <td className="px-4 py-3 text-right">
                 <div className="flex items-center justify-end gap-3">
                   {a.isPaywalled && (
-                    <button onClick={() => setGiftLinksOpenId(giftLinksOpenId === a.id ? null : a.id)} data-explain="dashboard.gifts" className={`text-grey-300 hover:text-black ${giftLinksOpenId === a.id ? 'text-black' : ''}`}>Gifts</button>
+                    <button onClick={() => setGiftLinksOpenId(giftLinksOpenId === a.id ? null : a.id)} data-explain="dashboard.gifts" className={`text-grey-300 hover:text-black ${giftLinksOpenId === a.id ? 'text-black' : ''}`}>{C.ARTICLE_GIFTS}</button>
                   )}
-                  {inOverlay ? <button type="button" onClick={() => { useDashboardOverlay.getState().close(); useEditorOverlay.getState().open({ editEventId: a.nostrEventId }) }} className="text-grey-400 hover:text-black">Edit</button> : <Link href={`/write?edit=${a.nostrEventId}`} className="text-grey-400 hover:text-black">Edit</Link>}
-                  <button onClick={() => handleUnpublish(a.id)} disabled={unpublishingId===a.id} className="text-grey-300 hover:text-black disabled:opacity-50">{unpublishingId===a.id ? '...' : 'Unpublish'}</button>
-                  <button onClick={() => handleDeleteArticle(a.id)} disabled={deletingId===a.id} className="text-grey-300 hover:text-black disabled:opacity-50">{deletingId===a.id ? '...' : 'Delete'}</button>
+                  {inOverlay ? <button type="button" onClick={() => { useDashboardOverlay.getState().close(); useEditorOverlay.getState().open({ editEventId: a.nostrEventId }) }} className="text-grey-400 hover:text-black">{C.ARTICLE_EDIT}</button> : <Link href={`/write?edit=${a.nostrEventId}`} className="text-grey-400 hover:text-black">{C.ARTICLE_EDIT}</Link>}
+                  {a.publishedAt !== null && (
+                    <button onClick={(e) => handleUnpublish(e, a.id)} disabled={unpublishingId===a.id} className="text-grey-300 hover:text-black disabled:opacity-50">{unpublishingId===a.id ? '…' : C.ARTICLE_UNPUBLISH}</button>
+                  )}
+                  <button onClick={(e) => handleDeleteArticle(e, a.id)} disabled={deletingId===a.id} className="text-grey-300 hover:text-black disabled:opacity-50">{deletingId===a.id ? '…' : C.ARTICLE_DELETE}</button>
                 </div>
               </td>
             </tr>
             {giftLinksOpenId === a.id && (
-              <tr><td colSpan={6} className="bg-grey-50 border-b-2 border-grey-200"><GiftLinksPanel articleId={a.id} dTag={a.dTag} /></td></tr>
+              <tr><td colSpan={7} className="bg-grey-50 border-b-2 border-grey-200"><GiftLinksPanel articleId={a.id} dTag={a.dTag} /></td></tr>
             )}
             </React.Fragment>
           )
@@ -575,6 +657,7 @@ function ArticlesTab({ userId, pubkey, inOverlay = false }: { userId: string; pu
         </tbody>
       </table>
       {unpublishedMsg && <p className="text-ui-xs text-grey-600 px-4 py-2">{unpublishedMsg}</p>}
+      {dialog}
     </div>
   )
 }
@@ -585,8 +668,18 @@ function ArticlesTab({ userId, pubkey, inOverlay = false }: { userId: string; pu
 
 function PricingTab({ stripeReady }: { stripeReady: boolean }) {
   const { user, fetchMe } = useAuth()
-  const [subPrice, setSubPrice] = useState('')
-  const [annualDiscount, setAnnualDiscount] = useState('15')
+  // SEEDED FROM THE MEMBER'S OWN VALUES, which `/auth/me` now carries. The two
+  // fields opened blank / hard-coded at 15% whatever the writer had set — so
+  // the tab could not answer the question it exists to answer, and pressing
+  // Save wrote its own placeholders over their real pricing.
+  const [subPrice, setSubPrice] = useState(
+    user?.subscriptionPricePence != null
+      ? (user.subscriptionPricePence / 100).toFixed(2)
+      : ''
+  )
+  const [annualDiscount, setAnnualDiscount] = useState(
+    user?.annualDiscountPct != null ? String(user.annualDiscountPct) : '15'
+  )
   const [articlePriceMode, setArticlePriceMode] = useState<'auto' | 'fixed'>(
     user?.defaultArticlePricePence != null ? 'fixed' : 'auto'
   )
@@ -600,20 +693,20 @@ function PricingTab({ stripeReady }: { stripeReady: boolean }) {
     e.preventDefault()
     const pence = Math.round(parseFloat(subPrice) * 100)
     const discount = parseInt(annualDiscount, 10)
-    if (isNaN(pence) || pence < 0) { setPriceMsg('Enter a valid price.'); return }
-    if (isNaN(discount) || discount < 0 || discount > 30) { setPriceMsg('Discount must be 0–30%.'); return }
+    if (isNaN(pence) || pence < 0) { setPriceMsg(C.PRICING_INVALID_PRICE); return }
+    if (isNaN(discount) || discount < 0 || discount > 30) { setPriceMsg(C.PRICING_INVALID_DISCOUNT); return }
     const defaultArticlePricePence = articlePriceMode === 'fixed'
       ? Math.round(parseFloat(fixedArticlePrice || '0') * 100)
       : null
     if (articlePriceMode === 'fixed' && (isNaN(defaultArticlePricePence!) || defaultArticlePricePence! < 0)) {
-      setPriceMsg('Enter a valid per-article price.'); return
+      setPriceMsg(C.PRICING_INVALID_ARTICLE_PRICE); return
     }
     setSavingPrice(true); setPriceMsg(null)
     try {
       await accountApi.updateSubscriptionPrice(pence, discount, defaultArticlePricePence)
       await fetchMe()
-      setPriceMsg('Pricing updated.')
-    } catch { setPriceMsg('Failed to update.') }
+      setPriceMsg(C.PRICING_UPDATED)
+    } catch { setPriceMsg(C.PRICING_UPDATE_FAILED) }
     finally { setSavingPrice(false) }
   }
 
@@ -627,9 +720,9 @@ function PricingTab({ stripeReady }: { stripeReady: boolean }) {
       <form onSubmit={handleSavePrice} className="space-y-8">
         {/* Subscription price */}
         <div className="bg-glasshouse-well px-6 py-5">
-          <p className="label-ui text-grey-400 mb-4">Subscription pricing</p>
+          <p className="label-ui text-grey-400 mb-4">{C.PRICING_SUBSCRIPTION_TITLE}</p>
           <p className="text-ui-xs text-grey-600 leading-relaxed mb-4">
-            Set the monthly price readers pay to subscribe to your content. Readers can also choose an annual plan at a discount you configure.
+            {C.PRICING_SUBSCRIPTION_INTRO}
           </p>
           <div className="space-y-4">
             <div className="flex items-center gap-3">
@@ -643,7 +736,7 @@ function PricingTab({ stripeReady }: { stripeReady: boolean }) {
                 className="w-28 bg-grey-100 px-3 py-1.5 text-ui-sm font-sans text-black placeholder-grey-300"
                 placeholder="3.00"
               />
-              <span className="text-ui-xs font-sans text-grey-300">/month</span>
+              <span className="text-ui-xs font-sans text-grey-300">{C.PRICING_PER_MONTH}</span>
             </div>
             <div className="flex items-center gap-3">
               <span className="text-ui-sm font-sans text-grey-400 w-[13px]">%</span>
@@ -656,11 +749,11 @@ function PricingTab({ stripeReady }: { stripeReady: boolean }) {
                 className="w-28 bg-grey-100 px-3 py-1.5 text-ui-sm font-sans text-black placeholder-grey-300"
                 placeholder="15"
               />
-              <span className="text-ui-xs font-sans text-grey-300">annual discount</span>
+              <span className="text-ui-xs font-sans text-grey-300">{C.PRICING_ANNUAL_DISCOUNT}</span>
             </div>
             {monthlyPence > 0 && (
               <p className="text-ui-xs font-sans text-grey-400">
-                Readers pay £{subPrice}/mo or £{annualPounds}/year{discountPct > 0 ? ` (save ${discountPct}%)` : ''}
+                {C.pricingPreview(subPrice, annualPounds, discountPct)}
               </p>
             )}
           </div>
@@ -668,9 +761,9 @@ function PricingTab({ stripeReady }: { stripeReady: boolean }) {
 
         {/* Per-article pricing */}
         <div className="bg-glasshouse-well px-6 py-5">
-          <p className="label-ui text-grey-400 mb-4">Per-article pricing</p>
+          <p className="label-ui text-grey-400 mb-4">{C.PRICING_PER_ARTICLE_TITLE}</p>
           <p className="text-ui-xs text-grey-600 leading-relaxed mb-4">
-            Default price for paywalled articles. You can override this per article in the editor. Free articles are always free.
+            {C.PRICING_PER_ARTICLE_INTRO}
           </p>
           <div className="space-y-3">
             <button
@@ -681,10 +774,10 @@ function PricingTab({ stripeReady }: { stripeReady: boolean }) {
               }`}
             >
               <p className={`text-ui-sm font-medium ${articlePriceMode === 'auto' ? 'text-white' : 'text-black'}`}>
-                Auto
+                {C.PRICING_MODE_AUTO}
               </p>
               <p className={`text-ui-xs mt-0.5 ${articlePriceMode === 'auto' ? 'text-grey-300' : 'text-grey-400'}`}>
-                Price scales with article length
+                {C.PRICING_MODE_AUTO_HELP}
               </p>
             </button>
             <button
@@ -695,10 +788,10 @@ function PricingTab({ stripeReady }: { stripeReady: boolean }) {
               }`}
             >
               <p className={`text-ui-sm font-medium ${articlePriceMode === 'fixed' ? 'text-white' : 'text-black'}`}>
-                Fixed default
+                {C.PRICING_MODE_FIXED}
               </p>
               <p className={`text-ui-xs mt-0.5 ${articlePriceMode === 'fixed' ? 'text-grey-300' : 'text-grey-400'}`}>
-                Same starting price for every paywalled article
+                {C.PRICING_MODE_FIXED_HELP}
               </p>
             </button>
             {articlePriceMode === 'fixed' && (
@@ -713,7 +806,7 @@ function PricingTab({ stripeReady }: { stripeReady: boolean }) {
                   className="w-28 bg-grey-100 px-3 py-1.5 text-ui-sm font-sans text-black placeholder-grey-300"
                   placeholder="0.20"
                 />
-                <span className="text-ui-xs font-sans text-grey-300">per read</span>
+                <span className="text-ui-xs font-sans text-grey-300">{C.PRICING_PER_READ}</span>
               </div>
             )}
           </div>
@@ -721,7 +814,7 @@ function PricingTab({ stripeReady }: { stripeReady: boolean }) {
 
         <div className="px-6">
           <button type="submit" disabled={savingPrice} className="btn text-sm disabled:opacity-50">
-            {savingPrice ? 'Saving…' : 'Save pricing'}
+            {savingPrice ? C.PRICING_SAVING : C.PRICING_SAVE}
           </button>
           {priceMsg && <p className="text-ui-xs font-sans text-grey-600 mt-2">{priceMsg}</p>}
         </div>
@@ -786,17 +879,16 @@ function WelcomeMessageSection() {
       // string, and the reader gets the default rather than a blank email.
       const trimmed = message.trim()
       await accountApi.updateSubscriptionWelcome(trimmed.length > 0 ? trimmed : null)
-      setMsg(trimmed.length > 0 ? 'Welcome message saved.' : 'Cleared — subscribers get the default welcome.')
-    } catch { setMsg('Failed to save.') }
+      setMsg(trimmed.length > 0 ? C.WELCOME_SAVED : C.WELCOME_CLEARED)
+    } catch { setMsg(C.WELCOME_SAVE_FAILED) }
     finally { setSaving(false) }
   }
 
   return (
     <form onSubmit={handleSave} className="bg-glasshouse-well px-6 py-5">
-      <p className="label-ui text-grey-400 mb-4">Welcome message</p>
+      <p className="label-ui text-grey-400 mb-4">{C.WELCOME_TITLE}</p>
       <p className="text-ui-xs text-grey-600 leading-relaxed mb-4">
-        Sent to a reader the moment they subscribe — the one time you know they
-        are listening. Leave it empty and we send a short welcome in your name.
+        {C.WELCOME_INTRO}
       </p>
       <textarea
         value={message}
@@ -804,7 +896,7 @@ function WelcomeMessageSection() {
         maxLength={WELCOME_MAX}
         rows={6}
         disabled={loading}
-        placeholder={loading ? '' : 'Thanks for subscribing. Here is what you can expect from me…'}
+        placeholder={loading ? '' : C.WELCOME_PLACEHOLDER}
         className="w-full bg-grey-100 px-4 py-2.5 text-ui-sm font-sans text-black placeholder-grey-300 focus:outline-none resize-none disabled:opacity-50"
       />
       <p className="text-ui-xs font-sans text-grey-300 mt-1 text-right">
@@ -812,7 +904,7 @@ function WelcomeMessageSection() {
       </p>
       <div className="mt-3">
         <button type="submit" disabled={saving || loading} className="btn text-sm disabled:opacity-50">
-          {saving ? 'Saving…' : 'Save welcome message'}
+          {saving ? C.WELCOME_SAVING : C.WELCOME_SAVE}
         </button>
         {msg && <p className="text-ui-xs font-sans text-grey-600 mt-2">{msg}</p>}
       </div>

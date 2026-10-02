@@ -1,6 +1,8 @@
 import { KIND_ARTICLE, KIND_DELETION } from './ndk'
 import { signAndPublish, signViaGateway } from './sign'
 import { articles as articlesApi, publications as publicationsApi, tags as tagsApi } from './api'
+import { failureSentence, request } from './api/client'
+import { PAYWALL_EMPTY } from './publish-validation'
 import type { PublishData } from '../components/editor/ArticleEditor'
 
 // =============================================================================
@@ -27,13 +29,14 @@ import type { PublishData } from '../components/editor/ArticleEditor'
 //   soft-deleted (best-effort) so nothing broken stays in feeds; the draft
 //   still holds the full content. Edits are left in place — their original
 //   vault key is intact, so reader unlocks keep working via the DB ciphertext.
+//   A step-5 failure is the OPPOSITE CASE and says so: the piece is live by
+//   then, and the failure is that our record of it is stale. Not retried
+//   (the far end does not dedupe the subscriber broadcast), draft kept, and
+//   recovery is an edit — see the comment at step 5 itself.
 //
 // Drive fulfilment (draftId) and the subscriber email ride only the FINAL
 // index call (step 2 for free, step 5 for paywalled) — see indexArticle below.
 // =============================================================================
-
-// Use relative URLs so requests go through the Next.js rewrite (same origin).
-const API_BASE = '/api/v1'
 
 interface PublishResult {
   articleEventId: string
@@ -53,7 +56,7 @@ export async function publishArticle(
   // (the key service rejects an empty body) — refuse before touching anything.
   // The editor validates this too; this is the pipeline's own guard.
   if (isPaywalled && !data.paywallContent.trim()) {
-    throw new Error('There is no content after the paywall gate — move the gate up, or remove it.')
+    throw new Error(PAYWALL_EMPTY)
   }
 
   // `final` marks the index call after which the article is fully live (the
@@ -150,14 +153,51 @@ export async function publishArticle(
     }
     // Edits keep their original vault key, so the live article still works.
     throw new Error(
-      `Publishing the paywalled section failed — ${err instanceof Error ? err.message : 'unknown error'}. ` +
+      `Publishing the paywalled section failed — ${failureSentence(err, 'the server did not answer')}. ` +
       'Nothing broken went live and your draft is intact. Please try publishing again.'
     )
   }
 
   // Step 5: Re-index with v2 event ID (upsert on (writer, dTag)). The final
   // call: carries draftId (drive fulfilment) + fires the new-article email.
-  await indexArticle(signedV2.id, { final: true, emailAsNew: indexedAsNew })
+  //
+  // THE ARTICLE IS ALREADY LIVE HERE, and this is the only failure in the
+  // pipeline where that is true — so this catch must not borrow step 3/4's
+  // message. v2 carries the payload tag and has reached the relay, and the
+  // step-2 index row is already serving the piece on the site. What did not
+  // happen is the re-index, so `articles.nostr_event_id` still names v1 (an
+  // event that was never published), and with it the two things that ride
+  // ONLY the final call: the subscriber email and the pledge-drive match.
+  // Telling the writer "nothing went live" is false in the one direction
+  // that matters — they republish, and a new d-tag mints a SECOND live copy.
+  //
+  // IT IS NOT RETRIED, and the reason is the far end rather than this call.
+  // The index route fires `sendPublishNotifications` after its transaction
+  // commits, and that function WRITES `articles.email_sent_at` without ever
+  // reading it — so a retry after a lost response re-broadcasts to every
+  // subscriber. An ambiguous failure is retryable only under an identity the
+  // far end dedupes on; this one has none, and a double broadcast is not
+  // recoverable.
+  //
+  // THE DRAFT IS KEPT ON PURPOSE. `pledge_drives.draft_id` is ON DELETE SET
+  // NULL and the match never ran, so deleting the draft would destroy the
+  // drive's only match key — the caller's `cleanUpDraft` sits past this
+  // throw, which is what keeps it. Recovery is an EDIT, not a republish:
+  // reopening the piece carries its d-tag, so step 2 upserts the same row
+  // and step 5 re-indexes it, and an edit emails nobody.
+  try {
+    await indexArticle(signedV2.id, { final: true, emailAsNew: indexedAsNew })
+  } catch (err) {
+    throw new Error(
+      `Your article is live — the paywalled version reached the relay — but ` +
+      `all.haus could not finish recording it: ${failureSentence(err, 'the server did not answer')}. ` +
+      'Subscribers were not emailed, and our copy still points at the ' +
+      'pre-paywall version of the event. Your draft has been kept. Do not ' +
+      'publish again from here — that would create a second copy. Reopen the ' +
+      'article from your dashboard and publish it as an edit, which completes ' +
+      'the record.'
+    )
+  }
 
   return { articleEventId: signedV2.id, dTag, articleId }
 }
@@ -209,32 +249,22 @@ async function encryptPaywallBody(
   dTag: string,
   data: PublishData
 ): Promise<{ ciphertext: string; algorithm: string }> {
-  const res = await fetch(`${API_BASE}/articles/${articleEventId}/vault`, {
-    method: 'POST',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      articleId,
-      paywallBody: data.paywallContent,
-      pricePence: data.pricePence,
-      gatePositionPct: data.gatePositionPct,
-      nostrDTag: dTag,
-    }),
-  })
-
-  if (!res.ok) {
-    const body = await res.json().catch(() => null)
-    // Prefer the human `message`; never string-interpolate a non-string
-    // `error` (a zod flatten object renders as "[object Object]").
-    const detail =
-      typeof body?.message === 'string' ? body.message
-      : typeof body?.error === 'string' ? body.error
-      : body?.error != null ? JSON.stringify(body.error)
-      : 'unknown'
-    throw new Error(`Vault encryption failed: ${res.status} — ${detail}`)
-  }
-
-  const result = await res.json()
+  // A refusal is an `ApiError`, worded by the catch around step 3/4 through
+  // `failureSentence` — which never interpolates a non-string `error` (a zod
+  // flatten object would render as "[object Object]").
+  const result = await request<{ ciphertext: string; algorithm: string }>(
+    `/articles/${articleEventId}/vault`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        articleId,
+        paywallBody: data.paywallContent,
+        pricePence: data.pricePence,
+        gatePositionPct: data.gatePositionPct,
+        nostrDTag: dTag,
+      }),
+    },
+  )
   return { ciphertext: result.ciphertext, algorithm: result.algorithm }
 }
 
@@ -272,7 +302,12 @@ export async function publishToPublication(
 // moduleResolution, no workspace setup) can't cleanly import from shared/.
 // web/tests/publish.test.ts asserts identical output to the gateway version
 // and is how drift is caught.
-function slugify(title: string, maxLen = 80): string {
+// Exported so `web/tests/publish.test.ts` can compare it against
+// `shared/src/lib/slug.ts` directly. Two implementations of one algorithm exist
+// because Next cannot cleanly import from `shared/` here; the parity test is
+// the only thing holding them together, and until 2026-09-10 it compared this
+// one against a hand-written literal instead.
+export function slugify(title: string, maxLen = 80): string {
   return title
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, '')

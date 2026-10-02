@@ -33,12 +33,26 @@ vi.mock("../src/lib/atproto-resolve.js", async (importOriginal) => ({
 }));
 
 const mockResolveWebFinger = vi.fn();
+// THE SEAM IS `fetchActorProfileWithVerdict`, NOT `fetchActorProfile`. Since
+// signed fetch shipped, the liveness probe needs to know WHY there is no
+// profile — "no such account" and "that server will not let us read, and we
+// cannot make it" are the same `null` to the plain fetcher and two entirely
+// different sentences to a member who has just pasted a handle. Mocking the
+// old seam would leave the real one running against a mocked transport, which
+// is how these two arms could drift apart in silence.
 const mockFetchActorProfile = vi.fn();
 vi.mock("../src/lib/activitypub-resolve.js", async (importOriginal) => ({
   ...(await importOriginal<object>()),
   resolveWebFinger: (...a: unknown[]) => mockResolveWebFinger(...a),
-  fetchActorProfile: (...a: unknown[]) => mockFetchActorProfile(...a),
+  fetchActorProfileWithVerdict: (...a: unknown[]) => mockFetchActorProfile(...a),
 }));
+
+/** A profile found. */
+const found = (profile: unknown) => ({ profile, signedFetchRefused: false });
+/** No profile, and it is a fact about the ACCOUNT. */
+const notFound = () => ({ profile: null, signedFetchRefused: false });
+/** No profile, and it is a fact about US. */
+const refused = () => ({ profile: null, signedFetchRefused: true });
 
 const mockFetchNostrProfile = vi.fn();
 vi.mock("../src/lib/nostr-search.js", async (importOriginal) => ({
@@ -51,10 +65,13 @@ function httpResponse(opts: {
   status?: number;
   text?: string;
   contentType?: string | null;
+  /** Where the fetch ENDED (safeFetch's post-redirect url); absent = as asked. */
+  url?: string;
 }) {
   return {
     ok: opts.ok ?? true,
     status: opts.status ?? 200,
+    url: opts.url,
     text: opts.text ?? "",
     headers: {
       get: (name: string) =>
@@ -120,6 +137,31 @@ describe("verifySourceLiveness — rss", () => {
     );
     const v = await verifySourceLiveness("rss", "https://example.com/feed.json");
     expect(v).toMatchObject({ ok: true, displayName: "JSON Example" });
+  });
+
+  it("canonicalises to the url the feed was SERVED at, not the one asked for (CA-C4)", async () => {
+    // (protocol, source_uri) is the source key and items dedup globally on
+    // guid, so `http://…/feed` redirecting to `https://…/feed/` was a second
+    // source that never received an item. The post-redirect url is the source.
+    mockSafeFetch.mockResolvedValue(
+      httpResponse({
+        text: RSS_XML,
+        contentType: "application/rss+xml",
+        url: "https://example.com/feed/",
+      }),
+    );
+    const v = await verifySourceLiveness("rss", "http://example.com/feed");
+    expect(v).toMatchObject({ ok: true, sourceUri: "https://example.com/feed/" });
+    // …and a JSON feed takes the same door.
+    mockSafeFetch.mockResolvedValue(
+      httpResponse({
+        text: JSON_FEED,
+        contentType: "application/feed+json",
+        url: "https://example.com/feed.json",
+      }),
+    );
+    const j = await verifySourceLiveness("rss", "http://example.com/feed.json");
+    expect(j).toMatchObject({ ok: true, sourceUri: "https://example.com/feed.json" });
   });
 
   it("rejects an HTML page as unreachable (well-formed URL, not a feed)", async () => {
@@ -307,7 +349,7 @@ describe("verifySourceLiveness — activitypub", () => {
   };
 
   it("verifies an https actor URL and canonicalises to the document id", async () => {
-    mockFetchActorProfile.mockResolvedValue(ACTOR_PROFILE);
+    mockFetchActorProfile.mockResolvedValue(found(ACTOR_PROFILE));
     const v = await verifySourceLiveness(
       "activitypub",
       "https://mastodon.social/users/alice",
@@ -318,7 +360,7 @@ describe("verifySourceLiveness — activitypub", () => {
 
   it("webfingers an acct (with or without leading @) to its actor and probes it", async () => {
     mockResolveWebFinger.mockResolvedValue(ACTOR);
-    mockFetchActorProfile.mockResolvedValue(ACTOR_PROFILE);
+    mockFetchActorProfile.mockResolvedValue(found(ACTOR_PROFILE));
     for (const input of ["alice@mastodon.social", "@alice@mastodon.social"]) {
       const v = await verifySourceLiveness("activitypub", input);
       expect(v).toMatchObject({ ok: true, sourceUri: ACTOR });
@@ -334,7 +376,7 @@ describe("verifySourceLiveness — activitypub", () => {
   });
 
   it("rejects a URL that is not an actor document as unreachable", async () => {
-    mockFetchActorProfile.mockResolvedValue(null);
+    mockFetchActorProfile.mockResolvedValue(notFound());
     const v = await verifySourceLiveness(
       "activitypub",
       "https://example.com/not-an-actor",
@@ -351,6 +393,38 @@ describe("verifySourceLiveness — activitypub", () => {
     ).toMatchObject({ ok: false, reason: "malformed" });
     expect(mockResolveWebFinger).not.toHaveBeenCalled();
     expect(mockFetchActorProfile).not.toHaveBeenCalled();
+  });
+
+  it("A CAPABILITY WE LACK IS NOT A FACT ABOUT THE SOURCE, and the member is told which", async () => {
+    // Both answers are a 422 — there is nothing the member can do either way —
+    // but "this address doesn't exist" and "that server won't let us read it"
+    // send them to two different places. The probe has always KNOWN (it saw
+    // the 401, it had already tried a signature and the client API) and said
+    // the first of the two, so a member adding one account from a hardened
+    // instance and another from an ordinary one got the same sentence for
+    // opposite reasons, and the one that was our fault read as theirs.
+    mockFetchActorProfile.mockResolvedValue(refused());
+    const v = await verifySourceLiveness(
+      "activitypub",
+      "https://akkoma.example/users/alice",
+    );
+    expect(v).toMatchObject({ ok: false, reason: "unreachable" });
+    expect((v as { message: string }).message).toMatch(/limitation at our end/);
+
+    // The control, and the whole point of the pair: the OTHER refusal must not
+    // say this. A probe that returned our sentence for every failure would
+    // blame the platform for every typo.
+    mockFetchActorProfile.mockResolvedValue(notFound());
+    const other = await verifySourceLiveness(
+      "activitypub",
+      "https://example.com/not-an-actor",
+    );
+    expect((other as { message: string }).message).not.toMatch(
+      /limitation at our end/,
+    );
+    expect((other as { message: string }).message).toMatch(
+      /did not return an ActivityPub actor document/,
+    );
   });
 
   it("brake off: actor URL passes unprobed; an acct still webfingers but skips the actor probe", async () => {

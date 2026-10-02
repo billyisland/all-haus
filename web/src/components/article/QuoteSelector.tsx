@@ -20,7 +20,7 @@ interface QuoteSelectorProps {
 
 export function QuoteSelector({ articleBodyRef, articleId, articleTitle, articlePubkey, writerName, isLoggedIn, isAuthor = false, onCite }: QuoteSelectorProps) {
   const [selectionPopup, setSelectionPopup] = useState<{ x: number; y: number; text: string; raw: string; start: number; end: number } | null>(null)
-  const openCompose = useCompose((s) => s.open)
+  const openQuote = useCompose((s) => s.openQuote)
 
   const handleMouseUp = useCallback(() => {
     if (!isLoggedIn) return
@@ -63,7 +63,10 @@ export function QuoteSelector({ articleBodyRef, articleId, articleTitle, article
             className="px-3 py-1.5 hover:opacity-80 transition-opacity"
             onMouseDown={e => {
               e.preventDefault()
-              openCompose('reply', {
+              // A quote, and now asked for as one: this button is labelled
+              // Quote and always built a QuoteTarget, but the store's only
+              // target was the quote's, so it had to ask for mode 'reply'.
+              openQuote({
                 eventId: articleId,
                 eventKind: 30023,
                 authorPubkey: articlePubkey,

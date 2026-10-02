@@ -1,9 +1,20 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { pool } from "@platform-pub/shared/db/client.js";
+import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
 import { requireAuth, optionalAuth } from "../middleware/auth.js";
 import { checkArticleAccess } from "../services/article-access/index.js";
+import { resolveEventTarget, replyEventIdIsTaken } from "../lib/event-target.js";
+import { signEvent } from "../lib/key-custody-client.js";
+import {
+  enqueueRelayPublish,
+  type SignedNostrEvent,
+} from "@platform-pub/shared/lib/relay-outbox.js";
+import { resolveMentionedAccountIds } from "../lib/mentions.js";
+import { blockExistsBetween, loadHiddenAuthorIds } from "../lib/blocks.js";
 import logger from "@platform-pub/shared/lib/logger.js";
+import { zodValidationError } from "@platform-pub/shared/lib/validation.js";
+import { truncatePreview } from "@platform-pub/shared/lib/text.js";
+import { isUuid } from "../lib/request-inputs.js";
 
 // =============================================================================
 // Reply Routes
@@ -11,11 +22,25 @@ import logger from "@platform-pub/shared/lib/logger.js";
 // POST   /replies                      — Index a published reply
 // GET    /replies/:targetEventId       — Fetch threaded replies for content
 // DELETE /replies/:replyId             — Soft-delete a reply
-// PATCH  /articles/:id/replies         — Toggle replies on an article
-// PATCH  /notes/:id/replies            — Toggle replies on a note
+// (Replies on an article are toggled by `PATCH /articles/:id`; a note has no
+// toggle — CA-I4 deleted the two uncalled PATCH …/replies routes.)
 // =============================================================================
 
 const REPLY_CHAR_LIMIT = 2000;
+
+// `GET /replies/:targetEventId` returned EVERY comment on a piece, with no
+// bound of any kind, and builds a two-level tree out of them in memory. One
+// popular article — or one automated flood under any article, since a reply
+// costs an account and nothing else — is an unbounded row count and an
+// unbounded response on a route `optionalAuth` serves to anybody.
+//
+// A time-ordered prefix is the safe cut, and that is not an accident: a reply
+// is published after the comment it replies to, so `ORDER BY published_at ASC`
+// puts every parent before its child and any prefix of it is closed under
+// parenthood. Truncating the tail therefore drops leaves and can never orphan
+// a comment it keeps. (The assembly below re-parents an orphan to the top
+// level anyway, which is the belt to this braces.)
+const REPLY_TREE_LIMIT = 500;
 
 const IndexReplySchema = z.object({
   nostrEventId: z.string().min(1),
@@ -23,10 +48,6 @@ const IndexReplySchema = z.object({
   targetKind: z.number().int(),
   parentCommentId: z.string().uuid().nullable().optional(),
   content: z.string().min(1).max(REPLY_CHAR_LIMIT),
-});
-
-const ToggleRepliesSchema = z.object({
-  enabled: z.boolean(),
 });
 
 export async function replyRoutes(app: FastifyInstance) {
@@ -37,63 +58,61 @@ export async function replyRoutes(app: FastifyInstance) {
   app.post("/replies", { preHandler: requireAuth }, async (req, reply) => {
     const parsed = IndexReplySchema.safeParse(req.body);
     if (!parsed.success) {
-      return reply.status(400).send({ error: parsed.error.flatten() });
+      return reply.status(400).send(zodValidationError(parsed.error));
     }
 
     const authorId = req.session!.sub;
     const data = parsed.data;
 
     try {
-      // Verify target exists and replies are enabled
-      let targetQuery;
-      if (data.targetKind === 30023) {
-        // `id`, `access_mode` and `publication_id` ride along for the paywall
-        // guard below — they are not display fields.
-        targetQuery = await pool.query<{
-          id: string;
-          writer_id: string;
-          comments_enabled: boolean;
-          access_mode: string;
-          publication_id: string | null;
-        }>(
-          `SELECT id, writer_id, comments_enabled, access_mode, publication_id
-             FROM articles
-            WHERE nostr_event_id = $1 AND deleted_at IS NULL`,
-          [data.targetEventId],
-        );
-      } else {
-        targetQuery = await pool.query<{
-          author_id: string;
-          comments_enabled: boolean;
-        }>(
-          `SELECT author_id, comments_enabled FROM notes
-           WHERE nostr_event_id = $1`,
-          [data.targetEventId],
-        );
-      }
-
-      if (targetQuery.rows.length === 0) {
-        return reply.status(404).send({ error: "Target content not found" });
-      }
-
-      const target = targetQuery.rows[0];
-      if (!target.comments_enabled) {
-        return reply
-          .status(403)
-          .send({ error: "Replies are disabled on this content" });
-      }
-
-      // Check if replier is blocked by content author
-      const contentAuthorId =
-        "writer_id" in target ? target.writer_id : target.author_id;
-      const blockCheck = await pool.query(
-        `SELECT 1 FROM blocks WHERE blocker_id = $1 AND blocked_id = $2`,
-        [contentAuthorId, authorId],
+      // WHAT THE ID NAMES DECIDES, NOT WHAT THE REQUEST CLAIMS (MIRROR-AUDIT
+      // §2.7). This route used to pick its table from `data.targetKind`, so a
+      // note minted under a paywalled article's event id — which `POST /notes`
+      // accepts, the id being client-supplied — plus `targetKind: 1` sent the
+      // lookup into `notes`, and the guard below, which keys on the ARTICLE
+      // row, never ran. The resolver searches articles first and the squattable
+      // table last; see its header for the order and why a disagreeing kind is
+      // ignored rather than refused.
+      const target = await resolveEventTarget(
+        pool,
+        data.targetEventId,
+        data.targetKind,
       );
-      if (blockCheck.rows.length > 0) {
+
+      if (!target) {
+        return reply.status(404).send({ error: "We couldn't find what you're replying to." });
+      }
+
+      // A COMMENT IS NOT A REPLY TARGET, and this is the one place the resolver
+      // finds something this route must still refuse. `comments.target_event_id`
+      // is the CONVERSATION'S ROOT — replies-to-replies share it and nest via
+      // `parentCommentId`, which the parent check below enforces — so accepting
+      // a comment here would mint a row whose target is not a root and quietly
+      // break every reader that assumes one. Nesting is `parentCommentId`.
+      if (target.kind === 1111) {
+        return reply.status(400).send({
+          error: "target_is_reply",
+          message:
+            "Reply to the conversation's root and nest with parentCommentId.",
+        });
+      }
+
+      if (!target.commentsEnabled) {
         return reply
           .status(403)
-          .send({ error: "You cannot reply to this content" });
+          .send({ error: "Replies are turned off for this post." });
+      }
+
+      // A block between the replier and the content's author, EITHER way
+      // (W2, 2026-09-24) — through the one home, with the one neutral refusal.
+      // It asked one direction only; a blocker could go on commenting under
+      // the work of the member they had blocked, in a conversation that member
+      // could no longer answer in.
+      const contentAuthorId = target.authorId;
+      if (await blockExistsBetween(contentAuthorId, authorId)) {
+        return reply
+          .status(403)
+          .send({ error: "You can't reply to this." });
       }
 
       // A comment on a piece you cannot read is a write into a conversation the
@@ -111,15 +130,15 @@ export async function replyRoutes(app: FastifyInstance) {
       // (readerId === writerId), so an author commenting under their own
       // paywalled piece is unaffected.
       // ARTICLE-HEADED-CONVERSATIONS-ADR D7.
-      // Narrowed by `in`, not by `data.targetKind`: the discriminator lives on
-      // the REQUEST and the union lives on the row, which is the same idiom the
-      // block check above uses (`"writer_id" in target`).
-      if ("access_mode" in target && target.access_mode === "paywalled") {
+      // Narrowed by the RESOLVED kind, never by `data.targetKind`: the
+      // discriminator lives on the request and the union lives on the row, and
+      // trusting the request here was the §2.7 bypass itself.
+      if (target.kind === 30023 && target.accessMode === "paywalled") {
         const access = await checkArticleAccess(
           authorId,
-          target.id,
-          target.writer_id,
-          target.publication_id,
+          target.articleId,
+          target.authorId,
+          target.publicationId,
         );
         if (!access.hasAccess) {
           return reply
@@ -128,40 +147,152 @@ export async function replyRoutes(app: FastifyInstance) {
         }
       }
 
-      // If replying to another reply, verify parent exists and references same target
+      // If replying to another reply, verify parent exists and references same
+      // target. `author_id` comes off THIS read and not a second one: it is the
+      // person being replied to, and the guard has already proved the row is
+      // live and in this conversation, which is exactly what makes them a
+      // recipient. A later lookup would be a second chance to read a row that
+      // has changed underneath the first.
+      let parentAuthorId: string | null = null;
       if (data.parentCommentId) {
-        const parentCheck = await pool.query<{ target_event_id: string }>(
-          `SELECT target_event_id FROM comments WHERE id = $1 AND deleted_at IS NULL`,
+        const parentCheck = await pool.query<{
+          target_event_id: string;
+          author_id: string;
+        }>(
+          `SELECT target_event_id, author_id FROM comments WHERE id = $1 AND deleted_at IS NULL`,
           [data.parentCommentId],
         );
         if (parentCheck.rows.length === 0) {
-          return reply.status(404).send({ error: "Parent reply not found" });
+          return reply.status(404).send({ error: "We couldn't find the reply you're answering." });
         }
         if (parentCheck.rows[0].target_event_id !== data.targetEventId) {
           return reply
             .status(400)
             .send({ error: "Parent reply references different content" });
         }
+        parentAuthorId = parentCheck.rows[0].author_id;
+        // THE PERSON BEING REPLIED TO IS ASKED TOO (CA-B8, 2026-09-29). The
+        // guard above asks the CONTENT's author; a reply to a comment puts
+        // words under somebody else's remark, and a block between the replier
+        // and THAT member ran unasked — a blocked member could go on answering
+        // the blocker's comments (the projector hides the parent from them,
+        // which is a UI rule, and a UI rule is not an access control). Same
+        // home, same neutral refusal; the root author is not re-asked.
+        if (
+          parentAuthorId !== contentAuthorId &&
+          (await blockExistsBetween(parentAuthorId, authorId))
+        ) {
+          return reply
+            .status(403)
+            .send({ error: "You can't reply to this." });
+        }
       }
 
-      const result = await pool.query<{ id: string }>(
-        `INSERT INTO comments (
-           author_id, nostr_event_id, target_event_id, target_kind,
-           parent_comment_id, content, published_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, now())
-         ON CONFLICT (nostr_event_id) DO NOTHING
-         RETURNING id`,
-        [
-          authorId,
-          data.nostrEventId,
-          data.targetEventId,
-          data.targetKind,
-          data.parentCommentId ?? null,
-          data.content,
-        ],
-      );
+      // A NATIVE REPLY IS A POST, SO IT GETS ITS TIMELINE ROW — in the SAME
+      // TRANSACTION as the comment, like every other dual-write on the site
+      // (`POST /notes`, the article publishers). Until migration 232 a comment
+      // had no `feed_items` row at all, which is the whole of why a reply could
+      // never reach a feed however its author's followers had composed one,
+      // while EXTERNAL replies have been arriving throughout.
+      //
+      // `is_reply` is TRUE by construction, and that is the only thing the
+      // reader's "no replies" chip needs: `feed_sources.exclude_replies` is
+      // already asked of `fi.is_reply` inside the feed's source arms, so this
+      // one column makes the setting govern native replies with no new
+      // predicate anywhere.
+      //
+      // Everything else about the card — its body, its conversation, who it
+      // answers — is read back through the `comments` join by the shared
+      // projection, so nothing here is a second copy of the reply's content
+      // except `content_preview`, which exists for the surfaces that only have
+      // the row (the moderation snapshot).
+      const { commentId, duplicate, squatted } = await withTransaction(async (client) => {
+        // A COMMENT MUST NOT SHADOW AN ARTICLE OR A NOTE (CA-B2): the unique
+        // index refuses only a second comment. Asked in the same transaction
+        // as the INSERT, as `POST /notes` asks its twin, so a concurrent
+        // plant cannot slip between the check and the write.
+        if (await replyEventIdIsTaken(client, data.nostrEventId)) {
+          return { commentId: null, duplicate: false, squatted: true };
+        }
+        const result = await client.query<{ id: string }>(
+          `INSERT INTO comments (
+             author_id, nostr_event_id, target_event_id, target_kind,
+             parent_comment_id, content, published_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, now())
+           ON CONFLICT (nostr_event_id) DO NOTHING
+           RETURNING id`,
+          [
+            authorId,
+            data.nostrEventId,
+            data.targetEventId,
+            // The RESOLVED kind is what gets persisted. `comments.target_kind` is
+            // read as a fact about the row it points at, so storing the client's
+            // claim would record the squat's version of events forever.
+            target.kind,
+            data.parentCommentId ?? null,
+            data.content,
+          ],
+        );
 
-      if (result.rows.length === 0) {
+        if (result.rows.length === 0) return { commentId: null, duplicate: true, squatted: false };
+        const cId = result.rows[0].id;
+
+        const {
+          rows: [author],
+        } = await client.query<{
+          display_name: string | null;
+          avatar_blossom_url: string | null;
+          username: string | null;
+        }>(
+          `SELECT display_name, avatar_blossom_url, username FROM accounts WHERE id = $1`,
+          [authorId],
+        );
+
+        await client.query(
+          `INSERT INTO feed_items (
+             item_type, comment_id, author_id,
+             author_name, author_avatar, author_username,
+             content_preview, nostr_event_id,
+             published_at, is_reply
+           ) VALUES (
+             'comment', $1, $2,
+             $3, $4, $5,
+             $6, $7,
+             now(), TRUE
+           )
+           ON CONFLICT (comment_id) WHERE comment_id IS NOT NULL DO UPDATE SET
+             content_preview = EXCLUDED.content_preview,
+             author_name = EXCLUDED.author_name,
+             author_avatar = EXCLUDED.author_avatar,
+             author_username = EXCLUDED.author_username`,
+          [
+            cId,
+            authorId,
+            author?.display_name ?? author?.username ?? "Unknown",
+            author?.avatar_blossom_url ?? null,
+            author?.username ?? null,
+            truncatePreview(data.content),
+            data.nostrEventId,
+          ],
+        );
+
+        return { commentId: cId, duplicate: false, squatted: false };
+      });
+
+      // `commentId === null` is the same fact as `duplicate` and is spelled
+      // out so the narrowing is the compiler's rather than a reader's: a
+      // destructured union does not carry its discriminant.
+      if (squatted) {
+        logger.warn(
+          { authorId, nostrEventId: data.nostrEventId },
+          "Reply refused: event id already names an article or a note",
+        );
+        return reply.status(409).send({
+          error: "event_id_taken",
+          message: "That event id already belongs to other content.",
+        });
+      }
+      if (duplicate || commentId === null) {
         return reply.status(200).send({ ok: true, duplicate: true });
       }
 
@@ -176,42 +307,76 @@ export async function replyRoutes(app: FastifyInstance) {
           logger.warn({ err }, "Failed to insert reply feed_engagement"),
         );
 
-      // Resolve target article/note for notification context
-      const articleRow =
-        data.targetKind === 30023
-          ? await pool
-              .query<{
-                id: string;
-              }>(
-                `SELECT id FROM articles WHERE nostr_event_id = $1 AND deleted_at IS NULL`,
-                [data.targetEventId],
-              )
-              .then((r) => r.rows[0] ?? null)
-          : null;
-      const noteRow =
-        data.targetKind === 1
-          ? await pool
-              .query<{
-                id: string;
-              }>(`SELECT id FROM notes WHERE nostr_event_id = $1`, [
-                data.targetEventId,
-              ])
-              .then((r) => r.rows[0] ?? null)
-          : null;
+      // The notification's reference columns come off the RESOLVED target,
+      // never off a second lookup keyed on `data.targetKind`. That second
+      // lookup was the §2.7 branch-on-kind surviving one statement past the
+      // fix (S25): for the honest mismatch the resolver tolerates — a native
+      // reply projected as `type: "note"` replying with kind 1 on an article —
+      // it read `notes`, found nothing, and wrote the notification with BOTH
+      // `article_id` and `note_id` NULL. Right recipient, no link. The 1111 arm
+      // was refused above, so what remains is exactly an article or a note.
+      const notificationArticleId =
+        target.kind === 30023 ? target.articleId : null;
+      const notificationNoteId = target.kind === 1 ? target.noteId : null;
 
-      // Notify content author of new reply (skip if replying to own content)
-      if (authorId !== contentAuthorId) {
+      // A REPLY IS TO SOMEBODY, AND UNTIL 2026-09-18 IT TOLD THE WRONG PERSON.
+      // This notified the RESOLVED target's author and nobody else — so
+      // replying to a comment told the author of the article or note, while the
+      // person actually replied to learned nothing and had no way to find out
+      // that the conversation they were in had continued. Two people have a
+      // claim on a nested reply and they are told different things:
+      //
+      //   the parent comment's author  "X replied to your comment"
+      //   the root's author            "X replied to <your piece>"
+      //
+      // WHICH IS WHICH IS `parent_comment_id`, BOUND ON ONE ROW AND NOT THE
+      // OTHER (migration 230). The two rows are otherwise identical — same
+      // actor, same article/note, and the same `comment_id`, which on BOTH is
+      // the NEW reply, because that is what the panel renders and what
+      // `focus_post_id` opens. Without a column to tell them apart the client is
+      // holding two indistinguishable rows and has to guess the sentence.
+      // `recipient_id` separates them in `idx_notifications_dedup`, so they do
+      // not collapse; the new column is deliberately not in that index and the
+      // migration says why.
+      //
+      // ONE PERSON, ONE ROW, AND THE SPECIFIC SENTENCE WINS. Where the parent's
+      // author IS the root's author — a writer answered under their own piece
+      // and somebody replied to them — they get a single notification, the one
+      // naming their comment. Two rows for one person, one of them vaguer,
+      // would be the pub_* collapse in reverse.
+      //
+      // SELF IS DROPPED LAST, not by an early return: replying to your own
+      // comment under somebody else's piece still owes THAT writer a
+      // notification, and a guard placed at the top would have swallowed it.
+      const recipients: Array<{ id: string; parentCommentId: string | null }> =
+        [];
+      if (parentAuthorId) {
+        recipients.push({
+          id: parentAuthorId,
+          parentCommentId: data.parentCommentId ?? null,
+        });
+      }
+      if (contentAuthorId !== parentAuthorId) {
+        recipients.push({ id: contentAuthorId, parentCommentId: null });
+      }
+
+      // ONE STATEMENT EACH, never one INSERT with two VALUES rows: a partial
+      // outcome is not a total one, and a single statement makes the two
+      // recipients share a fate they have no reason to share.
+      for (const recipient of recipients) {
+        if (recipient.id === authorId) continue;
         pool
           .query(
-            `INSERT INTO notifications (recipient_id, actor_id, type, article_id, note_id, comment_id)
-           VALUES ($1, $2, 'new_reply', $3, $4, $5)
+            `INSERT INTO notifications (recipient_id, actor_id, type, article_id, note_id, comment_id, parent_comment_id)
+           VALUES ($1, $2, 'new_reply', $3, $4, $5, $6)
            ON CONFLICT DO NOTHING`,
             [
-              contentAuthorId,
+              recipient.id,
               authorId,
-              articleRow?.id ?? null,
-              noteRow?.id ?? null,
-              result.rows[0].id,
+              notificationArticleId,
+              notificationNoteId,
+              commentId,
+              recipient.parentCommentId,
             ],
           )
           .catch((err) =>
@@ -221,48 +386,57 @@ export async function replyRoutes(app: FastifyInstance) {
 
       logger.info(
         {
-          replyId: result.rows[0].id,
+          replyId: commentId,
           authorId,
           targetEventId: data.targetEventId,
         },
         "Reply indexed",
       );
 
-      // Notify @mentioned users (fire-and-forget)
-      const mentionMatches = data.content.matchAll(
-        /(?<![a-zA-Z0-9.])@([a-zA-Z0-9_]+)/g,
-      );
-      const mentionedUsernames = [
-        ...new Set([...mentionMatches].map((m) => m[1])),
-      ];
-      if (mentionedUsernames.length > 0) {
-        const { rows: mentionedUsers } = await pool.query<{ id: string }>(
-          `SELECT id FROM accounts WHERE username = ANY($1) AND status = 'active' AND id != $2`,
-          [mentionedUsernames, authorId],
+      // Notify @mentioned users (fire-and-forget). The scan and the handle walk
+      // live in `lib/mentions.ts` — see that header for why the greedy token is
+      // not the handle. The LOOKUP is caught here too: it sat under the route's
+      // own catch, so a failure of it answered 500 for a reply already written.
+      let mentionedIds: string[] = [];
+      try {
+        mentionedIds = await resolveMentionedAccountIds(
+          pool,
+          data.content,
+          authorId,
         );
-        for (const mentioned of mentionedUsers) {
-          pool
-            .query(
-              `INSERT INTO notifications (recipient_id, actor_id, type, article_id, note_id)
-             VALUES ($1, $2, 'new_mention', $3, $4)
-             ON CONFLICT DO NOTHING`,
-              [
-                mentioned.id,
-                authorId,
-                articleRow?.id ?? null,
-                noteRow?.id ?? null,
-              ],
-            )
-            .catch((err) =>
-              logger.warn({ err }, "Failed to insert mention notification"),
-            );
-        }
+      } catch (err) {
+        logger.warn({ err }, "Failed to resolve mentions");
+      }
+      for (const mentionedId of mentionedIds) {
+        pool
+          .query(
+            // BINDS THE COMMENT THE MENTION IS IN (migration 198's other
+            // half; the column was already in the dedup index). Bound to the
+            // article or note alone, two mentions of the same person by the
+            // same author in two different comments on ONE article were one
+            // notification, and the second was silently dropped — which for a
+            // mention is somebody being told about a conversation they were
+            // named in and not told about the next one.
+            `INSERT INTO notifications (recipient_id, actor_id, type, article_id, note_id, comment_id)
+           VALUES ($1, $2, 'new_mention', $3, $4, $5)
+           ON CONFLICT DO NOTHING`,
+            [
+              mentionedId,
+              authorId,
+              notificationArticleId,
+              notificationNoteId,
+              commentId,
+            ],
+          )
+          .catch((err) =>
+            logger.warn({ err }, "Failed to insert mention notification"),
+          );
       }
 
-      return reply.status(201).send({ commentId: result.rows[0].id });
+      return reply.status(201).send({ commentId });
     } catch (err) {
       logger.error({ err, authorId }, "Reply indexing failed");
-      return reply.status(500).send({ error: "Reply indexing failed" });
+      return reply.status(500).send({ error: "Couldn't post your reply. Please try again." });
     }
   });
 
@@ -351,19 +525,29 @@ export async function replyRoutes(app: FastifyInstance) {
          JOIN accounts a ON a.id = c.author_id
          LEFT JOIN trust_layer1 tl ON tl.user_id = c.author_id
          WHERE c.target_event_id = $1
-         ORDER BY c.published_at ASC`,
-        [targetEventId],
+         ORDER BY c.published_at ASC
+         LIMIT $2`,
+        [targetEventId, REPLY_TREE_LIMIT],
       );
 
-      // Get muted users for the current user
-      let mutedIds: Set<string> = new Set();
-      if (currentUserId) {
-        const mutes = await pool.query<{ muted_id: string }>(
-          "SELECT muted_id FROM mutes WHERE muter_id = $1",
-          [currentUserId],
-        );
-        mutedIds = new Set(mutes.rows.map((r) => r.muted_id));
-      }
+      // The TOTAL is a fact about `comments`, not about what the cap left — the
+      // standing rule this repo keeps arriving at (an empty denominator, a
+      // truncated sample, the reading log's `hasMore`): a signal about a source
+      // is computed from the source, never from the rows a downstream filter
+      // returned. Counted here rather than folded into the page query as a
+      // window function, which would count only the window it is computed over
+      // and so be the same mistake one level in.
+      const { rows: countRows } = await pool.query<{ n: string }>(
+        `SELECT count(*) AS n FROM comments
+          WHERE target_event_id = $1 AND deleted_at IS NULL`,
+        [targetEventId],
+      );
+      const totalCount = Number(countRows[0]?.n ?? 0);
+
+      // Authors hidden from this viewer: muted by them, or a block either way
+      // (lib/blocks.ts). Still called `isMuted` on the wire — it is the flag
+      // the reply renders nothing for, and it means "hidden", not "muted".
+      const mutedIds = await loadHiddenAuthorIds(currentUserId ?? null);
 
       // Build threaded tree (max 2 levels)
       interface ReplyNode {
@@ -419,7 +603,12 @@ export async function replyRoutes(app: FastifyInstance) {
 
       return reply.status(200).send({
         comments: topLevel,
-        totalCount: rows.filter((r) => !r.deleted_at).length,
+        totalCount,
+        // A capped tree that reads as a whole one is the absence this repo
+        // treats as the bug. Say so rather than letting `comments.length <
+        // totalCount` be inferred — deleted rows are counted out of the total
+        // and in to the page, so the two do not subtract cleanly.
+        truncated: rows.length >= REPLY_TREE_LIMIT,
         repliesEnabled,
         commentsEnabled: repliesEnabled, // backwards-compat alias
       });
@@ -436,18 +625,23 @@ export async function replyRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const userId = req.session!.sub;
       const { replyId } = req.params;
+      if (!isUuid(replyId)) {
+        return reply.status(404).send({ error: "We couldn't find that reply." });
+      }
 
       const { rows } = await pool.query<{
         author_id: string;
         target_event_id: string;
         target_kind: number;
+        nostr_event_id: string | null;
+        deleted_at: Date | null;
       }>(
-        "SELECT author_id, target_event_id, target_kind FROM comments WHERE id = $1",
+        "SELECT author_id, target_event_id, target_kind, nostr_event_id, deleted_at FROM comments WHERE id = $1",
         [replyId],
       );
 
       if (rows.length === 0) {
-        return reply.status(404).send({ error: "Reply not found" });
+        return reply.status(404).send({ error: "We couldn't find that reply." });
       }
 
       const replyRow = rows[0];
@@ -471,81 +665,61 @@ export async function replyRoutes(app: FastifyInstance) {
       if (replyRow.author_id !== userId && !isContentAuthor) {
         return reply
           .status(403)
-          .send({ error: "Not authorised to delete this reply" });
+          .send({ error: "You can only delete your own replies, or replies to something you wrote." });
       }
 
-      await pool.query("UPDATE comments SET deleted_at = now() WHERE id = $1", [
-        replyId,
-      ]);
+      // THE RELAY IS TOLD TOO (CA-B1, 2026-09-29). A reply IS a relay event:
+      // the web signs it as kind 1 and `POST /sign-and-publish` enqueues it
+      // before this route indexes it, so a soft delete here alone left the
+      // kind-1 on the relay and every mirror for ever — `DELETE /notes` sends
+      // a kind-5 and this did not. The tombstone is signed as the REPLY'S
+      // AUTHOR whoever pressed delete (the content author may remove a reply
+      // under their piece, and a kind-5 from any other pubkey is ignored under
+      // NIP-09), signed BEFORE the transaction as the note route does (key-
+      // custody down fails cleanly, nothing half-done), and enqueued as
+      // `note_deletion` — the event is a kind 1 and `relay_outbox`'s type
+      // CHECK has no comment kind, exactly as moderation's removal enqueues
+      // it. A reply that never reached the relay (no event id) or is already
+      // deleted gets no second tombstone.
+      let tombstone: SignedNostrEvent | null = null;
+      if (replyRow.nostr_event_id && replyRow.deleted_at === null) {
+        tombstone = (await signEvent(replyRow.author_id, {
+          kind: 5,
+          content: "",
+          tags: [["e", replyRow.nostr_event_id]],
+          created_at: Math.floor(Date.now() / 1000),
+        })) as SignedNostrEvent;
+      }
+
+      // THE CARD GOES WITH THE COMMENT, in the same transaction that soft-
+      // deletes it. Feed reads filter on `feed_items.deleted_at` and nothing
+      // else, so a comment soft-deleted without this stays in every feed it had
+      // reached — the §0k.1 shape, one table over. The thread still renders the
+      // node as "[deleted]" (that is `comments.deleted_at`, which the projector
+      // reads); what this removes is the standalone card.
+      await withTransaction(async (client) => {
+        const { rowCount } = await client.query(
+          "UPDATE comments SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL",
+          [replyId],
+        );
+        await client.query(
+          `UPDATE feed_items SET deleted_at = now()
+            WHERE comment_id = $1 AND deleted_at IS NULL`,
+          [replyId],
+        );
+        // Inside the caller's transaction, like every publish (posts.md), and
+        // only where THIS call did the deleting — a repeat press sends nothing.
+        if (tombstone && (rowCount ?? 0) > 0) {
+          await enqueueRelayPublish(client, {
+            entityType: "note_deletion",
+            entityId: replyId,
+            signedEvent: tombstone,
+          });
+        }
+      });
 
       logger.info({ replyId, userId }, "Reply soft-deleted");
       return reply.status(200).send({ ok: true });
-    },
-  );
-
-  // ---------------------------------------------------------------------------
-  // PATCH /articles/:id/replies — toggle replies on an article
-  // ---------------------------------------------------------------------------
-
-  app.patch<{ Params: { id: string } }>(
-    "/articles/:id/replies",
-    { preHandler: requireAuth },
-    async (req, reply) => {
-      const parsed = ToggleRepliesSchema.safeParse(req.body);
-      if (!parsed.success) {
-        return reply.status(400).send({ error: parsed.error.flatten() });
-      }
-
-      const writerId = req.session!.sub;
-      const result = await pool.query(
-        `UPDATE articles SET comments_enabled = $1
-         WHERE id = $2 AND writer_id = $3 AND deleted_at IS NULL
-         RETURNING id`,
-        [parsed.data.enabled, req.params.id, writerId],
-      );
-
-      if (result.rows.length === 0) {
-        return reply
-          .status(404)
-          .send({ error: "Article not found or not owned by you" });
-      }
-
-      return reply
-        .status(200)
-        .send({ ok: true, repliesEnabled: parsed.data.enabled });
-    },
-  );
-
-  // ---------------------------------------------------------------------------
-  // PATCH /notes/:id/replies — toggle replies on a note
-  // ---------------------------------------------------------------------------
-
-  app.patch<{ Params: { id: string } }>(
-    "/notes/:id/replies",
-    { preHandler: requireAuth },
-    async (req, reply) => {
-      const parsed = ToggleRepliesSchema.safeParse(req.body);
-      if (!parsed.success) {
-        return reply.status(400).send({ error: parsed.error.flatten() });
-      }
-
-      const authorId = req.session!.sub;
-      const result = await pool.query(
-        `UPDATE notes SET comments_enabled = $1
-         WHERE id = $2 AND author_id = $3
-         RETURNING id`,
-        [parsed.data.enabled, req.params.id, authorId],
-      );
-
-      if (result.rows.length === 0) {
-        return reply
-          .status(404)
-          .send({ error: "Note not found or not owned by you" });
-      }
-
-      return reply
-        .status(200)
-        .send({ ok: true, repliesEnabled: parsed.data.enabled });
     },
   );
 }

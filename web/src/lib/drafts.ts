@@ -1,4 +1,5 @@
 import type { PublishData } from "../components/editor/ArticleEditor";
+import { ApiError, request } from "./api/client";
 
 // =============================================================================
 // Draft Saving
@@ -12,8 +13,6 @@ import type { PublishData } from "../components/editor/ArticleEditor";
 // Relay-side draft events (kind 30024) are a post-launch addition.
 // =============================================================================
 
-const API_BASE = "/api/v1";
-
 export interface DraftData {
   title: string;
   dek?: string; // optional standfirst/subtitle
@@ -25,6 +24,10 @@ export interface DraftData {
   coverImageUrl?: string | null;
   publicationId?: string | null;
   commentsEnabled?: boolean; // "allow replies" toggle
+  // Mint a row of its own rather than let the gateway guess. Without an id or a
+  // dTag, `POST /drafts` updates the writer's most recent untagged draft, which
+  // is an unrelated piece whenever one exists. Set only by `createDraftTargeter`.
+  newDraft?: true;
 }
 
 export interface SavedDraft {
@@ -33,83 +36,84 @@ export interface SavedDraft {
   scheduledAt: string | null;
 }
 
-export async function saveDraft(data: DraftData): Promise<SavedDraft> {
-  const res = await fetch(`${API_BASE}/drafts`, {
+// Every call below goes through `request()`: a refusal is an `ApiError`
+// carrying the route's status and body, which a surface words with
+// `failureSentence` (lib/api/client) — never a hand-built "Draft save failed:
+// 500" string (CA-J2).
+export function saveDraft(data: DraftData): Promise<SavedDraft> {
+  return request<SavedDraft>("/drafts", {
     method: "POST",
-    credentials: "include",
-    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-
-  if (!res.ok) {
-    const body = await res.json().catch(() => null);
-    throw new Error(
-      `Draft save failed: ${res.status} — ${body?.error ?? "unknown"}`,
-    );
-  }
-
-  return res.json();
 }
 
+// An outage is not an empty drawer. This used to answer any non-ok response
+// with `[]`, so a dead gateway showed the dashboard's content list with the
+// member's drafts silently missing — and, being an ordinary render, the list's
+// own error branch never fired. A writer looking for something they had saved
+// and not yet published would have been told, by omission, that it was gone.
 export async function loadDrafts(): Promise<SavedDraft[]> {
-  const res = await fetch(`${API_BASE}/drafts`, {
-    credentials: "include",
-  });
-
-  if (!res.ok) return [];
-  const data = await res.json();
-  return data.drafts ?? [];
+  const data = await request<{ drafts?: SavedDraft[] }>("/drafts");
+  return data?.drafts ?? [];
 }
 
-export async function loadDraft(draftId: string): Promise<DraftData | null> {
-  const res = await fetch(`${API_BASE}/drafts/${draftId}`, {
-    credentials: "include",
-  });
-
-  if (!res.ok) return null;
-  return res.json();
+/**
+ * What `GET /drafts/:id` actually returns — `DraftData` plus the row's own
+ * bookkeeping. The route is WRITER-SCOPED on the session cookie, so it carries
+ * no writer identity: a caller that needs one takes it from `useAuth()`, which
+ * is the same person by construction.
+ */
+export interface LoadedDraft extends DraftData {
+  draftId: string;
+  autoSavedAt: string;
+  scheduledAt: string | null;
 }
 
+/**
+ * A single draft, or null.
+ *
+ * THREE STATES, NOT TWO (the outage rule): `undefined` is an outage — the
+ * gateway could not be reached or answered 5xx — while `null` is a definitive
+ * "no such draft of yours". A caller that folds them together tells a writer
+ * their work is gone when the gateway merely blinked.
+ */
+export async function loadDraft(
+  draftId: string,
+): Promise<LoadedDraft | null | undefined> {
+  try {
+    return await request<LoadedDraft>(`/drafts/${draftId}`);
+  } catch (err) {
+    if (err instanceof ApiError && (err.status === 404 || err.status === 401 || err.status === 403)) {
+      return null;
+    }
+    return undefined;
+  }
+}
+
+// A DELETE THAT ANSWERED 4xx/5xx IS NOT A DELETE (CA-E3). This awaited the
+// fetch and never read `res.ok`, so the dashboard filtered the row out on a
+// refusal and the draft came back on the next load, with `DRAFT_DELETE_FAILED`
+// reserved for a network throw alone. `request()` throws on any non-2xx. The
+// only other caller (`cleanUpDraft` in `useArticleEditorInit`) is best-effort
+// inside its own try/catch, so the throw reaches nothing that cannot take it.
 export async function deleteDraft(draftId: string): Promise<void> {
-  await fetch(`${API_BASE}/drafts/${draftId}`, {
-    method: "DELETE",
-    credentials: "include",
-  });
+  await request<unknown>(`/drafts/${draftId}`, { method: "DELETE" });
 }
 
-export async function scheduleDraft(
+// A refusal a writer can act on ("set a price", "give it a title") is the
+// route's `message`, which `failureSentence` shows as written.
+export function scheduleDraft(
   draftId: string,
   scheduledAt: string,
 ): Promise<{ ok: boolean; scheduledAt: string }> {
-  const res = await fetch(`${API_BASE}/drafts/${draftId}/schedule`, {
+  return request(`/drafts/${draftId}/schedule`, {
     method: "POST",
-    credentials: "include",
-    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ scheduledAt }),
   });
-
-  if (!res.ok) {
-    const body = await res.json().catch(() => null);
-    throw new Error(
-      `Schedule failed: ${res.status} — ${body?.error ?? "unknown"}`,
-    );
-  }
-
-  return res.json();
 }
 
 export async function unscheduleDraft(draftId: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/drafts/${draftId}/schedule`, {
-    method: "DELETE",
-    credentials: "include",
-  });
-
-  if (!res.ok) {
-    const body = await res.json().catch(() => null);
-    throw new Error(
-      `Unschedule failed: ${res.status} — ${body?.error ?? "unknown"}`,
-    );
-  }
+  await request<unknown>(`/drafts/${draftId}/schedule`, { method: "DELETE" });
 }
 
 // =============================================================================
@@ -133,7 +137,10 @@ function fingerprintOf(data: DraftData): string {
   ].join("|");
 }
 
-export function createAutoSaver(delayMs = 3000) {
+export function createAutoSaver(
+  delayMs = 3000,
+  save: (data: DraftData) => Promise<SavedDraft> = saveDraft,
+) {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let lastSavedContent = "";
 
@@ -151,7 +158,7 @@ export function createAutoSaver(delayMs = 3000) {
       if (fingerprint === lastSavedContent) return;
 
       try {
-        const result = await saveDraft(data);
+        const result = await save(data);
         lastSavedContent = fingerprint;
         onSaved?.(result);
       } catch (err) {
@@ -177,4 +184,39 @@ export function createAutoSaver(delayMs = 3000) {
   };
 
   return debouncedSave;
+}
+
+// =============================================================================
+// createDraftTargeter — one piece, one row, from its FIRST save.
+//
+// A save carrying no draftId and no dTag used to let `POST /drafts` guess, and
+// the guess is "the writer's most recent untagged, unscheduled draft": a new
+// piece's first autosave overwrote an unrelated draft's title and body whenever
+// one existed. The guess was there to stop the first autosave and an explicit
+// Save racing into two rows. So the first save now asks for a row of its own
+// (`newDraft`), and the race is closed HERE instead: every save that still has
+// no id while the first is in flight waits for it and targets the row it made.
+// A first save that FAILS mints nothing, so the next one tries again.
+// =============================================================================
+
+export function createDraftTargeter(
+  save: (data: DraftData) => Promise<SavedDraft> = saveDraft,
+) {
+  let first: Promise<SavedDraft> | null = null;
+
+  return async function saveTargeted(data: DraftData): Promise<SavedDraft> {
+    if (data.draftId || data.dTag) return save(data);
+    for (;;) {
+      const pending = first;
+      if (!pending) break;
+      const made = await pending.catch(() => null);
+      if (made) return save({ ...data, draftId: made.draftId });
+      if (first === pending) first = null;
+    }
+    // Synchronous from the loop's last check to here, so a second caller
+    // resuming after us sees this promise and waits on it.
+    const mine = save({ ...data, newDraft: true });
+    first = mine;
+    return mine;
+  };
 }

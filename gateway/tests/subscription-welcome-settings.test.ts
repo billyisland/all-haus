@@ -32,6 +32,9 @@ let accountExists = true
 let sessionSub = 'writer-1'
 
 function query(sql: string, params: unknown[] = []) {
+  // The writer gate's read (lib/writer-gate.ts). Every author in this file is
+  // an admitted writer; the reader cases live in writer-gate.test.ts.
+  if (sql.includes('AS can_write')) return Promise.resolve({ rows: [{ can_write: true }], rowCount: 1 });
   if (/UPDATE accounts SET subscription_welcome_message/.test(sql)) {
     // Write what the route actually passed — including null, and including ''.
     cell = params[0] as string | null

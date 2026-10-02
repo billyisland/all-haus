@@ -13,25 +13,22 @@ export interface WriterEarnings {
   // "reserved, pending redirect". 0 when the tribute money flow is dark.
   reservedPence: number
   readCount: number
-}
-
-export interface ArticleEarnings {
-  articleId: string
-  title: string
-  dTag: string
-  publishedAt: string | null
-  readCount: number
-  netEarningsPence: number
-  pendingPence: number
-  paidPence: number
+  // L5.4 / audit 3.11: gross and fee beside net. `feePence` is DERIVED by the
+  // service from gross − the reads' own net at their stamped rate, never
+  // recomputed from the dial — and never gross − the settled buckets, which
+  // are net of any tribute carve (that is the author's money, not our fee).
+  grossPence: number
+  feePence: number
+  // A2 / Writer 11.1: reading given away on readers' free allowances. Its own
+  // figure — never added to earnings (nobody was charged) and never subtracted
+  // from them (the reader would not have paid).
+  allowanceCoveredPence: number
+  allowanceReadCount: number
 }
 
 export const payment = {
   getEarnings: (writerId: string) =>
     request<WriterEarnings>(`/earnings/${writerId}`),
-
-  getPerArticleEarnings: (writerId: string) =>
-    request<{ articles: ArticleEarnings[] }>(`/earnings/${writerId}/articles`),
 }
 
 // =============================================================================
@@ -45,9 +42,11 @@ export const payment = {
  * it previously declared did not exist on the wire — `balancePence`,
  * `freeAllowanceTotalPence` and `recentReads` were all silently `undefined`,
  * and because the API client is a raw pass-through with no key remapping,
- * nothing anywhere reported it. The live consequence was on the Ledger's net
- * balance, which reads `earnings − tabBalance`: with `tabBalance` permanently 0,
- * a reader who owed money saw a net balance as though they owed none.
+ * nothing anywhere reported it. The live consequence was on the Ledger header,
+ * which then netted `earnings − tabBalance`: with `tabBalance` permanently 0, a
+ * reader who owed money saw a balance as though they owed none. (That netting
+ * is itself gone — Reader Terms 11.1; `BalanceHeader` now renders the two
+ * figures separately — but `tabBalancePence` is still the name on the wire.)
  *
  * `freeAllowanceTotalPence` is now genuinely on the wire (§0o.9a) — the reader's
  * OWN granted allowance (`accounts.free_allowance_granted_pence`, migration
@@ -62,6 +61,13 @@ export const payment = {
  */
 export interface TabOverview {
   tabBalancePence: number
+  /** What the platform owes THIS reader back and has not yet refunded
+   * (migration 206). POSITIVE pence, and its own figure: a reading tab can no
+   * longer go into credit, so this is never subtracted from `tabBalancePence`
+   * and never presented as a balance (Reader Terms 4.3). Both can be non-zero
+   * at once — owing us for today's reading does not cancel a refund we owe
+   * from a billing error last month. */
+  refundDuePence: number
   freeAllowanceRemainingPence: number
   /** The `free_allowance_pence` dial — the gauge's denominator. See above. */
   freeAllowanceTotalPence: number
@@ -121,9 +127,59 @@ export interface Subscriber {
   gettingMoneysworth: boolean
 }
 
+/**
+ * The answer to "settle my tab now" (Reader Terms 5.3). A refusal is a 402/409/
+ * 502 and arrives as an ApiError; a 200 means the request was understood, and
+ * `settled` says whether a charge was actually made — a tab with nothing on it,
+ * or too little for Stripe to charge, is not an error and must not be shown as
+ * one.
+ */
+export interface SettleTabResult {
+  ok: boolean
+  settled: boolean
+  reason?: 'nothing_due' | 'below_minimum'
+  amountPence?: number
+  balancePence?: number
+  message: string
+}
+
+/**
+ * The Writer's payout preferences (L5.3; Writer 6.3).
+ *
+ * The cadence vocabulary is a runtime array with the type derived from it,
+ * never a bare union: it crosses the wire to a zod enum and a column CHECK, and
+ * a type can be compared against nothing at test time.
+ * `web/tests/payout-prefs-wire.test.ts` reads the gateway's own list and
+ * `schema.sql`'s CHECK and asserts all three agree.
+ */
+export const PAYOUT_CADENCES = ['daily', 'weekly', 'monthly'] as const
+export type PayoutCadence = (typeof PAYOUT_CADENCES)[number]
+
+export interface PayoutPreferences {
+  cadence: PayoutCadence
+  /** NULL = use the platform's figure, which is not the same as naming it. */
+  thresholdPence: number | null
+  /** The floor. It ships with the answer rather than being a copy over here. */
+  platformThresholdPence: number
+  /** The anchor the cadence is measured from; null where nobody has been paid. */
+  lastPaidAt: string | null
+}
+
 export const account = {
   getTab: () =>
     request<TabOverview>('/my/tab'),
+
+  getPayoutPreferences: () =>
+    request<PayoutPreferences>('/my/payout-preferences'),
+
+  updatePayoutPreferences: (cadence: PayoutCadence, thresholdPence: number | null) =>
+    request<{ cadence: PayoutCadence; thresholdPence: number | null }>(
+      '/my/payout-preferences',
+      { method: 'PATCH', body: JSON.stringify({ cadence, thresholdPence }) }
+    ),
+
+  settleTab: () =>
+    request<SettleTabResult>('/my/tab/settle', { method: 'POST' }),
 
   getMySubscriptions: () =>
     request<{ subscriptions: MySubscription[] }>('/subscriptions/mine'),
@@ -133,12 +189,6 @@ export const account = {
       method: 'PATCH',
       body: JSON.stringify({ notifyOnPublish }),
     }),
-
-  exportReceipts: () =>
-    request<Blob>('/receipts/export'),
-
-  exportAccount: () =>
-    request<Blob>('/account/export'),
 
   updateSubscriptionPrice: (pricePence: number, annualDiscountPct?: number, defaultArticlePricePence?: number | null) =>
     request<{ ok: boolean }>('/settings/subscription-price', {

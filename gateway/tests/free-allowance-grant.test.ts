@@ -17,7 +17,7 @@ import Fastify from "fastify";
 //   · `free_allowance_granted_pence` — what this reader was gifted. Stamped
 //     from the dial at signup, then never restated. A retune must not tell a
 //     reader gifted £5 that they were gifted £7.50, on the gauge or on their
-//     statement's "Starting credit" line: the gift is a historical fact about
+//     statement's "Starting allowance" line: the gift is a historical fact about
 //     them, and the free-allowance invariant is that it is never revisited.
 //   · `free_allowance_remaining_pence` — what is left of it (the pre-existing
 //     column, decremented by accrual).

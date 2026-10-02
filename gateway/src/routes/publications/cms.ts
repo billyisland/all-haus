@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { requireWriter } from "../../lib/writer-gate.js";
 import { requirePublicationPermission } from "../../middleware/publication-auth.js";
 import { signEvent } from "../../lib/key-custody-client.js";
 import {
@@ -15,6 +16,7 @@ import {
 } from "../../services/publication-publisher.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 import { zodValidationError } from "@platform-pub/shared/lib/validation.js";
+import { parseLimit, parseOffset } from "../../lib/request-inputs.js";
 
 // =============================================================================
 // Publication CMS — author-facing article management inside a publication
@@ -64,11 +66,8 @@ export async function publicationCmsRoutes(app: FastifyInstance) {
       const { id } = req.params;
       const member = req.publicationMember!;
       const status = (req.query as any).status;
-      const limit = Math.min(
-        parseInt((req.query as any).limit ?? "50", 10),
-        100,
-      );
-      const offset = parseInt((req.query as any).offset ?? "0", 10);
+      const limit = parseLimit((req.query as any).limit, 50, 100);
+      const offset = parseOffset((req.query as any).offset);
 
       let statusFilter = "";
       const values: any[] = [id];
@@ -111,7 +110,7 @@ export async function publicationCmsRoutes(app: FastifyInstance) {
 
   app.post<{ Params: { id: string } }>(
     "/publications/:id/articles",
-    { preHandler: [requireAuth, requirePublicationPermission()] },
+    { preHandler: [requireAuth, requireWriter, requirePublicationPermission()] },
     async (req, reply) => {
       const parsed = SubmitArticleSchema.safeParse(req.body);
       if (!parsed.success) {
@@ -154,6 +153,7 @@ export async function publicationCmsRoutes(app: FastifyInstance) {
     {
       preHandler: [
         requireAuth,
+        requireWriter,
         requirePublicationPermission("can_edit_others"),
       ],
     },
@@ -325,7 +325,7 @@ export async function publicationCmsRoutes(app: FastifyInstance) {
 
   app.post<{ Params: { id: string; articleId: string } }>(
     "/publications/:id/articles/:articleId/publish",
-    { preHandler: [requireAuth, requirePublicationPermission("can_publish")] },
+    { preHandler: [requireAuth, requireWriter, requirePublicationPermission("can_publish")] },
     async (req, reply) => {
       const { id, articleId } = req.params;
       const editorId = req.session!.sub;

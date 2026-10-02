@@ -2,10 +2,31 @@
 // Signing Utility
 //
 // Signs a Nostr event template via the gateway's custodial signing service.
-// Works with plain event objects — no NDK dependency required.
+// Works with plain event objects — no NDK dependency required. A refusal is
+// an `ApiError` from `request()` (CA-J2).
 // =============================================================================
 
-const GATEWAY_URL = process.env.NEXT_PUBLIC_GATEWAY_URL ?? ''
+import { request } from './api/client'
+
+interface SignedFields {
+  id: string
+  sig: string
+  pubkey: string
+  created_at: number
+}
+
+function signBody(event: NostrEventTemplate): string {
+  return JSON.stringify({
+    kind: event.kind,
+    content: event.content,
+    tags: event.tags,
+    created_at: event.created_at,
+  })
+}
+
+function withSignature(event: NostrEventTemplate, s: SignedFields): SignedNostrEvent {
+  return { ...event, id: s.id, sig: s.sig, pubkey: s.pubkey, created_at: s.created_at }
+}
 
 export interface NostrEventTemplate {
   kind: number
@@ -22,30 +43,8 @@ export interface SignedNostrEvent extends NostrEventTemplate {
 }
 
 export async function signViaGateway(event: NostrEventTemplate): Promise<SignedNostrEvent> {
-  const res = await fetch(`${GATEWAY_URL}/api/v1/sign`, {
-    method: 'POST',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      kind: event.kind,
-      content: event.content,
-      tags: event.tags,
-      created_at: event.created_at,
-    }),
-  })
-
-  if (!res.ok) {
-    throw new Error(`Event signing failed: ${res.status}`)
-  }
-
-  const signedData = await res.json()
-  return {
-    ...event,
-    id: signedData.id,
-    sig: signedData.sig,
-    pubkey: signedData.pubkey,
-    created_at: signedData.created_at,
-  }
+  const signed = await request<SignedFields>('/sign', { method: 'POST', body: signBody(event) })
+  return withSignature(event, signed)
 }
 
 /**
@@ -53,28 +52,6 @@ export async function signViaGateway(event: NostrEventTemplate): Promise<SignedN
  * Eliminates the need for the client to have direct relay access.
  */
 export async function signAndPublish(event: NostrEventTemplate): Promise<SignedNostrEvent> {
-  const res = await fetch(`${GATEWAY_URL}/api/v1/sign-and-publish`, {
-    method: 'POST',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      kind: event.kind,
-      content: event.content,
-      tags: event.tags,
-      created_at: event.created_at,
-    }),
-  })
-
-  if (!res.ok) {
-    throw new Error(`Sign-and-publish failed: ${res.status}`)
-  }
-
-  const signedData = await res.json()
-  return {
-    ...event,
-    id: signedData.id,
-    sig: signedData.sig,
-    pubkey: signedData.pubkey,
-    created_at: signedData.created_at,
-  }
+  const signed = await request<SignedFields>('/sign-and-publish', { method: 'POST', body: signBody(event) })
+  return withSignature(event, signed)
 }

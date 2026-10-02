@@ -1,4 +1,5 @@
 import { request } from './client'
+import type { ViewerRelation } from './social'
 
 export interface WriterProfile {
   id: string
@@ -27,6 +28,11 @@ export interface WriterProfile {
   // ADR D7): network identities the SUBJECT proved, filtered server-side to
   // active + valid + show_on_profile. Absent on a stale gateway.
   presences?: ProfilePresence[]
+  // What the VIEWER has done to this writer (W2): the Mute/Block pair on the
+  // bar. Absent for an anonymous reader, on your own profile, on a stale
+  // gateway — and on the SSR'd page, whose server fetch carries no session, so
+  // the control asks `/my/relations/:id` itself when this is missing.
+  viewer?: ViewerRelation
 }
 
 export interface ProfilePresence {

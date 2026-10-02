@@ -2,6 +2,9 @@ import type { FastifyInstance } from 'fastify'
 import { requireAuth } from '../middleware/auth.js'
 import { pool } from '@platform-pub/shared/db/client.js'
 import logger from '@platform-pub/shared/lib/logger.js'
+import { parseTimestampCursor } from '@platform-pub/shared/lib/timestamp-cursor.js'
+import { isUuid, parseLimit } from '../lib/request-inputs.js'
+import { traffologyEnabled } from '@platform-pub/shared/lib/env.js'
 
 // =============================================================================
 // Traffology routes — writer analytics API
@@ -20,13 +23,42 @@ import logger from '@platform-pub/shared/lib/logger.js'
 
 const INGEST_URL = process.env.TRAFFOLOGY_INGEST_URL ?? 'http://localhost:3005'
 
+/**
+ * `<created_at::text>|<uuid>`. Split at the LAST `|` — the timestamp half
+ * carries no `|` but says so here rather than in the reader's head.
+ * Returns null for anything malformed, which the route answers 400 to: both
+ * halves go straight into casts, so Postgres would otherwise raise and the
+ * route would 500 with a database message in the body.
+ */
+function parseFeedCursor(raw: string | undefined): { ts: string; id: string } | null {
+  if (typeof raw !== 'string') return null
+  const at = raw.lastIndexOf('|')
+  if (at < 0) return null
+  const ts = parseTimestampCursor(raw.slice(0, at))
+  const id = raw.slice(at + 1)
+  if (!ts || !isUuid(id)) return null
+  return { ts, id }
+}
+
 export async function traffologyRoutes(app: FastifyInstance) {
+  // PARKED: every route here 404s unless TRAFFOLOGY_ENABLED is on (env.ts),
+  // so the surface is absent rather than an empty dashboard (walkthrough A15).
+  // One hook covers the plugin's own encapsulation context.
+  app.addHook('preHandler', async (_req, reply) => {
+    if (!traffologyEnabled()) {
+      return reply.status(404).send({ error: "We couldn't find that." })
+    }
+  })
+
   // GET /traffology/concurrent/:pieceId — live reader count for a single piece
   app.get<{ Params: { pieceId: string } }>(
     '/traffology/concurrent/:pieceId',
     { preHandler: requireAuth },
     async (req, reply) => {
       const { pieceId } = req.params
+      if (!isUuid(pieceId)) {
+        return reply.status(404).send({ error: "We couldn't find that piece." })
+      }
       const writerId = req.session!.sub
 
       const { rows } = await pool.query(
@@ -34,18 +66,18 @@ export async function traffologyRoutes(app: FastifyInstance) {
         [pieceId, writerId],
       )
       if (rows.length === 0) {
-        return reply.status(404).send({ error: 'Piece not found' })
+        return reply.status(404).send({ error: "We couldn't find that piece." })
       }
 
       try {
         const res = await fetch(`${INGEST_URL}/concurrent/${pieceId}`)
         if (!res.ok) {
-          return reply.status(502).send({ error: 'Ingest service unavailable' })
+          return reply.status(502).send({ error: "Couldn't reach the analytics service. Please try again in a moment." })
         }
         return reply.send(await res.json())
       } catch (err) {
         logger.error({ err }, 'Failed to query traffology-ingest')
-        return reply.status(502).send({ error: 'Ingest service unavailable' })
+        return reply.status(502).send({ error: "Couldn't reach the analytics service. Please try again in a moment." })
       }
     },
   )
@@ -60,12 +92,12 @@ export async function traffologyRoutes(app: FastifyInstance) {
       try {
         const res = await fetch(`${INGEST_URL}/concurrent/writer/${writerId}`)
         if (!res.ok) {
-          return reply.status(502).send({ error: 'Ingest service unavailable' })
+          return reply.status(502).send({ error: "Couldn't reach the analytics service. Please try again in a moment." })
         }
         return reply.send(await res.json())
       } catch (err) {
         logger.error({ err }, 'Failed to query traffology-ingest')
-        return reply.status(502).send({ error: 'Ingest service unavailable' })
+        return reply.status(502).send({ error: "Couldn't reach the analytics service. Please try again in a moment." })
       }
     },
   )
@@ -78,26 +110,43 @@ export async function traffologyRoutes(app: FastifyInstance) {
     { preHandler: requireAuth },
     async (req, reply) => {
       const writerId = req.session!.sub
-      const limit = Math.min(parseInt(req.query.limit ?? '20', 10), 50)
-      const cursor = req.query.cursor // ISO timestamp
+      const limit = parseLimit(req.query.limit, 20, 50)
+
+      // `<created_at::text>|<id>`, compared row-wise against
+      // `($3::timestamptz, $4::uuid)` and ordered on the same pair. Two rules
+      // at once. The timestamp never becomes a JS Date, which holds
+      // milliseconds where timestamptz holds microseconds — and this cursor is
+      // DESCENDING, compared with `<`, so a truncated position would skip the
+      // observations inside the lost microsecond rather than repeat them
+      // (shared/lib/timestamp-cursor.ts). And the `id` tiebreak is needed
+      // whatever the precision: two observations minted in one statement share
+      // a `created_at` exactly, and a bare `<` on the timestamp alone drops
+      // every one of them but the last.
+      const parsedCursor = parseFeedCursor(req.query.cursor)
+      if (req.query.cursor !== undefined && !parsedCursor) {
+        return reply.status(400).send({ error: 'invalid_cursor' })
+      }
 
       const { rows: observations } = await pool.query(
         `SELECT
            o.id, o.piece_id, o.observation_type, o.priority,
-           o.values, o.created_at,
+           o.values, o.created_at, o.created_at::text AS created_at_exact,
            p.title AS piece_title, p.article_id
          FROM traffology.observations o
          LEFT JOIN traffology.pieces p ON p.id = o.piece_id
          WHERE o.writer_id = $1
            AND o.suppressed = FALSE
-           ${cursor ? 'AND o.created_at < $3' : ''}
-         ORDER BY o.created_at DESC
+           ${parsedCursor ? 'AND (o.created_at, o.id) < ($3::timestamptz, $4::uuid)' : ''}
+         ORDER BY o.created_at DESC, o.id DESC
          LIMIT $2`,
-        cursor ? [writerId, limit, cursor] : [writerId, limit],
+        parsedCursor
+          ? [writerId, limit, parsedCursor.ts, parsedCursor.id]
+          : [writerId, limit],
       )
 
+      const last = observations[observations.length - 1]
       const nextCursor = observations.length === limit
-        ? observations[observations.length - 1].created_at
+        ? `${last.created_at_exact}|${last.id}`
         : null
 
       return reply.send({ observations, nextCursor })
@@ -112,6 +161,9 @@ export async function traffologyRoutes(app: FastifyInstance) {
     { preHandler: requireAuth },
     async (req, reply) => {
       const { pieceId } = req.params
+      if (!isUuid(pieceId)) {
+        return reply.status(404).send({ error: "We couldn't find that piece." })
+      }
       const writerId = req.session!.sub
 
       // Piece info + stats
@@ -131,7 +183,7 @@ export async function traffologyRoutes(app: FastifyInstance) {
         [pieceId, writerId],
       )
       if (!piece) {
-        return reply.status(404).send({ error: 'Piece not found' })
+        return reply.status(404).send({ error: "We couldn't find that piece." })
       }
 
       // Source stats with half-day buckets

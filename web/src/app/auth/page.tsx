@@ -1,8 +1,9 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, Suspense } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
 import { auth, signupOffer } from '../../lib/api'
+import { startGoogleAuth } from '../../lib/google-oauth'
 import { useAuth } from '../../stores/auth'
 import { PublicShell } from '../../components/public/PublicShell'
 import {
@@ -23,6 +24,19 @@ import {
   controlLine,
   SLAB,
 } from '../../components/public/palette'
+import {
+  AUTH_TRY_AGAIN,
+  LINK_SENT_TITLE,
+  LINK_SENT_BEFORE,
+  LINK_SENT_AFTER,
+  LINK_SENT_AGAIN,
+  SIGNIN_TITLE,
+  SIGNIN_INTRO,
+  SIGNIN_SUBMIT,
+  SIGNIN_NEW_HERE,
+  LINK_MAKE_ACCOUNT,
+  LINK_JOIN_WAITLIST,
+} from '../../content/auth'
 
 // `/auth` is login-only, and that is a division of labour rather than a closure
 // now: making an account has its own surface at `/auth/signup`
@@ -51,7 +65,7 @@ import {
 // rather than by a dashed border — the house has no dashed line weight, and  hairline-ok (prose: describes the border this file REMOVED)
 // inventing one for a development affordance was how the register drifted in
 // the first place.
-export default function AuthPage() {
+function AuthPageBody() {
   const searchParams = useSearchParams()
   const router = useRouter()
   const setUser = useAuth((s) => s.setUser)
@@ -90,6 +104,17 @@ export default function AuthPage() {
     return () => { cancelled = true }
   }, [])
 
+  // Not an <a> any more: the flow mints a browser binding before it leaves
+  // (MIRROR-AUDIT §2.5, `lib/google-oauth.ts`), so the handoff is JS-driven.
+  // If the binding cannot be made there is nothing safe to navigate TO, so this
+  // says so rather than sending the visitor to a sign-in that would be refused.
+  function handleGoogle() {
+    setError(null)
+    void startGoogleAuth(arrival).catch(() => {
+      setError('Google sign-in couldn’t start in this browser. Try the email link.')
+    })
+  }
+
   async function handleLogin(e: React.FormEvent) {
     e.preventDefault()
     setLoading(true)
@@ -98,7 +123,7 @@ export default function AuthPage() {
       await auth.login(email, arrival ?? undefined)
       setMagicLinkSent(true)
     } catch {
-      setError('Something went wrong. Please try again.')
+      setError(AUTH_TRY_AGAIN)
     } finally {
       setLoading(false)
     }
@@ -127,13 +152,13 @@ export default function AuthPage() {
       <PublicShell>
         <PublicVessel>
           <PublicCard>
-            <PublicTitle>Check your email</PublicTitle>
+            <PublicTitle>{LINK_SENT_TITLE}</PublicTitle>
           </PublicCard>
           <PublicCard>
             <PublicBody>
-              If an account exists for{' '}
-              <span style={{ color: palette.cardTitle }}>{email}</span>, we’ve
-              sent a login link. It expires in fifteen minutes.
+              {LINK_SENT_BEFORE}
+              <span style={{ color: palette.cardTitle }}>{email}</span>
+              {LINK_SENT_AFTER}
             </PublicBody>
           </PublicCard>
           <PublicCard>
@@ -145,7 +170,7 @@ export default function AuthPage() {
                 setEmail('')
               }}
             >
-              Try a different email
+              {LINK_SENT_AGAIN}
             </PublicButton>
           </PublicCard>
         </PublicVessel>
@@ -157,16 +182,16 @@ export default function AuthPage() {
     <PublicShell>
       <PublicVessel>
         <PublicCard>
-          <PublicTitle>Welcome back</PublicTitle>
+          <PublicTitle>{SIGNIN_TITLE}</PublicTitle>
           <div style={{ marginTop: 10 }}>
-            <PublicBody>We’ll send a login link to your email.</PublicBody>
+            <PublicBody>{SIGNIN_INTRO}</PublicBody>
           </div>
         </PublicCard>
 
         {error && <FormError>{error}</FormError>}
 
         <PublicCard>
-          <PublicButton variant="outline" full href={`/api/v1/auth/google${arrivalQs}`}>
+          <PublicButton variant="outline" full onClick={handleGoogle}>
             <GoogleMark />
             Continue with Google
           </PublicButton>
@@ -190,18 +215,18 @@ export default function AuthPage() {
               placeholder="you@example.com"
             />
             <PublicButton type="submit" full disabled={loading}>
-              {loading ? 'Working…' : 'Send login link'}
+              {loading ? 'Sending…' : SIGNIN_SUBMIT}
             </PublicButton>
           </form>
         </PublicCard>
 
         <PublicCard>
           <PublicBody>
-            New here?{' '}
+            {SIGNIN_NEW_HERE}{' '}
             {canSignUp ? (
-              <PublicLink href={`/auth/signup${arrivalQs}`}>Make an account</PublicLink>
+              <PublicLink href={`/auth/signup${arrivalQs}`}>{LINK_MAKE_ACCOUNT}</PublicLink>
             ) : (
-              <PublicLink href="/waitlist">Join the waiting list</PublicLink>
+              <PublicLink href="/waitlist">{LINK_JOIN_WAITLIST}</PublicLink>
             )}
           </PublicBody>
         </PublicCard>
@@ -247,5 +272,15 @@ function GoogleMark() {
       <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05" />
       <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335" />
     </svg>
+  )
+}
+
+// useSearchParams() bails this subtree out to client rendering; the boundary
+// keeps that bail-out to the page instead of the whole route (CA-F13).
+export default function AuthPage() {
+  return (
+    <Suspense fallback={null}>
+      <AuthPageBody />
+    </Suspense>
   )
 }

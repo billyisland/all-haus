@@ -12,15 +12,18 @@
 // the gateway now sources dTag/pricePence/externalSourceId too.
 // =============================================================================
 
-// The six render levels (§3 / §4 matrix). The level governs size/indent/gap/
+// The seven render levels (§3 / §4 matrix). The level governs size/indent/gap/
 // affordance-set — never which fields exist; every Post always carries everything.
+// `preview` is the queue's compact rows (WORKSPACE-QUEUE-ADR §VII.5) — named
+// so it does not collide with `Density`'s unrelated 'compact' (D2).
 export type Level =
   | "focal"
   | "feed"
   | "thread-parent"
   | "thread-reply"
   | "quoted"
-  | "condensed";
+  | "condensed"
+  | "preview";
 
 export type BiddabilityTier = "A" | "B" | "C" | "D";
 
@@ -53,6 +56,13 @@ export interface PostOrigin {
   // "nostr" for native all.haus content; the source protocol otherwise.
   protocol: "nostr" | "atproto" | "activitypub" | "rss" | "email" | string;
   uri: string; // permalink / at:// / status id / event id — the stable handle
+  // The item's public web PERMALINK where the ingester knew one — a DIFFERENT
+  // thing from `uri`, which is its stable identity. They coincide for
+  // atproto/activitypub/nostr and for RSS feeds whose guid happens to be a
+  // link; they do not for a feed whose guid is a `urn:uuid:`, a `tag:` or a
+  // bare integer. Optional so historical payloads typecheck; read it through
+  // `originWebUrl`, never directly.
+  webUrl?: string | null;
   sourceName: string | null; // origin-site name shown in the tag
   // The container the reader subscribed to where that is not the author
   // (BYLINE-AND-PROVENANCE-ADR D8): a native article's publication, rendered
@@ -61,19 +71,33 @@ export interface PostOrigin {
   // `active` is publications.status = 'active' — the only state /pub/:slug
   // resolves in; the name renders regardless, the link only while active.
   publication: { name: string; slug: string; active: boolean } | null;
+  // Whether `/source/:id` will serve `externalSourceId`: the gateway's own two
+  // conditions (a public protocol, an active row), so a private email
+  // newsletter's card does not link to a 404. Read it through `sourcePageId`.
+  sourceBrowsable?: boolean;
+  // An external NOSTR item's own event id and author pubkey (hex), so a quote
+  // of it can carry a real NIP-18 `q` tag to the relays it lives on (CA-I13).
+  // Absent for every other protocol and for native content, whose quote uses
+  // `version` and `author.pubkey`.
+  nostrEvent?: { id: string; pubkey: string } | null;
 }
 
 export interface PostAuthor {
   // Identity record id (native author_id / external_author_id). NULL for tier
   // C/D — no stable handle ⇒ no profile ⇒ plain-text byline.
   id: string | null;
-  accountId: string | null; // lazy link to a real all.haus account
-  displayName: string | null; // native: NULL here, resolved at render via useWriterName(pubkey)
+  // The all.haus member this identity belongs to. External: the member who
+  // linked the account, present ONLY where they consented to showing it
+  // (CROSS-NETWORK-ROUNDTRIP-ADR D1) — so its absence says nothing.
+  accountId: string | null;
+  // External only: that member's handle, the byline's link to them.
+  memberUsername?: string | null;
+  displayName: string | null; // native: accounts.display_name (NULL if the member set none)
   handle: string | null;
   handleUri: string | null; // link to profile on origin (external)
   // No avatar — a card body carries no pfp (CLAUDE.md › Feed card chassis);
   // the hover card (AuthorModal) fetches its own from /author-card.
-  pubkey: string | null; // native only — the useWriterName key + vote target
+  pubkey: string | null; // native only — the NIP-10 p tag + vote target
   pipStatus: PipStatus;
 }
 
@@ -107,6 +131,15 @@ export interface Post {
   // Its one reader is PostActions (D6): reply, quote and vote are SUPPRESSED,
   // not disabled, on a conversation you may read but may not join.
   rootLocked?: boolean;
+  // NATIVE COMMENT NODES ONLY (gateway `commentToPost`), and its ABSENCE is
+  // what tells a THING from a remark inside one: a comment is projected as
+  // `type: "note"` with its own event id in `version`, so nothing else here
+  // distinguishes the two. `replyTargetFromPost` is its one reader — a reply
+  // is addressed to the conversation's ROOT and nests via `parentCommentId`,
+  // and without this the card addressed it to the comment, which the gateway
+  // refuses (400 `target_is_reply`). Absent on every article, note and
+  // external post; read it as "is this a comment", never default it.
+  conversation?: { rootEventId: string; rootKind: number; commentId: string };
   body: PostBody;
   inReplyTo: string | null; // parent handle (origin id this phase; gateway resolves to post_id)
   quotes: string | null; // quoted handle (depth-1)

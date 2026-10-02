@@ -1,5 +1,14 @@
 import { describe, it, expect } from 'vitest'
-import { formatPounds, formatDate, paragraph, button, emailHtml } from '../src/lib/subscription-emails.js'
+import { formatPounds, formatDate } from '../src/lib/email/format.js'
+import {
+  button,
+  link,
+  p,
+  renderBlocksHtml,
+  renderBlocksText,
+  renderEmail,
+  SIGN_OFF,
+} from '../src/lib/email/layout.js'
 
 describe('formatPounds', () => {
   it('formats zero pence', () => {
@@ -34,39 +43,41 @@ describe('formatDate', () => {
   })
 })
 
-describe('paragraph', () => {
-  it('wraps text in a styled p tag', () => {
-    const result = paragraph('Hello world')
-    expect(result).toContain('<p')
-    expect(result).toContain('Hello world</p>')
-    expect(result).toContain('style=')
-  })
-})
-
-describe('button', () => {
-  it('creates a styled link', () => {
-    const result = button('https://example.com', 'Click me')
-    expect(result).toContain('href="https://example.com"')
-    expect(result).toContain('Click me</a>')
-    expect(result).toContain('style=')
-    expect(result).toContain('display: inline-block')
-  })
-})
-
-describe('emailHtml', () => {
-  it('includes the heading', () => {
-    const result = emailHtml('Test Heading', '<p>body</p>')
-    expect(result).toContain('Test Heading')
-    expect(result).toContain('<h2')
+describe('the layout', () => {
+  it('escapes every string it is handed, including a button label', () => {
+    const html = renderBlocksHtml([p('<b>x</b>'), button('https://example.com', '<img src=x>')])
+    expect(html).not.toContain('<b>x</b>')
+    expect(html).not.toContain('<img src=x>')
+    expect(html).toContain('&lt;img src=x&gt;')
   })
 
-  it('includes the body content', () => {
-    const result = emailHtml('Heading', '<p>My content</p>')
-    expect(result).toContain('<p>My content</p>')
+  it('renders a button as a styled link in HTML and as "label: url" in text', () => {
+    const blocks = [button('https://example.com/go', 'Go')]
+    expect(renderBlocksHtml(blocks)).toContain('href="https://example.com/go"')
+    expect(renderBlocksHtml(blocks)).toContain('display: inline-block')
+    expect(renderBlocksText(blocks)).toBe('Go: https://example.com/go')
   })
 
-  it('includes the footer tagline', () => {
-    const result = emailHtml('H', '<p>b</p>')
-    expect(result).toContain('all.haus')
+  it('refuses a non-http href — the label survives, the link does not', () => {
+    const html = renderBlocksHtml([p(link('javascript:alert(1)', 'click')), button('javascript:alert(1)', 'Go')])
+    expect(html).not.toContain('javascript:')
+    expect(html).toContain('click')
+    expect(html).toContain('Go')
+  })
+
+  it('writes a link with a label as "label (url)" in text, and a bare one as the url', () => {
+    expect(renderBlocksText([p(link('https://a.example', 'A'))])).toBe('A (https://a.example)')
+    expect(renderBlocksText([p(link('https://a.example'))])).toBe('https://a.example')
+  })
+
+  it('gives both bodies the heading and the sign-off, from one description', () => {
+    const out = renderEmail({ subject: 'S', heading: 'Test Heading', blocks: [p('My content')] })
+    expect(out.subject).toBe('S')
+    expect(out.htmlBody).toContain('<h2')
+    expect(out.htmlBody).toContain('Test Heading')
+    expect(out.htmlBody).toContain('My content')
+    expect(out.htmlBody).toContain(SIGN_OFF)
+    expect(out.textBody.startsWith('Test Heading\n\nMy content')).toBe(true)
+    expect(out.textBody).toContain(SIGN_OFF)
   })
 })

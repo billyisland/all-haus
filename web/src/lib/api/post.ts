@@ -33,6 +33,37 @@ export function postThread(
   return request<PostThreadResponse>(`/thread/${postId}${qs ? `?${qs}` : ""}`);
 }
 
+// The article foot's resting shape: GET /thread/:postId/top (post-thread.ts).
+// Direct replies ranked by how much conversation hangs off each, with their
+// first replies as previews; opening one reads the ordinary /thread from it.
+export interface TopLevelEntry {
+  id: string;
+  count: number; // everything beneath it, previews included
+  previewIds: string[];
+}
+export interface PostThreadTopResponse {
+  rootId: string;
+  posts: Post[];
+  topLevel: TopLevelEntry[];
+  nextOffset?: number;
+  totalTopLevel: number;
+  totalReplies: number;
+  focus: { postId: string; topLevelId: string } | null;
+  repostEdges: RepostEdge[];
+}
+
+export function postThreadTop(
+  postId: string,
+  opts?: { limit?: number; offset?: number; focusComment?: string | null },
+): Promise<PostThreadTopResponse> {
+  const params = new URLSearchParams();
+  if (opts?.limit) params.set("limit", String(opts.limit));
+  if (opts?.offset) params.set("offset", String(opts.offset));
+  if (opts?.focusComment) params.set("focusComment", opts.focusComment);
+  const qs = params.toString();
+  return request<PostThreadTopResponse>(`/thread/${postId}/top${qs ? `?${qs}` : ""}`);
+}
+
 // =============================================================================
 // Constructed author profile — Phase 4 (§4.4, §9). Keyed on the persistent
 // author.id (native accounts.id / tier-A/B external_authors.id). The single
@@ -78,6 +109,9 @@ export interface AuthorProfile {
   // ("the same person, also over there"), rendered as unlinkable chips. Present
   // only for an external author whose source row exists; absent otherwise.
   linkedSources?: LinkedSource[];
+  // What the VIEWER has done to this author (W2) — present exactly when a
+  // `followTarget` of type "user" is: a native account, a viewer, not them.
+  viewerRelation?: { muted: boolean; blocked: boolean };
 }
 
 export interface LinkedSource {

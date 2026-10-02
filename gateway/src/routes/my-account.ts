@@ -1,7 +1,12 @@
 import type { FastifyInstance } from "fastify";
 import { requireAuth } from "../middleware/auth.js";
-import { pool } from "@platform-pub/shared/db/client.js";
-import { readNetSql } from "@platform-pub/shared/lib/per-read-net.js";
+import { accountRateLimitKey } from "../lib/rate-limit-keys.js";
+import { requestSettlement } from "../lib/settlement-client.js";
+import { z } from "zod";
+import { pool, loadConfig } from "@platform-pub/shared/db/client.js";
+import { zodValidationError } from "@platform-pub/shared/lib/validation.js";
+import { readNetSql, readFeeBpsSql } from "@platform-pub/shared/lib/per-read-net.js";
+import { parseLimit, parseOffset } from "../lib/request-inputs.js";
 
 // =============================================================================
 // The arrival read, in the reader's own statement (PAYWALL-ARRIVAL-ADR D2/§11.3)
@@ -71,6 +76,19 @@ const ARRIVAL_READ_SQL = `re.article_id IS NOT DISTINCT FROM (
       AND re.allowance_consumed_pence > 0
       AND re.is_subscription_read = FALSE`;
 
+// A statement line links a piece only where its page opens. `GET /articles/:dTag`
+// answers any row under the d-tag that was ever published — a withdrawn piece
+// still renders for the readers who paid for it — and 404s where none was, so
+// a read of a piece its writer has since unpublished linked to "not found" on
+// both registers (MODERNHAUS-ADR §E7.3). This is that route's own WHERE, asked
+// of the d-tag rather than the row, since the live row may be a different one.
+function articleLinkSql(art: string): string {
+  return `CASE WHEN EXISTS (
+          SELECT 1 FROM articles pa
+           WHERE pa.nostr_d_tag = ${art}.nostr_d_tag AND pa.published_at IS NOT NULL
+        ) THEN '/article/' || ${art}.nostr_d_tag END`;
+}
+
 // The two statement statements, EXPORTED so the DB-backed parity test executes
 // the real ones rather than a retyped copy of them (the
 // `CONVERT_PROVISIONAL_READS_SQL` precedent). §11.3's rule is that the entry
@@ -100,9 +118,10 @@ export function buildStatementSQL(
         a.created_at AS date,
         'credit' AS type,
         'free_allowance' AS category,
-        'Starting credit' AS description,
+        'Starting allowance' AS description,
         (a.free_allowance_granted_pence - a.arrival_gift_pence) AS amount_pence,
-        NULL AS link
+        NULL AS link,
+        NULL::uuid AS ref_id
       FROM accounts a
       WHERE a.id = $1
 
@@ -120,7 +139,8 @@ export function buildStatementSQL(
         'free_allowance' AS category,
         'Arrival gift — ' || art.title AS description,
         a.arrival_gift_pence AS amount_pence,
-        '/article/' || art.nostr_d_tag AS link
+        ${articleLinkSql("art")} AS link,
+        NULL::uuid AS ref_id
       FROM accounts a
       JOIN articles art ON art.id = a.arrival_article_id
       WHERE a.id = $1 AND a.arrival_gift_pence > 0
@@ -139,7 +159,8 @@ export function buildStatementSQL(
         (re.chargeable_pence
           + CASE WHEN ${ARRIVAL_READ_SQL}
                  THEN re.allowance_consumed_pence ELSE 0 END)::int AS amount_pence,
-        '/article/' || art.nostr_d_tag AS link
+        ${articleLinkSql("art")} AS link,
+        NULL::uuid AS ref_id
       FROM read_events re
       JOIN articles art ON art.id = re.article_id
       WHERE re.reader_id = $1
@@ -159,7 +180,8 @@ export function buildStatementSQL(
         'free_read' AS category,
         art.title AS description,
         0 AS amount_pence,
-        '/article/' || art.nostr_d_tag AS link
+        ${articleLinkSql("art")} AS link,
+        NULL::uuid AS ref_id
       FROM read_events re
       JOIN articles art ON art.id = re.article_id
       WHERE re.reader_id = $1
@@ -184,11 +206,12 @@ export function buildStatementSQL(
         -- credit is net of the inspirer-bound (released|paid) shares.
         -- Dial A: released|paid are the only accrual states. No-op when no
         -- accruals exist (feature dark).
-        (${readNetSql("re.chargeable_pence", "$2")}
+        (${readNetSql("re.chargeable_pence", readFeeBpsSql("re.", "$2"))}
           - COALESCE((SELECT SUM(ta.amount_pence) FROM tribute_accruals ta
                       WHERE ta.read_event_id = re.id
                         AND ta.state IN ('released', 'paid')), 0))::int AS amount_pence,
-        '/article/' || art.nostr_d_tag AS link
+        ${articleLinkSql("art")} AS link,
+        NULL::uuid AS ref_id
       FROM read_events re
       JOIN articles art ON art.id = re.article_id
       JOIN accounts reader ON reader.id = re.reader_id
@@ -207,7 +230,8 @@ export function buildStatementSQL(
         'subscription_charge' AS category,
         'Subscription to ' || COALESCE(w.display_name, w.username) AS description,
         se.amount_pence,
-        '/' || w.username AS link
+        '/' || w.username AS link,
+        NULL::uuid AS ref_id
       FROM subscription_events se
       JOIN accounts w ON w.id = se.writer_id
       WHERE se.reader_id = $1
@@ -223,7 +247,8 @@ export function buildStatementSQL(
         'subscription_earning' AS category,
         'Subscriber: ' || COALESCE(r.display_name, r.username) AS description,
         se.amount_pence,
-        '/' || r.username AS link
+        '/' || r.username AS link,
+        NULL::uuid AS ref_id
       FROM subscription_events se
       JOIN accounts r ON r.id = se.reader_id
       WHERE se.writer_id = $1
@@ -240,7 +265,8 @@ export function buildStatementSQL(
         CASE v.direction WHEN 'up' THEN 'Upvote' ELSE 'Downvote' END
           || COALESCE(': ' || art.title, '') AS description,
         vc.amount_pence::int AS amount_pence,
-        CASE WHEN art.nostr_d_tag IS NOT NULL THEN '/article/' || art.nostr_d_tag ELSE NULL END AS link
+        ${articleLinkSql("art")} AS link,
+        NULL::uuid AS ref_id
       FROM vote_charges vc
       JOIN votes v ON v.id = vc.vote_id
       LEFT JOIN articles art ON art.nostr_event_id = v.target_nostr_event_id
@@ -257,7 +283,8 @@ export function buildStatementSQL(
         'Upvote from ' || COALESCE(voter.display_name, voter.username, 'Someone')
           || COALESCE(' on ' || art.title, '') AS description,
         vc.amount_pence::int AS amount_pence,
-        CASE WHEN art.nostr_d_tag IS NOT NULL THEN '/article/' || art.nostr_d_tag ELSE NULL END AS link
+        ${articleLinkSql("art")} AS link,
+        NULL::uuid AS ref_id
       FROM vote_charges vc
       JOIN votes v ON v.id = vc.vote_id
       JOIN accounts voter ON voter.id = vc.voter_id
@@ -274,7 +301,13 @@ export function buildStatementSQL(
         'settlement' AS category,
         'Balance settled' AS description,
         ts.amount_pence,
-        NULL AS link
+        NULL AS link,
+        -- THE SETTLEMENT THIS ROW IS ABOUT, so the receipt (Reader Terms 5.2)
+        -- is reachable from the one line that says a charge happened. The
+        -- entry id already carries it as the suffix of 'settlement-<uuid>', and
+        -- stripping a prefix off a display key to get a join key is exactly
+        -- the derived-key trap: the column is the key, the id is a label.
+        ts.id AS ref_id
       FROM tab_settlements ts
       WHERE ts.reader_id = $1
     )
@@ -323,7 +356,7 @@ export const SUMMARY_STATEMENT_SQL = `
       UNION ALL
 
       SELECT 'credit',
-        (${readNetSql("re.chargeable_pence", "$3")}
+        (${readNetSql("re.chargeable_pence", readFeeBpsSql("re.", "$3"))}
           - COALESCE((SELECT SUM(ta.amount_pence) FROM tribute_accruals ta
                       WHERE ta.read_event_id = re.id
                         AND ta.state IN ('released', 'paid')), 0))::int,
@@ -362,7 +395,119 @@ export const SUMMARY_STATEMENT_SQL = `
   `;
 
 
+// The settle bucket, keyed on the authenticated account
+// (lib/rate-limit-keys.ts says why an account and not an IP).
+const settleRateLimitKey = accountRateLimitKey("settle");
+
+// =============================================================================
+// THE WRITER'S SAY IN WHEN THEY ARE PAID (L5.3, migration 210; Writer 6.3)
+//
+// The vocabulary is declared as a runtime array with the type DERIVED from it,
+// never the other way round: a bare TS union can be compared against nothing at
+// test time, and this one crosses the web↔gateway boundary — the settings
+// control sends one of these strings and the column's CHECK accepts exactly
+// these. `web/tests/payout-prefs-wire.test.ts` reads this list out of this file
+// and the CHECK out of `schema.sql`, because a hand-written client interface is
+// a claim about a server that nothing checks.
+// =============================================================================
+export const PAYOUT_CADENCES = ["daily", "weekly", "monthly"] as const;
+
+const PayoutPreferencesSchema = z.object({
+  cadence: z.enum(PAYOUT_CADENCES),
+  // NULL means "use the platform's figure", which is a different answer from
+  // any number the writer could type — including the platform's own, which
+  // they would then be pinned to if the dial later moved down.
+  thresholdPence: z.number().int().positive().max(1_000_000).nullable(),
+});
+
 export async function myAccountRoutes(app: FastifyInstance) {
+  // ---------------------------------------------------------------------------
+  // GET /my/payout-preferences — what this writer has chosen, and the floor
+  //
+  // The platform's own threshold ships WITH the answer rather than being a
+  // second constant in the client: it is the floor the writer's figure is held
+  // to, the surface has to state it, and a copy over there would be a dial with
+  // two readers that can disagree.
+  // ---------------------------------------------------------------------------
+  app.get("/my/payout-preferences", { preHandler: requireAuth }, async (req, reply) => {
+    const userId = req.session!.sub;
+    try {
+      const config = await loadConfig();
+      const { rows } = await pool.query<{
+        payout_cadence: string;
+        payout_threshold_pence: number | null;
+        last_paid_at: string | null;
+      }>(
+        `SELECT a.payout_cadence,
+                a.payout_threshold_pence,
+                (SELECT max(wp.completed_at) FROM writer_payouts wp
+                  WHERE wp.writer_id = a.id AND wp.status = 'completed') AS last_paid_at
+           FROM accounts a WHERE a.id = $1`,
+        [userId],
+      );
+      if (rows.length === 0) {
+        return reply.status(404).send({ error: "Account not found" });
+      }
+      return reply.send({
+        cadence: rows[0].payout_cadence,
+        thresholdPence: rows[0].payout_threshold_pence,
+        platformThresholdPence: config.writerPayoutThresholdPence,
+        // The anchor the cadence is measured from, so the surface can say when
+        // the next payment can be — and say nothing rather than guessing where
+        // there has never been one.
+        lastPaidAt: rows[0].last_paid_at,
+      });
+    } catch (err) {
+      req.log.error({ err }, "Failed to read payout preferences");
+      return reply.status(500).send({ error: "Failed to read payout preferences" });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // PATCH /my/payout-preferences
+  //
+  // THE FLOOR IS ENFORCED HERE AS WELL AS IN THE PAYOUT QUERY, and the two say
+  // it differently on purpose. The query takes GREATEST(theirs, the dial) so a
+  // dial that moves UP tomorrow moves everybody up without anybody's row being
+  // rewritten — a stored figure is what the writer asked for, not what the
+  // platform will do. This route refuses a figure BELOW today's dial, because
+  // storing one we would never honour is a setting that lies back to them.
+  // ---------------------------------------------------------------------------
+  app.patch("/my/payout-preferences", { preHandler: requireAuth }, async (req, reply) => {
+    const parsed = PayoutPreferencesSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.status(400).send(zodValidationError(parsed.error));
+    }
+    const userId = req.session!.sub;
+    const { cadence, thresholdPence } = parsed.data;
+
+    try {
+      const config = await loadConfig();
+      if (thresholdPence !== null && thresholdPence < config.writerPayoutThresholdPence) {
+        return reply.status(400).send({
+          error: "threshold_below_platform_minimum",
+          platformThresholdPence: config.writerPayoutThresholdPence,
+          message:
+            "Payouts cannot be set below the platform minimum — each transfer costs us a fee, so smaller ones would cost more to make than they carry.",
+        });
+      }
+
+      const { rowCount } = await pool.query(
+        `UPDATE accounts
+            SET payout_cadence = $2, payout_threshold_pence = $3, updated_at = now()
+          WHERE id = $1`,
+        [userId, cadence, thresholdPence],
+      );
+      if (rowCount !== 1) {
+        return reply.status(404).send({ error: "Account not found" });
+      }
+      return reply.send({ cadence, thresholdPence });
+    } catch (err) {
+      req.log.error({ err }, "Failed to save payout preferences");
+      return reply.status(500).send({ error: "Failed to save payout preferences" });
+    }
+  });
+
   // GET /my/tab
   app.get("/my/tab", { preHandler: requireAuth }, async (req, reply) => {
     const userId = req.session!.sub;
@@ -379,7 +524,22 @@ export async function myAccountRoutes(app: FastifyInstance) {
         `SELECT a.free_allowance_remaining_pence,
                 a.free_allowance_granted_pence,
                 a.card_action_required_at,
-                COALESCE(lrb.balance_pence, 0) AS balance_pence
+                COALESCE(lrb.balance_pence, 0) AS balance_pence,
+                -- WHAT WE OWE THEM, WHICH IS NOT A BALANCE AND NOT NETTED
+                -- (migration 206; Reader Terms 4.3). A reading tab can no
+                -- longer go into credit: an over-collection is moved out into
+                -- reader_credits the moment it would exist, so balance_pence
+                -- above is always a debt or nothing. That is what stops anyone
+                -- spending it — and it would also make the refund INVISIBLE to
+                -- the person owed it, which 4.3 does not permit either: it
+                -- promises the money goes back to their card, and a promise
+                -- nobody is told about is not one they can hold us to. So the
+                -- payable ships as its OWN figure, beside the tab and never
+                -- subtracted from it.
+                COALESCE((
+                  SELECT SUM(rc.amount_pence) FROM reader_credits rc
+                   WHERE rc.reader_id = a.id AND rc.status = 'pending_refund'
+                ), 0) AS refund_due_pence
          FROM accounts a
          LEFT JOIN ledger_reader_balance lrb ON lrb.account_id = a.id
          WHERE a.id = $1`,
@@ -404,7 +564,21 @@ export async function myAccountRoutes(app: FastifyInstance) {
       );
       const settled = reads.rows.find((r: any) => r.settledAt);
       return reply.send({
-        tabBalancePence: account.rows[0]?.balance_pence ?? 0,
+        // COERCED, and it had not been. `ledger_reader_balance.balance_pence`
+        // is a bigint, node-postgres hands a bigint back as a STRING, and this
+        // route's own type has always said `number` — so the field crossed the
+        // wire as "300" and every client read it through coercion. Most
+        // comparisons survive that (`"300" > 0` is true); a STRICT one does not,
+        // and the Ledger's "Nothing owed on your reading tab." branch is
+        // `tabBalancePence === 0`, which "0" never satisfies. A reader with a
+        // clear tab was told it settles from their card once it reaches its
+        // threshold. Found by driving it, which is the only thing that finds
+        // this class: it typechecks, and a mocked route hands back whatever the
+        // fixture's author typed.
+        tabBalancePence: Number(account.rows[0]?.balance_pence ?? 0),
+        // Same reason, and this one is a sum: `amount_pence` is bigint too, so
+        // a client adding two uncoerced payables would concatenate them.
+        refundDuePence: Number(account.rows[0]?.refund_due_pence ?? 0),
         freeAllowanceRemainingPence:
           account.rows[0]?.free_allowance_remaining_pence ?? 0,
         // The gauge's denominator, and it is THIS READER'S grant (migration 169)
@@ -430,6 +604,103 @@ export async function myAccountRoutes(app: FastifyInstance) {
   });
 
   // =========================================================================
+  // POST /my/tab/settle — Reader Terms 5.3, "You can settle your tab early at
+  // any time from your account".
+  //
+  // The same reserve→create→confirm settlement every other trigger takes; the
+  // only new thing is who decided. So there is no new money path here and no
+  // new arithmetic — `settleNow` reuses the whole discipline (row-stable
+  // idempotency key, terminal-vs-ambiguous split, in-flight guard) and this
+  // route's entire job is to turn the typed outcome into a sentence.
+  //
+  // EVERY OUTCOME GETS ITS OWN ANSWER. A settlement that did not happen has
+  // four quite different reasons — nothing owed, less than Stripe will charge,
+  // a charge already running, a card that will not work — and collapsing them
+  // into one "could not settle" would leave three of those readers pressing a
+  // button that can never do anything, with no idea which of them they are.
+  // =========================================================================
+  //
+  // RATE-LIMITED, AND KEYED ON THE ACCOUNT. Every press can create a Stripe
+  // PaymentIntent, which makes this one of the three routes on the platform
+  // where a repeated request costs real money. The in-flight guard already
+  // makes a second concurrent settlement impossible, so this is not the
+  // correctness bound — it is what stops a stolen cookie spending somebody's
+  // card in a loop and filling their statement with £0.30 lines. `req.ip` is
+  // the proxy's behind nginx, so the bucket is the SESSION (the same reasoning
+  // as the export routes' `accountRateLimitKey`).
+  app.post(
+    "/my/tab/settle",
+    {
+      preHandler: requireAuth,
+      config: {
+        rateLimit: {
+          max: 6,
+          timeWindow: "1 minute",
+          keyGenerator: settleRateLimitKey,
+        },
+      },
+    },
+    async (req, reply) => {
+    const userId = req.session!.sub;
+    const outcome = await requestSettlement(userId, "reader_requested");
+
+    switch (outcome.kind) {
+      case "charged":
+        return reply.status(200).send({
+          ok: true,
+          settled: true,
+          amountPence: outcome.amountPence,
+          message: "Your card is being charged for what you owe.",
+        });
+      case "nothing_due":
+        return reply.status(200).send({
+          ok: true,
+          settled: false,
+          reason: "nothing_due",
+          message: "There is nothing on your tab to settle.",
+        });
+      case "below_minimum":
+        // Not a failure, and not the reader's fault: Stripe will not take a
+        // charge under 30p. Naming the figure is the difference between "try
+        // later" and "read a little more first".
+        return reply.status(200).send({
+          ok: true,
+          settled: false,
+          reason: "below_minimum",
+          balancePence: outcome.balancePence,
+          message:
+            "Your tab is too small to charge — card payments start at 30p. It will settle once it grows.",
+        });
+      case "in_flight":
+        return reply.status(409).send({
+          error: "settlement_in_flight",
+          message: "We are already settling your tab. Give it a moment.",
+        });
+      case "no_card":
+        return reply.status(402).send({
+          error: "card_required",
+          message: "Add a payment card to settle your tab.",
+        });
+      case "card_action_required":
+      case "card_declined":
+        return reply.status(402).send({
+          error: "card_action_required",
+          // The card and the tab are the subject, never us: the debt is to the
+          // writers (Reader Terms 1.1; web/tests/seller-framing.test.ts).
+          message: "The card on file was declined. Add a working card to settle your tab.",
+        });
+      case "ambiguous":
+        // The charge may be live. A 502 and an honest sentence, never a
+        // cheerful "that did not work" the reader answers by pressing again.
+        return reply.status(502).send({
+          error: "settlement_unconfirmed",
+          message:
+            "We could not confirm whether that payment went through. Check your tab again shortly before retrying.",
+        });
+    }
+  });
+
+  // =========================================================================
   // GET /my/account-statement — unified credits, debits & paginated statement
   // =========================================================================
   app.get<{
@@ -445,8 +716,8 @@ export async function myAccountRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const userId = req.session!.sub;
       const filter = req.query.filter ?? "all"; // 'all' | 'credits' | 'debits'
-      const limit = Math.min(parseInt(req.query.limit ?? "30", 10) || 30, 200);
-      const offset = parseInt(req.query.offset ?? "0", 10) || 0;
+      const limit = parseLimit(req.query.limit, 30, 200);
+      const offset = parseOffset(req.query.offset);
       const includeFreeReads = req.query.include_free_reads === "true";
 
       try {

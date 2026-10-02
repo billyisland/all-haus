@@ -21,9 +21,13 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { PersonCard } from "./PersonCard";
 import { FEED_LOG_STYLE } from "./ProfileChrome";
 import { formatDateFromISO } from "../../lib/format";
-import { useEscapeShield } from "../../hooks/useEscapeShield";
 import type { VesselPalette } from "../workspace/tokens";
-import { account, subscribe as apiSubscribe, type MySubscription } from "../../lib/api";
+import { account, subscribe as apiSubscribe, subscriptions as subscriptionsApi, type MySubscription } from "../../lib/api";
+import { unfollowEverywhere } from "../../hooks/useFeedFollow";
+import { request, failureSentence } from "../../lib/api/client";
+import { mapSubscribeError } from "../../lib/subscribe-errors";
+import { ConfirmDialog } from "../ui/ConfirmDialog";
+import { ProfileLink } from "../ui/ProfileLink";
 
 interface Following {
   id: string;
@@ -59,9 +63,27 @@ export function FollowingTab({
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
+  // A failed page SAYS so under the button, which stays as the retry.
+  const [moreError, setMoreError] = useState<string | null>(null);
   const [unfollowingId, setUnfollowingId] = useState<string | null>(null);
   const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
   const [confirmUnsubId, setConfirmUnsubId] = useState<string | null>(null);
+  const unsubAnchorRef = useRef<HTMLElement | null>(null);
+  const [unsubError, setUnsubError] = useState<string | null>(null);
+  // The row is gone once unfollowed, so a partial outcome is said at the list.
+  const [unfollowShortfall, setUnfollowShortfall] = useState<string | null>(null);
+  // ONE LINE PER ROW, SAID OUT LOUD (walkthrough A9). Every act on this list
+  // used to end in `catch { /* silently fail */ }`, so a reader pressing
+  // Subscribe with no card, a declined card, un-accepted Reader Terms or a
+  // writer not on sale saw nothing happen at all — while the same press on the
+  // writer's profile explained each. `needsTerms` cannot be answered here (the
+  // consent replaces the control, and it lives on the profile), so that one
+  // sends the member there.
+  const [rowError, setRowError] = useState<{
+    id: string;
+    message: string;
+    needsTerms?: boolean;
+  } | null>(null);
 
   useEffect(() => {
     // The same `cancelled` guard `FollowersTab` got in the same commit, and for
@@ -73,40 +95,27 @@ export function FollowingTab({
       setLoading(true);
       setFailed(false);
       try {
-        const fetches: Promise<any>[] = [
-          fetch(`/api/v1/writers/${username}/following?limit=30`, {
-            credentials: "include",
-          }),
-          fetch(`/api/v1/writers/${username}/subscriptions?limit=50`, {
-            credentials: "include",
-          }),
-        ];
-        if (isOwnProfile) {
-          fetches.push(account.getMySubscriptions());
-        }
-
-        const results = await Promise.all(fetches);
+        const [followData, subData, mySubData] = await Promise.all([
+          request<{ following?: Following[]; total?: number }>(
+            `/writers/${username}/following?limit=30`,
+          ).catch(() => null),
+          request<{ subscriptions?: PublicSubscription[] }>(
+            `/writers/${username}/subscriptions?limit=50`,
+          ).catch(() => null),
+          isOwnProfile ? account.getMySubscriptions() : Promise.resolve(null),
+        ]);
         if (cancelled) return;
-        const followRes = results[0] as Response;
-        const subRes = results[1] as Response;
 
-        if (followRes.ok) {
-          const data = await followRes.json();
-          if (cancelled) return;
-          setFollowing(data.following ?? []);
-          setTotal(data.total ?? 0);
+        if (followData) {
+          setFollowing(followData.following ?? []);
+          setTotal(followData.total ?? 0);
         } else {
           // The list itself failed. The subscriptions leg is secondary — its
           // own failure leaves that section absent, which is not a claim.
           setFailed(true);
         }
-        if (subRes.ok) {
-          const data = await subRes.json();
-          if (cancelled) return;
-          setSubscriptions(data.subscriptions ?? []);
-        }
-        if (isOwnProfile && results[2]) {
-          const mySubData = results[2] as { subscriptions: MySubscription[] };
+        if (subData) setSubscriptions(subData.subscriptions ?? []);
+        if (mySubData) {
           const map = new Map<string, MySubscription>();
           for (const s of mySubData.subscriptions) {
             map.set(s.writerId, s);
@@ -127,35 +136,52 @@ export function FollowingTab({
 
   async function loadMore() {
     setLoadingMore(true);
+    setMoreError(null);
     try {
-      const res = await fetch(
-        `/api/v1/writers/${username}/following?limit=30&offset=${following.length}`,
-        { credentials: "include" },
+      const data = await request<{ following?: Following[] }>(
+        `/writers/${username}/following?limit=30&offset=${following.length}`,
       );
-      if (res.ok) {
-        const data = await res.json();
-        setFollowing((prev) => [...prev, ...(data.following ?? [])]);
-      }
-    } catch {
-      /* silently fail */
+      setFollowing((prev) => [...prev, ...(data.following ?? [])]);
+    } catch (err) {
+      setMoreError(failureSentence(err, "Couldn’t load the next page. Please try again."));
     } finally {
       setLoadingMore(false);
     }
   }
 
+  // Unfollow here is the WHOLE act: the graph row and every feed source the
+  // viewer holds for this writer. Two things it must not do, and it did both.
+  // It bypassed the shared `useFollows` store with a raw DELETE, so a Follow
+  // button mounted anywhere else went on reading "Following" (the stale-label
+  // bug the store exists to prevent); and since the convergence a graph row
+  // removed on its own leaves the `account` sources standing, so the writer
+  // keeps arriving in the feeds of somebody who just unfollowed them.
   async function handleUnfollow(writerId: string) {
     setUnfollowingId(writerId);
+    setRowError(null);
+    setUnfollowShortfall(null);
     try {
-      const res = await fetch(`/api/v1/follows/${writerId}`, {
-        method: "DELETE",
-        credentials: "include",
+      const { skipped, feedsUnreadable } = await unfollowEverywhere({
+        type: "user",
+        id: writerId,
+        isFollowing: true,
       });
-      if (res.ok) {
-        setFollowing((prev) => prev.filter((f) => f.id !== writerId));
-        setTotal((prev) => prev - 1);
+      setFollowing((prev) => prev.filter((f) => f.id !== writerId));
+      setTotal((prev) => prev - 1);
+      // The follow is gone either way; a feed that still carries them is a
+      // shortfall the member needs to hear about, or their posts keep
+      // arriving after a press that looked complete.
+      if (feedsUnreadable || skipped > 0) {
+        setUnfollowShortfall(
+          feedsUnreadable
+            ? "Unfollowed. We couldn’t check your channels, though, so any that carried their posts still do. Use Follow ▾ on their profile to see."
+            : `Unfollowed, but ${skipped === 1 ? "one channel" : `${skipped} channels`} still carr${skipped === 1 ? "ies" : "y"} their posts. Use Follow ▾ on their profile to take them out of ${skipped === 1 ? "it" : "them"}.`,
+        );
       }
     } catch {
-      /* silently fail */
+      // The store reverts its optimistic update and the row stays — which,
+      // said nothing, looked exactly like a press that had not registered.
+      setRowError({ id: writerId, message: "Couldn’t unfollow them. Please try again." });
     } finally {
       setUnfollowingId(null);
     }
@@ -163,6 +189,7 @@ export function FollowingTab({
 
   async function handleSubscribe(writerId: string) {
     setActionLoadingId(writerId);
+    setRowError(null);
     try {
       const result = await apiSubscribe(writerId, { period: "monthly" });
       setMySubs((prev) => {
@@ -184,40 +211,39 @@ export function FollowingTab({
         });
         return next;
       });
-    } catch {
-      /* silently fail */
+    } catch (err) {
+      const view = mapSubscribeError(err);
+      setRowError({ id: writerId, message: view.message, needsTerms: view.needsTerms });
     } finally {
       setActionLoadingId(null);
     }
   }
 
+  const UNSUB_FAILED = "Couldn't cancel — you are still subscribed. Try again.";
+
   async function handleUnsubscribe(writerId: string) {
-    setConfirmUnsubId(null);
     setActionLoadingId(writerId);
+    setUnsubError(null);
     try {
-      const res = await fetch(`/api/v1/subscriptions/${writerId}`, {
-        method: "DELETE",
-        credentials: "include",
+      const data = await subscriptionsApi.unsubscribe(writerId);
+      setMySubs((prev) => {
+        const next = new Map(prev);
+        const existing = next.get(writerId);
+        if (existing) {
+          next.set(writerId, {
+            ...existing,
+            status: "cancelled",
+            autoRenew: false,
+            cancelledAt: new Date().toISOString(),
+            currentPeriodEnd: data.accessUntil,
+          });
+        }
+        return next;
       });
-      if (res.ok) {
-        const data = await res.json();
-        setMySubs((prev) => {
-          const next = new Map(prev);
-          const existing = next.get(writerId);
-          if (existing) {
-            next.set(writerId, {
-              ...existing,
-              status: "cancelled",
-              autoRenew: false,
-              cancelledAt: new Date().toISOString(),
-              currentPeriodEnd: data.accessUntil,
-            });
-          }
-          return next;
-        });
-      }
+      setConfirmUnsubId(null);
     } catch {
-      /* silently fail */
+      // A refusal must not close the dialog as though it had worked.
+      setUnsubError(UNSUB_FAILED);
     } finally {
       setActionLoadingId(null);
     }
@@ -225,6 +251,7 @@ export function FollowingTab({
 
   async function handleResubscribe(writerId: string) {
     setActionLoadingId(writerId);
+    setRowError(null);
     try {
       const result = await apiSubscribe(writerId, { period: "monthly" });
       setMySubs((prev) => {
@@ -246,8 +273,9 @@ export function FollowingTab({
         });
         return next;
       });
-    } catch {
-      /* silently fail */
+    } catch (err) {
+      const view = mapSubscribeError(err);
+      setRowError({ id: writerId, message: view.message, needsTerms: view.needsTerms });
     } finally {
       setActionLoadingId(null);
     }
@@ -259,7 +287,7 @@ export function FollowingTab({
         className="py-10 text-center text-ui-sm"
         style={{ color: palette.cardMeta }}
       >
-        Loading...
+        Loading…
       </div>
     );
   }
@@ -280,14 +308,47 @@ export function FollowingTab({
 
   return (
     <div>
-      {/* Unsubscribe confirmation modal */}
-      {confirmUnsubId && confirmWriter && (
-        <UnsubscribeModal
-          confirmWriter={confirmWriter}
-          confirmSub={confirmSub ?? undefined}
-          onClose={() => setConfirmUnsubId(null)}
-          onConfirm={() => handleUnsubscribe(confirmUnsubId)}
-        />
+      {/* Unsubscribe confirmation — the house dialog, hung off the
+          Subscribed button. It was a hand-rolled `fixed inset-0` scrim inside
+          the profile's Glasshouse (walkthrough A12). */}
+      <ConfirmDialog
+        anchorRef={unsubAnchorRef}
+        open={confirmUnsubId !== null && !!confirmWriter}
+        title="Cancel subscription?"
+        confirmLabel="Cancel subscription"
+        busy={confirmUnsubId !== null && actionLoadingId === confirmUnsubId}
+        error={unsubError}
+        onConfirm={() => {
+          if (confirmUnsubId) void handleUnsubscribe(confirmUnsubId);
+        }}
+        onCancel={() => {
+          setConfirmUnsubId(null);
+          setUnsubError(null);
+        }}
+      >
+        <p>
+          Your subscription to{" "}
+          <strong className="text-black">
+            {confirmWriter?.displayName ?? confirmWriter?.username}
+          </strong>{" "}
+          stays active until the end of the current period
+          {confirmSub?.currentPeriodEnd && (
+            <>
+              {" "}
+              (
+              {new Date(confirmSub.currentPeriodEnd).toLocaleDateString(
+                "en-GB",
+                { day: "numeric", month: "long", year: "numeric" },
+              )}
+              )
+            </>
+          )}
+          . You won&rsquo;t be charged again.
+        </p>
+      </ConfirmDialog>
+
+      {unfollowShortfall && (
+        <p className="text-ui-xs text-crimson mb-3">{unfollowShortfall}</p>
       )}
 
       {/* Following list */}
@@ -305,8 +366,8 @@ export function FollowingTab({
             const isCancelled = sub?.status === "cancelled";
 
             return (
+              <div key={f.id}>
               <PersonCard
-                key={f.id}
                 palette={palette}
                 href={`/${f.username}`}
                 avatar={f.avatar}
@@ -323,17 +384,21 @@ export function FollowingTab({
                           className="btn-accent py-1 px-3 text-[11px] disabled:opacity-50 transition-colors"
                         >
                           {actionLoadingId === f.id
-                            ? "..."
+                            ? "…"
                             : `Subscribe £${(f.subscriptionPricePence / 100).toFixed(2)}/mo`}
                         </button>
                       )}
                       {isActive && (
                         <button
-                          onClick={() => setConfirmUnsubId(f.id)}
+                          onClick={(e) => {
+                            unsubAnchorRef.current = e.currentTarget;
+                            setUnsubError(null);
+                            setConfirmUnsubId(f.id);
+                          }}
                           disabled={actionLoadingId === f.id}
                           className="btn-soft py-1 px-3 text-[11px] disabled:opacity-50 transition-colors"
                         >
-                          {actionLoadingId === f.id ? "..." : "Subscribed"}
+                          {actionLoadingId === f.id ? "…" : "Subscribed"}
                         </button>
                       )}
                       {isCancelled && (
@@ -348,7 +413,7 @@ export function FollowingTab({
                           }
                         >
                           {actionLoadingId === f.id
-                            ? "..."
+                            ? "…"
                             : "Cancelled — resubscribe"}
                         </button>
                       )}
@@ -360,7 +425,7 @@ export function FollowingTab({
                         className="btn-ghost py-1 px-3 text-[11px] hover:text-red-600 disabled:opacity-50 transition-colors"
                         style={{ color: palette.cardMeta }}
                       >
-                        {unfollowingId === f.id ? "..." : "Unfollow"}
+                        {unfollowingId === f.id ? "…" : "Unfollow"}
                       </button>
                     </>
                   ) : (
@@ -373,6 +438,20 @@ export function FollowingTab({
                   )
                 }
               />
+              {rowError?.id === f.id && (
+                <p className="text-ui-xs text-crimson mt-2 px-1">
+                  {rowError.message}
+                  {rowError.needsTerms && (
+                    <>
+                      {" "}
+                      <ProfileLink href={`/${f.username}`} className="underline">
+                        Open their profile to accept and subscribe.
+                      </ProfileLink>
+                    </>
+                  )}
+                </p>
+              )}
+              </div>
             );
           })}
         </div>
@@ -386,9 +465,14 @@ export function FollowingTab({
             className="btn-soft py-1.5 px-4 text-ui-xs disabled:opacity-50"
           >
             {loadingMore
-              ? "Loading..."
+              ? "Loading…"
               : `Load more (${total - following.length} remaining)`}
           </button>
+          {moreError && (
+            <p role="alert" className="mt-2 text-ui-xs text-crimson">
+              {moreError}
+            </p>
+          )}
         </div>
       )}
 
@@ -413,108 +497,6 @@ export function FollowingTab({
           </div>
         </>
       )}
-    </div>
-  );
-}
-
-function UnsubscribeModal({
-  confirmWriter,
-  confirmSub,
-  onClose,
-  onConfirm,
-}: {
-  confirmWriter: Following;
-  confirmSub?: MySubscription;
-  onClose: () => void;
-  onConfirm: () => void;
-}) {
-  const dialogRef = useRef<HTMLDivElement>(null);
-
-  // Escape via the shared shield so it closes only this dialog, not the host
-  // Glasshouse under it (§0k.3); Tab keeps the focus trap below.
-  useEscapeShield(true, onClose);
-  const handleKeyDown = useCallback(
-    (e: KeyboardEvent) => {
-      if (e.key === "Tab" && dialogRef.current) {
-        const focusable = dialogRef.current.querySelectorAll<HTMLElement>(
-          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-        );
-        if (focusable.length === 0) return;
-        const first = focusable[0];
-        const last = focusable[focusable.length - 1];
-        if (e.shiftKey && document.activeElement === first) {
-          e.preventDefault();
-          last.focus();
-        } else if (!e.shiftKey && document.activeElement === last) {
-          e.preventDefault();
-          first.focus();
-        }
-      }
-    },
-    [],
-  );
-
-  useEffect(() => {
-    document.addEventListener("keydown", handleKeyDown);
-    dialogRef.current?.focus();
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [handleKeyDown]);
-
-  return (
-    <div
-      className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4"
-      onClick={onClose}
-    >
-      <div
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="unsub-modal-title"
-        tabIndex={-1}
-        className="bg-white max-w-sm w-full p-6"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h3
-          id="unsub-modal-title"
-          className="text-[16px] font-sans font-semibold text-black mb-2"
-        >
-          Cancel subscription?
-        </h3>
-        <p className="text-ui-sm text-grey-600 mb-1">
-          Are you sure you want to cancel your subscription to{" "}
-          <strong className="text-black">
-            {confirmWriter.displayName ?? confirmWriter.username}
-          </strong>
-          ?
-        </p>
-        <p className="text-ui-sm text-grey-600 mb-6">
-          Your subscription will remain active until the end of your current
-          billing period
-          {confirmSub?.currentPeriodEnd && (
-            <>
-              {" "}
-              (
-              {new Date(confirmSub.currentPeriodEnd).toLocaleDateString(
-                "en-GB",
-                { day: "numeric", month: "long", year: "numeric" },
-              )}
-              )
-            </>
-          )}
-          . You won't be charged again.
-        </p>
-        <div className="flex gap-2 justify-end">
-          <button onClick={onClose} className="btn-soft py-1.5 px-4 text-ui-xs">
-            Keep subscription
-          </button>
-          <button
-            onClick={onConfirm}
-            className="btn py-1.5 px-4 text-ui-xs bg-red-600 hover:bg-red-700 text-white"
-          >
-            Cancel subscription
-          </button>
-        </div>
-      </div>
     </div>
   );
 }

@@ -3,6 +3,8 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { publications as pubApi, type PublicationMember } from '../../lib/api'
 import { uploadImage } from '../../lib/media'
+import { failureSentence } from '../../lib/api/client'
+import { useConfirm } from '../ui/ConfirmDialog'
 
 interface Props {
   publicationId: string
@@ -32,6 +34,7 @@ export function PublicationSettingsTab({ publicationId, publicationSlug, isOwner
   const [deleting, setDeleting] = useState(false)
   const [transferring, setTransferring] = useState(false)
   const [dangerMsg, setDangerMsg] = useState<string | null>(null)
+  const { ask, dialog } = useConfirm()
 
   useEffect(() => {
     pubApi.get(publicationSlug)
@@ -42,7 +45,7 @@ export function PublicationSettingsTab({ publicationId, publicationSlug, isOwner
         setLogoUrl(pub.logo_blossom_url ?? null)
         setHomepageLayout(pub.homepage_layout ?? 'blog')
       })
-      .catch(() => setMsg('Failed to load settings.'))
+      .catch(() => setMsg('Couldn’t load this publication’s settings. Please try again.'))
       .finally(() => setLoading(false))
   }, [publicationSlug])
 
@@ -67,7 +70,7 @@ export function PublicationSettingsTab({ publicationId, publicationSlug, isOwner
       })
       setMsg('Settings saved.')
     } catch {
-      setMsg('Failed to save.')
+      setMsg('Couldn’t save your changes. Please try again.')
     } finally {
       setSaving(false)
     }
@@ -81,8 +84,8 @@ export function PublicationSettingsTab({ publicationId, publicationSlug, isOwner
     try {
       const result = await uploadImage(file)
       setLogoUrl(result.url)
-    } catch (err: any) {
-      setMsg(err.message ?? 'Upload failed')
+    } catch (err) {
+      setMsg(failureSentence(err, 'Couldn’t upload that image. Please try again.'))
     } finally {
       setUploading(false)
     }
@@ -97,19 +100,24 @@ export function PublicationSettingsTab({ publicationId, publicationSlug, isOwner
       setMsg('Layout updated.')
     } catch {
       setHomepageLayout(prev)
-      setMsg('Failed to update layout.')
+      setMsg('Couldn’t change the layout. Please try again.')
     }
   }
 
-  async function handleArchive() {
-    if (!confirm(`Archive ${name}? It will be hidden from all readers.`)) return
+  async function handleArchive(e: React.MouseEvent<HTMLElement>) {
+    const ok = await ask(e.currentTarget, {
+      title: `Archive ${name}?`,
+      body: 'It is hidden from every reader. Its content, members and subscriber records are kept, and you can restore it later.',
+      confirmLabel: 'Archive',
+    })
+    if (!ok) return
     setArchiving(true)
     setDangerMsg(null)
     try {
       await pubApi.archive(publicationId)
       window.location.href = '/reader?overlay=dashboard'
     } catch {
-      setDangerMsg('Failed to archive.')
+      setDangerMsg('Couldn’t archive this publication. Please try again.')
       setArchiving(false)
     }
   }
@@ -122,7 +130,7 @@ export function PublicationSettingsTab({ publicationId, publicationSlug, isOwner
       await pubApi.transferOwnership(publicationId, selectedNewOwner)
       window.location.href = '/reader?overlay=dashboard'
     } catch {
-      setDangerMsg('Failed to transfer ownership.')
+      setDangerMsg('Couldn’t transfer ownership. Please try again.')
       setTransferring(false)
     }
   }
@@ -134,7 +142,7 @@ export function PublicationSettingsTab({ publicationId, publicationSlug, isOwner
       await pubApi.archive(publicationId)
       window.location.href = '/reader?overlay=dashboard'
     } catch {
-      setDangerMsg('Failed to delete.')
+      setDangerMsg('Couldn’t delete this publication. Please try again.')
       setDeleting(false)
     }
   }
@@ -152,6 +160,7 @@ export function PublicationSettingsTab({ publicationId, publicationSlug, isOwner
 
   return (
     <div className="space-y-6">
+      {dialog}
       {/* Settings form */}
       <div className="bg-glasshouse-well px-6 py-5 space-y-6">
         <form onSubmit={handleSave} className="space-y-4">
@@ -183,7 +192,7 @@ export function PublicationSettingsTab({ publicationId, publicationSlug, isOwner
                   disabled={uploading}
                   className="btn-soft py-1.5 px-4 text-ui-xs disabled:opacity-50"
                 >
-                  {uploading ? 'Uploading...' : 'Upload logo'}
+                  {uploading ? 'Uploading…' : 'Upload logo'}
                 </button>
                 {logoUrl && (
                   <button
@@ -228,7 +237,7 @@ export function PublicationSettingsTab({ publicationId, publicationSlug, isOwner
             />
           </div>
           <button type="submit" disabled={saving || uploading} className="btn text-sm disabled:opacity-50">
-            {saving ? 'Saving...' : 'Save'}
+            {saving ? 'Saving…' : 'Save'}
           </button>
         </form>
         {msg && <p className="text-ui-xs text-grey-600">{msg}</p>}
@@ -309,7 +318,7 @@ export function PublicationSettingsTab({ publicationId, publicationSlug, isOwner
                 disabled={archiving}
                 className="btn-soft py-2 px-4 text-sm disabled:opacity-50"
               >
-                {archiving ? 'Archiving...' : 'Archive publication'}
+                {archiving ? 'Archiving…' : 'Archive publication'}
               </button>
             </div>
 
@@ -394,7 +403,7 @@ export function PublicationSettingsTab({ publicationId, publicationSlug, isOwner
                     disabled={!selectedNewOwner || transferring}
                     className="btn py-2 px-4 text-sm disabled:opacity-50"
                   >
-                    {transferring ? 'Transferring...' : 'Transfer'}
+                    {transferring ? 'Transferring…' : 'Transfer'}
                   </button>
                 </div>
               </div>
@@ -440,7 +449,7 @@ export function PublicationSettingsTab({ publicationId, publicationSlug, isOwner
                     className="btn py-2 px-4 text-sm disabled:opacity-50"
                     style={{ backgroundColor: 'var(--ah-danger-red)', borderColor: 'var(--ah-danger-red)' }}
                   >
-                    {deleting ? 'Deleting...' : 'Delete forever'}
+                    {deleting ? 'Deleting…' : 'Delete forever'}
                   </button>
                 </div>
               </div>

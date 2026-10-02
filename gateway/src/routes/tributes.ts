@@ -4,10 +4,19 @@ import { randomBytes, createHash } from 'node:crypto'
 import { z } from 'zod'
 import { pool, withTransaction } from '@platform-pub/shared/db/client.js'
 import { sendEmail } from '@platform-pub/shared/lib/email.js'
-import { tributesEnabled } from '@platform-pub/shared/lib/env.js'
+import { renderEmail } from '@platform-pub/shared/lib/email/layout.js'
+import {
+  tributeAuthorCopyEmail,
+  tributeOfferEmail,
+  tributePercent,
+} from '@platform-pub/shared/lib/email/templates/tributes.js'
+import { requireEnv, tributesEnabled } from '@platform-pub/shared/lib/env.js'
 import logger from '@platform-pub/shared/lib/logger.js'
 import { requireAuth, optionalAuth } from '../middleware/auth.js'
+import { requireWriter } from '../lib/writer-gate.js'
 import { resolveTarget } from './upstream-edges.js'
+import { zodValidationError } from '@platform-pub/shared/lib/validation.js'
+import { isUuid } from '../lib/request-inputs.js'
 
 // =============================================================================
 // Upstream Edges — Phase 2 (tribute authoring + contact)
@@ -158,11 +167,11 @@ export async function tributeRoutes(app: FastifyInstance) {
   // ---------------------------------------------------------------------------
   // POST /tributes — the author offers a share of the piece's earnings.
   // ---------------------------------------------------------------------------
-  app.post('/tributes', { preHandler: requireAuth }, async (req, reply) => {
+  app.post('/tributes', { preHandler: [requireAuth, requireWriter] }, async (req, reply) => {
     const writerId = req.session!.sub
     const parsed = CreateSchema.safeParse(req.body)
     if (!parsed.success) {
-      return reply.status(400).send({ error: parsed.error.flatten() })
+      return reply.status(400).send(zodValidationError(parsed.error))
     }
     const { articleId, percentageBps, target, inviteEmail, note, citationEdgeId, parentTributeId } = parsed.data
 
@@ -344,8 +353,8 @@ export async function tributeRoutes(app: FastifyInstance) {
     { preHandler: requireAuth },
     async (req, reply) => {
       const inspirerId = req.session!.sub
-      if (!UUID_RE.test(req.params.id)) {
-        return reply.status(400).send({ error: 'Invalid id' })
+      if (!isUuid(req.params.id)) {
+        return reply.status(404).send({ error: 'Offer not found or not yours to accept' })
       }
       let result: { articleId: string; percentageBps: number } | null = null
       try {
@@ -397,8 +406,8 @@ export async function tributeRoutes(app: FastifyInstance) {
     { preHandler: requireAuth },
     async (req, reply) => {
       const inspirerId = req.session!.sub
-      if (!UUID_RE.test(req.params.id)) {
-        return reply.status(400).send({ error: 'Invalid id' })
+      if (!isUuid(req.params.id)) {
+        return reply.status(404).send({ error: 'Offer not found or not yours to decline' })
       }
       let notFound = false
       try {
@@ -444,7 +453,7 @@ export async function tributeRoutes(app: FastifyInstance) {
     const accountId = req.session!.sub
     const parsed = ClaimSchema.safeParse(req.body)
     if (!parsed.success) {
-      return reply.status(400).send({ error: parsed.error.flatten() })
+      return reply.status(400).send(zodValidationError(parsed.error))
     }
     const tokenHash = hashToken(parsed.data.token)
 
@@ -499,8 +508,8 @@ export async function tributeRoutes(app: FastifyInstance) {
     { preHandler: requireAuth },
     async (req, reply) => {
       const writerId = req.session!.sub
-      if (!UUID_RE.test(req.params.id)) {
-        return reply.status(400).send({ error: 'Invalid id' })
+      if (!isUuid(req.params.id)) {
+        return reply.status(404).send({ error: 'Tribute not found, not yours, or no longer withdrawable' })
       }
       const { rows } = await pool.query(
         `UPDATE tributes
@@ -527,8 +536,8 @@ export async function tributeRoutes(app: FastifyInstance) {
     '/articles/:id/tributes',
     { preHandler: optionalAuth },
     async (req, reply) => {
-      if (!UUID_RE.test(req.params.id)) {
-        return reply.status(400).send({ error: 'Invalid id' })
+      if (!isUuid(req.params.id)) {
+        return reply.status(404).send({ error: 'Article not found' })
       }
       const viewerId = req.session?.sub ?? null
 
@@ -682,9 +691,9 @@ async function sendExternalInvite(args: {
   percentageBps: number
   note: string | null
 }): Promise<void> {
-  const appUrl = process.env.APP_URL ?? 'http://localhost:3000'
+  const appUrl = requireEnv('APP_URL')
   const claimUrl = `${appUrl}/tribute/claim?token=${encodeURIComponent(args.rawToken)}`
-  const pct = (args.percentageBps / 100).toFixed(args.percentageBps % 100 === 0 ? 0 : 2)
+  const percent = tributePercent(args.percentageBps)
 
   // Author identity + email for the CC reference copy.
   const { rows } = await pool.query<{ email: string | null; display_name: string | null; username: string | null }>(
@@ -695,83 +704,26 @@ async function sendExternalInvite(args: {
   const authorName = author?.display_name ?? author?.username ?? 'A writer on all.haus'
 
   // --- The inspirer's offer email (carries the claim link) ---
-  const lines = [
-    `${authorName} credits you as an inspiration for their piece "${args.articleTitle}" on all.haus,`,
-    `and wants to share ${pct}% of what the piece earns with you.`,
-    '',
-    args.note ? `They added: "${args.note}"` : '',
-    args.note ? '' : '',
-    'There is nothing to buy and no catch. To read the piece and decide whether to accept,',
-    'create a free account here:',
-    '',
-    claimUrl,
-    '',
-    "If you accept, you'll be paid that share of what the piece earns — both what it has earned so far and what it earns from then on.",
-    'If you do nothing, nothing is held in your name; the offer simply lapses and the share stays with the writer. You can ignore this email safely.',
-  ].filter((l, i, a) => !(l === '' && a[i - 1] === '')) // collapse blank runs
-
   await sendEmail({
     to: args.inviteEmail,
-    subject: `${authorName} wants to share earnings with you on all.haus`,
-    textBody: lines.join('\n'),
-    htmlBody: `
-      <div style="font-family: -apple-system, system-ui, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px 0;">
-        <p style="font-size: 15px; color: #57534e; line-height: 1.6;">
-          <strong>${escapeHtml(authorName)}</strong> credits you as an inspiration for their piece
-          &ldquo;${escapeHtml(args.articleTitle)}&rdquo; on all.haus, and wants to share
-          <strong>${pct}%</strong> of what it earns with you.
-        </p>
-        ${args.note ? `<p style="font-size: 15px; color: #57534e; line-height: 1.6;">They added: &ldquo;${escapeHtml(args.note)}&rdquo;</p>` : ''}
-        <p style="font-size: 15px; color: #57534e; line-height: 1.6;">
-          There is nothing to buy and no catch. Create a free account to read the piece and decide:
-        </p>
-        <a href="${claimUrl}"
-           style="display: inline-block; background: #1c1917; color: #ffffff; font-size: 14px; font-weight: 500; padding: 12px 28px; border-radius: 6px; text-decoration: none;">
-          Read it &amp; decide
-        </a>
-        <p style="font-size: 13px; color: #a8a29e; margin-top: 32px; line-height: 1.5;">
-          If you do nothing, the share returns to the writer. You can ignore this email safely.
-        </p>
-      </div>
-    `.trim(),
+    ...renderEmail(
+      tributeOfferEmail({
+        authorName,
+        articleTitle: args.articleTitle,
+        percent,
+        note: args.note,
+        claimUrl,
+      }),
+    ),
   })
 
   // --- The author's reference copy (NO token / claim link) ---
   if (author?.email) {
     await sendEmail({
       to: author.email,
-      subject: `We've reached out to your tribute recipient for "${args.articleTitle}"`,
-      textBody: [
-        `We've emailed ${args.inviteEmail} your offer to share ${pct}% of "${args.articleTitle}".`,
-        '',
-        'A personal note from you helps — both to convey the spirit of the tribute and to get the',
-        'message past spam filters. The claim link is private to them, so it is not included here.',
-        '',
-        'Until they accept, the share stays part of your earnings, reserved pending their reply; if they never accept, it stays yours.',
-      ].join('\n'),
-      htmlBody: `
-        <div style="font-family: -apple-system, system-ui, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px 0;">
-          <p style="font-size: 15px; color: #57534e; line-height: 1.6;">
-            We've emailed <strong>${escapeHtml(args.inviteEmail)}</strong> your offer to share
-            <strong>${pct}%</strong> of &ldquo;${escapeHtml(args.articleTitle)}&rdquo;.
-          </p>
-          <p style="font-size: 15px; color: #57534e; line-height: 1.6;">
-            A personal note from you helps — both to convey the spirit of the tribute and to get the
-            message past spam filters. Their claim link is private, so it isn't included here.
-          </p>
-          <p style="font-size: 13px; color: #a8a29e; margin-top: 24px; line-height: 1.5;">
-            Until they accept, the share stays part of your earnings, reserved pending their reply; if they never accept, it stays yours.
-          </p>
-        </div>
-      `.trim(),
+      ...renderEmail(
+        tributeAuthorCopyEmail({ inviteEmail: args.inviteEmail, articleTitle: args.articleTitle, percent }),
+      ),
     })
   }
-}
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
 }

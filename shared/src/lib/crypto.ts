@@ -22,6 +22,10 @@ import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
 
 const IV_LEN = 12
 const TAG_LEN = 16
+// Without `authTagLength` Node accepts a 4–16 byte tag on decrypt, so a
+// truncated stored blob would verify against a weaker tag than the one
+// written; pinned, a short tag throws (CA-F14c).
+const GCM_TAG = { authTagLength: TAG_LEN } as const
 
 // Range of version bytes we treat as "plausibly versioned" in decrypt(). 1–8
 // is plenty: one key rotation per deploy cycle for a few years, while still
@@ -96,12 +100,41 @@ export function decryptCredentials(blob: string): string {
     buf.length >= 1 + IV_LEN + TAG_LEN + 1
 
   if (isVersioned) {
+    // KEY RESOLUTION IS OUTSIDE THE TRY, AND IT IS TERMINAL.
+    //
+    // Two unrelated causes used to share one `catch`, and only one of them is
+    // a reason to fall through. `getKeyForVersion` throws when the operator has
+    // not configured `LINKED_ACCOUNT_KEY_HEX_V{n}` for a version that IS in the
+    // data — a CONFIGURATION fact, and one the legacy path cannot possibly
+    // recover from (a versioned blob read at v0 offsets has its iv and tag one
+    // byte out by construction). Swallowed, the operator was handed the legacy
+    // path's `Unsupported state or unable to authenticate data`, which says the
+    // credential is corrupt. It is not: it is fine, and the key to read it was
+    // never supplied. Rotating a key and then meeting that message is exactly
+    // the moment somebody concludes the rollover destroyed the rows.
+    //
+    // The DECRYPTION throwing is the ambiguous case the fall-through exists for
+    // — a v0 blob whose random first byte happened to look like a version — and
+    // that one still falls through. Same terminal-vs-ambiguous split as the
+    // Stripe and outbound classifiers.
+    let key: Buffer
     try {
-      const key = getKeyForVersion(maybeVersion)
+      key = getKeyForVersion(maybeVersion)
+    } catch (err) {
+      throw new Error(
+        `Cannot decrypt a version-${maybeVersion} credential: ` +
+          `${err instanceof Error ? err.message : String(err)}. ` +
+          `The stored value is intact; set LINKED_ACCOUNT_KEY_HEX_V${maybeVersion} ` +
+          `(or LINKED_ACCOUNT_KEY_HEX, if ${maybeVersion} is the current version) ` +
+          `to the key that wrote it.`,
+        { cause: err },
+      )
+    }
+    try {
       const iv = buf.subarray(1, 1 + IV_LEN)
       const tag = buf.subarray(1 + IV_LEN, 1 + IV_LEN + TAG_LEN)
       const ct = buf.subarray(1 + IV_LEN + TAG_LEN)
-      const decipher = createDecipheriv('aes-256-gcm', key, iv)
+      const decipher = createDecipheriv('aes-256-gcm', key, iv, GCM_TAG)
       decipher.setAuthTag(tag)
       const pt = Buffer.concat([decipher.update(ct), decipher.final()])
       return pt.toString('utf8')
@@ -116,7 +149,7 @@ export function decryptCredentials(blob: string): string {
   const iv = buf.subarray(0, IV_LEN)
   const tag = buf.subarray(IV_LEN, IV_LEN + TAG_LEN)
   const ct = buf.subarray(IV_LEN + TAG_LEN)
-  const decipher = createDecipheriv('aes-256-gcm', key, iv)
+  const decipher = createDecipheriv('aes-256-gcm', key, iv, GCM_TAG)
   decipher.setAuthTag(tag)
   const pt = Buffer.concat([decipher.update(ct), decipher.final()])
   return pt.toString('utf8')

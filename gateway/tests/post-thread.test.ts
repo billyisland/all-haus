@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { collectDescendants } from "../src/lib/thread-walk.js";
+import { collectDescendants, rankTopLevel } from "../src/lib/thread-walk.js";
 
 // Minimal node shape the walk needs (the real CommentRow has more fields).
 type Node = { derived_post_id: string; label: string };
@@ -105,4 +105,53 @@ describe("collectDescendants (P0-2 cycle guard)", () => {
     // 2000 chain nodes + 1 loop node, finite.
     expect(out).toHaveLength(2001);
   });
+});
+
+describe("rankTopLevel (the article foot's rest state)", () => {
+  type C = {
+    derived_post_id: string;
+    published_at_epoch: number;
+    id: string;
+    hidden?: boolean;
+  };
+  const c = (id: string, t: number, hidden = false): C => ({
+    derived_post_id: id,
+    published_at_epoch: t,
+    id: `00000000-0000-0000-0000-00000000000${t % 10}`,
+    hidden,
+  });
+  const counted = (n: C) => !n.hidden;
+  const shown = (n: C) => !n.hidden;
+
+  it("ranks direct replies by subtree size, ties newest first, previews chronological", () => {
+    const a = c("a", 1), b = c("b", 2), d = c("d", 3), e = c("e", 4);
+    const a1 = c("a1", 5), a2 = c("a2", 6), a3 = c("a3", 7), a1x = c("a1x", 8);
+    const e1 = c("e1", 9);
+    const childrenOf = adjacency_([
+      ["R", a], ["R", b], ["R", d], ["R", e],
+      ["a", a3], ["a", a1], ["a", a2], ["a1", a1x],
+      ["e", e1],
+    ]);
+    const out = rankTopLevel("R", childrenOf, counted, shown, 2);
+    // a has four below it; e has one; b and d have none (d newer, so first).
+    expect(out.map((r) => [r.node.derived_post_id, r.count])).toEqual([
+      ["a", 4], ["e", 1], ["d", 0], ["b", 0],
+    ]);
+    // previews are a's first two DIRECT replies by time — never a grandchild.
+    expect(out[0].previews.map((p) => p.derived_post_id)).toEqual(["a1", "a2"]);
+  });
+
+  it("drops a hidden reply that answers nothing, keeps one that has answers", () => {
+    const h = c("h", 1, true), k = c("k", 2, true), k1 = c("k1", 3);
+    const childrenOf = adjacency_([["R", h], ["R", k], ["k", k1]]);
+    const out = rankTopLevel("R", childrenOf, counted, shown, 2);
+    expect(out.map((r) => r.node.derived_post_id)).toEqual(["k"]);
+    expect(out[0].count).toBe(1);
+  });
+
+  function adjacency_(edges: Array<[string, C]>): Map<string, C[]> {
+    const m = new Map<string, C[]>();
+    for (const [p, n] of edges) (m.get(p) ?? m.set(p, []).get(p)!).push(n);
+    return m;
+  }
 });

@@ -3,6 +3,7 @@
 import React from "react";
 import { QuotedPostTile } from "../workspace/QuotedPostTile";
 import { truncateText } from "../../lib/format";
+import { safeHttpUrl } from "../../lib/external-links";
 import type { Post } from "../../lib/post/types";
 import type { VesselPalette } from "../workspace/tokens";
 
@@ -165,9 +166,12 @@ export function QuotedEmbed({
 
   // Static context (no onQuoteOpen): an external quote with a permalink links
   // out to the origin. Click must not bubble to the card. Only http(s) is a
-  // permitted href — the gateway already enforces this, but guard here too so a
-  // non-http(s) value can never reach href (no javascript:).
-  const safeUrl = preview.url && /^https?:\/\//i.test(preview.url) ? preview.url : null;
+  // permitted href. This was the ONLY sink in the tree carrying that gate, and
+  // its comment claimed "the gateway already enforces this", which was untrue
+  // for as long as it stood (MIRROR-AUDIT-2026-09-08 §2.3). Both ends now do:
+  // the writers refuse a non-http(s) value at persistence, and every render
+  // sink goes through this one helper (web/tests/href-guard.test.ts).
+  const safeUrl = safeHttpUrl(preview.url);
   if (safeUrl) {
     return (
       <a

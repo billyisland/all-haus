@@ -17,6 +17,7 @@ import {
 } from "../../lib/explain/registry";
 import { useExplain, type Annotation, type Program } from "../../stores/explain";
 import { useGlasshousePresence } from "../../stores/glasshouse";
+import { useAuth } from "../../stores/auth";
 import { readingLog } from "../../lib/api/articles";
 
 // =============================================================================
@@ -167,21 +168,26 @@ export function useOpenExplain(): () => void {
 }
 
 // ---------------------------------------------------------------------------
-// First-run program (EXPLAIN-ADR §9 slice 6, D6-D8).
+// First-run program (EXPLAIN-ADR §9 slice 6, D6-D8; rebuilt for the queue by
+// T1, WORKSPACE-QUEUE-ADR §XI.6).
 //
-// The six-beat sequence, resolved from the live registry at open(). Beats 1-2
-// (the vessel and its add-source) anchor to the LOWEST-sort_rank vessel; the
-// provenance fork (D7) reads that vessel's `fromStarter`. Beat 3 (card.byline)
-// and beat 4 (disc) carry no key (representative card / singleton). Beats 5-6
-// free-float over the floor (`alwaysFloat`); beat 6 carries the "done"
-// affordance. Anchor-or-float is decided per beat in the overlay (D8): a beat
-// whose target element is absent at render renders free-floating centred.
+// The sequence, resolved from the live registry at open(). Beats 1-2 (the
+// vessel and its add-source) anchor to the LOWEST-sort_rank vessel root — in
+// the queue there is exactly one, the focal entry — and the provenance fork
+// (D7) reads that root's `fromStarter`. The byline and ∀ beats carry no key
+// (representative card / singleton). The queue beat and the finale free-float
+// (`alwaysFloat`); the finale carries the "done" affordance. Anchor-or-float
+// is decided per beat in the overlay (D8): a beat whose target element is
+// absent at render renders free-floating centred.
 // ---------------------------------------------------------------------------
 
 function resolveFirstRunProgram(
   registry: ExplainRegistry,
   hasReading: boolean,
 ): Program {
+  // Read at open(), off the store, like `onboardedAt` is: the tour opens once
+  // and the answer only has to be right at that moment.
+  const canWrite = useAuth.getState().user?.canWrite === true;
   const anchor = registry
     .snapshot()
     .filter((r) => r.kind === "vessel")
@@ -189,7 +195,11 @@ function resolveFirstRunProgram(
   const anchorKey = anchor?.key;
   const fromStarter = !!anchor?.params?.fromStarter;
 
-  const annotations: Annotation[] = firstRunBeats(fromStarter, hasReading).map((b) => ({
+  const annotations: Annotation[] = firstRunBeats({
+    fromStarter,
+    hasReading,
+    canWrite,
+  }).map((b) => ({
     kind: b.kind,
     // Beats 1 (vessel) + 2 (vessel.addSource) anchor to the same vessel; every
     // other beat is a singleton / representative card and carries no key.
@@ -206,7 +216,7 @@ function resolveFirstRunProgram(
 }
 
 // Resolve the first-run program from the live registry and open it. No-op
-// outside a provider or with zero annotations (unreachable — the six beats are
+// outside a provider or with zero annotations (unreachable — the beats are
 // fixed). Used by the FirstRunController's D6 auto-entry.
 export function useOpenFirstRun(): (hasReading?: boolean) => void {
   const registry = useContext(ExplainContext);
@@ -343,7 +353,7 @@ export function FirstRunController({
 }
 
 // ---------------------------------------------------------------------------
-// Headless PREVIEW entry — `/reader?firstrun=1` replays the six beats on
+// Headless PREVIEW entry — `/reader?firstrun=1` replays the beats on
 // demand. Added 2026-09-04 because the sequence had become unwatchable: with
 // the welcome sheet deleted the tour runs exactly once per member, gated on a
 // column and a device key, so seeing it meant minting a fresh account or
@@ -423,7 +433,9 @@ export function FirstRunPreview() {
 // Register an explainable ROOT. Pass an existing `ref` (the vessel/floor already
 // owns one) or let the hook mint one and attach the returned ref to the DOM
 // node. Outside a provider (e.g. the loading-state Floor) this is an inert
-// no-op. Re-registers when key/order/params change.
+// no-op. Re-registers when key/order/params change. `enabled: false` holds
+// the registration off without breaking the rules of hooks — a queue entry is
+// the `vessel` root only while it is focal.
 export function useExplainable<T extends HTMLElement = HTMLElement>(
   kind: ExplainKind,
   opts?: {
@@ -431,6 +443,7 @@ export function useExplainable<T extends HTMLElement = HTMLElement>(
     ref?: React.RefObject<T>;
     order?: number;
     params?: Record<string, unknown>;
+    enabled?: boolean;
   },
 ): React.RefObject<T> {
   const registry = useContext(ExplainContext);
@@ -439,12 +452,13 @@ export function useExplainable<T extends HTMLElement = HTMLElement>(
   const key = opts?.key ?? kind;
   const order = opts?.order;
   const params = opts?.params;
+  const enabled = opts?.enabled ?? true;
   // Serialise params so the effect re-registers when a value (feedName /
   // fromStarter) changes, without depending on object identity.
   const paramsKey = params ? JSON.stringify(params) : "";
 
   useEffect(() => {
-    if (!registry) return;
+    if (!registry || !enabled) return;
     return registry.register({
       kind,
       key,
@@ -453,7 +467,7 @@ export function useExplainable<T extends HTMLElement = HTMLElement>(
       params,
     });
     // params is captured via paramsKey; ref identity is stable per element.
-  }, [registry, kind, key, order, paramsKey, ref]);
+  }, [registry, kind, key, order, paramsKey, ref, enabled]);
 
   return ref;
 }

@@ -6,12 +6,12 @@
 //
 // Builds a realistic feed: a real `feeds` row with N external_source members
 // (feed_sources), each carrying items whose canonical_url collides with its
-// paired source's (the cross-posted twins). `matched` is built from feed_sources
+// paired source's (the cross-posted twins). `source_pool` is built from feed_sources
 // exactly as sourceFilteredItems does, so the plan reflects production cardinality
 // — not a giant ANY() array. The whole thing runs in a transaction that is ALWAYS
 // rolled back.
 //
-// Runs the faithful dedup path (matched → real DEDUP_CTES → scored with the real
+// Runs the faithful dedup path (source_pool → real DEDUP_CTES → scored with the real
 // suppress filter → real provenance lateral → ORDER/LIMIT) at three link
 // densities to show the linked_sources guard's effect:
 //   1. zero links   — the common production case (guard ⇒ candidates empty)
@@ -25,7 +25,7 @@
 import pg from "pg";
 import {
   dedupCtes,
-  DEDUP_SUPPRESS_FILTER,
+  dedupSuppressFilter,
   DEDUP_PROVENANCE_LATERAL,
 } from "../src/lib/dedup-sql.js";
 
@@ -38,14 +38,15 @@ if (!DB_URL) {
 const NUM_SOURCES = parseInt(process.argv[2] ?? "200", 10);
 const ITEMS_PER_SOURCE = parseInt(process.argv[3] ?? "20", 10);
 
-// The faithful dedup query, parameterised on $1 = reader, $2 = feed id. `matched`
+// The faithful dedup query, parameterised on $1 = reader, $2 = feed id. `source_pool`
 // mirrors sourceFilteredItems' external_source membership; `scored` carries the
-// chronological effective_score and the real suppress filter; then the real
-// provenance lateral and the keyset ORDER/LIMIT.
+// real suppress filter; then the real provenance lateral and the keyset
+// ORDER/LIMIT. The order is the feed's own since migration 202 — a timeline on
+// (published_at, id), with volume a per-source FILTER rather than a multiplier
+// on the sort key.
 const DEDUP_QUERY = `
-  WITH RECURSIVE matched AS (
-    SELECT fi.id AS fi_id, MAX(fs.weight)::float8 AS weight,
-           bool_or(NOT fs.exclude_replies) AS allow_replies
+  WITH RECURSIVE source_pool AS (
+    SELECT fi.id AS fi_id, bool_or(NOT fs.exclude_replies) AS allow_replies
       FROM feed_items fi
       JOIN feed_sources fs
         ON fs.feed_id = $2 AND fs.muted_at IS NULL
@@ -56,22 +57,21 @@ const DEDUP_QUERY = `
   ${dedupCtes(3)},
   scored AS (
     SELECT fi.id AS fi_id, fi.source_id, fi.published_at,
-           ei.dedup_fingerprint AS fp,
-           (EXTRACT(EPOCH FROM fi.published_at)::float8 * m.weight)::float8 AS effective_score
+           ei.dedup_fingerprint AS fp
       FROM feed_items fi
-      JOIN matched m ON m.fi_id = fi.id
+      JOIN source_pool m ON m.fi_id = fi.id
       JOIN external_items ei ON ei.id = fi.external_item_id
       WHERE fi.deleted_at IS NULL
-        ${DEDUP_SUPPRESS_FILTER}
+        ${dedupSuppressFilter("fi.id")}
   )
   SELECT scored.fi_id, prov.also_on
   FROM (
     SELECT scored.* FROM scored
-    ORDER BY effective_score DESC, fi_id DESC
+    ORDER BY published_at DESC, fi_id DESC
     LIMIT 20
   ) scored
   ${DEDUP_PROVENANCE_LATERAL}
-  ORDER BY scored.effective_score DESC, scored.fi_id DESC`;
+  ORDER BY scored.published_at DESC, scored.fi_id DESC`;
 
 async function main() {
   const client = new pg.Client({ connectionString: DB_URL });
@@ -185,7 +185,7 @@ async function main() {
 
     // Correctness sanity: worst case suppresses one twin per linked url.
     const { rows: cnt } = await client.query<{ count: string }>(
-      `WITH RECURSIVE matched AS (
+      `WITH RECURSIVE source_pool AS (
          SELECT fi.id AS fi_id FROM feed_items fi
          JOIN feed_sources fs ON fs.feed_id = $2 AND fs.external_source_id = fi.source_id
          WHERE fi.deleted_at IS NULL

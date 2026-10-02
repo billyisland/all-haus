@@ -1,7 +1,7 @@
 import { notFound } from 'next/navigation'
 import type { Metadata } from 'next'
 import { PublicationMasthead } from '../../../../components/publication/PublicationMasthead'
-import { LoadFailed } from '../../../../components/publication/article-shared'
+import { LoadFailed } from '../../../../components/ui/LoadFailed'
 import {
   PubMastheadList,
   type MastheadMember,
@@ -11,7 +11,7 @@ import { PublicPage } from '../../../../components/public/PublicPage'
 const GATEWAY = process.env.GATEWAY_INTERNAL_URL ?? process.env.GATEWAY_URL ?? 'http://localhost:3000'
 
 async function getPublication(slug: string) {
-  const res = await fetch(`${GATEWAY}/api/v1/publications/${slug}/public`, {
+  const res = await fetch(`${GATEWAY}/api/v1/publications/${encodeURIComponent(slug)}/public`, {
     next: { revalidate: 60 },
   })
   if (!res.ok) return null
@@ -20,7 +20,7 @@ async function getPublication(slug: string) {
 
 /** null means the fetch FAILED — distinct from a publication with no masthead. */
 async function getMasthead(slug: string) {
-  const res = await fetch(`${GATEWAY}/api/v1/publications/${slug}/masthead`, {
+  const res = await fetch(`${GATEWAY}/api/v1/publications/${encodeURIComponent(slug)}/masthead`, {
     next: { revalidate: 60 },
   })
   if (!res.ok) return null

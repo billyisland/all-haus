@@ -109,7 +109,14 @@ describe("removeSource exclusion hook", () => {
 
     const result = await removeSource(FEED, OWNER, SOURCE_ROW);
 
-    expect(result).toEqual({ notFound: false, toreDownNostr: false });
+    // `follow: null` — this was not an account source, so the native-follow
+    // question does not arise. A boolean would have the route reporting a
+    // follow state for a removed Bluesky feed.
+    expect(result).toEqual({
+      notFound: false,
+      toreDownNostr: false,
+      follow: null,
+    });
     const excl = exclusionCalls();
     expect(excl).toHaveLength(1);
     expect(excl[0].params).toEqual([FEED, XS]);
@@ -149,13 +156,48 @@ describe("removeSource exclusion hook", () => {
     expect(markFollowListDirty).toHaveBeenCalledWith(OWNER);
   });
 
-  it("records no exclusion for non-external sources", async () => {
-    deleteReturns = [{ source_type: "account", external_source_id: null }];
+  it("records no exclusion for an ACCOUNT source, and drops its follow", async () => {
+    // An exclusion is about re-sync resurrecting an imported external source;
+    // an account source has no origin graph to sync from. The fixture carries
+    // a real `account_id` because since 2026-09-18 that column is what sends
+    // the removal down the native-follow teardown — a row without one tests a
+    // shape the DELETE cannot return.
+    const ACCT = "55555555-0000-4000-8000-000000000005";
+    deleteReturns = [
+      { source_type: "account", external_source_id: null, account_id: ACCT },
+    ];
+    remainingCount = 0; // no other feed of this owner holds them
 
     const result = await removeSource(FEED, OWNER, SOURCE_ROW);
 
-    expect(result).toEqual({ notFound: false, toreDownNostr: false });
+    expect(result).toEqual({
+      notFound: false,
+      toreDownNostr: false,
+      follow: "dropped",
+    });
     expect(exclusionCalls()).toHaveLength(0);
+    expect(
+      txCalls.some((c) => c.sql.includes("DELETE FROM follows")),
+    ).toBe(true);
+    // The published kind-3 list carries native follows too, so a retracted
+    // one has to reach it — the external arm is not the only caller.
+    expect(markFollowListDirty).toHaveBeenCalledWith(OWNER);
+  });
+
+  it("an account source still in another feed keeps its follow", async () => {
+    const ACCT = "55555555-0000-4000-8000-000000000005";
+    deleteReturns = [
+      { source_type: "account", external_source_id: null, account_id: ACCT },
+    ];
+    remainingCount = 1;
+
+    const result = await removeSource(FEED, OWNER, SOURCE_ROW);
+
+    expect(result.follow).toBe("kept");
+    expect(
+      txCalls.some((c) => c.sql.includes("DELETE FROM follows")),
+    ).toBe(false);
+    expect(markFollowListDirty).not.toHaveBeenCalled();
   });
 
   it("returns notFound without any hook when the row doesn't exist", async () => {
@@ -163,6 +205,7 @@ describe("removeSource exclusion hook", () => {
 
     const result = await removeSource(FEED, OWNER, SOURCE_ROW);
 
+    expect(result.follow).toBeNull();
     expect(result.notFound).toBe(true);
     expect(exclusionCalls()).toHaveLength(0);
   });

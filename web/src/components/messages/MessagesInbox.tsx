@@ -10,6 +10,15 @@ import { useResolverInput } from '../../hooks/useResolverInput'
 import { ConversationList } from './ConversationList'
 import { MessageThread } from './MessageThread'
 import { NotificationsPanel } from '../notifications/NotificationsPanel'
+import {
+  MESSAGES_NEW_MESSAGE_TITLE,
+  MESSAGES_TO_LABEL,
+  MESSAGES_RECIPIENT_PLACEHOLDER,
+  MESSAGES_NO_ONE_FOUND,
+  MESSAGES_START_FAILED,
+  MESSAGES_EMPTY_PANE,
+  MESSAGES_CONVERSATION_FALLBACK,
+} from '../../content/messages'
 
 // =============================================================================
 // MessagesInbox — the merged notifications + direct-messages surface.
@@ -60,11 +69,17 @@ export function MessagesInbox({
   const pagerRef = useRef<HTMLDivElement>(null)
   const [mobilePage, setMobilePage] = useState(0)
 
+  // The list that could not be read is its own state (CA-E1): the bare catch
+  // left `conversations` empty, and the list said "No conversations yet".
+  const [convLoadFailed, setConvLoadFailed] = useState(false)
   async function fetchConversations() {
+    setConvLoadFailed(false)
     try {
       const data = await messagesApi.listConversations()
       setConversations(data.conversations)
-    } catch {}
+    } catch {
+      setConvLoadFailed(true)
+    }
   }
 
   const handleMessagesRead = useCallback(() => {
@@ -188,13 +203,13 @@ export function MessagesInbox({
       setShowNewMessage(false)
       ri.reset()
       void fetchConversations()
-    } catch { setCreateError('Couldn’t start the conversation. Try again.') }
+    } catch { setCreateError(MESSAGES_START_FAILED) }
     finally { setCreating(false) }
   }
 
   const activeConv = conversations.find(c => c.id === activeConvId)
   const otherMembers = activeConv?.members.filter(m => m.id !== user?.id) ?? []
-  const activeMemberName = otherMembers.map(m => m.displayName ?? m.username).join(', ') || 'Conversation'
+  const activeMemberName = otherMembers.map(m => m.displayName ?? m.username).join(', ') || MESSAGES_CONVERSATION_FALLBACK
   const activeMemberId = otherMembers.length === 1 ? otherMembers[0].id : undefined
 
   // The new-message form — reused by the desktop reading pane and the mobile
@@ -208,10 +223,10 @@ export function MessagesInbox({
         >
           &#8592;
         </button>
-        <p className="text-ui-sm font-sans font-semibold text-black">New message</p>
+        <p className="text-ui-sm font-sans font-semibold text-black">{MESSAGES_NEW_MESSAGE_TITLE}</p>
       </div>
       <div className="p-4">
-        <label className="label-ui text-grey-600 block mb-2">To</label>
+        <label className="label-ui text-grey-600 block mb-2">{MESSAGES_TO_LABEL}</label>
         <input
           type="text"
           value={ri.query}
@@ -232,17 +247,17 @@ export function MessagesInbox({
               void startConversation(recipientMatches[0].account!.id)
             else ri.submit()
           }}
-          placeholder="Username, email, npub…"
+          placeholder={MESSAGES_RECIPIENT_PLACEHOLDER}
           className="w-full bg-glasshouse-well px-3 py-2 text-ui-sm font-sans text-black placeholder-grey-300"
           autoFocus
         />
         <div className="mt-1.5 min-h-[24px]">
           {ri.resolving && (
-            <p className="label-ui text-grey-600 px-1 py-1">RESOLVING…</p>
+            <p className="label-ui text-grey-600 px-1 py-1">Looking it up…</p>
           )}
           {!ri.resolving && (ri.doneEmpty || ri.resolveError) && recipientMatches.length === 0 && (
             <p className="text-ui-xs text-grey-600 px-1 py-1">
-              No one found — try a username, email, or npub.
+              {MESSAGES_NO_ONE_FOUND}
             </p>
           )}
           {recipientMatches.length > 0 && (
@@ -271,7 +286,12 @@ export function MessagesInbox({
   )
 
   const thread = (
+    // Keyed on the conversation (CA-E4): a fetch or poll still in flight from
+    // the previous thread resolves into an unmounted instance, where its
+    // setState is a no-op — rather than merging A's page, cursor and
+    // mark-read into B.
     <MessageThread
+      key={activeConvId}
       conversationId={activeConvId!}
       memberName={activeMemberName}
       memberId={activeMemberId}
@@ -332,6 +352,8 @@ export function MessagesInbox({
           <div className="w-full shrink-0 snap-start flex flex-col min-h-0">
             <ConversationList
               conversations={conversations}
+              loadFailed={convLoadFailed}
+              onRetry={() => void fetchConversations()}
               activeId={activeConvId}
               onSelect={(id) => selectConversation(id)}
               onNewMessage={() => setShowNewMessage(true)}
@@ -378,6 +400,8 @@ export function MessagesInbox({
       <div className="w-[240px] shrink-0 flex flex-col min-h-0 bg-grey-100 pt-6">
         <ConversationList
           conversations={conversations}
+          loadFailed={convLoadFailed}
+          onRetry={() => void fetchConversations()}
           activeId={activeConvId}
           onSelect={(id) => selectConversation(id)}
           onNewMessage={() => setShowNewMessage(true)}
@@ -390,7 +414,7 @@ export function MessagesInbox({
           : activeConvId ? thread
           : (
             <div className="flex-1 flex items-center justify-center px-6">
-              <p className="text-ui-sm font-sans text-grey-600 text-center">Select a conversation or start a new one.</p>
+              <p className="text-ui-sm font-sans text-grey-600 text-center">{MESSAGES_EMPTY_PANE}</p>
             </div>
           )}
       </div>

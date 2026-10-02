@@ -1,26 +1,22 @@
 'use client'
 
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { useAuth } from '../../stores/auth'
-import { publishNote, type CrossPostTarget, type QuoteTarget } from '../../lib/publishNote'
-import { publishReply } from '../../lib/replies'
-import {
-  linkedAccounts as linkedAccountsApi,
-  type LinkedAccount,
-} from '../../lib/api'
+import type { QuoteTarget } from '../../lib/publishNote'
+import type { NoteEvent } from '../../lib/ndk'
 import { Glasshouse } from './Glasshouse'
-import { useEditorOverlay, seedFromNote } from '../../stores/editorOverlay'
-
-const NOTE_CHAR_LIMIT = 1000
-const NUDGE_WORDS_THRESHOLD = 400
+import { MediaPreview } from '../ui/MediaPreview'
+import { CrossPostPill } from '../compose/CrossPostPill'
+import { AttachImageButton } from '../compose/AttachImageButton'
+import { useNoteComposer, NOTE_CHAR_LIMIT } from '../../hooks/useNoteComposer'
+import { NOTE_TOO_LONG_READER } from '../../content/writer-access'
+import { networkName } from '../../content/conversation'
 
 // Every colour here is in the INVERTING family (`ink`/`white`/`bone`/greys).
 // This panel is mounted at the WorkspaceView root with NO light island above
 // it, so its ground resolves through the `html.dark` inversion — and a
 // never-inverting foreground on top of one (`ink-925` on `white` = 26 26 24 on
 // 30 29 26, a contrast ratio of 1.03:1) is invisible. Foreground and ground
-// must be in the SAME inversion family; see web/CLAUDE.md › Global light/dark
-// mode.
+// must be in the SAME inversion family; see `.claude/rules/web-theme.md` ›
+// Global light/dark mode.
 const TOKENS = {
   panelBorder: 'var(--ah-ink)',
   bannerBg: 'var(--ah-bone)',
@@ -34,232 +30,66 @@ const TOKENS = {
   fieldBg: 'var(--ah-glasshouse-well)',
 }
 
-type Protocol = 'allhaus' | 'nostr' | 'atproto' | 'activitypub'
-
-const PROTOCOL_LABELS: Record<Protocol, string> = {
-  allhaus: 'ALL.HAUS',
-  nostr: 'NOSTR',
-  atproto: 'BLUESKY',
-  activitypub: 'MASTODON',
-}
-
-// Maps a linked-account protocol to the cross-post protocol the publish path
-// fans out to. nostr_external/rss can't receive an original cross-post.
-const PROTOCOL_FROM_LINKED: Record<LinkedAccount['protocol'], Protocol | null> = {
-  atproto: 'atproto',
-  activitypub: 'activitypub',
-  nostr_external: null,
-  rss: null,
-}
-
-export interface ReplyTarget {
-  // The event being threaded under. For a reply to a top-level note/article this
-  // is that event; for a reply to a comment this is the conversation ROOT (so
-  // target_event_id stays the root and the comment is linked via the parent
-  // fields below — see ConversationView).
-  eventId: string
-  eventKind: number
-  // The author being replied to (parent comment author for nested replies) —
-  // drives the NIP-10 `p` tag and the "Replying to …" line.
-  authorPubkey: string
-  authorName: string
-  excerpt?: string
-  // Set when replying to a comment rather than a top-level post: the parent
-  // comment's UUID (index linkage) and its Nostr event id (NIP-10 `e` reply tag).
-  parentCommentId?: string
-  parentCommentEventId?: string
-}
-
 interface ComposerProps {
   open: boolean
-  replyTarget?: ReplyTarget | null
   // When set, the note is published as a NIP-18 quote embedding this target.
-  // Mutually exclusive with replyTarget.
   quoteTarget?: QuoteTarget | null
   onClose: () => void
-  onPublished?: () => void
-  // Slice 13: separate signal for reply publishes so the parent can refetch
-  // the affected card's inline thread without refetching every vessel's items.
-  onReplied?: (targetEventId: string) => void
+  /** A supersede: the host drops `open` and KEEPS the quote target, so the
+   *  draft comes back as what it was written as. */
+  onSuspend: () => void
+  onPublished?: (note: NoteEvent) => void
 }
 
-// Note/reply/quote composer. Article writing graduated to the global
-// EditorOverlay (the full ArticleEditor in a Glasshouse) — the "Write an
-// article →" affordance and the long-note nudge open that overlay, seeding it
-// with the in-progress note body.
-export function Composer({ open, replyTarget, quoteTarget, onClose, onPublished, onReplied }: ComposerProps) {
-  const { user } = useAuth()
-  const [body, setBody] = useState('')
-  const [publishing, setPublishing] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  // Native protocols always broadcast; linked networks are admitted here but
-  // additionally gated by the per-send cross-post pills below.
-  const [enabledProtocols] = useState<Set<Protocol>>(
-    () => new Set<Protocol>(['allhaus', 'nostr', 'atproto', 'activitypub']),
-  )
-  const [linkedByProtocol, setLinkedByProtocol] = useState<Partial<Record<Protocol, LinkedAccount>>>({})
-  // Per-send cross-post toggles, seeded from each presence's cross_post_default
-  // (the "Default on" checkbox in Reach other networks) — so settings pick the
-  // default and the pill is the per-note override.
-  const [crossPostOn, setCrossPostOn] = useState<Partial<Record<Protocol, boolean>>>({})
-  const [nudgeDismissed, setNudgeDismissed] = useState(false)
-  const [showNudge, setShowNudge] = useState(false)
-
-  const bodyRef = useRef<HTMLTextAreaElement>(null)
-
-  useEffect(() => {
-    if (!open) return
-    setBody('')
-    setError(null)
-    setPublishing(false)
-    setNudgeDismissed(false)
-    setShowNudge(false)
-    const t = setTimeout(() => bodyRef.current?.focus(), 0)
-
-    // Fetch linked accounts so the protocol toggles know which non-native
-    // protocols can actually receive a cross-post. Failure is non-fatal —
-    // toggles fall back to disconnected state and the publish remains a
-    // pure Nostr broadcast.
-    let cancelled = false
-    linkedAccountsApi
-      .list()
-      .then(({ accounts }) => {
-        if (cancelled) return
-        const map: Partial<Record<Protocol, LinkedAccount>> = {}
-        const on: Partial<Record<Protocol, boolean>> = {}
-        for (const acc of accounts) {
-          if (!acc.isValid) continue
-          const p = PROTOCOL_FROM_LINKED[acc.protocol]
-          if (p && !map[p]) {
-            map[p] = acc
-            on[p] = acc.crossPostDefault
-          }
-        }
-        setLinkedByProtocol(map)
-        setCrossPostOn(on)
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setLinkedByProtocol({})
-          setCrossPostOn({})
-        }
-      })
-
-    return () => {
-      cancelled = true
-      clearTimeout(t)
-    }
-  }, [open])
-
-  // Note→article elevation: carry the in-progress body (with a heading-prefixed
-  // first line promoted to the title) into the article editor overlay, then
-  // close this composer. One-way per slice 10.
-  const openArticleEditor = useCallback(() => {
-    useEditorOverlay.getState().open(seedFromNote(body))
-    onClose()
-  }, [body, onClose])
-
-  // 400-word nudge. Per spec, one-shot per session — once dismissed it doesn't
-  // re-show until the Composer reopens.
-  useEffect(() => {
-    if (nudgeDismissed) {
-      setShowNudge(false)
-      return
-    }
-    const wordCount = body.trim() === '' ? 0 : body.trim().split(/\s+/).length
-    if (wordCount >= NUDGE_WORDS_THRESHOLD) setShowNudge(true)
-  }, [body, nudgeDismissed])
+// The workspace's note/quote composer. Its BEHAVIOUR is `useNoteComposer`,
+// shared with the global `ComposeOverlay` — the two compose surfaces are one
+// rule (web/CLAUDE.md › *Compose surfaces*), so everything but the
+// presentation lives in the hook. Article writing is the global EditorOverlay;
+// "Make this an article" and the over-limit banner open it, seeded with the
+// note body and its pictures.
+export function Composer({ open, quoteTarget, onClose, onSuspend, onPublished }: ComposerProps) {
+  const c = useNoteComposer({
+    open,
+    quoteTarget: quoteTarget ?? null,
+    close: onClose,
+    onPublished,
+  })
 
   if (!open) return null
 
-  // External quotes append "\n\n<url>" to the published body (see publishNote),
-  // so reserve that length here. Otherwise a body within the limit in the box
-  // produces an over-limit note: the relay accepts the signed event but the
-  // index POST (content.max(1000)) rejects it, orphaning the event on the relay.
-  const quoteUrlReserve =
-    quoteTarget?.isExternal && quoteTarget.quotedUrl ? quoteTarget.quotedUrl.length + 2 : 0
-  const charCount = body.length + quoteUrlReserve
-  const overLimit = charCount > NOTE_CHAR_LIMIT
-  // Every send from this surface is a public broadcast (the recipient "To"
-  // field is gone; DMs live in the Messages inbox). Non-native protocols only
-  // fire a cross-post when a valid linked account exists for that protocol.
-  const broadcastNostrSelected = enabledProtocols.has('nostr')
-  const linkedProtocols = (['atproto', 'activitypub'] as const).filter(
-    (p) => linkedByProtocol[p],
-  )
-  const crossPostTargets: { protocol: Protocol; account: LinkedAccount }[] = []
-  for (const p of linkedProtocols) {
-    if (!enabledProtocols.has(p)) continue
-    if (!crossPostOn[p]) continue
-    crossPostTargets.push({ protocol: p, account: linkedByProtocol[p]! })
-  }
-
-  const isReply = !!replyTarget
-  const isQuote = !!quoteTarget
-
-  const canPublish =
-    !!user &&
-    !!body.trim() &&
-    !overLimit &&
-    !publishing &&
-    (isReply || isQuote || broadcastNostrSelected)
-
-  async function handlePublish() {
-    if (!canPublish || !user) return
-    setPublishing(true)
-    setError(null)
-    try {
-      if (isQuote && quoteTarget) {
-        await publishNote(body, user.pubkey, quoteTarget)
-        onPublished?.()
-        onClose()
-        return
-      }
-      if (isReply && replyTarget) {
-        await publishReply({
-          content: body,
-          targetEventId: replyTarget.eventId,
-          targetKind: replyTarget.eventKind,
-          targetAuthorPubkey: replyTarget.authorPubkey,
-          parentCommentId: replyTarget.parentCommentId,
-          parentCommentEventId: replyTarget.parentCommentEventId,
-        })
-        onReplied?.(replyTarget.eventId)
-        onPublished?.()
-        onClose()
-        return
-      }
-      const cross: CrossPostTarget[] = crossPostTargets.map(({ account }) => ({
-        linkedAccountId: account.id,
-        actionType: 'original',
-      }))
-      await publishNote(body, user.pubkey, undefined, cross.length > 0 ? cross : undefined)
-      onPublished?.()
-      onClose()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to publish.')
-      setPublishing(false)
-    }
-  }
-
-  // Glasshouse owns the scrim / ✕ / Escape; route all three here so a publish
-  // in flight can't be dismissed out from under itself.
-  function handleClose() {
-    if (!publishing) onClose()
-  }
+  const { media, charCount, isOver, displayError, isQuote } = c
 
   return (
     <Glasshouse
-      onClose={handleClose}
+      onClose={c.dismiss}
+      // A SUPERSEDE IS NOT A DISCARD, and this prop used to make it one. The
+      // escalation IS a handover — the body travels into the editor, so
+      // neither the publishing guard nor any confirm applies — but it is one
+      // superseder out of many, and every ∀-menu destination took an unsent
+      // note away in a click with nothing said. Refusing to close is not the
+      // alternative (two live Glasshouses, the state `21bb0bfe` replaced), so
+      // the draft survives the supersede and comes back on reopen.
+      // The host SUSPENDS rather than closes, keeping the quote target — its
+      // close clears it, and a superseded quote used to come back as a note.
+      onSupersede={() => c.onSupersede(onSuspend)}
       maxWidth={640}
-      ariaLabel={isReply ? 'Reply' : isQuote ? 'Quote' : 'New note'}
+      ariaLabel={isQuote ? 'Quote' : 'New note'}
       persistKey="composer"
       resizable
+      // THE THIRD IMMERSIVE PANE. Writing is writing at either length: the note
+      // composer takes `coverNavChrome` exactly as the reader and the article
+      // editor do, and `WorkspaceView` un-mounts the bar + muster while it is
+      // open. Without it a 640 box hung under a live muster — twenty black
+      // roundels, the loudest thing on screen, over the one surface that is
+      // meant to be a blank page. No `fillHeight`: a note is short, so the pane
+      // stays content-sized (and stretchable) rather than claiming the window.
+      coverNavChrome
     >
       {/* Flex column that fills the pane: when the pane is content-sized (default)
           `h-full` resolves to auto so the textarea stays compact; when the pane is
           stretched it resolves to the explicit height, giving the flex-1 textarea
-          free space to fill. */}
+          free space to fill. The scroll region is the OUTER box, so the scrollbar
+          stays at the pane's edge however narrow the column inside it gets. */}
       <div
         className="flex flex-col h-full max-h-[var(--gh-h)] overflow-y-auto"
         style={{ padding: 24 }}
@@ -267,244 +97,250 @@ export function Composer({ open, replyTarget, quoteTarget, onClose, onPublished,
         // leaf doesn't; the pane chrome stays with the generic `pane` tag.
         data-explain="composer"
       >
-        {/* Mode label — also reserves top-right clearance for the Glasshouse ✕. */}
-        <div
-          className="label-ui"
-          style={{ color: TOKENS.hintFg, marginBottom: 16, paddingRight: 32 }}
-        >
-          {isReply ? 'REPLY' : isQuote ? 'QUOTE' : 'NOTE'}
-        </div>
-        {isReply && replyTarget && (
+        {/* THE MEASURE COLUMN. The textarea was `w-full`, so stretching the pane
+            to 1400 gave the note a ~180-character line — every pixel of the
+            stretch spent on the one thing that gets worse the more of it you
+            have. It now caps at `.ah-measure`: unchanged at rest (the pane opens
+            at 640, so the field is parent-limited well under the cap), then
+            easing wider on the pane's curve (lib/workspace/measure.ts).
+
+            The cap is on the COLUMN and not on the textarea alone, or the field
+            would narrow and centre while the reply banner, the nudge and the
+            publish row stayed full-width beside it — a lopsided pane. Capping the
+            lot makes the extra width air on both sides, which is exactly what the
+            article editor does with its document column; the two writers answer a
+            stretch the same way because they are the same act at two lengths.
+
+            Height is untouched and stays linear: more lines is always worth
+            having, so the textarea keeps `flex-1` and the column passes the
+            pane's height straight through (`flex-1 … min-h-0`). */}
+        <div className="ah-measure w-full mx-auto flex-1 flex flex-col min-h-0">
+          {/* Mode label — also reserves top-right clearance for the Glasshouse ✕. */}
           <div
-            style={{
-              background: TOKENS.bannerBg,
-              padding: '10px 12px',
-              marginBottom: 16,
-            }}
+            className="label-ui"
+            style={{ color: TOKENS.hintFg, marginBottom: 16, paddingRight: 32 }}
           >
+            {isQuote ? 'QUOTE' : 'NOTE'}
+          </div>
+          {isQuote && quoteTarget && (
             <div
-              className="label-ui"
-              style={{ color: TOKENS.hintFg }}
+              style={{
+                background: TOKENS.bannerBg,
+                padding: '10px 12px',
+                marginBottom: 16,
+                borderLeft: `4px solid ${TOKENS.panelBorder}`,
+              }}
             >
-              Replying to {replyTarget.authorName}
+              <div className="label-ui" style={{ color: TOKENS.hintFg }}>
+                Quoting{' '}
+                {quoteTarget.previewAuthorName ??
+                  (quoteTarget.authorPubkey
+                    ? `${quoteTarget.authorPubkey.slice(0, 10)}…`
+                    : (quoteTarget.quotedSource ?? 'a post'))}
+              </div>
+              {quoteTarget.previewTitle && (
+                <p
+                  className="font-sans text-ui-xs mt-1"
+                  style={{ color: TOKENS.bannerFg, fontWeight: 500 }}
+                >
+                  {quoteTarget.previewTitle}
+                </p>
+              )}
+              {quoteTarget.previewContent && (
+                // Clamped for the BANNER only. previewContent is the snapshot that
+                // gets stored (quotePreviewContent — a whole note, up to 1000
+                // chars), which is right for the inset a reader later expands and
+                // far too much for a strip above the textarea.
+                <p
+                  className="font-serif italic text-[13px] mt-1 line-clamp-3"
+                  style={{ color: TOKENS.bannerFg, lineHeight: 1.45 }}
+                >
+                  {quoteTarget.previewContent}
+                </p>
+              )}
             </div>
-            {replyTarget.excerpt && (
-              <p
-                className="font-serif italic text-[13px] mt-1"
-                style={{ color: TOKENS.bannerFg, lineHeight: 1.45 }}
-              >
-                {replyTarget.excerpt}
-              </p>
-            )}
-          </div>
-        )}
+          )}
 
-        {isQuote && quoteTarget && (
-          <div
+          <textarea
+            ref={c.textareaRef}
+            value={c.content}
+            onChange={c.handleChange}
+            onKeyDown={c.handleKeyDown}
+            placeholder="What’s on your mind?"
+            className="font-serif text-[16px] w-full flex-1"
             style={{
-              background: TOKENS.bannerBg,
-              padding: '10px 12px',
-              marginBottom: 16,
-              borderLeft: `4px solid ${TOKENS.panelBorder}`,
+              background: TOKENS.fieldBg,
+              padding: '12px 14px',
+              minHeight: 160,
+              resize: 'none',
+              outline: 'none',
+              lineHeight: 1.55,
+              marginTop: 16,
             }}
-          >
-            <div className="label-ui" style={{ color: TOKENS.hintFg }}>
-              Quoting{' '}
-              {quoteTarget.previewAuthorName ??
-                (quoteTarget.authorPubkey
-                  ? `${quoteTarget.authorPubkey.slice(0, 10)}…`
-                  : (quoteTarget.quotedSource ?? 'a post'))}
+          />
+          <MediaPreview
+            attachments={media.attachments}
+            onRemove={media.removeAttachment}
+            uploading={media.uploading}
+          />
+          {/* The prompted half of the escalation — the standing button below is
+              the quiet half. Same band, same copy and the same two text actions
+              as the global `ComposeOverlay`: the two compose surfaces are one
+              rule (web/CLAUDE.md › *Compose surfaces*), so a prompt added to
+              one is owed to the other in the same construction, not merely at
+              the same moment. */}
+          {c.showNudge && (
+            <div
+              className="bg-glasshouse-well flex items-center justify-between gap-4"
+              style={{ marginTop: 8, padding: '12px 16px' }}
+            >
+              <span className="text-ui-xs" style={{ color: TOKENS.bannerFg }}>
+                This is over the {NOTE_CHAR_LIMIT.toLocaleString('en-GB')}-character limit for notes. Would you like to turn it into an article?
+              </span>
+              <span className="flex items-center gap-4">
+                <button
+                  type="button"
+                  onClick={c.escalateToArticle}
+                  className="btn-text"
+                  data-explain="composer.article"
+                >
+                  Make it an article
+                </button>
+                <button type="button" onClick={c.dismissNudge} className="btn-text-muted">
+                  Dismiss
+                </button>
+              </span>
             </div>
-            {quoteTarget.previewTitle && (
-              <p
-                className="font-sans text-ui-xs mt-1"
-                style={{ color: TOKENS.bannerFg, fontWeight: 500 }}
+          )}
+          {/* The standing offer — withdrawn while the banner is up, because the
+              banner IS the offer at that moment and two controls carrying the
+              same action, stacked, is furniture arguing with itself. */}
+          {c.showTooLong && (
+            <div
+              className="bg-glasshouse-well"
+              style={{ marginTop: 8, padding: '12px 16px' }}
+            >
+              <span className="text-ui-xs" style={{ color: TOKENS.bannerFg }}>
+                {NOTE_TOO_LONG_READER}
+              </span>
+            </div>
+          )}
+          {c.canEscalate && !c.showNudge && (
+            <div style={{ marginTop: 8, textAlign: 'right' }}>
+              <button
+                type="button"
+                onClick={c.escalateToArticle}
+                className="font-sans text-ui-xs"
+                data-explain="composer.article"
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  color: TOKENS.hintFg,
+                  cursor: 'pointer',
+                  padding: 0,
+                }}
               >
-                {quoteTarget.previewTitle}
-              </p>
-            )}
-            {quoteTarget.previewContent && (
-              // Clamped for the BANNER only. previewContent is the snapshot that
-              // gets stored (quotePreviewContent — a whole note, up to 1000
-              // chars), which is right for the inset a reader later expands and
-              // far too much for a strip above the textarea.
-              <p
-                className="font-serif italic text-[13px] mt-1 line-clamp-3"
-                style={{ color: TOKENS.bannerFg, lineHeight: 1.45 }}
-              >
-                {quoteTarget.previewContent}
-              </p>
-            )}
-          </div>
-        )}
+                Make this an article →
+              </button>
+            </div>
+          )}
 
-        <textarea
-          ref={bodyRef}
-          value={body}
-          onChange={(e) => setBody(e.target.value)}
-          placeholder="What are you thinking?"
-          className="font-serif text-[16px] w-full flex-1"
-          style={{
-            background: TOKENS.fieldBg,
-            padding: '12px 14px',
-            minHeight: 160,
-            resize: 'none',
-            outline: 'none',
-            lineHeight: 1.55,
-            marginTop: 16,
-          }}
-        />
-        {showNudge && (
           <div
             style={{
-              marginTop: 8,
-              padding: '10px 12px',
-              background: TOKENS.bannerBg,
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'space-between',
-              gap: 12,
+              marginTop: 12,
+              gap: 16,
             }}
           >
-            <span className="font-sans text-ui-xs" style={{ color: TOKENS.bannerFg }}>
-              This is getting long. Switch to article mode?
-            </span>
-            <span style={{ display: 'flex', gap: 8 }}>
+            <div className="flex items-center gap-4 min-w-0">
+              <AttachImageButton onClick={media.triggerImageUpload} disabled={media.uploading} />
+              <span
+                className="font-mono text-mono-xs"
+                style={{ color: isOver ? TOKENS.errorFg : TOKENS.hintFg }}
+              >
+                {c.activeCrossPosts.length > 0 && (
+                  <>
+                    Also posting to{' '}
+                    {c.activeCrossPosts
+                      .map((a) => networkName(a.protocol) ?? a.protocol)
+                      .join(' · ')}{' '}
+                    —{' '}
+                  </>
+                )}
+                {charCount}/{NOTE_CHAR_LIMIT}
+              </span>
+            </div>
+
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              {/* Per-send cross-post pills — one per valid linked network that
+                  can receive an original post, resting on the account's own
+                  default. A quote carries none. An outage is said out loud:
+                  silence would read as "linked nothing". */}
+              {c.linkedAccountsFailed && (
+                <span className="label-ui" style={{ color: TOKENS.hintFg }}>
+                  Couldn&rsquo;t check your linked accounts, so this will only go to all.haus
+                </span>
+              )}
+              {c.crossPostAccounts.map((account) => (
+                <CrossPostPill
+                  key={account.id}
+                  account={account}
+                  active={c.isCrossPostOn(account)}
+                  onToggle={() => c.toggleCrossPost(account)}
+                />
+              ))}
               <button
                 type="button"
-                onClick={openArticleEditor}
-                className="label-ui"
-                data-explain="composer.article"
+                onClick={c.handlePost}
+                disabled={!c.canPost}
+                title={isQuote ? 'Quote (Ctrl+Enter)' : 'Post (Ctrl+Enter)'}
+                className="font-sans text-ui-xs"
                 style={{
-                  padding: '6px 10px',
-                  background: TOKENS.publishBg,
+                  padding: '8px 16px',
+                  background: c.canPost ? TOKENS.publishBg : TOKENS.publishDisabled,
                   color: TOKENS.publishFg,
                   border: 'none',
-                  cursor: 'pointer',
+                  cursor: c.canPost ? 'pointer' : 'default',
                 }}
               >
-                Switch
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setShowNudge(false)
-                  setNudgeDismissed(true)
-                }}
-                className="label-ui"
-                style={{
-                  padding: '6px 10px',
-                  background: 'transparent',
-                  color: TOKENS.hintFg,
-                  border: 'none',
-                  cursor: 'pointer',
-                }}
-              >
-                Dismiss
-              </button>
-            </span>
-          </div>
-        )}
-        {!isReply && !isQuote && (
-          <div style={{ marginTop: 8, textAlign: 'right' }}>
-            <button
-              type="button"
-              onClick={openArticleEditor}
-              className="font-sans text-ui-xs"
-              data-explain="composer.article"
-              style={{
-                background: 'transparent',
-                border: 'none',
-                color: TOKENS.hintFg,
-                cursor: 'pointer',
-                padding: 0,
-              }}
-            >
-              Make this an article →
-            </button>
-          </div>
-        )}
-
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            marginTop: 12,
-            gap: 16,
-          }}
-        >
-          <div className="font-mono text-mono-xs" style={{ color: TOKENS.hintFg }}>
-            {error ? (
-              <span style={{ color: TOKENS.errorFg }}>{error}</span>
-            ) : isReply || isQuote ? (
-              <span style={{ color: overLimit ? TOKENS.errorFg : TOKENS.hintFg }}>
-                {charCount}/{NOTE_CHAR_LIMIT}
-              </span>
-            ) : !broadcastNostrSelected ? (
-              <span style={{ color: TOKENS.errorFg }}>
-                Cross-protocol broadcast needs Nostr as the anchor. Include Nostr to publish.
-              </span>
-            ) : crossPostTargets.length > 0 ? (
-              <span style={{ color: overLimit ? TOKENS.errorFg : TOKENS.hintFg }}>
-                Publishing to Nostr ·{' '}
-                {crossPostTargets.map((t) => PROTOCOL_LABELS[t.protocol]).join(' · ')} —{' '}
-                {charCount}/{NOTE_CHAR_LIMIT}
-              </span>
-            ) : (
-              <span style={{ color: overLimit ? TOKENS.errorFg : TOKENS.hintFg }}>
-                {charCount}/{NOTE_CHAR_LIMIT}
-              </span>
-            )}
-          </div>
-
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            {/* Per-send cross-post pills — one per valid linked network, seeded
-                from cross_post_default. Only plain notes cross-post from this
-                composer (replies/quotes publish through their own paths). */}
-            {!isReply && !isQuote &&
-              linkedProtocols.map((p) => (
-                <button
-                  key={p}
-                  type="button"
-                  onClick={() => setCrossPostOn((prev) => ({ ...prev, [p]: !prev[p] }))}
-                  className={`label-ui toggle-chip ${crossPostOn[p] ? 'toggle-chip-active' : 'toggle-chip-inactive'}`}
-                  data-explain="composer.crosspost"
-                  title={
-                    crossPostOn[p]
-                      ? `Will also post to ${PROTOCOL_LABELS[p]} (@${linkedByProtocol[p]?.externalHandle ?? ''})`
-                      : `Not posting to ${PROTOCOL_LABELS[p]} this time`
-                  }
-                >
-                  {PROTOCOL_LABELS[p]}
-                </button>
-              ))}
-            <button
-              type="button"
-              onClick={handlePublish}
-              disabled={!canPublish}
-              className="font-sans text-ui-xs"
-              style={{
-                padding: '8px 16px',
-                background: canPublish ? TOKENS.publishBg : TOKENS.publishDisabled,
-                color: TOKENS.publishFg,
-                border: 'none',
-                cursor: canPublish ? 'pointer' : 'default',
-              }}
-            >
-              {publishing
-                ? isReply
-                  ? 'Replying…'
-                  : isQuote
+                {c.publishing
+                  ? isQuote
                     ? 'Quoting…'
-                    : 'Publishing…'
-                : isReply
-                  ? 'Reply'
+                    : 'Posting…'
                   : isQuote
                     ? 'Quote'
-                    : 'Publish'}
-            </button>
+                    : 'Post'}
+              </button>
+            </div>
           </div>
+
+          {/* Error / confirm dismiss — the same two lines as the overlay. */}
+          {(displayError || c.confirmDismiss) && (
+            <div style={{ marginTop: 12 }}>
+              {c.confirmDismiss && (
+                <p className="text-ui-sm" style={{ color: TOKENS.hintFg }}>
+                  Discard this? Press Escape or click away again to confirm.
+                </p>
+              )}
+              {displayError && (
+                <div className="flex items-center justify-between">
+                  <p className="text-ui-xs" style={{ color: TOKENS.errorFg }}>
+                    {displayError}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={c.clearError}
+                    aria-label="Dismiss error"
+                    className="text-grey-600 hover:text-crimson text-sm ml-2"
+                  >
+                    &times;
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </Glasshouse>

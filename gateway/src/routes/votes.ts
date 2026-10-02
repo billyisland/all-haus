@@ -4,6 +4,7 @@ import { pool, withTransaction } from '@platform-pub/shared/db/client.js'
 import { requireAuth } from '../middleware/auth.js'
 import { checkArticleAccess } from '../services/article-access/index.js'
 import { resolveLockedRoots } from '../lib/root-locked.js'
+import { resolveEventTarget } from '../lib/event-target.js'
 import { zodValidationError } from '@platform-pub/shared/lib/validation.js'
 import logger from '@platform-pub/shared/lib/logger.js'
 
@@ -15,9 +16,10 @@ import logger from '@platform-pub/shared/lib/logger.js'
 // GET    /votes/mine?eventIds=id1,id2,...     — batch fetch my vote counts (auth)
 //
 // Audit F9 (2026-07-06): paid voting was removed. Votes are free — no tab
-// debit, no vote_charges row, no ledger entry. The `votes`/`vote_charges`
-// tables and their historical ledger entries are left inert (append-only); this
-// route now only records the vote row (cost 0) and the tally. The former
+// debit, no vote_charges row, no ledger entry. `vote_charges` and its
+// historical ledger entries are left inert (append-only); the paid-vote columns
+// on `votes` were dropped by migration 265. This route records the vote row and
+// the tally. The former
 // GET /votes/price endpoint and the paid-confirm flow were stripped.
 // =============================================================================
 
@@ -45,58 +47,34 @@ export async function voteRoutes(app: FastifyInstance) {
       const { targetEventId, targetKind, direction } = parsed.data
       const voterId = req.session!.sub
 
-      return withTransaction(async (client) => {
+      const answer = await withTransaction(async (client): Promise<{ status: number; body: unknown }> => {
         // ------------------------------------------------------------------
         // 1. Resolve the content author
         // ------------------------------------------------------------------
-        let authorId: string | null = null
-        // The article's paywall ingredients ride the same read (30023), or the
-        // comment's root event id does (1111) — for the guard in step 1b.
-        let article: {
-          id: string
-          writer_id: string
-          access_mode: string
-          publication_id: string | null
-        } | null = null
-        let commentRootEventId: string | null = null
+        // WHAT THE ID NAMES DECIDES, NOT WHAT THE REQUEST CLAIMS (MIRROR-AUDIT
+        // §2.7). Branching on `targetKind` made the declared kind a way to
+        // choose which table gets searched: a note minted under a paywalled
+        // article's event id (`POST /notes` takes the id from the client) plus
+        // `targetKind: 1` landed in `notes`, left `article` null, and neither
+        // arm of the guard below ran — the vote tallied against the article's
+        // event id all the same. The resolver searches the squattable table
+        // last; see its header.
+        //
+        // IT ALSO FIXES A LIVE BUG IN THE HONEST DIRECTION. A native reply is
+        // projected into a thread as a Post of `type: "note"`, so `PostActions`
+        // declares kind 1 for it in good faith; the old branch searched `notes`,
+        // found nothing and 404'd every such vote. Resolved by row it finds the
+        // comment — and gets the comment's guard with it.
+        const target = await resolveEventTarget(client, targetEventId, targetKind)
 
-        if (targetKind === 30023) {
-          const { rows } = await client.query<{
-            id: string
-            writer_id: string
-            access_mode: string
-            publication_id: string | null
-          }>(
-            `SELECT id, writer_id, access_mode, publication_id
-               FROM articles
-              WHERE nostr_event_id = $1 AND deleted_at IS NULL`,
-            [targetEventId]
-          )
-          article = rows[0] ?? null
-          authorId = article?.writer_id ?? null
-        } else if (targetKind === 1) {
-          const { rows } = await client.query<{ author_id: string }>(
-            `SELECT author_id FROM notes WHERE nostr_event_id = $1`,
-            [targetEventId]
-          )
-          authorId = rows[0]?.author_id ?? null
-        } else if (targetKind === 1111) {
-          const { rows } = await client.query<{
-            author_id: string
-            target_event_id: string
-          }>(
-            `SELECT author_id, target_event_id
-               FROM comments
-              WHERE nostr_event_id = $1 AND deleted_at IS NULL`,
-            [targetEventId]
-          )
-          authorId = rows[0]?.author_id ?? null
-          commentRootEventId = rows[0]?.target_event_id ?? null
+        if (!target) {
+          return { status: 404, body: { error: "We couldn't find that post." } }
         }
 
-        if (!authorId) {
-          return reply.status(404).send({ error: 'Content not found' })
-        }
+        const authorId = target.authorId
+        const article = target.kind === 30023 ? target : null
+        const commentRootEventId =
+          target.kind === 1111 ? target.rootEventId : null
 
         // ------------------------------------------------------------------
         // 1b. A vote is a WRITE into gated content, so it carries the READ's
@@ -121,20 +99,20 @@ export async function voteRoutes(app: FastifyInstance) {
         //     filters to paywalled article roots, so a note-rooted comment costs
         //     one query that finds nothing and votes through.
         // ------------------------------------------------------------------
-        if (article && article.access_mode === 'paywalled') {
+        if (article && article.accessMode === 'paywalled') {
           const access = await checkArticleAccess(
             voterId,
-            article.id,
-            article.writer_id,
-            article.publication_id,
+            article.articleId,
+            article.authorId,
+            article.publicationId,
           )
           if (!access.hasAccess) {
-            return reply.status(403).send({ error: 'Unlock this article to vote' })
+            return { status: 403, body: { error: 'Unlock this article to vote' } }
           }
         } else if (commentRootEventId) {
           const locked = await resolveLockedRoots(voterId, [commentRootEventId])
           if (locked.has(commentRootEventId)) {
-            return reply.status(403).send({ error: 'Unlock this article to vote' })
+            return { status: 403, body: { error: 'Unlock this article to vote' } }
           }
         }
 
@@ -142,38 +120,34 @@ export async function voteRoutes(app: FastifyInstance) {
         // 2. Prevent self-voting
         // ------------------------------------------------------------------
         if (voterId === authorId) {
-          return reply.status(400).send({ error: 'Cannot vote on your own content' })
+          return { status: 400, body: { error: "You can't vote on your own posts." } }
         }
 
         // ------------------------------------------------------------------
-        // 3. Count existing votes in this direction
-        //    Advisory lock serialises concurrent votes for the same
-        //    voter/target/direction to prevent duplicate sequence numbers.
-        // ------------------------------------------------------------------
-        await client.query(
-          `SELECT pg_advisory_xact_lock(hashtext($1 || $2 || $3))`,
-          [voterId, targetEventId, direction]
-        )
-        const countRow = await client.query<{ count: string }>(
-          `SELECT COUNT(*) AS count FROM votes
-           WHERE voter_id = $1 AND target_nostr_event_id = $2 AND direction = $3`,
-          [voterId, targetEventId, direction]
-        )
-        const existingCount = parseInt(countRow.rows[0].count, 10)
-        const sequenceNumber = existingCount + 1
-
-        // ------------------------------------------------------------------
-        // 3b. Cap: ONE free vote per (voter, target, direction).
+        // 3. Record the vote — ONE free vote per (voter, target, direction).
         //
         // Under paid voting the escalating cost was the only brake on repeat
         // votes; F9 removed the cost but shipped no replacement cap, so any
         // account could loop POST /votes and inflate a tally without bound
-        // (2026-07-06 audit P1). A repeat in the same direction is an
-        // idempotent no-op: return the current tally, counted: false, so the
-        // client can tell nothing was recorded. Historical multi-vote rows
-        // (sequence_number > 1) stay untouched in the tallies.
+        // (2026-07-06 audit P1). The cap is the partial unique index
+        // `idx_votes_one_per_direction` (migration 265), so a concurrent pair
+        // cannot both land: the loser's INSERT does nothing and returns no row.
+        // A repeat in the same direction is an idempotent no-op — the current
+        // tally, `counted: false`, so the client can tell nothing was recorded.
+        // Historical multi-votes (sequence_number > 1) stay in the tallies and
+        // outside the index.
         // ------------------------------------------------------------------
-        if (existingCount >= 1) {
+        const inserted = await client.query<{ id: string }>(
+          `INSERT INTO votes
+             (voter_id, target_nostr_event_id, target_author_id, direction, sequence_number)
+           VALUES ($1, $2, $3, $4, 1)
+           ON CONFLICT (voter_id, target_nostr_event_id, direction)
+             WHERE sequence_number = 1 DO NOTHING
+           RETURNING id`,
+          [voterId, targetEventId, authorId, direction]
+        )
+
+        if (inserted.rowCount === 0) {
           const tallyRow = await client.query<{
             upvote_count: number
             downvote_count: number
@@ -184,38 +158,29 @@ export async function voteRoutes(app: FastifyInstance) {
             [targetEventId]
           )
           const tally = tallyRow.rows[0]
-          return reply.status(200).send({
+          return { status: 200, body: {
             ok: true,
             counted: false,
-            sequenceNumber: existingCount,
             tally: {
               upvoteCount: tally?.upvote_count ?? 0,
               downvoteCount: tally?.downvote_count ?? 0,
               netScore: tally?.net_score ?? 0,
             },
-          })
+          } }
         }
 
         // ------------------------------------------------------------------
-        // 4. Insert vote row (F9: free — no cost, no tab, no charge row)
-        // ------------------------------------------------------------------
-        await client.query<{ id: string }>(
-          `INSERT INTO votes
-             (voter_id, target_nostr_event_id, target_author_id,
-              direction, sequence_number, cost_pence, tab_id, on_free_allowance)
-           VALUES ($1, $2, $3, $4, $5, 0, NULL, FALSE)
-           RETURNING id`,
-          [voterId, targetEventId, authorId, direction, sequenceNumber]
-        )
-
-        // ------------------------------------------------------------------
-        // 5. Upsert the tally
+        // 4. Upsert the tally and return it
         // ------------------------------------------------------------------
         const upDelta = direction === 'up' ? 1 : 0
         const downDelta = direction === 'down' ? 1 : 0
         const scoreDelta = direction === 'up' ? 1 : -1
 
-        await client.query(
+        const { rows: [tally] } = await client.query<{
+          upvote_count: number
+          downvote_count: number
+          net_score: number
+        }>(
           `INSERT INTO vote_tallies
              (target_nostr_event_id, upvote_count, downvote_count, net_score)
            VALUES ($1, $2, $3, $4)
@@ -223,40 +188,30 @@ export async function voteRoutes(app: FastifyInstance) {
              upvote_count  = vote_tallies.upvote_count  + $2,
              downvote_count = vote_tallies.downvote_count + $3,
              net_score     = vote_tallies.net_score     + $4,
-             updated_at    = now()`,
+             updated_at    = now()
+           RETURNING upvote_count, downvote_count, net_score`,
           [targetEventId, upDelta, downDelta, scoreDelta]
         )
 
-        // ------------------------------------------------------------------
-        // 9. Fetch updated tally to return
-        // ------------------------------------------------------------------
-        const tallyRow = await client.query<{
-          upvote_count: number
-          downvote_count: number
-          net_score: number
-        }>(
-          `SELECT upvote_count, downvote_count, net_score
-           FROM vote_tallies WHERE target_nostr_event_id = $1`,
-          [targetEventId]
-        )
-        const tally = tallyRow.rows[0]
-
         logger.info(
-          { voterId, targetEventId, direction, sequenceNumber },
+          { voterId, targetEventId, direction },
           'Vote recorded'
         )
 
-        return reply.status(201).send({
+        return { status: 201, body: {
           ok: true,
           counted: true,
-          sequenceNumber,
           tally: {
             upvoteCount: tally.upvote_count,
             downvoteCount: tally.downvote_count,
             netScore: tally.net_score,
           },
-        })
+        } }
       })
+
+      // Sent AFTER the commit: a reply sent from inside the callback went out
+      // before COMMIT, so a 201 could name a vote that then failed to commit.
+      return reply.status(answer.status).send(answer.body)
     }
   )
 

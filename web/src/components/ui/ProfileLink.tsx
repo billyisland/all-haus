@@ -25,7 +25,8 @@
 
 import Link from "next/link";
 import type { ComponentProps, MouseEvent } from "react";
-import { useProfile } from "../../stores/profileOverlay";
+import { useProfile, type ProfileFocus } from "../../stores/profileOverlay";
+import { activeGlasshouseRect } from "../workspace/Glasshouse";
 import type { FeedScheme } from "../workspace/tokens";
 
 /** Classify a profile href into an overlay target, or null if it isn't one. */
@@ -48,16 +49,28 @@ export function profileTargetFromHref(
  *  `frameScheme` (the launching feed's COLOURWAY, `palette.scheme`) is passed
  *  through when the profile was opened from a feed card, so the pane wears that
  *  feed's scheme entire; omit it elsewhere and the pane takes the global
- *  content palette. */
+ *  content palette.
+ *
+ *  THE ENTRY BOX IS READ HERE, NOT ASKED FOR. A profile opened while another
+ *  Glasshouse is up — a byline inside the reader, a notification row inside the
+ *  Messages inbox — takes that pane's place, which is the handoff the primitive
+ *  already knows how to draw; `activeGlasshouseRect()` is null when nothing is
+ *  open, so the bare-floor case is untouched and no caller has to know which
+ *  case it is in. Read at the CLICK, because the outgoing pane is gone by the
+ *  time the newcomer mounts. */
 export function openProfileHref(
   href: string,
   frameScheme?: FeedScheme | null,
+  /** Opened from a surface that knows WHICH of this person's posts it is about
+   *  (a notification row), and what to put back when the pane closes. */
+  extra?: { focus?: ProfileFocus | null; returnTo?: "messages" | null },
 ): boolean {
   const target = profileTargetFromHref(href);
   if (!target) return false;
+  const opts = { frameScheme, enterFrom: activeGlasshouseRect(), ...extra };
   if (target.kind === "external")
-    useProfile.getState().openExternal(target.authorId, frameScheme);
-  else useProfile.getState().openNative(target.username, frameScheme);
+    useProfile.getState().openExternal(target.authorId, opts);
+  else useProfile.getState().openNative(target.username, opts);
   return true;
 }
 

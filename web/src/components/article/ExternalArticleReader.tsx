@@ -24,14 +24,15 @@
 //     alone, which is why opening a video item was where the video went away.
 // =============================================================================
 
-import React, { useEffect, useState, type RefObject } from "react";
+import React, { useEffect, useRef, useState, type RefObject } from "react";
 import { externalItems } from "../../lib/api/external-items";
-import { externalizeHtml } from "../../lib/external-links";
+import { externalizeHtml, safeHttpUrl } from "../../lib/external-links";
 import { InlineVideo } from "../post/PostMedia";
 import { embedFrameSrc } from "../../lib/media-embed";
 import type { MediaItem } from "../../lib/post/types";
 import { useReadingPosition } from "../../hooks/useReadingPosition";
 import { useReadingLog } from "../../hooks/useReadingLog";
+import { useBodyImageLightbox } from "../../hooks/useBodyImageLightbox";
 import { useAuth } from "../../stores/auth";
 
 interface ExtractResult {
@@ -123,6 +124,10 @@ export function ExternalArticleReader({
     };
   }, [url]);
 
+  // Body pictures open the lightbox, as the native reader's do.
+  const bodyRef = useRef<HTMLDivElement>(null);
+  useBodyImageLightbox(bodyRef, loading ? null : article?.content);
+
   const displayTitle = article?.title || initialTitle || "";
   const displaySite = article?.siteName || initialSiteName || "";
   const videos = (media ?? []).filter((m) => m.type === "video" && m.url);
@@ -133,7 +138,7 @@ export function ExternalArticleReader({
       <div className={`${paddingX} pt-8 pb-5`}>
         {showSiteName && displaySite && (
           <a
-            href={url}
+            href={safeHttpUrl(url)}
             target="_blank"
             rel="noopener noreferrer"
             className="label-ui text-grey-600 hover:text-black transition-colors mb-2 inline-block"
@@ -207,10 +212,10 @@ export function ExternalArticleReader({
         {error && (
           <div className="text-center py-8">
             <p className="text-ui-xs text-grey-600 mb-4">
-              Could not extract this page.
+              Couldn’t pull the text out of this page. You can read it on the original site instead.
             </p>
             <a
-              href={url}
+              href={safeHttpUrl(url)}
               target="_blank"
               rel="noopener noreferrer"
               className="btn-text"
@@ -220,15 +225,26 @@ export function ExternalArticleReader({
           </div>
         )}
 
+        {/* CAPTIONS (2026-09-12). A picture caption reaches the client as
+            <figure><figcaption> — the gateway's extract route normalises every
+            provable one into that shape before sanitising, since the class that
+            said "caption" on the origin page does not survive Readability or the
+            sanitiser (gateway/src/lib/article-captions.ts). The VOICE is not
+            spelled here: `ah-caption-voice` (globals.css) is the one home, taken
+            by this reader, the native `.prose` reader and the editor's own node
+            view alike — three surfaces that must agree, since a caption written
+            in one is read in the others. An uncaptioned picture keeps the body
+            rhythm ([&_img]:my-4); inside a figure the figure owns the spacing. */}
         {article && !loading && (
           <>
             <div
-              className="font-serif text-[16px] leading-[1.7] text-black [&_p]:mb-4 [&_p:last-child]:mb-0 [&_h1]:text-xl [&_h1]:font-bold [&_h1]:mb-3 [&_h1]:mt-6 [&_h2]:text-lg [&_h2]:font-bold [&_h2]:mb-3 [&_h2]:mt-5 [&_h3]:text-base [&_h3]:font-bold [&_h3]:mb-2 [&_h3]:mt-4 [&_blockquote]:border-l-2 [&_blockquote]:border-grey-300 [&_blockquote]:pl-4 [&_blockquote]:text-grey-600 [&_blockquote]:my-4 [&_a]:text-black [&_a]:underline [&_img]:max-w-full [&_img]:h-auto [&_img]:my-4 [&_ul]:list-disc [&_ul]:pl-6 [&_ul]:mb-4 [&_ol]:list-decimal [&_ol]:pl-6 [&_ol]:mb-4 [&_li]:mb-1 [&_pre]:bg-grey-50 [&_pre]:p-4 [&_pre]:overflow-x-auto [&_pre]:text-sm [&_pre]:my-4 [&_code]:font-mono [&_code]:text-sm [&_iframe]:w-full [&_iframe]:aspect-video [&_iframe]:my-4 [&_iframe]:block [&_iframe]:border-0 [&_video]:w-full [&_video]:h-auto [&_video]:my-4 [&_video]:block [&_audio]:w-full [&_audio]:my-4 [&_audio]:block"
+              ref={bodyRef}
+              className="ah-caption-voice font-serif text-[16px] leading-[1.7] text-black [&_p]:mb-4 [&_p:last-child]:mb-0 [&_h1]:text-xl [&_h1]:font-bold [&_h1]:mb-3 [&_h1]:mt-6 [&_h2]:text-lg [&_h2]:font-bold [&_h2]:mb-3 [&_h2]:mt-5 [&_h3]:text-base [&_h3]:font-bold [&_h3]:mb-2 [&_h3]:mt-4 [&_blockquote]:border-l-2 [&_blockquote]:border-grey-300 [&_blockquote]:pl-4 [&_blockquote]:text-grey-600 [&_blockquote]:my-4 [&_a]:text-black [&_a]:underline [&_img]:max-w-full [&_img]:h-auto [&_img]:my-4 [&_ul]:list-disc [&_ul]:pl-6 [&_ul]:mb-4 [&_ol]:list-decimal [&_ol]:pl-6 [&_ol]:mb-4 [&_li]:mb-1 [&_pre]:bg-grey-50 [&_pre]:p-4 [&_pre]:overflow-x-auto [&_pre]:text-sm [&_pre]:my-4 [&_code]:font-mono [&_code]:text-sm [&_iframe]:w-full [&_iframe]:aspect-video [&_iframe]:my-4 [&_iframe]:block [&_iframe]:border-0 [&_video]:w-full [&_video]:h-auto [&_video]:my-4 [&_video]:block [&_audio]:w-full [&_audio]:my-4 [&_audio]:block"
               dangerouslySetInnerHTML={{ __html: externalizeHtml(article.content) }}
             />
             <div className="mt-8">
               <a
-                href={url}
+                href={safeHttpUrl(url)}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="btn-text"

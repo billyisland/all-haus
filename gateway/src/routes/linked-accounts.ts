@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import crypto from "node:crypto";
 import { z } from "zod";
-import { pool } from "@platform-pub/shared/db/client.js";
+import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
 import { safeFetch } from "@platform-pub/shared/lib/http-client.js";
 import { encryptJson, decryptJson } from "@platform-pub/shared/lib/crypto.js";
 import { getAtprotoClient } from "@platform-pub/shared/lib/atproto-oauth.js";
@@ -14,6 +14,11 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireEnv } from "@platform-pub/shared/lib/env.js";
 import { zodValidationError } from "@platform-pub/shared/lib/validation.js";
 import logger from "@platform-pub/shared/lib/logger.js";
+import { authoritativeId } from "@platform-pub/shared/lib/activitypub-origin.js";
+import {
+  MASTODON_SCOPES,
+  coversMastodonScopes,
+} from "@platform-pub/shared/lib/mastodon-scopes.js";
 
 // =============================================================================
 // Linked Accounts (Phase 5 — outbound reply router)
@@ -41,7 +46,8 @@ const APP_URL = requireEnv("APP_URL");
 // SESSION_SECRET automatically when `signed: true` is set.
 const CALLBACK_PATH = "/api/v1/linked-accounts/callback";
 
-const MASTODON_SCOPES = "read:accounts write:statuses";
+// MASTODON_SCOPES lives in shared/src/lib/mastodon-scopes.ts, beside the check
+// the outbound worker runs against what a token was actually granted.
 const CLIENT_NAME = "all.haus";
 
 // ASSISTED atproto (NETWORK-CONCIERGE-ADR §6.1, Phase 2). The "set one up for
@@ -106,6 +112,11 @@ interface MastodonVerifyCredentialsResponse {
   display_name: string;
   avatar: string;
   url: string;
+  // The account's ActivityPub actor id (Mastodon 4.2+). Stored as the
+  // presence's stable_handle, the key the member's claim on their external
+  // author row is made by (migration 237), and only where the instance that
+  // answered is authoritative for it.
+  uri?: string;
   // The post-link import offer's count (FOLLOW-GRAPH-IMPORT-ADR §7.1) —
   // free because this call already happens.
   following_count?: number;
@@ -133,12 +144,13 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
       show_on_profile: boolean;
       token_expires_at: Date | null;
       created_at: Date;
+      credentials_enc: string | null;
     }>(
       `
       SELECT id, protocol, provenance, lifecycle_state, external_id,
              handle, service_url,
              is_valid, cross_post_default, show_on_profile,
-             token_expires_at, created_at
+             token_expires_at, created_at, credentials_enc
       FROM network_presences
       WHERE account_id = $1
       ORDER BY created_at DESC
@@ -160,6 +172,7 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
         showOnProfile: r.show_on_profile,
         tokenExpiresAt: r.token_expires_at,
         createdAt: r.created_at,
+        needsReconnect: mastodonNeedsReconnect(r),
       })),
       // Single source of truth for the dark-ship flags so the UI shows the
       // ASSISTED affordances only when the server can honour them (§6.1.1 S6).
@@ -197,11 +210,34 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
     { preHandler: requireAuth },
     async (req, reply) => {
       const userId = req.session!.sub;
-      const { rowCount } = await pool.query(
-        `DELETE FROM network_presences WHERE id = $1 AND account_id = $2`,
-        [req.params.id, userId],
-      );
-      if (rowCount === 0) return reply.status(404).send({ error: "Not found" });
+      // Disconnecting a presence must also drop the credential it was the only
+      // pointer to (MIRROR-AUDIT §2.10). Deleting the row alone left an
+      // orphaned `atproto_oauth_sessions` entry behind for every Bluesky
+      // presence ever unlinked — a live OAuth session for a link the member
+      // has explicitly ended. The DELETE returns the DID because after the
+      // row is gone there is nothing left to join on, and both statements
+      // ride one transaction so a failure cannot leave the pair half-done.
+      const removed = await withTransaction(async (client) => {
+        const { rows } = await client.query<{
+          protocol: string;
+          external_id: string | null;
+        }>(
+          `DELETE FROM network_presences
+            WHERE id = $1 AND account_id = $2
+            RETURNING protocol, external_id`,
+          [req.params.id, userId],
+        );
+        if (rows.length === 0) return false;
+        const presence = rows[0];
+        if (presence.protocol === "atproto" && presence.external_id) {
+          await client.query(
+            `DELETE FROM atproto_oauth_sessions WHERE did = $1`,
+            [presence.external_id],
+          );
+        }
+        return true;
+      });
+      if (!removed) return reply.status(404).send({ error: "We couldn't find that." });
       return { ok: true };
     },
   );
@@ -254,7 +290,7 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
           body.data.showOnProfile ?? null,
         ],
       );
-      if (rowCount === 0) return reply.status(404).send({ error: "Not found" });
+      if (rowCount === 0) return reply.status(404).send({ error: "We couldn't find that." });
       return { ok: true };
     },
   );
@@ -279,7 +315,7 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
       const schema = z.object({ instanceUrl: z.string().min(1) });
       const parsed = schema.safeParse(req.body);
       if (!parsed.success)
-        return reply.status(400).send({ error: parsed.error.flatten() });
+        return reply.status(400).send(zodValidationError(parsed.error));
 
       let instance: URL;
       try {
@@ -289,10 +325,10 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
             : `https://${parsed.data.instanceUrl}`,
         );
       } catch {
-        return reply.status(400).send({ error: "Invalid instance URL" });
+        return reply.status(400).send({ error: "That isn't a server address we can use." });
       }
       if (instance.protocol !== "https:") {
-        return reply.status(400).send({ error: "Instance must use https" });
+        return reply.status(400).send({ error: "The server's address must start with https://." });
       }
       const instanceOrigin = instance.origin;
 
@@ -309,7 +345,7 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
         );
         return reply
           .status(502)
-          .send({ error: "Could not register with that Mastodon instance" });
+          .send({ error: "Couldn't connect to that Mastodon server. Please check the address and try again." });
       }
 
       // Signed state cookie — ties the callback to this user + instance + protocol.
@@ -365,14 +401,14 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
       if (!mastodonAssistedEnabled()) {
         return reply
           .status(503)
-          .send({ error: "Assisted setup is not available yet" });
+          .send({ error: "all.haus can't set up accounts for you yet." });
       }
       const userId = req.session!.sub;
       const parsed = z
         .object({ instance: z.string().min(1).max(256).optional() })
         .safeParse(req.body ?? {});
       if (!parsed.success)
-        return reply.status(400).send({ error: parsed.error.flatten() });
+        return reply.status(400).send(zodValidationError(parsed.error));
 
       const allowed = mastodonAssistedInstances();
       const requested = parsed.data.instance
@@ -384,7 +420,7 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
       if (!host || !allowed.includes(host)) {
         return reply
           .status(400)
-          .send({ error: "That instance is not available for assisted setup" });
+          .send({ error: "We can't set up accounts on that server." });
       }
       const instanceOrigin = `https://${host}`;
 
@@ -403,7 +439,7 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
           info.registrations.approval_required
         ) {
           return reply.status(409).send({
-            error: `${host} is not accepting open signups right now — try linking an existing account instead`,
+            error: `${host} isn't taking new sign-ups at the moment. You can link an account you already have instead.`,
           });
         }
       } catch (err) {
@@ -412,7 +448,7 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
           "Mastodon assisted: registration check failed",
         );
         return reply.status(502).send({
-          error: "Could not verify signup is open — try again shortly",
+          error: "Couldn't check whether that server is taking sign-ups. Please try again shortly.",
         });
       }
 
@@ -427,7 +463,7 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
         );
         return reply
           .status(502)
-          .send({ error: "Could not register with that Mastodon instance" });
+          .send({ error: "Couldn't connect to that Mastodon server. Please check the address and try again." });
       }
 
       const nonce = crypto.randomBytes(16).toString("hex");
@@ -543,15 +579,28 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
           scope: token.scope,
         });
 
+        // The identity the link proves (CROSS-NETWORK-ROUNDTRIP-ADR D1): the
+        // actor id, accepted only from the host that served it (§2.9) — an
+        // instance naming another host's actor would otherwise make this
+        // member the author of a stranger's posts. NULL when the instance
+        // serves none; a relink of the SAME account keeps the one it had.
+        const actorUri = authoritativeId(profile.uri, statePayload.instance);
+
         await pool.query(
           `
           INSERT INTO network_presences (
             account_id, protocol, provenance, external_id, handle,
             service_url, credentials_enc, is_valid,
-            last_refreshed_at, updated_at
-          ) VALUES ($1, 'activitypub', $6, $2, $3, $4, $5, TRUE, now(), now())
+            last_refreshed_at, updated_at, stable_handle
+          ) VALUES ($1, 'activitypub', $6, $2, $3, $4, $5, TRUE, now(), now(), $7)
           ON CONFLICT (account_id, protocol)
           DO UPDATE SET
+            stable_handle     = CASE
+              WHEN network_presences.external_id = EXCLUDED.external_id
+               AND network_presences.service_url IS NOT DISTINCT FROM EXCLUDED.service_url
+              THEN COALESCE(EXCLUDED.stable_handle, network_presences.stable_handle)
+              ELSE EXCLUDED.stable_handle
+            END,
             external_id       = EXCLUDED.external_id,
             handle            = EXCLUDED.handle,
             service_url       = EXCLUDED.service_url,
@@ -571,6 +620,7 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
             statePayload.instance,
             credentialsEnc,
             provenance,
+            actorUri,
           ],
         );
 
@@ -595,7 +645,8 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
           qs.set("follows", String(profile.following_count));
         return reply.redirect(`${APP_URL}/settings?${qs.toString()}`);
       } catch (err) {
-        // 23505 = the (protocol, external_id) unique index (migration 115):
+        // 23505 = the (protocol, external_id) unique index (migration 115), or
+        // the (protocol, stable_handle) one (migration 237):
         // another account already links this identity. Reject cleanly rather
         // than clobbering the existing presence.
         if ((err as { code?: string })?.code === "23505") {
@@ -631,7 +682,7 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
         .object({ handle: z.string().min(1).max(256) })
         .safeParse(req.body);
       if (!parsed.success)
-        return reply.status(400).send({ error: parsed.error.flatten() });
+        return reply.status(400).send(zodValidationError(parsed.error));
 
       let identifier = parsed.data.handle.trim();
       try {
@@ -682,7 +733,7 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
         return reply
           .status(502)
           .send({
-            error: "Could not start Bluesky OAuth — check the handle is valid",
+            error: "Couldn't connect to Bluesky. Please check the handle and try again.",
           });
       }
     },
@@ -706,7 +757,7 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
       if (!assistedEnabled()) {
         return reply
           .status(503)
-          .send({ error: "Assisted setup is not available yet" });
+          .send({ error: "all.haus can't set up accounts for you yet." });
       }
       const userId = req.session!.sub;
 
@@ -745,7 +796,7 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
         );
         return reply
           .status(502)
-          .send({ error: "Could not start Bluesky setup — try again shortly" });
+          .send({ error: "Couldn't start setting up your Bluesky account. Please try again shortly." });
       }
     },
   );
@@ -830,11 +881,12 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
           INSERT INTO network_presences (
             account_id, protocol, provenance, external_id, handle,
             service_url, credentials_enc, is_valid,
-            last_refreshed_at, updated_at
-          ) VALUES ($1, 'atproto', $4, $2, $3, NULL, NULL, TRUE, now(), now())
+            last_refreshed_at, updated_at, stable_handle
+          ) VALUES ($1, 'atproto', $4, $2, $3, NULL, NULL, TRUE, now(), now(), $2)
           ON CONFLICT (account_id, protocol)
           DO UPDATE SET
             external_id       = EXCLUDED.external_id,
+            stable_handle     = EXCLUDED.stable_handle,
             handle            = EXCLUDED.handle,
             provenance        = EXCLUDED.provenance,
             lifecycle_state   = 'active',
@@ -843,6 +895,16 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
             updated_at        = now()
         `,
           [userId, did, handle, provenance],
+        );
+
+        // `client.callback()` wrote the session before this presence existed,
+        // so nothing could attribute it. Stamp it now (migration 194) — the
+        // session store's own upsert COALESCE-fills it on later writes, so
+        // this is the only moment that needs saying out loud.
+        await pool.query(
+          `UPDATE atproto_oauth_sessions SET account_id = $1
+            WHERE did = $2 AND account_id IS DISTINCT FROM $1`,
+          [userId, did],
         );
 
         logger.info(
@@ -857,7 +919,8 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
           qs.set("follows", String(followsCount));
         return reply.redirect(`${APP_URL}/settings?${qs.toString()}`);
       } catch (err) {
-        // 23505 = the (protocol, external_id) unique index (migration 115):
+        // 23505 = the (protocol, external_id) unique index (migration 115), or
+        // the (protocol, stable_handle) one (migration 237):
         // another account already links this DID. Reject cleanly rather than
         // clobbering the existing presence (and its shared OAuth session).
         if ((err as { code?: string })?.code === "23505") {
@@ -878,6 +941,32 @@ export async function linkedAccountsRoutes(app: FastifyInstance) {
 // Mastodon OAuth helpers
 // =============================================================================
 
+// A Mastodon token keeps the scopes it was GRANTED until the member reconnects,
+// so one minted before MASTODON_SCOPES widened cannot do everything the
+// outbound worker asks of it (the worker refuses on the same check). Only an
+// otherwise-valid presence is asked: an invalid one already says "Invalid".
+// An unreadable credential is logged and answered true — reconnecting is what
+// replaces it.
+function mastodonNeedsReconnect(r: {
+  id: string;
+  protocol: string;
+  is_valid: boolean;
+  credentials_enc: string | null;
+}): boolean {
+  if (r.protocol !== "activitypub" || !r.is_valid || !r.credentials_enc)
+    return false;
+  try {
+    const creds = decryptJson<{ scope?: string }>(r.credentials_enc);
+    return !coversMastodonScopes(creds.scope);
+  } catch (err) {
+    logger.error(
+      { err, presenceId: r.id },
+      "Mastodon presence credentials could not be decrypted",
+    );
+    return true;
+  }
+}
+
 function buildMastodonAuthorizeUrl(
   instanceOrigin: string,
   clientId: string,
@@ -893,6 +982,13 @@ function buildMastodonAuthorizeUrl(
   return authorizeUrl.toString();
 }
 
+// One registered app per instance, shared by every member on it. Mastodon
+// refuses an authorize request for scopes beyond the app's REGISTERED ones, so
+// a row registered before MASTODON_SCOPES widened is re-registered here and
+// replaced — conditionally on the client_id we read, so two members connecting
+// at once converge on ONE app rather than each leaving with a client_id the
+// callback will not find. Either way the answer is re-read from the row, which
+// is what `getStoredMastodonApp` will hand the callback.
 async function getOrRegisterMastodonApp(
   instance: string,
   redirectUri: string,
@@ -900,16 +996,18 @@ async function getOrRegisterMastodonApp(
   const { rows } = await pool.query<{
     client_id: string;
     client_secret_enc: string;
+    scopes: string | null;
   }>(
-    `SELECT client_id, client_secret_enc
+    `SELECT client_id, client_secret_enc, scopes
      FROM oauth_app_registrations
      WHERE protocol = 'activitypub' AND instance_url = $1`,
     [instance],
   );
-  if (rows[0]) {
+  const stored = rows[0];
+  if (stored && coversMastodonScopes(stored.scopes)) {
     return {
-      clientId: rows[0].client_id,
-      clientSecret: decryptJson<string>(rows[0].client_secret_enc),
+      clientId: stored.client_id,
+      clientSecret: decryptJson<string>(stored.client_secret_enc),
     };
   }
 
@@ -930,23 +1028,47 @@ async function getOrRegisterMastodonApp(
     throw new Error("App registration missing client_id/client_secret");
   }
 
-  await pool.query(
-    `
-    INSERT INTO oauth_app_registrations (
-      protocol, instance_url, client_id, client_secret_enc, scopes, redirect_uri
-    ) VALUES ('activitypub', $1, $2, $3, $4, $5)
-    ON CONFLICT (protocol, instance_url) DO NOTHING
-  `,
-    [
-      instance,
-      body.client_id,
-      encryptJson(body.client_secret),
-      MASTODON_SCOPES,
-      redirectUri,
-    ],
-  );
+  if (stored) {
+    await pool.query(
+      `
+      UPDATE oauth_app_registrations
+      SET client_id = $2, client_secret_enc = $3, scopes = $4,
+          redirect_uri = $5, updated_at = now()
+      WHERE protocol = 'activitypub' AND instance_url = $1
+        AND client_id = $6
+    `,
+      [
+        instance,
+        body.client_id,
+        encryptJson(body.client_secret),
+        MASTODON_SCOPES,
+        redirectUri,
+        stored.client_id,
+      ],
+    );
+    logger.info(
+      { instance, previousScopes: stored.scopes, scopes: MASTODON_SCOPES },
+      "Mastodon app re-registered for wider scopes",
+    );
+  } else {
+    await pool.query(
+      `
+      INSERT INTO oauth_app_registrations (
+        protocol, instance_url, client_id, client_secret_enc, scopes, redirect_uri
+      ) VALUES ('activitypub', $1, $2, $3, $4, $5)
+      ON CONFLICT (protocol, instance_url) DO NOTHING
+    `,
+      [
+        instance,
+        body.client_id,
+        encryptJson(body.client_secret),
+        MASTODON_SCOPES,
+        redirectUri,
+      ],
+    );
+  }
 
-  return { clientId: body.client_id, clientSecret: body.client_secret };
+  return getStoredMastodonApp(instance);
 }
 
 async function getStoredMastodonApp(

@@ -14,7 +14,7 @@
 // mental model lives in one place.
 // =============================================================================
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type MouseEvent } from 'react'
 import { linkedAccounts, privacyPreferences, type LinkedAccount } from '../../lib/api'
 import {
   ASSISTED_BLUESKY_CONSENT,
@@ -23,6 +23,9 @@ import {
 } from '../../lib/api/linked-accounts'
 import { useFollowImportRun } from '../../hooks/useFollowImportRun'
 import { FollowImportSection } from '../network/FollowImportSection'
+import { useConfirm } from '../ui/ConfirmDialog'
+import * as C from '../../content/networks'
+import { failureSentence } from '../../lib/api/client'
 
 type SatelliteKey = 'mastodon' | 'bluesky'
 
@@ -32,8 +35,8 @@ const SATELLITES: {
   protocol: LinkedAccount['protocol']
   conciergeHandle: string
 }[] = [
-  { key: 'bluesky', label: 'Bluesky', protocol: 'atproto', conciergeHandle: 'you.all.haus' },
-  { key: 'mastodon', label: 'Mastodon', protocol: 'activitypub', conciergeHandle: '@you@all.haus' },
+  { key: 'bluesky', label: C.NETWORK_LABEL_BLUESKY, protocol: 'atproto', conciergeHandle: 'you.all.haus' },
+  { key: 'mastodon', label: C.NETWORK_LABEL_MASTODON, protocol: 'activitypub', conciergeHandle: '@you@all.haus' },
 ]
 
 export function NetworkReachPanel() {
@@ -52,6 +55,17 @@ export function NetworkReachPanel() {
   // Nostr presence (the degenerate concierge) — relocated from PrivacyPreferences.
   const [discoveryEnabled, setDiscoveryEnabled] = useState<boolean | null>(null)
   const [publishFollowGraph, setPublishFollowGraph] = useState<boolean | null>(null)
+  const [discoverableByEmail, setDiscoverableByEmail] = useState<boolean | null>(null)
+  // A failed read ASSERTS NOTHING (walkthrough A10). The catch used to guess —
+  // discovery Off, follow graph On — and the guess was not harmless: pressing
+  // Private on a member who is really public early-returned in `setDiscovery`
+  // (the guessed value already matched), so a public member could not go
+  // private. And the email control, left null, stated "private" over two dead
+  // chips. So a failed load leaves all three null, says it failed, and offers
+  // a retry; every write's failure is said too, never a silent revert.
+  const [prefsLoadFailed, setPrefsLoadFailed] = useState(false)
+  const [prefsWriteError, setPrefsWriteError] = useState<string | null>(null)
+  const { ask, dialog } = useConfirm()
 
   // Follow-graph import (FOLLOW-GRAPH-IMPORT-ADR §7.2). One run at a time
   // across this panel: the per-presence "Import follows" affordance and the
@@ -72,32 +86,44 @@ export function NetworkReachPanel() {
         capabilities ?? { assistedBluesky: false, assistedMastodon: false },
       )
     } catch (err: any) {
-      setError(err.message ?? 'Failed to load network presences')
+      setError(failureSentence(err, C.NETWORK_LOAD_FAILED))
     }
   }
 
   useEffect(() => { void load() }, [])
 
-  useEffect(() => {
+  function loadPrefs() {
+    setPrefsLoadFailed(false)
     privacyPreferences.get()
       .then(res => {
         setDiscoveryEnabled(res.discoveryEnabled)
         setPublishFollowGraph(res.publishFollowGraph)
+        setDiscoverableByEmail(res.discoverableByEmail)
       })
-      .catch(() => {
-        setDiscoveryEnabled(false)
-        setPublishFollowGraph(true)
-      })
-  }, [])
+      .catch(() => setPrefsLoadFailed(true))
+  }
+
+  useEffect(() => { loadPrefs() }, [])
+
+  const prefsUnread = prefsLoadFailed ? (
+    <>
+      {C.PREFS_LOAD_FAILED}{' '}
+      <button onClick={loadPrefs} className="btn-text">{C.PREFS_RETRY}</button>
+    </>
+  ) : null
+
+  const SAVE_FAILED = C.PREFS_SAVE_FAILED
 
   async function setDiscovery(value: boolean) {
     if (discoveryEnabled === value) return
     const previous = discoveryEnabled
     setDiscoveryEnabled(value)
+    setPrefsWriteError(null)
     try {
       await privacyPreferences.update({ discoveryEnabled: value })
     } catch {
       setDiscoveryEnabled(previous)
+      setPrefsWriteError(SAVE_FAILED)
     }
   }
 
@@ -105,10 +131,25 @@ export function NetworkReachPanel() {
     if (publishFollowGraph === value) return
     const previous = publishFollowGraph
     setPublishFollowGraph(value)
+    setPrefsWriteError(null)
     try {
       await privacyPreferences.update({ publishFollowGraph: value })
     } catch {
       setPublishFollowGraph(previous)
+      setPrefsWriteError(SAVE_FAILED)
+    }
+  }
+
+  async function setEmailFindable(value: boolean) {
+    if (discoverableByEmail === value) return
+    const previous = discoverableByEmail
+    setDiscoverableByEmail(value)
+    setPrefsWriteError(null)
+    try {
+      await privacyPreferences.update({ discoverableByEmail: value })
+    } catch {
+      setDiscoverableByEmail(previous)
+      setPrefsWriteError(SAVE_FAILED)
     }
   }
 
@@ -121,7 +162,21 @@ export function NetworkReachPanel() {
       const { authorizeUrl } = await linkedAccounts.connectMastodon(`https://${trimmed}`)
       window.location.href = authorizeUrl
     } catch (err: any) {
-      setError(err.message ?? 'Failed to start connection')
+      setError(failureSentence(err, C.NETWORK_CONNECT_FAILED))
+      setConnecting(false)
+    }
+  }
+
+  // Re-runs the link flow against the presence's own instance; the callback
+  // upserts on (account, protocol), so the same row gets the wider token.
+  async function handleReconnectMastodon(instance: string) {
+    setConnecting(true)
+    setError(null)
+    try {
+      const { authorizeUrl } = await linkedAccounts.connectMastodon(instance)
+      window.location.href = authorizeUrl
+    } catch (err: any) {
+      setError(failureSentence(err, C.NETWORK_CONNECT_FAILED))
       setConnecting(false)
     }
   }
@@ -135,7 +190,7 @@ export function NetworkReachPanel() {
       const { authorizeUrl } = await linkedAccounts.connectBluesky(trimmed)
       window.location.href = authorizeUrl
     } catch (err: any) {
-      setError(err.message ?? 'Failed to start connection')
+      setError(failureSentence(err, C.NETWORK_CONNECT_FAILED))
       setConnecting(false)
     }
   }
@@ -147,7 +202,7 @@ export function NetworkReachPanel() {
       const { authorizeUrl } = await linkedAccounts.assistedBluesky()
       window.location.href = authorizeUrl
     } catch (err: any) {
-      setError(err.message ?? 'Failed to start setup')
+      setError(failureSentence(err, C.NETWORK_SETUP_FAILED))
       setConnecting(false)
     }
   }
@@ -161,18 +216,23 @@ export function NetworkReachPanel() {
       )
       window.location.href = authorizeUrl
     } catch (err: any) {
-      setError(err.message ?? 'Failed to start setup')
+      setError(failureSentence(err, C.NETWORK_SETUP_FAILED))
       setConnecting(false)
     }
   }
 
-  async function handleDisconnect(id: string) {
-    if (!confirm('Disconnect this account? Cross-posts will stop.')) return
+  async function handleDisconnect(e: MouseEvent<HTMLElement>, id: string, label: string) {
+    const ok = await ask(e.currentTarget, {
+      title: C.networkDisconnectTitle(label),
+      body: C.NETWORK_DISCONNECT_BODY,
+      confirmLabel: C.NETWORK_DISCONNECT_CONFIRM,
+    })
+    if (!ok) return
     try {
       await linkedAccounts.remove(id)
       await load()
     } catch (err: any) {
-      setError(err.message ?? 'Failed to disconnect')
+      setError(failureSentence(err, C.NETWORK_DISCONNECT_FAILED))
     }
   }
 
@@ -181,7 +241,7 @@ export function NetworkReachPanel() {
       await linkedAccounts.update(acct.id, { crossPostDefault: !acct.crossPostDefault })
       await load()
     } catch (err: any) {
-      setError(err.message ?? 'Failed to update')
+      setError(failureSentence(err, C.NETWORK_UPDATE_FAILED))
     }
   }
 
@@ -195,7 +255,7 @@ export function NetworkReachPanel() {
       await linkedAccounts.update(acct.id, { showOnProfile: !acct.showOnProfile })
       await load()
     } catch (err: any) {
-      setError(err.message ?? 'Failed to update')
+      setError(failureSentence(err, C.NETWORK_UPDATE_FAILED))
     }
   }
 
@@ -209,11 +269,13 @@ export function NetworkReachPanel() {
           <div data-explain="settings.discovery">
             <div className="flex items-center justify-between gap-4">
               <div className="min-w-0 pr-6">
-                <p className="text-ui-sm text-black">Nostr</p>
+                <p className="text-ui-sm text-black">{C.NOSTR_TITLE}</p>
                 <p className="text-ui-xs text-grey-600 mt-1 leading-relaxed">
-                  {discoveryEnabled
-                    ? "Public. You've allowed all.haus to publish your profile and where to read you to the Nostr network, so people anywhere on Nostr can find and follow you."
-                    : 'Your account is a Nostr identity, not published beyond all.haus. Turn on discovery to publish your profile to the public Nostr network.'}
+                  {discoveryEnabled === null
+                    ? prefsUnread
+                    : discoveryEnabled
+                    ? C.NOSTR_PUBLIC
+                    : C.NOSTR_PRIVATE}
                 </p>
               </div>
               <div className="flex shrink-0">
@@ -222,14 +284,14 @@ export function NetworkReachPanel() {
                   className={`label-ui toggle-chip ${discoveryEnabled === true ? 'toggle-chip-active' : 'toggle-chip-inactive'}`}
                   disabled={discoveryEnabled === null}
                 >
-                  Public
+                  {C.NOSTR_PUBLIC_LABEL}
                 </button>
                 <button
                   onClick={() => setDiscovery(false)}
                   className={`label-ui toggle-chip ${discoveryEnabled === false ? 'toggle-chip-active' : 'toggle-chip-inactive'}`}
                   disabled={discoveryEnabled === null}
                 >
-                  Private
+                  {C.NOSTR_PRIVATE_LABEL}
                 </button>
               </div>
             </div>
@@ -238,8 +300,7 @@ export function NetworkReachPanel() {
             {discoveryEnabled && (
               <div className="flex items-center justify-between gap-4 mt-4 pl-4">
                 <p className="text-ui-xs text-grey-600 pr-6 leading-relaxed">
-                  Also publish who you follow as a public Nostr contact list. Turn off to keep
-                  your follow list private.
+                  {C.NOSTR_FOLLOW_GRAPH}
                 </p>
                 <div className="flex shrink-0">
                   <button
@@ -247,19 +308,59 @@ export function NetworkReachPanel() {
                     className={`label-ui toggle-chip ${publishFollowGraph === true ? 'toggle-chip-active' : 'toggle-chip-inactive'}`}
                     disabled={publishFollowGraph === null}
                   >
-                    On
+                    {C.TOGGLE_ON}
                   </button>
                   <button
                     onClick={() => setFollowGraph(false)}
                     className={`label-ui toggle-chip ${publishFollowGraph === false ? 'toggle-chip-active' : 'toggle-chip-inactive'}`}
                     disabled={publishFollowGraph === null}
                   >
-                    Off
+                    {C.TOGGLE_OFF}
                   </button>
                 </div>
               </div>
             )}
           </div>
+
+          {/* Findable by email — its own question, and OFF by default.
+              Deliberately NOT nested under the Nostr discovery toggle above:
+              publishing a profile to the public Nostr mesh and being findable by
+              the address you log in with are different things, and a member who
+              wants one has said nothing about the other. */}
+          <div>
+            <div className="flex items-center justify-between gap-4">
+              <div className="min-w-0 pr-6">
+                <p className="text-ui-sm text-black">{C.EMAIL_FINDABLE_TITLE}</p>
+                <p className="text-ui-xs text-grey-600 mt-1 leading-relaxed">
+                  {discoverableByEmail === null
+                    ? prefsUnread
+                    : discoverableByEmail
+                    ? C.EMAIL_FINDABLE_ON
+                    : C.EMAIL_FINDABLE_OFF}
+                </p>
+              </div>
+              <div className="flex shrink-0">
+                <button
+                  onClick={() => setEmailFindable(true)}
+                  className={`label-ui toggle-chip ${discoverableByEmail === true ? 'toggle-chip-active' : 'toggle-chip-inactive'}`}
+                  disabled={discoverableByEmail === null}
+                >
+                  {C.TOGGLE_ON}
+                </button>
+                <button
+                  onClick={() => setEmailFindable(false)}
+                  className={`label-ui toggle-chip ${discoverableByEmail === false ? 'toggle-chip-active' : 'toggle-chip-inactive'}`}
+                  disabled={discoverableByEmail === null}
+                >
+                  {C.TOGGLE_OFF}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {prefsWriteError && (
+            <p className="text-ui-xs text-crimson">{prefsWriteError}</p>
+          )}
 
           {/* Satellite networks — link yours, or (soon) concierge. */}
           {accounts === null ? (
@@ -281,13 +382,27 @@ export function NetworkReachPanel() {
                     <div className="min-w-0 pr-6">
                       <div className="flex items-center gap-2">
                         <p className="text-ui-sm text-black">{net.label}</p>
-                        {acct && !acct.isValid && <span className="label-ui text-red-600">Invalid</span>}
+                        {acct && !acct.isValid && <span className="label-ui text-red-600">{C.NETWORK_INVALID}</span>}
                       </div>
                       {acct ? (
-                        <p className="text-ui-sm text-grey-600 truncate mt-1">{acct.externalHandle ?? acct.externalId}</p>
+                        <>
+                          <p className="text-ui-sm text-grey-600 truncate mt-1">{acct.externalHandle ?? acct.externalId}</p>
+                          {acct.needsReconnect && acct.instanceUrl && (
+                            <p className="text-ui-xs text-grey-600 mt-1 leading-relaxed">
+                              {C.NETWORK_RECONNECT_NOTE}{' '}
+                              <button
+                                onClick={() => void handleReconnectMastodon(acct.instanceUrl!)}
+                                disabled={connecting}
+                                className="btn-text"
+                              >
+                                {connecting ? C.NETWORK_REDIRECTING : C.NETWORK_RECONNECT}
+                              </button>
+                            </p>
+                          )}
+                        </>
                       ) : (
                         <p className="text-ui-xs text-grey-600 mt-1 leading-relaxed">
-                          Cross-post your notes and replies to {net.label}.
+                          {C.networkCrossPostOffer(net.label)}
                         </p>
                       )}
                     </div>
@@ -301,7 +416,7 @@ export function NetworkReachPanel() {
                             onChange={() => handleToggleDefault(acct)}
                             className="cursor-pointer"
                           />
-                          <span className="label-ui text-grey-600">Default on</span>
+                          <span className="label-ui text-grey-600">{C.NETWORK_DEFAULT_ON}</span>
                         </label>
                         <label className="flex items-center gap-2 cursor-pointer">
                           <input
@@ -310,7 +425,7 @@ export function NetworkReachPanel() {
                             onChange={() => handleToggleShowOnProfile(acct)}
                             className="cursor-pointer"
                           />
-                          <span className="label-ui text-grey-600">Show on profile</span>
+                          <span className="label-ui text-grey-600">{C.NETWORK_SHOW_ON_PROFILE}</span>
                         </label>
                         {/* Follow-graph import for a linked presence (§7.2) —
                             only for protocols the server can read. Opt-in per
@@ -335,28 +450,28 @@ export function NetworkReachPanel() {
                               disabled={importBusy}
                               className="btn-text"
                             >
-                              Import follows
+                              {C.NETWORK_IMPORT_FOLLOWS}
                             </button>
                           )}
-                        <button onClick={() => handleDisconnect(acct.id)} className="btn-text-danger">
-                          Disconnect
+                        <button onClick={(e) => handleDisconnect(e, acct.id, net.label)} className="btn-text-danger">
+                          {C.NETWORK_DISCONNECT}
                         </button>
                       </div>
                     ) : (showConnect === net.key || showAssisted === net.key) ? null : (
                       <div className="flex items-center gap-4 shrink-0">
                         <button onClick={() => setShowConnect(net.key)} className="btn-text">
-                          Link yours
+                          {C.NETWORK_LINK_YOURS}
                         </button>
                         {assistedAvailable ? (
                           <button onClick={() => setShowAssisted(net.key)} className="btn-text">
-                            Set one up
+                            {C.NETWORK_SET_ONE_UP}
                           </button>
                         ) : (
                           <span
                             className="label-ui text-grey-300 cursor-not-allowed"
-                            title={`Coming soon: all.haus will set up a ${net.label} account for you.`}
+                            title={C.networkSetUpSoonTitle(net.label)}
                           >
-                            Set one up · soon
+                            {C.NETWORK_SET_ONE_UP_SOON}
                           </span>
                         )}
                       </div>
@@ -369,8 +484,8 @@ export function NetworkReachPanel() {
                   {!acct && showAssisted !== net.key && (
                     <p className="text-ui-xs text-grey-600 mt-2 leading-relaxed">
                       {assistedAvailable
-                        ? `Don't have a ${net.label} account? all.haus can set one up for you — you'll create a normal ${net.label} account that ${net.label} holds the keys to; all.haus just connects it.`
-                        : `Don't have a ${net.label} account? Soon all.haus will set one up for you — guiding you through ${net.label}'s own signup so the account is yours.`}
+                        ? C.networkAssistedAvailable(net.label)
+                        : C.networkAssistedComing(net.label)}
                     </p>
                   )}
 
@@ -404,10 +519,10 @@ export function NetworkReachPanel() {
                           disabled={connecting}
                           className="btn-text"
                         >
-                          {connecting ? 'Redirecting…' : `Create ${net.label} account`}
+                          {connecting ? C.NETWORK_REDIRECTING : C.networkCreateAccount(net.label)}
                         </button>
                         <button onClick={() => setShowAssisted(null)} className="btn-text-muted">
-                          Cancel
+                          {C.NETWORK_CANCEL}
                         </button>
                       </div>
                     </div>
@@ -416,44 +531,44 @@ export function NetworkReachPanel() {
                   {/* Link-yours OAuth form (per network) */}
                   {showConnect === net.key && net.key === 'mastodon' && (
                     <div className="pt-4">
-                      <p className="label-ui text-grey-600 mb-2">Mastodon instance</p>
+                      <p className="label-ui text-grey-600 mb-2">{C.MASTODON_INSTANCE_LABEL}</p>
                       <input
                         type="text"
                         value={instanceUrl}
                         onChange={e => setInstanceUrl(e.target.value)}
-                        placeholder="mastodon.social"
+                        placeholder={C.MASTODON_INSTANCE_PLACEHOLDER}
                         autoFocus
                         className="w-full bg-glasshouse-well px-4 py-2.5 text-sm text-black placeholder-grey-300 focus:outline-none max-w-sm"
                         onKeyDown={e => { if (e.key === 'Enter') void handleConnectMastodon() }}
                       />
                       <div className="flex gap-3 mt-3">
                         <button onClick={handleConnectMastodon} disabled={connecting || !instanceUrl.trim()} className="btn-text">
-                          {connecting ? 'Redirecting…' : 'Continue'}
+                          {connecting ? C.NETWORK_REDIRECTING : C.NETWORK_CONTINUE}
                         </button>
                         <button onClick={() => { setShowConnect(null); setInstanceUrl('') }} className="btn-text-muted">
-                          Cancel
+                          {C.NETWORK_CANCEL}
                         </button>
                       </div>
                     </div>
                   )}
                   {showConnect === net.key && net.key === 'bluesky' && (
                     <div className="pt-4">
-                      <p className="label-ui text-grey-600 mb-2">Bluesky handle</p>
+                      <p className="label-ui text-grey-600 mb-2">{C.BLUESKY_HANDLE_LABEL}</p>
                       <input
                         type="text"
                         value={blueskyHandle}
                         onChange={e => setBlueskyHandle(e.target.value)}
-                        placeholder="alice.bsky.social"
+                        placeholder={C.BLUESKY_HANDLE_PLACEHOLDER}
                         autoFocus
                         className="w-full bg-glasshouse-well px-4 py-2.5 text-sm text-black placeholder-grey-300 focus:outline-none max-w-sm"
                         onKeyDown={e => { if (e.key === 'Enter') void handleConnectBluesky() }}
                       />
                       <div className="flex gap-3 mt-3">
                         <button onClick={handleConnectBluesky} disabled={connecting || !blueskyHandle.trim()} className="btn-text">
-                          {connecting ? 'Redirecting…' : 'Continue'}
+                          {connecting ? C.NETWORK_REDIRECTING : C.NETWORK_CONTINUE}
                         </button>
                         <button onClick={() => { setShowConnect(null); setBlueskyHandle('') }} className="btn-text-muted">
-                          Cancel
+                          {C.NETWORK_CANCEL}
                         </button>
                       </div>
                     </div>
@@ -477,6 +592,7 @@ export function NetworkReachPanel() {
         </div>
 
         {error && <p className="text-ui-xs text-red-600 mt-4">{error}</p>}
+        {dialog}
     </>
   )
 }

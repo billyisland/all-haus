@@ -26,6 +26,7 @@
 import { useState } from 'react'
 import { useAuth } from '../../stores/auth'
 import { CardSetup } from '../payment/CardSetup'
+import { CARD_DECLINED_LABEL, CARD_DECLINED_BODY, CARD_DECLINED_AFTER, CARD_DECLINED_ACTION } from '../../content/ledger'
 
 export function CardActionRequired({
   since,
@@ -44,16 +45,14 @@ export function CardActionRequired({
       role="alert"
       className="mb-8 bg-glasshouse-well/40 p-5"
     >
-      <p className="label-ui text-crimson">Card declined</p>
+      <p className="label-ui text-crimson">{CARD_DECLINED_LABEL}</p>
 
       <p className="text-ui-sm text-black mt-2">
-        Your reading tab is paused. We could not take payment with the card on
-        file, so nothing further will be charged until you add a working one.
+        {CARD_DECLINED_BODY}
       </p>
 
       <p className="text-ui-xs text-grey-600 mt-2">
-        Anything you have already read stays on your tab and settles once a new
-        card is added. Your free allowance is unaffected.
+        {CARD_DECLINED_AFTER}
       </p>
 
       {attaching ? (
@@ -74,7 +73,7 @@ export function CardActionRequired({
           onClick={() => setAttaching(true)}
           className="btn-accent mt-4"
         >
-          Add a card
+          {CARD_DECLINED_ACTION}
         </button>
       )}
     </section>

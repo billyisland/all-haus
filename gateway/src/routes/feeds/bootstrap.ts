@@ -21,7 +21,7 @@ import { loadFeedItemsPage } from "./items.js";
 //
 // Shape mirrors the existing endpoints so the client maps it field-for-field:
 //   { feeds: WorkspaceFeed[],
-//     vessels: { [feedId]: { sources, items, nextCursor, placeholder } } }
+//     vessels: { [feedId]: { sources, items, nextCursor, placeholder, asOf } } }
 //
 // The per-vessel `items`/`nextCursor`/`placeholder` are exactly what GET
 // /feeds/:id/items returns (minus the redundant `feed`, already in `feeds`);
@@ -31,6 +31,12 @@ import { loadFeedItemsPage } from "./items.js";
 // =============================================================================
 
 const FIRST_PAGE_LIMIT = 20;
+
+/** How many feeds hydrate at once (CA-G8). Each runs its sources read beside
+ *  a page read of 3-4 sequential queries, so an unbounded fan-out over a
+ *  member with ten-plus feeds took the whole 20-slot pool for the duration and
+ *  queued every other request on the gateway behind one workspace load. */
+const BOOTSTRAP_CONCURRENCY = 4;
 
 export function registerFeedBootstrapRoutes(app: FastifyInstance) {
   app.get("/bootstrap", { preHandler: requireAuth }, async (req, reply) => {
@@ -45,37 +51,50 @@ export function registerFeedBootstrapRoutes(app: FastifyInstance) {
         items: unknown[];
         nextCursor: string | undefined;
         placeholder: boolean;
+        asOf: string;
       }
     > = {};
 
+    // A fixed set of workers pulling from one queue: at most
+    // BOOTSTRAP_CONCURRENCY feeds in flight, each failing alone.
+    const queue = [...feedRows];
+    const hydrate = async (feed: (typeof feedRows)[number]) => {
+      try {
+        const [sources, page] = await Promise.all([
+          loadFeedSources(feed.id),
+          loadFeedItemsPage(
+            ownerId,
+            feed.id,
+            feed.source_count,
+            undefined,
+            FIRST_PAGE_LIMIT,
+          ),
+        ]);
+        vessels[feed.id] = {
+          sources,
+          items: page.items,
+          nextCursor: page.nextCursor,
+          placeholder: page.placeholder,
+          asOf: page.asOf,
+        };
+      } catch (err) {
+        // Omit this feed's vessel payload; the client loads it lazily. One
+        // bad feed must not blank the whole workspace.
+        logger.error(
+          { err, feedId: feed.id, ownerId },
+          "Bootstrap vessel hydration failed",
+        );
+      }
+    };
     await Promise.all(
-      feedRows.map(async (feed) => {
-        try {
-          const [sources, page] = await Promise.all([
-            loadFeedSources(feed.id),
-            loadFeedItemsPage(
-              ownerId,
-              feed.id,
-              feed.source_count,
-              undefined,
-              FIRST_PAGE_LIMIT,
-            ),
-          ]);
-          vessels[feed.id] = {
-            sources,
-            items: page.items,
-            nextCursor: page.nextCursor,
-            placeholder: page.placeholder,
-          };
-        } catch (err) {
-          // Omit this feed's vessel payload; the client loads it lazily. One
-          // bad feed must not blank the whole workspace.
-          logger.error(
-            { err, feedId: feed.id, ownerId },
-            "Bootstrap vessel hydration failed",
-          );
-        }
-      }),
+      Array.from(
+        { length: Math.min(BOOTSTRAP_CONCURRENCY, queue.length) },
+        async () => {
+          for (let feed = queue.shift(); feed; feed = queue.shift()) {
+            await hydrate(feed);
+          }
+        },
+      ),
     );
 
     return reply.send({ feeds: feedRows.map(feedRowToResponse), vessels });

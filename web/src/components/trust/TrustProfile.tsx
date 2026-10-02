@@ -97,7 +97,7 @@ export function TrustProfile({ userId, compact = false }: TrustProfileProps) {
 
   if (loading)
     return (
-      <div className="text-ui-xs text-grey-600">Loading trust profile…</div>
+      <div className="text-ui-xs text-grey-600">Loading…</div>
     );
   if (error || !data) return null;
 

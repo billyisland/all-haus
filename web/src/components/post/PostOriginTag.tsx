@@ -7,6 +7,7 @@ import { InwardLink } from "../ui/InwardLink";
 import { PlatformResonance } from "./PostResonance";
 import { formatDateRelative } from "../../lib/format";
 import type { VesselPalette } from "../workspace/tokens";
+import { sourcePageId } from "../../lib/post/source-page";
 
 // =============================================================================
 // PostOriginTag — the provenance line (§4 matrix row): `VIA RSS · The Guardian →`
@@ -19,7 +20,8 @@ import type { VesselPalette } from "../workspace/tokens";
 //     (`/source/:id`) — `InwardLink` (components/ui): a real <Link>, so
 //     new-tab / copy-link work, with a plain left-click intercepted by
 //     `openSurfaceHref` so inside the workspace it re-roots the surface
-//     overlay in place rather than escaping (web/CLAUDE.md › The escape ban);
+//     overlay in place rather than escaping (`.claude/rules/web-overlays.md`
+//     › The escape ban);
 //   • the trailing `→` is the SINGLE route out to the content's original
 //     location (CARD-BEHAVIOUR-ADR §VI.4). Nothing else on a card leaves
 //     all.haus.
@@ -127,10 +129,9 @@ export function PostOriginTag({
   // (hydrated) row has its sourceName nulled by the mapper, so `community` is
   // already absent there and no link is offered for a source that isn't this
   // post's.
+  const sourceId = sourcePageId(post);
   const sourceHref =
-    community && post.externalSourceId
-      ? `/source/${encodeURIComponent(post.externalSourceId)}`
-      : undefined;
+    community && sourceId ? `/source/${encodeURIComponent(sourceId)}` : undefined;
   const originHref = originWebUrl(post);
   const time = showTime ? (
     <>
@@ -200,7 +201,13 @@ function TagText({
   return (
     <div
       className="font-mono text-[0.625rem] uppercase tracking-[0.06em] mt-2"
-      style={{ color: palette.cardMeta, cursor: dragHandle ? "grab" : undefined }}
+      // A handle has no break opportunity of its own, so a long one would
+      // run past the card's edge; `anywhere` lets it break there instead.
+      style={{
+        color: palette.cardMeta,
+        cursor: dragHandle ? "grab" : undefined,
+        overflowWrap: "anywhere",
+      }}
       data-card-drag-handle={dragHandle ? "" : undefined}
     >
       {children}

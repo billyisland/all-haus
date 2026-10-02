@@ -11,6 +11,7 @@
 
 import type { WorkspaceFeed } from '../../lib/api'
 import type { UseFollowImportRun } from '../../hooks/useFollowImportRun'
+import * as C from '../../content/networks'
 
 export function FollowImportStatus({
   starting,
@@ -29,19 +30,19 @@ export function FollowImportStatus({
   if (starting) {
     return (
       <p className="font-mono text-mono-xs text-grey-600">
-        READING FOLLOW LIST…
+        {C.IMPORT_READING}
       </p>
     )
   }
   if (!run) return null
 
   const processed = run.imported + run.skipped + run.failed
-  const feedName = feed?.name?.trim() || 'your new feed'
+  const feedName = feed?.name?.trim() || C.IMPORT_DEFAULT_FEED_NAME
 
   if (run.status === 'failed') {
     return (
       <p className="font-mono text-mono-xs text-red-600">
-        IMPORT FAILED{run.error ? ` — ${run.error}` : ''}
+        {C.importFailed(run.error)}
       </p>
     )
   }
@@ -50,25 +51,23 @@ export function FollowImportStatus({
     <div className="space-y-1">
       {run.status === 'done' ? (
         <p className="font-mono text-mono-xs text-grey-600">
-          IMPORTED {run.imported}
-          {run.skipped > 0 && ` · ${run.skipped} ALREADY PRESENT`}
-          {run.failed > 0 && ` · ${run.failed} FAILED`}
+          {C.importDone(run.imported, run.skipped, run.failed)}
         </p>
       ) : (
         <p className="font-mono text-mono-xs text-grey-600">
-          IMPORTING {processed}/{run.total}…
+          {C.importProgress(processed, run.total)}
         </p>
       )}
       <p className="text-ui-xs text-grey-600 leading-relaxed">
         {run.status === 'done'
-          ? `“${feedName}” is in your workspace — retune, redistribute, or delete it like any feed.`
-          : `Building “${feedName}” in your workspace — you can keep working while it fills.`}
+          ? C.importDoneSummary(feedName)
+          : C.importRunningSummary(feedName)}
         {run.truncated &&
-          ` Imported the most recent ${run.total} of ${run.remoteTotal} follows; the rest stay on the origin network.`}
+          C.importTruncated(run.total, run.remoteTotal)}
         {(run.unresolved ?? 0) > 0 &&
-          ` ${run.unresolved} follows couldn't be matched to an account and were skipped.`}
+          C.importUnresolved(run.unresolved!)}
         {run.protocol === 'nostr_external' &&
-          ' Names fill in over the next few minutes as profiles arrive from relays.'}
+          C.IMPORT_NOSTR_NAMES}
       </p>
     </div>
   )

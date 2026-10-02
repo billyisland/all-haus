@@ -10,7 +10,11 @@ import {
 } from "../../lib/api/linked-accounts";
 import { externalItems } from "../../lib/api/external-items";
 import { useSettingsOverlay } from "../../stores/settingsOverlay";
-import { isDarkPalette, type VesselPalette } from "./tokens";
+import { InlineReplyPanel } from "../post/InlineReplyPanel";
+import { useConfirm } from "../ui/ConfirmDialog";
+import { type VesselPalette } from "./tokens";
+import { externalReplyNotSent, networkName } from "../../content/conversation";
+import { failureSentence } from "../../lib/api/client";
 
 const PROTOCOL_LABELS: Record<string, string> = {
   atproto: "BLUESKY",
@@ -43,6 +47,7 @@ export function InlineReplyBox({
   const [assistedAvailable, setAssistedAvailable] = useState(false);
   const [assistedInstance, setAssistedInstance] = useState("mastodon.social");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const { ask, dialog } = useConfirm();
 
   // ASSISTED "set one up": Bluesky on Phase 2 (§6.1), Mastodon on Phase 3 (§9).
   // Gate on the server flags so the prompt stays "coming soon" when dark.
@@ -64,12 +69,21 @@ export function InlineReplyBox({
     };
   }, [protocol]);
 
-  async function handleAssisted() {
+  async function handleAssisted(e: React.MouseEvent<HTMLElement>) {
     const consent =
       protocol === "atproto"
         ? ASSISTED_BLUESKY_CONSENT
         : assistedMastodonConsent(assistedInstance);
-    if (!window.confirm(consent)) return;
+    // The dialog is rendered INSIDE the panel, not beside it: it portals, but
+    // React still bubbles its key events up the component tree, and the panel
+    // is what stops Enter/Space reaching the card's own handler.
+    const ok = await ask(e.currentTarget, {
+      title: protocol === "atproto" ? "Set up a Bluesky account?" : "Set up a Mastodon account?",
+      body: <span className="whitespace-pre-line">{consent}</span>,
+      confirmLabel: "Continue",
+      width: 340,
+    });
+    if (!ok) return;
     try {
       const { authorizeUrl } =
         protocol === "atproto"
@@ -77,15 +91,9 @@ export function InlineReplyBox({
           : await linkedAccounts.assistedMastodon();
       window.location.href = authorizeUrl;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to start setup");
+      setError(failureSentence(err, "Couldn’t start setting up the account. Please try again."));
     }
   }
-
-  // Inset-panel fill replaces the old thin grey borders (lines are banned
-  // sitewide). A dark wash reads on the light card, a light wash on the dark card.
-  const panelWash = isDarkPalette(palette)
-    ? "rgb(var(--ah-white-rgb) / 0.05)"
-    : "rgba(0,0,0,0.04)";
 
   useEffect(() => {
     textareaRef.current?.focus();
@@ -103,11 +111,20 @@ export function InlineReplyBox({
     setPublishing(true);
     setError(null);
     try {
-      await externalItems.reply(itemId, linkedAccount.id, content.trim());
+      const res = await externalItems.reply(itemId, linkedAccount.id, content.trim());
       onReplied();
+      if (res.crossPost === "not_sent") {
+        // Published here, never queued for the network — say so rather than
+        // closing as if it went. The text is cleared so a second press cannot
+        // publish the same reply twice.
+        setContent("");
+        setError(externalReplyNotSent(networkName(protocol)));
+        setPublishing(false);
+        return;
+      }
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to send reply");
+      setError(failureSentence(err, "Couldn’t send your reply. It’s still in the box, so please try again."));
       setPublishing(false);
     }
   }
@@ -123,74 +140,63 @@ export function InlineReplyBox({
     }
   }
 
+  const platformLabel = PROTOCOL_LABELS[protocol] ?? protocol.toUpperCase();
+
   if (!linkedAccount) {
     return (
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="mt-3 py-3 px-4 rounded"
-        style={{ background: panelWash }}
+      <InlineReplyPanel
+        palette={palette}
+        label={`Replying via ${platformLabel}`}
+        onClose={onClose}
       >
-        <p className="text-ui-xs" style={{ color: palette.cardStandfirst }}>
-          Connect your {PROTOCOL_LABELS[protocol] ?? protocol} account to reply.{" "}
-          <button
-            type="button"
-            onClick={() => useSettingsOverlay.getState().open()}
-            className="underline"
-            style={{ color: palette.cardTitle }}
-          >
-            Settings →
-          </button>
-        </p>
-        <p className="text-ui-xs mt-1" style={{ color: palette.cardMeta }}>
-          {assistedAvailable ? (
-            <>
-              Don&apos;t have one?{" "}
-              <button
-                type="button"
-                onClick={handleAssisted}
-                className="underline"
-                style={{ color: palette.cardTitle }}
-              >
-                all.haus can set one up for you →
-              </button>
-            </>
-          ) : (
-            <>Don&apos;t have one? all.haus can set one up for you — coming soon.</>
-          )}
-        </p>
-        {error && (
-          <p className="text-ui-xs mt-1" style={{ color: "var(--ah-crimson)" }}>
-            {error}
+        <div className="px-3 pb-3 pt-1">
+          <p className="text-ui-xs" style={{ color: palette.cardStandfirst }}>
+            To reply here, link your {networkName(protocol) ?? protocol} account.{" "}
+            <button
+              type="button"
+              onClick={() => useSettingsOverlay.getState().open()}
+              className="underline"
+              style={{ color: palette.cardTitle }}
+            >
+              Settings →
+            </button>
           </p>
-        )}
-      </div>
+          <p className="text-ui-xs mt-1" style={{ color: palette.cardMeta }}>
+            {assistedAvailable ? (
+              <>
+                Don&rsquo;t have one?{" "}
+                <button
+                  type="button"
+                  onClick={handleAssisted}
+                  className="underline"
+                  style={{ color: palette.cardTitle }}
+                >
+                  all.haus can set one up for you →
+                </button>
+              </>
+            ) : (
+              <>Don&rsquo;t have one? Soon, all.haus will be able to set one up for you.</>
+            )}
+          </p>
+          {error && (
+            <p className="text-ui-xs mt-1" style={{ color: "var(--ah-crimson)" }}>
+              {error}
+            </p>
+          )}
+          {dialog}
+        </div>
+      </InlineReplyPanel>
     );
   }
 
-  const platformLabel = PROTOCOL_LABELS[protocol] ?? protocol.toUpperCase();
   const remaining = MAX_CHARS - content.length;
 
   return (
-    <div
-      onClick={(e) => e.stopPropagation()}
-      className="mt-3 rounded overflow-hidden"
-      style={{ background: panelWash }}
+    <InlineReplyPanel
+      palette={palette}
+      label={`Replying via ${platformLabel}`}
+      onClose={onClose}
     >
-      <div className="px-3 pt-2 flex items-center justify-between">
-        <span className="label-ui" style={{ color: palette.cardMeta }}>
-          REPLYING VIA {platformLabel}
-        </span>
-        <button
-          type="button"
-          onClick={onClose}
-          className="text-[16px] leading-none transition-opacity hover:opacity-70"
-          style={{ color: palette.cardMeta }}
-          aria-label="Close reply"
-        >
-          ×
-        </button>
-      </div>
-
       <textarea
         ref={textareaRef}
         value={content}
@@ -236,6 +242,6 @@ export function InlineReplyBox({
           {publishing ? "SENDING…" : "REPLY"}
         </button>
       </div>
-    </div>
+    </InlineReplyPanel>
   );
 }

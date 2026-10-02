@@ -23,6 +23,30 @@ import {
   IndeterminateSlab,
 } from '../../../components/public/Field'
 import { usePublicPalette } from '../../../components/public/palette'
+import { TermsConsent } from '../../../components/legal/TermsConsent'
+import { auth as authApi } from '../../../lib/api/auth'
+import { mapSubscribeError } from '../../../lib/subscribe-errors'
+import { TERMS_PURPOSE, termsVersionMismatch, TERMS_ACCEPT_FAILED } from '../../../content/terms-consent'
+import {
+  OFFER_FOR_YOU_TITLE,
+  OFFER_FOR_YOU_BODY,
+  OFFER_FOR_YOU_ACTION,
+  OFFER_UNAVAILABLE_TITLE,
+  OFFER_SUBSCRIBED_TITLE,
+  offerSubscribedBody,
+  offerKind,
+  offerWriterLead,
+  offerWasPrice,
+  offerPrice,
+  offerDiscount,
+  offerTerms,
+  OFFER_SIGN_IN,
+  offerButton,
+  offerLookupMessage,
+  OFFER_LOAD_FAILED,
+  OFFER_RETRY,
+} from '../../../content/subscribe-offer'
+import { SUBSCRIBE_ACCEPT } from '../../../content/ledger'
 
 // =============================================================================
 // Offer redeem page — /subscribe/:code
@@ -44,6 +68,12 @@ import { usePublicPalette } from '../../../components/public/palette'
 // MIXED REGISTER: a member can redeem in place; a visitor is sent to log in
 // with a redirect back. Account creation is closed during the beta
 // (CLOSED-BETA-ADR D1), so there is no signup path from here.
+//
+// THE READER TERMS (§0z item 5). A card-holder who registered before the text
+// existed meets a 403 here, the same one the paywall gate meets; the consent
+// takes the button's card, REPLACING the button, and accepting re-sends the
+// press. The control is the house's one `TermsConsent`, wearing this
+// register's colours through its `tone` seam.
 // =============================================================================
 
 export default function RedeemOfferPage() {
@@ -55,6 +85,10 @@ export default function RedeemOfferPage() {
   const [offer, setOffer] = useState<OfferLookup | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // The lookup got no answer (network, 5xx) — an outage, not a refusal, so the
+  // page offers a retry rather than a way home.
+  const [lookupOutage, setLookupOutage] = useState(false)
+  const [lookupAttempt, setLookupAttempt] = useState(0)
   // A grant offer names one recipient, so a logged-out visitor cannot be
   // resolved and the lookup 401s (§1.10). That is the COMMON arrival — the
   // recipient following the link from their notification — so it gets its own
@@ -62,10 +96,14 @@ export default function RedeemOfferPage() {
   const [needsLogin, setNeedsLogin] = useState(false)
   const [subscribing, setSubscribing] = useState(false)
   const [success, setSuccess] = useState(false)
+  const [needsTerms, setNeedsTerms] = useState(false)
+  const [termsChecked, setTermsChecked] = useState(false)
+  const [acceptingTerms, setAcceptingTerms] = useState(false)
 
   useEffect(() => {
     void (async () => {
       setLoading(true)
+      setLookupOutage(false)
       try {
         const result = await subscriptionOffers.lookup(params.code)
         setOffer(result)
@@ -74,9 +112,13 @@ export default function RedeemOfferPage() {
         if ((err as { status?: number })?.status === 401) {
           setNeedsLogin(true)
         } else {
-          setError(
-            err instanceof Error ? err.message : 'This offer is not available.',
-          )
+          // By STATUS, never `err.message` (CA-E2): an `ApiError` is an Error
+          // whose message is `API error 404: {"error":…}`, and that rendered
+          // on the page. A 404 is worded here, a 410 carries the route's own
+          // sentence, and anything else is an outage with a retry.
+          const mapped = offerLookupMessage(err)
+          setError(mapped.body)
+          setLookupOutage(mapped.outage)
         }
       } finally {
         setLoading(false)
@@ -85,7 +127,7 @@ export default function RedeemOfferPage() {
     // Not keyed on auth: the lookup carries the session cookie whether or not
     // the auth store has resolved yet, so the gateway already sees the viewer
     // on the first call. Logging in remounts this page anyway.
-  }, [params.code])
+  }, [params.code, lookupAttempt])
 
   async function handleSubscribe() {
     if (!offer || !user) return
@@ -96,18 +138,45 @@ export default function RedeemOfferPage() {
       setSuccess(true)
       setTimeout(() => router.push(`/${offer.writerUsername}`), 2000)
     } catch (err) {
-      // 402 card_required: subscriptions charge the reading tab, which needs a
-      // card on file to be collectable.
-      const status = (err as { status?: number })?.status
-      setError(
-        status === 402
-          ? 'Add a payment card in Settings before subscribing.'
-          : err instanceof Error
-            ? err.message
-            : 'Failed to subscribe. Please try again.',
-      )
+      // One mapper for every subscribe surface (lib/subscribe-errors.ts) —
+      // this used to read ANY 402 as "add a card", which is wrong for the
+      // card-holder whose card declined, and render `err.message`, which on an
+      // ApiError is the raw "API error 410: {…}" string.
+      const view = mapSubscribeError(err)
+      if (view.needsTerms) {
+        setNeedsTerms(true)
+        return
+      }
+      setError(view.message)
     } finally {
       setSubscribing(false)
+    }
+  }
+
+  // Accept, then resume the press — the paywall gate's shape. The version is
+  // the server's own `current`; `/auth/me` is refreshed before the retry; a
+  // refused acceptance is shown and the reader is asked again.
+  async function handleAcceptTerms() {
+    const version = user?.terms.reader.current
+    if (!version) return
+    setAcceptingTerms(true)
+    setError(null)
+    try {
+      await authApi.acceptTerms('reader', version)
+      await useAuth.getState().fetchMe()
+      setNeedsTerms(false)
+      setTermsChecked(false)
+      await handleSubscribe()
+    } catch (err) {
+      const code = (err as { body?: { error?: string } })?.body?.error
+      setError(
+        code === 'terms_version_mismatch'
+          ? termsVersionMismatch('reader')
+          : TERMS_ACCEPT_FAILED,
+      )
+      await useAuth.getState().fetchMe()
+    } finally {
+      setAcceptingTerms(false)
     }
   }
 
@@ -116,7 +185,7 @@ export default function RedeemOfferPage() {
       <PublicShell>
         <PublicVessel>
           <PublicCard style={{ padding: 0 }}>
-            <IndeterminateSlab label="Loading offer" />
+            <IndeterminateSlab />
           </PublicCard>
         </PublicVessel>
       </PublicShell>
@@ -128,20 +197,19 @@ export default function RedeemOfferPage() {
       <PublicShell>
         <PublicVessel>
           <PublicCard>
-            <PublicTitle>This one’s addressed to you</PublicTitle>
+            <PublicTitle>{OFFER_FOR_YOU_TITLE}</PublicTitle>
             <div style={{ marginTop: 10 }}>
               <PublicBody>
-                It’s a gift subscription for a particular account. Log in and
-                we’ll show you what it is.
+                {OFFER_FOR_YOU_BODY}
               </PublicBody>
             </div>
           </PublicCard>
           <PublicCard>
             <PublicButton
               full
-              href={`/auth?mode=login&redirect=${encodeURIComponent(`/subscribe/${params.code}`)}`}
+              href="/auth?mode=login"
             >
-              Log in to view
+              {OFFER_FOR_YOU_ACTION}
             </PublicButton>
           </PublicCard>
         </PublicVessel>
@@ -154,9 +222,17 @@ export default function RedeemOfferPage() {
       <PublicShell>
         <PublicVessel>
           <PublicCard>
-            <PublicTitle>This offer isn’t available</PublicTitle>
+            <PublicTitle>{lookupOutage ? OFFER_LOAD_FAILED : OFFER_UNAVAILABLE_TITLE}</PublicTitle>
             <div style={{ marginTop: 10 }}>
-              <PublicBody>{error}</PublicBody>
+              <PublicBody>
+                {lookupOutage ? (
+                  <PublicLink onClick={() => setLookupAttempt((n) => n + 1)}>
+                    {OFFER_RETRY}
+                  </PublicLink>
+                ) : (
+                  error
+                )}
+              </PublicBody>
             </div>
           </PublicCard>
           <PublicCard>
@@ -171,8 +247,6 @@ export default function RedeemOfferPage() {
 
   if (!offer) return null
 
-  const standardDisplay = `\u00A3${(offer.standardPricePence / 100).toFixed(2)}`
-  const discountedDisplay = `\u00A3${(offer.discountedPricePence / 100).toFixed(2)}`
   const isFree = offer.discountedPricePence === 0
   const writerName = offer.writerDisplayName ?? offer.writerUsername
 
@@ -181,10 +255,10 @@ export default function RedeemOfferPage() {
       <PublicShell>
         <PublicVessel>
           <PublicCard>
-            <PublicTitle>Subscribed.</PublicTitle>
+            <PublicTitle>{OFFER_SUBSCRIBED_TITLE}</PublicTitle>
             <div style={{ marginTop: 10 }}>
               <PublicBody>
-                You’re subscribed to {writerName}. Taking you to their profile.
+                {offerSubscribedBody(writerName)}
               </PublicBody>
             </div>
           </PublicCard>
@@ -201,12 +275,12 @@ export default function RedeemOfferPage() {
             className="label-ui"
             style={{ color: palette.cardMeta, marginBottom: 12 }}
           >
-            {offer.mode === 'grant' ? 'A gift for you' : 'Subscription offer'}
+            {offerKind(offer)}
           </div>
           <PublicTitle>{offer.label}</PublicTitle>
           <div style={{ marginTop: 10 }}>
             <PublicBody>
-              {offer.mode === 'grant' ? 'From ' : 'Subscribe to '}
+              {offerWriterLead(offer)}
               <ProfileLink
                 href={`/${offer.writerUsername}`}
                 className="underline underline-offset-4"
@@ -236,24 +310,24 @@ export default function RedeemOfferPage() {
                   textDecoration: 'line-through',
                 }}
               >
-                {standardDisplay}/mo
+                {offerWasPrice(offer)}
               </span>
             )}
             <span
               className="font-serif font-medium tracking-tight"
               style={{ fontSize: 34, lineHeight: 1, color: palette.cardTitle }}
             >
-              {isFree ? 'Free' : `${discountedDisplay}/mo`}
+              {offerPrice(offer)}
             </span>
-            <span className="label-ui" style={{ color: palette.crimson }}>
-              {offer.discountPct}% off
-            </span>
+            {!offer.isComp && (
+              <span className="label-ui" style={{ color: palette.crimson }}>
+                {offerDiscount(offer)}
+              </span>
+            )}
           </div>
           <div style={{ marginTop: 14 }}>
             <PublicBody>
-              {offer.durationMonths
-                ? `Discounted rate for ${offer.durationMonths} month${offer.durationMonths > 1 ? 's' : ''}, then ${standardDisplay}/mo.`
-                : 'Permanent rate.'}
+              {offerTerms(offer)}
             </PublicBody>
           </div>
         </PublicCard>
@@ -264,17 +338,34 @@ export default function RedeemOfferPage() {
           {!user ? (
             <PublicButton
               full
-              href={`/auth?mode=login&redirect=${encodeURIComponent(`/subscribe/${params.code}`)}`}
+              href="/auth?mode=login"
             >
-              Log in to subscribe
+              {OFFER_SIGN_IN}
             </PublicButton>
+          ) : needsTerms ? (
+            <>
+              <TermsConsent
+                kind="reader"
+                checked={termsChecked}
+                onChange={setTermsChecked}
+                purpose={TERMS_PURPOSE.subscribe}
+                state={user.terms.reader}
+                disabled={acceptingTerms}
+                tone={{ text: palette.cardStandfirst, link: palette.cardTitle }}
+              />
+              <PublicButton
+                full
+                disabled={!termsChecked || acceptingTerms || subscribing}
+                onClick={handleAcceptTerms}
+              >
+                {acceptingTerms || subscribing ? 'Subscribing…' : SUBSCRIBE_ACCEPT}
+              </PublicButton>
+            </>
           ) : (
             <PublicButton full disabled={subscribing} onClick={handleSubscribe}>
               {subscribing
                 ? 'Subscribing…'
-                : isFree
-                  ? 'Subscribe for free'
-                  : `Subscribe for ${discountedDisplay}/mo`}
+                : offerButton(offer)}
             </PublicButton>
           )}
         </PublicCard>

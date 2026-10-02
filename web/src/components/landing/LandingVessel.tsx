@@ -1,6 +1,8 @@
 'use client'
 
-import type { CSSProperties } from 'react'
+import { useRef, type CSSProperties } from 'react'
+import Link from 'next/link'
+import { useForwardedWheel } from '../../hooks/useForwardedWheel'
 import { paletteFor } from '../workspace/tokens'
 import { LIGHT_ISLAND_STYLE } from '../../lib/palette/island'
 import { useResolvedDark } from '../../stores/colorScheme'
@@ -57,8 +59,21 @@ import { ReaderDemo } from './demos/ReaderDemo'
 // hydration. Change wall thickness or padding THERE. What stays here is the
 // palette-derived wall colour, handed to the CSS as `--ah-landing-wall`.
 //
-// NO CALL TO ACTION IN HERE. The waiting-list button lives once, in the nav row,
-// where it is on screen for the whole page rather than only at the foot of it.
+// NO CALL TO ACTION IN HERE — no BUTTON, that is. The waiting-list button lives
+// once, in the nav row, where it is on screen for the whole page rather than
+// only at the foot of it, and it stays the accessible route. What the column
+// gained (2026-09-14, at the operator's request) is two POINTER affordances on
+// things that were already there: the three demos and the closing ∀ coda go to
+// `/waitlist` when clicked. A visitor who clicks the picture of the thing is
+// asking for the thing. Both are `aria-hidden` + `tabIndex={-1}` — see
+// LandingFigure's header for why a duplicate control takes neither a name nor a
+// tab stop.
+//
+// AND THE WHEEL IS FORWARDED FROM ANYWHERE ON THE PAGE — `useForwardedWheel`,
+// shared with PublicVessel, which has the same fitted chassis and had the same
+// dead floor around it. Its header carries the rule and the arithmetic. Touch
+// needs no equivalent: on mobile the column runs the full viewport width and the
+// finger is already on it.
 //
 // THE SCROLL EARNS ITS KEEP: sell text, then a SHOWCASE of three DEMOS, then a
 // closing CODA (the ∀ disc + the motto 'FOR ALL', centred) that ends the column.
@@ -129,6 +144,9 @@ import { ReaderDemo } from './demos/ReaderDemo'
 
 const GAP = 12 // inter-card gap
 
+/** Where a click on a demo or on the closing mark goes. */
+const WAITLIST_HREF = '/waitlist'
+
 /** Which demo a figure mounts. Copy for each lives in page.tsx. */
 export type FigureKey = 'canvas' | 'omnivore' | 'reader'
 
@@ -155,6 +173,10 @@ export function LandingVessel({
 }: LandingVesselProps) {
   const globalDark = useResolvedDark()
   const palette = paletteFor('basic', globalDark)
+
+  // The one moving part, addressed so the whole window can drive it.
+  const scrollRef = useRef<HTMLDivElement>(null)
+  useForwardedWheel(scrollRef)
 
   // A ⊔ frame that fills its flex parent and clips its overflow. Both frames use
   // it — outer and inner. The WALL THICKNESS AND PADDING ARE NOT HERE: they are
@@ -202,6 +224,7 @@ export function LandingVessel({
             marker, which is now the sitewide default rather than this column's
             own opt-out (globals.css); wheel / touch / keyboard are unaffected. */}
         <div
+          ref={scrollRef}
           style={{
             flex: 1,
             minHeight: 0,
@@ -286,6 +309,7 @@ export function LandingVessel({
                 palette={palette}
                 caption={figure.caption}
                 description={figure.description}
+                href={WAITLIST_HREF}
               >
                 {demoFor(figure.key)}
               </LandingFigure>
@@ -295,7 +319,10 @@ export function LandingVessel({
           {/* Closing coda — the mark, then the motto. Ends the scroll. Its own
               padding (not the shared `card` spread) so it can breathe as a
               finale. */}
-          <div
+          <Link
+            href={WAITLIST_HREF}
+            aria-hidden="true"
+            tabIndex={-1}
             style={{
               background: palette.cardBg,
               padding: '40px 20px',
@@ -303,6 +330,8 @@ export function LandingVessel({
               flexDirection: 'column',
               alignItems: 'center',
               gap: 18,
+              cursor: 'pointer',
+              textDecoration: 'none',
             }}
           >
             <ForallDisc size={64} />
@@ -316,7 +345,7 @@ export function LandingVessel({
             >
               &lsquo;FOR ALL&rsquo;
             </span>
-          </div>
+          </Link>
         </div>
       </div>
     </div>

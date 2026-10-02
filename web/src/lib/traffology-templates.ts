@@ -87,7 +87,7 @@ export function renderObservation(obs: Observation): RenderedObservation {
       html = subscriberConversion(v)
       break
     default:
-      html = `<span>${escapeHtml(obs.observation_type)}: ${escapeHtml(JSON.stringify(v))}</span>`
+      html = `<span>${esc(obs.observation_type)}: ${esc(JSON.stringify(v))}</span>`
   }
 
   return {
@@ -109,10 +109,10 @@ export function renderObservation(obs: Observation): RenderedObservation {
 function firstDaySummary(v: Record<string, any>): string {
   const readers = fmtNum(v.readers)
   const comparison = v.comparison
-    ? `, ${v.comparison} than usual`
+    ? `, ${esc(v.comparison)} than usual`
     : ''
   const topSource = v.topSource && v.topSourcePct
-    ? ` ${v.topSource} sent the most (${v.topSourcePct}%).`
+    ? ` ${esc(v.topSource)} sent the most (${esc(v.topSourcePct)}%).`
     : ''
   return `${em(v.title)} had ${readers} readers on its first day${comparison}.${topSource}`
 }
@@ -122,12 +122,12 @@ function anomaly(v: Record<string, any>): string {
 }
 
 function sourceNew(v: Record<string, any>): string {
-  return `A new source appeared \u2014 ${escapeHtml(v.sourceName)} has sent ${fmtNum(v.readers)} readers to ${em(v.title)}.`
+  return `A new source appeared \u2014 ${esc(v.sourceName)} has sent ${fmtNum(v.readers)} readers to ${em(v.title)}.`
 }
 
 function sourceBreakdown(v: Record<string, any>): string {
   const parts = (v.breakdown as Array<{ name: string; pct: number }>)
-    .map(s => `${escapeHtml(s.name)} (${s.pct}%)`)
+    .map(s => `${esc(s.name)} (${esc(s.pct)}%)`)
   const list = parts.length <= 2
     ? parts.join(' and ')
     : parts.slice(0, -1).join(', ') + ', and ' + parts[parts.length - 1]
@@ -135,41 +135,41 @@ function sourceBreakdown(v: Record<string, any>): string {
 }
 
 function sourceShift(v: Record<string, any>): string {
-  return `The main source of readers for ${em(v.title)} has shifted from ${escapeHtml(v.fromSource)} to ${escapeHtml(v.toSource)}. ${escapeHtml(v.toSource)} now accounts for ${v.pct}% of all readers.`
+  return `The main source of readers for ${em(v.title)} has shifted from ${esc(v.fromSource)} to ${esc(v.toSource)}. ${esc(v.toSource)} now accounts for ${esc(v.pct)}% of all readers.`
 }
 
 function sourceFamiliar(v: Record<string, any>): string {
   const above = v.aboveUsual ? ' That\u2019s higher than usual from this source.' : ''
-  return `${escapeHtml(v.sourceName)} sent ${fmtNum(v.readers)} readers to ${em(v.title)}.${above}`
+  return `${esc(v.sourceName)} sent ${fmtNum(v.readers)} readers to ${em(v.title)}.${above}`
 }
 
 function milestoneReaders(v: Record<string, any>): string {
   const count = fmtNum(v.totalReaders)
-  const rank = v.rankClause ? `, which makes it ${v.rankClause}` : ''
+  const rank = v.rankClause ? `, which makes it ${esc(v.rankClause)}` : ''
   return `${em(v.title)} has now been read ${count} times${rank}.`
 }
 
 function milestoneGeo(v: Record<string, any>): string {
-  return `${em(v.title)} has been read in ${escapeHtml(v.country)} \u2014 that\u2019s a first for you.`
+  return `${em(v.title)} has been read in ${esc(v.country)} \u2014 that\u2019s a first for you.`
 }
 
 function milestoneLongevity(v: Record<string, any>): string {
-  return `${em(v.title)} is still drawing readers ${fmtNum(v.daysAfter)} days after publication \u2014 ${fmtNum(v.weekReaders)} readers in the last week. Most of your pieces go quiet after ${v.typicalLifespan}.`
+  return `${em(v.title)} is still drawing readers ${fmtNum(v.daysAfter)} days after publication \u2014 ${fmtNum(v.weekReaders)} readers in the last week. Most of your pieces go quiet after ${esc(v.typicalLifespan)}.`
 }
 
 function anomalyLateSpike(v: Record<string, any>): string {
-  const source = v.topSource ? `, mostly from ${escapeHtml(v.topSource)}` : ''
+  const source = v.topSource ? `, mostly from ${esc(v.topSource)}` : ''
   return `${em(v.title)}, published ${fmtNum(v.daysAgo)} days ago, is getting traffic again \u2014 ${fmtNum(v.readers)} readers today${source}.`
 }
 
 function anomalyReadingTime(v: Record<string, any>): string {
   const dir = v.direction === 'high' ? 'more' : 'less'
-  return `Readers are spending ${dir} time on ${em(v.title)} than usual. Average reading time is ${v.actual} minutes; your usual is around ${v.baseline} minutes.`
+  return `Readers are spending ${dir} time on ${em(v.title)} than usual. Average reading time is ${esc(v.actual)} minutes; your usual is around ${esc(v.baseline)} minutes.`
 }
 
 function anomalyScrollDepth(v: Record<string, any>): string {
   const dir = v.direction === 'high' ? 'further' : 'less far'
-  return `Readers are scrolling ${dir} through ${em(v.title)} than usual. Average scroll depth is ${v.actual}%; your usual is around ${v.baseline}%.`
+  return `Readers are scrolling ${dir} through ${em(v.title)} than usual. Average scroll depth is ${esc(v.actual)}%; your usual is around ${esc(v.baseline)}%.`
 }
 
 function arrivalCurrent(v: Record<string, any>): string {
@@ -184,7 +184,7 @@ function arrivalCurrent(v: Record<string, any>): string {
 
 function arrivalNone(v: Record<string, any>): string {
   const lastReader = v.lastReaderAgo
-    ? ` Your last reader was ${v.lastReaderAgo}.`
+    ? ` Your last reader was ${esc(v.lastReaderAgo)}.`
     : ''
   return `No one reading right now.${lastReader}`
 }
@@ -195,14 +195,14 @@ function subscriberNew(v: Record<string, any>): string {
   const s = v.count === 1 ? 'subscriber' : 'subscribers'
   const when = v.when ?? 'today'
   const from = v.topPiece ? ` Most signed up from ${em(v.topPiece)}.` : ''
-  return `${count} new ${type} ${s} ${when}.${from}`
+  return `${count} new ${type} ${s} ${esc(when)}.${from}`
 }
 
 function subscriberLost(v: Record<string, any>): string {
   const count = fmtNum(v.count)
   const s = v.count === 1 ? 'subscriber' : 'subscribers'
   const when = v.when ?? 'today'
-  return `${count} paying ${s} cancelled ${when}. You now have ${fmtNum(v.remaining)} paying subscribers.`
+  return `${count} paying ${s} cancelled ${esc(when)}. You now have ${fmtNum(v.remaining)} paying subscribers.`
 }
 
 function subscriberConversion(v: Record<string, any>): string {
@@ -213,8 +213,8 @@ function subscriberConversion(v: Record<string, any>): string {
 // Formatting helpers
 // =============================================================================
 
-function em(title: string): string {
-  return `<em>${escapeHtml(title)}</em>`
+function em(title: unknown): string {
+  return `<em>${esc(title)}</em>`
 }
 
 /** Format number: words below 10, numerals above */
@@ -225,12 +225,37 @@ function fmtNum(n: number): string {
   return n.toLocaleString('en-GB')
 }
 
-function escapeHtml(s: string): string {
-  return s
+/**
+ * The one escaper for this file, applied to EVERY interpolation of a value that
+ * came out of `observation_data` (MIRROR-AUDIT §3 *Security*, S16).
+ *
+ * `firstDaySummary` interpolated a referrer-derived source name raw into a
+ * string that becomes `innerHTML`, so a referring host was a stored-XSS sink on
+ * the writer's own dashboard. Escaping is the correct treatment for a name — a
+ * sanitiser allow-list is not, because none of this was ever meant to be markup;
+ * the templates own the only tags here (`<em>`, `<span>`), which is why `em()`
+ * escapes its argument and THEN wraps it. Every other `v.*` interpolation is
+ * escaped too, not just the one that was live: `v` is untyped JSON off
+ * `traffology_observations.observation_data`, so which fields carry third-party
+ * text is a property of a generator that is currently parked and will be
+ * rewritten. A field-by-field judgement would have to be re-made every time it
+ * gains a field, and would be silently wrong the once.
+ *
+ * Non-strings pass through `String()` rather than being trusted: a numeric
+ * field's type is the generator's promise, not a guarantee, and `null` reaching
+ * `.replace` would throw inside a render.
+ *
+ * Five metacharacters, matching `shared/src/lib/text.ts::escapeHtml`. It is not
+ * imported from there because `web/` does not depend on `shared/`; the apostrophe
+ * arm was missing here, which mattered the moment an attribute context appeared.
+ */
+function esc(s: unknown): string {
+  return String(s ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
 }
 
 // =============================================================================

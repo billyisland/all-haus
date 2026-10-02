@@ -119,6 +119,10 @@ export interface SubscriptionOffer {
   redemptionCount: number
   expiresAt: string | null
   revoked: boolean
+  /** A comp: free, one calendar year, and it does not renew. Not a discount —
+   *  a 100%-off offer looks identical here and renews at full price after its
+   *  discounted months (migration 193). */
+  isComp: boolean
   createdAt: string
 }
 
@@ -131,6 +135,8 @@ export interface OfferLookup {
    * treat it as "a gift for you" without re-checking anything.
    */
   mode: 'code' | 'grant'
+  /** See SubscriptionOffer.isComp — the page must say what is being accepted. */
+  isComp: boolean
   discountPct: number
   durationMonths: number | null
   writerId: string
@@ -166,17 +172,7 @@ export const subscriptionOffers = {
     }),
 
   lookup: (code: string) =>
-    request<OfferLookup>(`/subscription-offers/redeem/${code}`),
-}
-
-export function subscribe(writerId: string, opts?: { period?: string; offerCode?: string }) {
-  return request<{ subscriptionId: string; status: string; pricePence: number; currentPeriodEnd?: string; writerName?: string }>(
-    `/subscriptions/${writerId}`,
-    {
-      method: 'POST',
-      body: JSON.stringify({ period: opts?.period, offerCode: opts?.offerCode }),
-    }
-  )
+    request<OfferLookup>(`/subscription-offers/redeem/${encodeURIComponent(code)}`),
 }
 
 // =============================================================================

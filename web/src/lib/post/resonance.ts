@@ -13,7 +13,7 @@ import type { Post } from "./types";
 // glance ("big for them, notable for Bluesky").
 //
 // Two independent axes, each with its own stored column:
-//   author   → feed_items.resonance_band  (0-3, dialled at 2.5/4/6)
+//   author   → feed_items.resonance_band  (0-3, dialled at 1.8/3/5)
 //   platform → feed_items.ambient_pctl    (0..1, 0.5 = network median, 0.9 = p90)
 //
 // Neither gates the other. A card can carry both marks, one, or neither — a

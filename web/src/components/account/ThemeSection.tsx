@@ -53,8 +53,8 @@ export function ThemeSection() {
     <div className="bg-glasshouse-well px-6 py-5">
       <p className="label-ui text-grey-400 mb-4">Theme</p>
       <p className="text-ui-xs text-grey-600 mb-4 leading-relaxed">
-        Sitewide colour preset. Each feed&rsquo;s own colour scheme is picked in
-        its feed composer; this sets the ground everything else sits on.
+        Sitewide colour preset. Each channel&rsquo;s own colour scheme is picked in
+        its channel composer; this sets the ground everything else sits on.
       </p>
       <div className="flex flex-wrap gap-3">
         {PRESET_THEMES.map((theme) => {

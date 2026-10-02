@@ -3,11 +3,14 @@ import { parseCursorEpoch } from "./cursor.js";
 // =============================================================================
 // Shared feed SQL — the candidate-gathering SELECT/JOINs over feed_items plus
 // the keyset cursor parser, reused by every read path that projects feed_items:
-//   post-feed.ts   (GET /feed/:feedId   — Post-model timeline)
-//   post-thread.ts (GET /thread/:postId — Post-model thread)
-//   sources.ts     (GET /sources/:id    — source surface, Post[])
-//   author.ts      (GET /author/:id/... — author surface, Post[])
-//   tags.ts        (GET /tags/:name/... — tag surface, Post[])
+//   feeds/items.ts  (GET /workspace/feeds/:id/items — the workspace timeline)
+//   post-thread.ts  (GET /thread/:postId — Post-model thread)
+//   sources.ts      (GET /sources/:id    — source surface, Post[])
+//   author.ts       (GET /author/:id/... — author surface, Post[])
+//   tags.ts         (GET /tags/:name/... — tag surface, Post[])
+//   reading-log.ts  (GET /me/reading-log — the reader's own log)
+// (This list used to head with `post-feed.ts`, the legacy reach-dial
+// `GET /feed/:feedId`, deleted with the feed-derived-subscriptions change.)
 //
 // Extracted from the retired legacy `GET /feed` handler (timeline.ts, deleted
 // in FEED-RETIREMENT-PLAN Slice 6). The legacy row→response mapper
@@ -66,7 +69,7 @@ export const FEED_SELECT = `
   acc.nostr_pubkey AS nostr_pubkey,
   -- Article-specific (NULL for non-articles)
   a.nostr_d_tag, a.access_mode, a.price_pence, a.gate_position_pct,
-  a.content_free, a.summary AS a_summary, a.size_tier,
+  a.content_free, a.summary AS a_summary,
   -- The publication the article was published IN (BYLINE-AND-PROVENANCE-ADR
   -- D8): a native card's provenance line reads VIA ALL.HAUS · <Publication>,
   -- because the publication is the thing the reader subscribed to — the same
@@ -89,6 +92,19 @@ export const FEED_SELECT = `
   n.quoted_excerpt, n.quoted_title, n.quoted_author,
   n.quoted_post_id, n.quoted_url, n.quoted_source,
   n.external_parent_id,
+  -- Comment-specific (NULL for non-comments) — a native reply, which lives in
+  -- the comments table and is projected through the ONE home for that shape
+  -- (post-mapper.ts::commentToPost). The columns are exactly that function's
+  -- CommentRow: its own content and row id, the conversation ROOT it is
+  -- addressed to (event id + the kind the insert RESOLVED), and the parent
+  -- remark it nests under. cmp is LEFT-joined because a top-level reply has
+  -- no parent comment — NULL there means "hangs off the root", which is what
+  -- commentToPost reads it as (parent_post_id, else the root's post_id).
+  cm.id AS cm_id, cm.content AS cm_content,
+  cm.parent_comment_id AS cm_parent_comment_id,
+  cm.target_event_id AS cm_target_event_id, cm.target_kind AS cm_target_kind,
+  cm.deleted_at AS cm_deleted_at,
+  cmp.nostr_event_id AS cmp_nostr_event_id,
   -- External-specific (NULL for non-external)
   ei.author_name AS ei_author_name, ei.author_handle AS ei_author_handle,
   ei.author_uri AS ei_author_uri,
@@ -97,10 +113,18 @@ export const FEED_SELECT = `
   ei.source_reply_uri AS ei_source_reply_uri,
   ei.source_quote_uri AS ei_source_quote_uri,
   ei.content_warning AS ei_content_warning,
+  -- The item's public web PERMALINK where the ingester knew one, which is NOT
+  -- fi.source_item_uri: that is the stable identity, and for RSS it is
+  -- the guid falling back to the link, and a guid is under no obligation
+  -- to be a URL at all. See
+  -- PostOrigin.webUrl.
+  ei.canonical_url AS ei_canonical_url,
   ei.interaction_data AS ei_interaction_data,
   ei.like_count AS ei_like_count, ei.reply_count AS ei_reply_count,
   ei.repost_count AS ei_repost_count,
   xs.display_name AS source_display_name, xs.avatar_url AS source_avatar_url,
+  -- Half of whether GET /sources/:id serves this row (PostOrigin.sourceBrowsable).
+  xs.is_active AS source_is_active,
   -- Is this row's source_id INHERITED rather than owned? A context-only row was
   -- minted by thread/profile hydration and anchored on the HYDRATING FOCAL's
   -- source (EXTERNAL-AUTHOR-HISTORY-ADR §4.2), so xs.display_name names the
@@ -127,6 +151,8 @@ export const FEED_JOINS = `
   LEFT JOIN articles a ON a.id = fi.article_id
   LEFT JOIN publications pub ON pub.id = a.publication_id
   LEFT JOIN notes n ON n.id = fi.note_id
+  LEFT JOIN comments cm ON cm.id = fi.comment_id
+  LEFT JOIN comments cmp ON cmp.id = cm.parent_comment_id
   LEFT JOIN accounts acc ON acc.id = fi.author_id
   LEFT JOIN external_items ei ON ei.id = fi.external_item_id
   LEFT JOIN external_sources xs ON xs.id = fi.source_id

@@ -1,13 +1,20 @@
 import type { Task } from "graphile-worker";
 import { pool } from "@platform-pub/shared/db/client.js";
 import { safeFetch } from "@platform-pub/shared/lib/http-client.js";
+import { httpUrlOrNull } from "@platform-pub/shared/lib/sanitize.js";
 import logger from "@platform-pub/shared/lib/logger.js";
+import { nostrEngagementCountsEnabled } from "@platform-pub/shared/lib/env.js";
+import { parseTimestampCursor } from "@platform-pub/shared/lib/timestamp-cursor.js";
 import { getPlatformConfig } from "../lib/platform-config.js";
 import { fetchNostrEngagementCounts } from "../lib/nostr-relay.js";
 import {
   loadResonanceParams,
   updateExternalResonance,
 } from "../lib/resonance.js";
+import {
+  extractMastodonStatusId,
+  readMastodonStatus,
+} from "@platform-pub/shared/lib/mastodon-api.js";
 
 // =============================================================================
 // external_engagement_refresh — periodic snapshot of engagement counts
@@ -47,11 +54,6 @@ const DAILY_REFRESH_HOUR_UTC = 4;
 // per-run budget and a relay-hint cap, independent of the HTTP-platform budget.
 const NOSTR_MAX_ITEMS = 300;
 const NOSTR_RELAY_HINT_CAP = 8;
-
-function nostrEngagementEnabled(): boolean {
-  const v = process.env.NOSTR_ENGAGEMENT_COUNTS_ENABLED;
-  return v === "1" || v === "true";
-}
 
 interface ExternalItemRow {
   id: string;
@@ -95,7 +97,19 @@ async function readDailySweepCursor(): Promise<string | null> {
     `SELECT value FROM platform_config WHERE key = $1`,
     [DAILY_SWEEP_CURSOR_KEY],
   );
-  return rows.length > 0 ? rows[0].value : null;
+  if (rows.length === 0) return null;
+  // The row is runtime state, but it sits in the table the admin config editor
+  // writes — so validate it here rather than letting a hand-edited value reach
+  // `$3::timestamptz` and throw the whole sweep. A malformed cursor means the
+  // same as an absent one: start from the top.
+  const cursor = parseTimestampCursor(rows[0].value);
+  if (!cursor) {
+    logger.warn(
+      { value: rows[0].value },
+      "daily engagement sweep cursor is not a timestamp — starting from the top",
+    );
+  }
+  return cursor;
 }
 
 async function writeDailySweepCursor(publishedAt: string): Promise<void> {
@@ -159,9 +173,13 @@ export function cardToLinkMedia(
   // Only "link" cards become preview tiles; photo/video cards are already
   // represented by the status's media_attachments.
   if (card.type && card.type !== "link") return null;
+  // Rendered as an `href`, so a non-http(s) scheme is refused rather than
+  // stored (see httpUrlOrNull's header).
+  const url = httpUrlOrNull(card.url);
+  if (!url) return null;
   return {
     type: "link",
-    url: card.url,
+    url,
     thumbnail: card.image ?? undefined,
     title: card.title || undefined,
     description: card.description || undefined,
@@ -204,8 +222,15 @@ export const externalEngagementRefresh: Task = async (_payload, _helpers) => {
   // acceptable for a periodic lossy refresh.
   const selectPage = (cursor: string | null) =>
     pool.query<ExternalItemRow>(
+      // `published_at::text`, not the column: node-postgres hands back a JS
+      // Date for a timestamptz, and a Date holds milliseconds where the column
+      // holds microseconds. The resume cursor below is stored from this value
+      // and fed back as `$3::timestamptz`, so it never becomes a Date at any
+      // point — a truncated cursor on a DESCENDING `<` keyset skips the rows
+      // inside the lost microsecond, and this sweep is the only thing that
+      // would ever have reached them (shared/lib/timestamp-cursor.ts).
       `SELECT id, protocol, source_item_uri, interaction_data, media,
-              like_count, reply_count, repost_count, published_at
+              like_count, reply_count, repost_count, published_at::text AS published_at
        FROM external_items
        WHERE published_at >= $1
          AND deleted_at IS NULL
@@ -265,7 +290,7 @@ export const externalEngagementRefresh: Task = async (_payload, _helpers) => {
   // page floor), so at scale it inherits the freshest-first starvation shape —
   // give it its own cursor before lighting NOSTR_ENGAGEMENT_COUNTS_ENABLED on
   // a backlog larger than NOSTR_MAX_ITEMS.
-  if (nostrEngagementEnabled()) {
+  if (nostrEngagementCountsEnabled()) {
     const { rows: nostrRows } = await pool.query<ExternalItemRow>(
       `SELECT id, protocol, source_item_uri, interaction_data, media,
               like_count, reply_count, repost_count
@@ -518,14 +543,26 @@ async function refreshMastodonHost(
     if (!statusId) continue;
 
     try {
-      const res = await safeFetch(
-        `https://${host}/api/v1/statuses/${statusId}`,
-        { headers: { Accept: "application/json" } },
-      );
+      const res = await readMastodonStatus(`https://${host}`, statusId);
 
-      if (!res.ok) continue;
+      // Each caller keeps its own 429/5xx split (ingest.md): a 429 is the
+      // instance saying stop, and a 5xx is an instance that cannot answer —
+      // one more GET after either is a GET the instance's ingest poll pays
+      // for, since the budget is per IP (CA-C13). A 404/410 is a fact about
+      // this status alone, so the loop goes on. The rows this run did not
+      // reach are simply refreshed by a later one.
+      if (!res.ok) {
+        if (res.status === 429 || res.status >= 500) {
+          logger.warn(
+            { host, status: res.status, remaining: items.length - items.indexOf(item) - 1 },
+            "Mastodon engagement refresh: host refused or failed — stopping this host for the run",
+          );
+          break;
+        }
+        continue;
+      }
 
-      const status = JSON.parse(res.text) as {
+      const status = res.body as {
         favourites_count?: number;
         replies_count?: number;
         reblogs_count?: number;
@@ -569,16 +606,3 @@ async function refreshMastodonHost(
   return updates;
 }
 
-function extractMastodonStatusId(uri: string): string | null {
-  // Mastodon status URIs: https://instance.social/users/name/statuses/12345
-  // or https://instance.social/@name/12345
-  try {
-    const parts = new URL(uri).pathname.split("/").filter(Boolean);
-    // /users/name/statuses/ID or /@name/ID
-    const last = parts[parts.length - 1];
-    if (last && /^\d+$/.test(last)) return last;
-    return null;
-  } catch {
-    return null;
-  }
-}

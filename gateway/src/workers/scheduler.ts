@@ -7,9 +7,13 @@ import {
 import {
   publishPersonalArticle,
   splitContent,
+  ArticleUnpublishableError,
 } from "../services/article-publisher.js";
 import { sendPublishNotifications } from "@platform-pub/shared/lib/publish-emails.js";
 import { checkAndTriggerDriveFulfilment } from "../routes/drives.js";
+import { WriterTermsRequiredError } from "../lib/terms-gate.js";
+import { WriterAccessRequiredError } from "../lib/writer-gate.js";
+import { generateDTag } from "@platform-pub/shared/lib/slug.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 
 // =============================================================================
@@ -82,13 +86,26 @@ export async function publishScheduledDrafts(): Promise<void> {
         "Scheduler: draft published successfully",
       );
     } catch (err) {
-      // Both are permanent rejections for as long as they hold, so they take
-      // the same disposition: un-schedule rather than retry. A suspended
+      // All four are permanent rejections for as long as they hold, so they
+      // take the same disposition: un-schedule rather than retry. A suspended
       // publication draft retried every cycle would log an error forever and
       // never publish — the generic branch below is for TRANSIENT failure only.
+      //
+      // So is an account not admitted as a writer (READER-WRITER-SPLIT-ADR):
+      // only a grant clears it, and the draft waits in the drafts list.
+      //
+      // An unaccepted Writer Agreement is permanent in exactly the same sense:
+      // nothing the scheduler can do clears it, only the writer can, and when
+      // they do the draft is sitting in their drafts ready to publish. So is a
+      // piece the publisher refuses outright (no title, nothing to publish, a
+      // gate over no price or at a position the vault refuses): the writer
+      // fixes it in the editor, and the draft is there to fix.
       if (
         err instanceof PublicationPaywallUnsupportedError ||
-        err instanceof PublicationsSuspendedError
+        err instanceof PublicationsSuspendedError ||
+        err instanceof WriterTermsRequiredError ||
+        err instanceof WriterAccessRequiredError ||
+        err instanceof ArticleUnpublishableError
       ) {
         // Permanent rejection — retrying can never succeed. Un-schedule the
         // draft (it returns to the writer's plain drafts, content intact).
@@ -99,10 +116,22 @@ export async function publishScheduledDrafts(): Promise<void> {
           )
           .catch(() => {});
         logger.warn(
-          { draftId: draft.id, writerId: draft.writer_id },
+          {
+            draftId: draft.id,
+            writerId: draft.writer_id,
+            ...(err instanceof ArticleUnpublishableError
+              ? { refusal: err.code }
+              : {}),
+          },
           err instanceof PublicationsSuspendedError
             ? "Scheduler: publication draft un-scheduled (publications suspended); draft kept intact"
-            : "Scheduler: paywalled publication draft un-scheduled (publication paywalls unsupported)",
+            : err instanceof WriterTermsRequiredError
+              ? "Scheduler: paywalled draft un-scheduled (Writer Agreement not accepted); draft kept intact"
+              : err instanceof WriterAccessRequiredError
+                ? "Scheduler: draft un-scheduled (the account is not admitted as a writer); draft kept intact"
+              : err instanceof ArticleUnpublishableError
+                ? "Scheduler: draft un-scheduled (the publisher refused it); draft kept intact"
+                : "Scheduler: paywalled publication draft un-scheduled (publication paywalls unsupported)",
         );
         continue;
       }
@@ -191,10 +220,36 @@ async function publishPublicationDraft(draft: ScheduledDraft): Promise<void> {
 }
 
 // =============================================================================
+// The d-tag is stamped on the DRAFT before the first publish, so a retry is
+// an edit of the same piece and never a second copy (CA-A1). `generateDTag`
+// appends a timestamp: passed the draft's NULL d-tag, the publisher minted a
+// fresh one on every attempt, and a publish that failed AFTER its first
+// transaction (a vault refusal, a key-service outage) left a committed
+// `articles` + `feed_items` row per minute for as long as the retry ran —
+// each one `paywalled` with no vault. Publish-now has stamped the tag on its
+// claim from the day it opened; the scheduler now does the same, before it
+// hands the draft over. COALESCE keeps a tag the draft gained meanwhile.
+// =============================================================================
+
+async function stampDTag(draft: ScheduledDraft): Promise<string> {
+  if (draft.nostr_d_tag) return draft.nostr_d_tag;
+  const minted = generateDTag(draft.title || "untitled");
+  const { rows } = await pool.query<{ nostr_d_tag: string }>(
+    `UPDATE article_drafts
+     SET nostr_d_tag = COALESCE(nostr_d_tag, $2)
+     WHERE id = $1
+     RETURNING nostr_d_tag`,
+    [draft.id, minted],
+  );
+  return rows[0]?.nostr_d_tag ?? minted;
+}
+
+// =============================================================================
 // Personal articles — the shared publisher, with every option at its default
 //
 // A scheduled publish is "now, tell the subscribers, match the drive", which is
-// exactly what publishPersonalArticle does when passed no options. Do not add
+// exactly what publishPersonalArticle does when passed no options. (A scheduled
+// EDIT of a live piece tells nobody; the publisher decides that, not us.) Do not add
 // options here to change scheduler behaviour; they exist for the importer.
 // =============================================================================
 
@@ -205,7 +260,7 @@ async function publishPersonalDraft(draft: ScheduledDraft): Promise<void> {
       title: draft.title,
       dek: draft.dek,
       contentRaw: draft.content_raw,
-      nostrDTag: draft.nostr_d_tag,
+      nostrDTag: await stampDTag(draft),
       gatePositionPct: draft.gate_position_pct,
       pricePence: draft.price_pence,
       coverImageUrl: draft.cover_image_url,

@@ -1,9 +1,15 @@
 import type { Task } from "graphile-worker";
 import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
 import logger from "@platform-pub/shared/lib/logger.js";
+import { isSourceBlocked } from "@platform-pub/shared/lib/platform-blocks.js";
 import { pinnedWebSocketOptions } from "@platform-pub/shared/lib/http-client.js";
 import { recordRepostEdge } from "../lib/repost-edge.js";
 import { getPlatformConfig } from "../lib/platform-config.js";
+import {
+  recordRelayFailure,
+  recordRelaySuccess,
+  relayOnCooldown,
+} from "../lib/relay-budget.js";
 import { NOSTR_FALLBACK_RELAYS } from "@platform-pub/shared/lib/nostr-relay-req.js";
 import {
   type NostrEvent,
@@ -32,8 +38,84 @@ import {
 
 const DEFAULT_LOOKBACK_SECONDS = 48 * 60 * 60; // 48 hours
 
+// =============================================================================
+// The cap is a RESUME POINT, not a loss (MIRROR-AUDIT §3, S17).
+//
+// One `since` cursor governs every kind in the poll's first filter
+// (1/5/6/16/30023), so it may never advance past an event this run declined to
+// process. It used to. The three streams were capped SEPARATELY, each keeping
+// the NEWEST maxItems, and the cursor was then set to the newest event seen —
+// so a source that published more than maxItems inside one poll window had its
+// OLDEST events dropped and the cursor moved beyond them. They were never
+// fetched again: a silent permanent gap, and the busier the author the more of
+// it. Nothing logged, nothing failed, and the feed simply had holes.
+//
+// Keeping the OLDEST maxItems inverts that. The cursor stops at the newest
+// event actually processed and the next tick continues from exactly there.
+// `since` is inclusive in NIP-01, so an event sharing the boundary second is
+// re-fetched rather than skipped, and every writer downstream is idempotent.
+//
+// Three further properties the shape depends on:
+//
+//   • ONE pool, deduped by event id. deletionEvents arrives as a flat array
+//     across relays, so the same kind-5 seen on three relays used to spend
+//     three of the cap's slots.
+//
+//   • The cursor is a max over what was CONSIDERED, not over what was written.
+//     A kind-6 that detectNostrRepost declines, or an event the published_at
+//     ratchet skips, has still been seen; holding the cursor back for it means
+//     a batch of nothing but those spins the source on one window for ever.
+//
+//   • The degenerate case: more than maxItems events sharing the boundary
+//     second. The batch is then identical every run and the cursor cannot move
+//     — the source stops ingesting for good, which is strictly worse than the
+//     gap this exists to close. So step past that second and SAY SO. A skipped
+//     window somebody can find in a log is not the silent drop it replaces.
+// =============================================================================
+export interface NostrPollPlan {
+  /** The events to process this run, oldest first. */
+  batch: NostrEvent[];
+  /** How many the cap left behind for the next tick. */
+  dropped: number;
+  /** Where the cursor lands. Never below `since`. */
+  cursor: number;
+  /** True only in the degenerate case above — a window is being skipped. */
+  skippedSecond: boolean;
+}
+
+export function planNostrPollBatch(
+  governed: NostrEvent[],
+  since: number,
+  maxItems: number,
+): NostrPollPlan {
+  const byId = new Map<string, NostrEvent>();
+  for (const e of governed) byId.set(e.id, e);
+  const ordered = [...byId.values()].sort(
+    (a, b) => a.created_at - b.created_at || (a.id < b.id ? -1 : 1),
+  );
+  const batch = ordered.slice(0, Math.max(0, maxItems));
+  const dropped = ordered.length - batch.length;
+
+  let cursor = since;
+  for (const e of batch) if (e.created_at > cursor) cursor = e.created_at;
+
+  const skippedSecond = dropped > 0 && cursor <= since;
+  if (skippedSecond) cursor = since + 1;
+
+  return { batch, dropped, cursor, skippedSecond };
+}
+
 export const feedIngestNostr: Task = async (payload, _helpers) => {
   const { sourceId } = payload as { sourceId: string };
+  // THE OPERATOR'S REFUSAL (L6.5, D7 §7). Checked per fetch rather than only at
+  // the poll selector, because a job can be enqueued from several places (the
+  // poll, a re-add, a backfill) and the guard has to sit where the work
+  // actually happens. One indexed lookup against an HTTP fetch we are about to
+  // spend.
+  if (await isSourceBlocked(sourceId)) {
+    logger.info({ sourceId }, "Source is blocked platform-wide — skipping fetch");
+    return;
+  }
 
   // Load source
   const {
@@ -95,7 +177,22 @@ export const feedIngestNostr: Task = async (payload, _helpers) => {
     const repostEvents = new Map<string, NostrEvent>();
     let latestProfile: NostrEvent | null = null;
 
+    // A RELAY'S FAILURE IS A FACT ABOUT THE RELAY, AND IT IS STILL RECORDED
+    // (CA-C3; `lib/relay-budget.ts` says why the two obvious fixes are
+    // refused). Every relay outcome is collected here: a dropped relay is
+    // skipped and named, a failure spends the RELAY's budget, and the poll's
+    // own verdict — recorded on the source without touching its deactivation
+    // count — is decided after the loop from what was tried.
+    const relayFailures: string[] = [];
+    let relaysTried = 0;
+    let relaysAnswered = 0;
+
     for (const relayUrl of relayUrls) {
+      if (relayOnCooldown(relayUrl)) {
+        relayFailures.push(`${relayUrl} (dropped after repeated failures)`);
+        continue;
+      }
+      relaysTried++;
       try {
         const wsOpts = await pinnedWebSocketOptions(relayUrl);
         const rawEvents = await fetchNostrRelayEvents(
@@ -138,34 +235,63 @@ export const feedIngestNostr: Task = async (payload, _helpers) => {
             eventsMap.set(event.id, event);
           }
         }
+        recordRelaySuccess(relayUrl);
+        relaysAnswered++;
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const dropped = recordRelayFailure(relayUrl);
+        relayFailures.push(`${relayUrl} (${msg})`);
         logger.warn(
-          {
-            sourceId,
-            relayUrl,
-            err: err instanceof Error ? err.message : String(err),
-          },
-          "Failed to fetch from relay — trying next",
+          { sourceId, relayUrl, err: msg, dropped },
+          dropped
+            ? "Failed to fetch from relay — dropped for every source until its cooldown ends"
+            : "Failed to fetch from relay — trying next",
         );
       }
     }
 
-    // Sort by created_at DESC, cap at maxItems
-    const events = [...eventsMap.values()]
-      .sort((a, b) => b.created_at - a.created_at)
-      .slice(0, maxItems);
+    // The poll's verdict. Some relays failed: the source is healthy (the rest
+    // answered, the cursor is a max over what they returned) and the failure
+    // is RECORDED in last_error so a member's quiet feed can be diagnosed.
+    // Every relay failed, or every relay was on cooldown: nothing was read,
+    // the cursor floors at `since` by `planNostrPollBatch`'s contract, and the
+    // interval backs off — doubling on the column itself, capped where the
+    // error path caps — WITHOUT spending error_count, because a relay outage
+    // must never deactivate the sources that happen to share that relay.
+    const allRelaysFailed = relaysAnswered === 0;
+    const relayError =
+      relayFailures.length > 0
+        ? `${
+            allRelaysFailed
+              ? "no relay answered"
+              : `${relayFailures.length}/${relayUrls.length} relays failed`
+          }: ${relayFailures.join("; ")}`.slice(0, 1000)
+        : null;
+    if (allRelaysFailed) {
+      logger.warn(
+        { sourceId, relays: relayUrls.length, tried: relaysTried },
+        "Nostr poll: no relay answered — backing off without spending the source's error budget",
+      );
+    }
 
-    // Cap deletions too — a chatty relay with long delete history can otherwise
-    // ship thousands of kind-5s per fetch cycle.
-    const cappedDeletes = deletionEvents
-      .sort((a, b) => b.created_at - a.created_at)
-      .slice(0, maxItems);
+    // One cap over the whole cursor-governed set, OLDEST first — see
+    // planNostrPollBatch, which owns the rule and is tested directly.
+    const plan = planNostrPollBatch(
+      [...eventsMap.values(), ...deletionEvents, ...repostEvents.values()],
+      since,
+      maxItems,
+    );
+    const events = plan.batch.filter(
+      (e) => e.kind !== 5 && e.kind !== 6 && e.kind !== 16,
+    );
+    const cappedDeletes = plan.batch.filter((e) => e.kind === 5);
+    const cappedReposts = plan.batch.filter((e) => e.kind === 6 || e.kind === 16);
+    const newestCreatedAt = plan.cursor;
 
     const sourceNip05 = nostrNip05(latestProfile);
 
     // Upsert events into external_items + feed_items
     let inserted = 0;
-    let newestCreatedAt = since;
 
     let updated = 0;
     for (const event of events) {
@@ -178,14 +304,12 @@ export const feedIngestNostr: Task = async (payload, _helpers) => {
 
       if (outcome === "inserted") inserted++;
       else if (outcome === "updated") updated++;
-      if (event.created_at > newestCreatedAt)
-        newestCreatedAt = event.created_at;
     }
 
     // Record NIP-18 reposts (kind 6/16) as edges. Pubkey + signature were
     // verified above, so event.pubkey === the source pubkey (the booster).
     let repostEdges = 0;
-    for (const event of repostEvents.values()) {
+    for (const event of cappedReposts) {
       const repost = detectNostrRepost(event);
       if (!repost) continue;
       try {
@@ -203,7 +327,6 @@ export const feedIngestNostr: Task = async (payload, _helpers) => {
           "Failed to record nostr repost edge",
         );
       }
-      if (event.created_at > newestCreatedAt) newestCreatedAt = event.created_at;
     }
 
     // Handle kind 5 deletions (pubkey + signature verified above).
@@ -229,6 +352,18 @@ export const feedIngestNostr: Task = async (payload, _helpers) => {
       );
     }
 
+    if (plan.skippedSecond) {
+      logger.warn(
+        { sourceId, since, dropped: plan.dropped, maxItems },
+        "Nostr poll: more than maxItems events share the cursor second — advancing past it; the remainder of that second is skipped",
+      );
+    } else if (plan.dropped > 0) {
+      logger.info(
+        { sourceId, dropped: plan.dropped, resumeAt: plan.cursor },
+        "Nostr poll: capped at maxItems — resuming from the newest event processed",
+      );
+    }
+
     // Update source: cursor, reset errors, optionally refresh display metadata.
     // metadata_updated_at only moves forward when we actually apply a profile
     // write, so the ratchet survives restarts.
@@ -237,12 +372,20 @@ export const feedIngestNostr: Task = async (payload, _helpers) => {
       UPDATE external_sources SET
         last_fetched_at = now(),
         cursor = $2,
+        -- error_count is the DEACTIVATION budget and a relay's failure never
+        -- spends it; last_error still carries what failed (CA-C3).
         error_count = 0,
-        last_error = NULL,
+        last_error = $6,
         -- Reset the poll interval to the base (the error path backs off up to
         -- 300·factor^6 ≈ 19,200s; without this a recovered source stayed on
-        -- its last backed-off interval forever — AP already resets on success).
-        fetch_interval_seconds = 300,
+        -- its last backed-off interval forever — AP already resets on success)
+        -- — unless NO relay answered, in which case the interval doubles on
+        -- itself up to that same cap: a backoff with no counter behind it,
+        -- because the only counter is the one a relay outage must not touch.
+        fetch_interval_seconds = CASE
+          WHEN $7 THEN LEAST(fetch_interval_seconds * 2, 19200)
+          ELSE 300
+        END,
         display_name = COALESCE($3, display_name),
         avatar_url = COALESCE($4, avatar_url),
         metadata_updated_at = CASE
@@ -258,6 +401,8 @@ export const feedIngestNostr: Task = async (payload, _helpers) => {
         profileName,
         profileAvatar,
         profileCreatedAt,
+        relayError,
+        allRelaysFailed,
       ],
     );
 

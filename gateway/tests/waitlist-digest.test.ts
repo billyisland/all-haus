@@ -18,11 +18,18 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 //     deploy landed a day later). It also made four of these tests wall-clock
 //     dependent: they rotted red 24h after their fixtures were written;
 //   · not yet due → no send, and no read of the waitlist at all;
-//   · a send failure → NO watermark write, so the next run retries the same
-//     rows (D7: the row is the product, the mail is the courtesy);
+//   · a send failure to EVERY recipient → NO watermark write, so the next run
+//     retries the same rows (D7: the row is the product, the mail is the
+//     courtesy) — but ONE failing recipient is a partial send: the others are
+//     still delivered to and the watermark still advances, or a single inactive
+//     admin address re-sends the whole digest to everyone else every hour;
 //   · the watermark is written by UPSERT, never a bare UPDATE, which against
 //     an absent key matches zero rows and reports success;
-//   · no admin ids, or admins with no email → no send, and no watermark write.
+//   · no admin ids, or admins with no email → no send, and no watermark write;
+//   · WRITER APPLICATIONS ride the same digest (READER-WRITER-SPLIT-ADR §8) on
+//     their OWN watermark: a digest goes when either list moved, each
+//     watermark advances only if its own rows were in the message, and an
+//     applications-only digest leaves the waitlist's window open.
 // =============================================================================
 
 interface Q {
@@ -39,15 +46,39 @@ let waitlistRows: Array<{
   created_at_exact: string;
 }> = [];
 let configRows: Array<{ key: string; value: string }> = [];
+let appRows: Array<{
+  username: string | null;
+  display_name: string | null;
+  created_at: Date;
+  created_at_exact: string;
+}> = [];
 let adminIds: string[] = [];
 let adminEmails: string[] = [];
 let sent: Array<{ to: string; subject: string; textBody: string }> = [];
 let failSend = false;
+/** Addresses whose send rejects, so a PARTIAL failure is representable. The
+ *  global flag above cannot express one: with every recipient failing or none,
+ *  the loop that aborted on the first rejection is indistinguishable from the
+ *  one that does not. */
+let failFor = new Set<string>();
 
 function query(sql: string, params: unknown[] = []) {
   queries.push({ sql, params });
   if (sql.includes("FROM platform_config")) {
     return Promise.resolve({ rows: configRows, rowCount: configRows.length });
+  }
+  if (sql.includes("FROM writer_applications") && sql.includes("count(*)")) {
+    // Structural: the pending filter is Postgres's to evaluate; the fixture
+    // says how many are pending.
+    return Promise.resolve({ rows: [{ pending: "5" }], rowCount: 1 });
+  }
+  if (sql.includes("FROM writer_applications")) {
+    const since = String(params[0]);
+    const rows = appRows
+      .filter((r) => r.created_at_exact > since)
+      .sort((a, b) => b.created_at.getTime() - a.created_at.getTime())
+      .map((r) => ({ ...r }));
+    return Promise.resolve({ rows, rowCount: rows.length });
   }
   if (sql.includes("FROM waitlist") && sql.includes("count(*)")) {
     return Promise.resolve({
@@ -82,7 +113,10 @@ vi.mock("@platform-pub/shared/lib/logger.js", () => ({
 
 vi.mock("@platform-pub/shared/lib/email.js", () => ({
   sendEmail: (p: { to: string; subject: string; textBody: string }) => {
-    if (failSend) return Promise.reject(new Error("postmark down"));
+    if (failSend || failFor.has(p.to)) {
+      // What Postmark answers for an admin address that has gone inactive.
+      return Promise.reject(new Error("postmark 406 inactive recipient"));
+    }
     sent.push(p);
     return Promise.resolve();
   },
@@ -111,9 +145,11 @@ beforeEach(() => {
   queries = [];
   sent = [];
   failSend = false;
+  failFor = new Set();
   adminIds = ["11111111-1111-1111-1111-111111111111"];
   adminEmails = ["owner@all.haus"];
   configRows = [];
+  appRows = [];
   waitlistRows = [
     { email: "one@example.com", created_at: OLD, created_at_exact: OLD_EXACT },
     { email: "two@example.com", created_at: MID, created_at_exact: MID_EXACT },
@@ -310,6 +346,65 @@ describe("waitlist operator digest", () => {
     expect(sent).toHaveLength(1);
   });
 
+  // ---------------------------------------------------------------------------
+  // ONE FAILING RECIPIENT IS A PARTIAL SEND, NOT A FAILED ONE.
+  //
+  // `sendEmail` throws, so a bare `for … await` over the recipients aborted on
+  // the first rejection — leaving the watermark unmoved. The next hourly tick
+  // then re-sent the WHOLE digest to whoever came before the broken address,
+  // and so did the one after that, for as long as that address stayed inactive.
+  // Both halves have to be asserted or the fix is untested: that the reachable
+  // admin is still sent to (the loop no longer aborts) AND that the watermark
+  // moves (the retry no longer spams them).
+  // ---------------------------------------------------------------------------
+  it("delivers to the reachable admins when one address fails, and advances the watermark", async () => {
+    adminIds = [
+      "11111111-1111-1111-1111-111111111111",
+      "22222222-2222-2222-2222-222222222222",
+      "33333333-3333-3333-3333-333333333333",
+    ];
+    adminEmails = ["first@all.haus", "broken@all.haus", "third@all.haus"];
+    failFor = new Set(["broken@all.haus"]);
+
+    const n = await sendWaitlistDigest();
+
+    // Reported, and to everyone we could reach — including the admin AFTER the
+    // broken one, which is what the aborting loop never got to.
+    expect(n).toBe(3);
+    expect(sent.map((s) => s.to)).toEqual(["first@all.haus", "third@all.haus"]);
+
+    // And the window closed on the newest reported row, so the next run has
+    // nothing to say rather than re-sending the same three joiners to the two
+    // who already have them. (The marker write is what the next run reads; this
+    // mock does not feed writes back into `configRows`, so the assertion is on
+    // the value written — which is the same thing one statement earlier.)
+    const writes = markerWrites();
+    expect(writes).toHaveLength(1);
+    expect(writes[0].params[0]).toBe("waitlist_digest_watermark");
+    expect(writes[0].params[1]).toBe(NEW_EXACT);
+  });
+
+  it("advances nothing when EVERY recipient fails", async () => {
+    adminIds = [
+      "11111111-1111-1111-1111-111111111111",
+      "22222222-2222-2222-2222-222222222222",
+    ];
+    adminEmails = ["one@all.haus", "two@all.haus"];
+    failFor = new Set(["one@all.haus", "two@all.haus"]);
+
+    // Nobody heard, so this is the D7 contract unchanged: the rows are still
+    // owed to somebody and the window stays open. Advancing on "we tried" is
+    // how a total email outage would swallow a batch of prospects in silence.
+    expect(await sendWaitlistDigest()).toBe(0);
+    expect(sent).toHaveLength(0);
+    expect(markerWrites()).toHaveLength(0);
+
+    // The retry proves the rows were not lost.
+    failFor = new Set();
+    expect(await sendWaitlistDigest()).toBe(3);
+    expect(sent.map((s) => s.to)).toEqual(["one@all.haus", "two@all.haus"]);
+  });
+
   it("sends nothing when there is no admin to tell", async () => {
     adminIds = [];
 
@@ -339,5 +434,90 @@ describe("waitlist operator digest", () => {
 
     await expect(sendWaitlistDigest()).resolves.toBe(0);
     boom.mockRestore();
+  });
+});
+
+describe("writer applications in the digest", () => {
+  const APP_OLD_EXACT = "2026-07-27T09:00:00.111111Z";
+  const APP_NEW_EXACT = "2026-07-27T17:00:00.222222Z";
+
+  beforeEach(() => {
+    appRows = [
+      { username: "vita", display_name: "Vita", created_at: new Date(APP_OLD_EXACT), created_at_exact: APP_OLD_EXACT },
+      { username: null, display_name: null, created_at: new Date(APP_NEW_EXACT), created_at_exact: APP_NEW_EXACT },
+    ];
+  });
+
+  const writeFor = (key: string) => markerWrites().find((q) => q.params.includes(key));
+
+  it("names applicants beside the joiners, in ONE message", async () => {
+    const n = await sendWaitlistDigest();
+
+    expect(n).toBe(5);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].subject).toContain("3 new");
+    expect(sent[0].subject).toContain("2 writer applications");
+    expect(sent[0].textBody).toContain("@vita");
+    // A deleted member's application is said, not dropped.
+    expect(sent[0].textBody).toContain("an account since deleted");
+    expect(sent[0].textBody).toContain("5 waiting in total");
+    // Both watermarks, each at its own newest row.
+    expect(writeFor("writer_applications_digest_watermark")?.params).toEqual([
+      "writer_applications_digest_watermark",
+      APP_NEW_EXACT,
+    ]);
+    expect(writeFor("waitlist_digest_watermark")?.params[1]).toBe(NEW_EXACT);
+  });
+
+  it("an applications-only digest leaves the waitlist's window open", async () => {
+    configRows = [
+      { key: "waitlist_digest_watermark", value: NEW_EXACT },
+      { key: "waitlist_digest_last_sent_at", value: NEW.toISOString() },
+    ];
+    vi.setSystemTime(new Date("2026-07-29T00:00:00Z"));
+
+    const n = await sendWaitlistDigest();
+
+    expect(n).toBe(2);
+    expect(sent[0].subject).toBe("all.haus — 2 writer applications");
+    expect(sent[0].textBody).not.toContain("@example.com");
+    // The waitlist watermark is NOT written; the cadence stamp is.
+    expect(markerWrites().some((q) => q.params[0] === "waitlist_digest_watermark")).toBe(false);
+    expect(writeFor("waitlist_digest_last_sent_at")).toBeDefined();
+    expect(writeFor("writer_applications_digest_watermark")?.params[1]).toBe(APP_NEW_EXACT);
+    vi.useRealTimers();
+  });
+
+  it("a joiners-only digest leaves the applications' window open", async () => {
+    appRows = [];
+
+    await sendWaitlistDigest();
+
+    expect(sent[0].textBody).not.toMatch(/writer application/i);
+    expect(writeFor("writer_applications_digest_watermark")).toBeUndefined();
+  });
+
+  it("reports only applications newer than their own watermark", async () => {
+    configRows = [
+      { key: "waitlist_digest_watermark", value: NEW_EXACT },
+      { key: "writer_applications_digest_watermark", value: APP_OLD_EXACT },
+      { key: "waitlist_digest_last_sent_at", value: NEW.toISOString() },
+    ];
+    vi.setSystemTime(new Date("2026-07-29T00:00:00Z"));
+
+    expect(await sendWaitlistDigest()).toBe(1);
+    expect(sent[0].textBody).not.toContain("@vita");
+    // The window is asked in Postgres's own precision, on its own key.
+    const q = queries.find((x) => x.sql.includes("FROM writer_applications") && !x.sql.includes("count(*)"));
+    expect(q?.sql).toContain("$1::timestamptz");
+    expect(q?.params[0]).toBe(APP_OLD_EXACT);
+    vi.useRealTimers();
+  });
+
+  it("advances neither applications nor joiners when every recipient fails", async () => {
+    failSend = true;
+
+    expect(await sendWaitlistDigest()).toBe(0);
+    expect(markerWrites()).toHaveLength(0);
   });
 });

@@ -1,4 +1,3 @@
-import { notFound } from 'next/navigation'
 import Script from 'next/script'
 import type { Metadata } from 'next'
 import { renderMarkdown } from '../../../lib/markdown'
@@ -8,6 +7,7 @@ import { PublicPage } from '../../../components/public/PublicPage'
 import { traffologyEnabled, publicationsEnabled } from '../../../lib/featureFlags'
 import type { ArticleMetadata } from '../../../lib/api'
 import { ReadingScrollbar } from '../../../components/layout/ReadingScrollbar'
+import { WithdrawnArticle } from '../../../components/article/WithdrawnArticle'
 
 // Publications suspended 2026-08-31 (lib/featureFlags.ts). A publication
 // article is still reachable at its PERSONAL /article/:dTag URL — that route is
@@ -36,17 +36,17 @@ const GATEWAY = process.env.GATEWAY_INTERNAL_URL ?? process.env.GATEWAY_URL ?? '
 // bounce (PAYWALL-ARRIVAL-ADR) is what a MEMBER gets too, not only a crawler.
 //
 // No cookie is forwarded, so the gateway answers with the anonymous projection.
-// That is the correct behaviour and not an accident: the route OMITS its two
-// viewer-derived fields (`writerSpendThisMonthPence`, `nudgeShownThisMonth`)
-// when there is no session rather than defaulting them, and a cache shared
-// between viewers is the last place a per-viewer figure may live.
+// That is the correct behaviour and not an accident: the route OMITS its
+// viewer-derived field (`writerSpendThisMonthPence`) when there is no session
+// rather than defaulting it, and a cache shared between viewers is the last
+// place a per-viewer figure may live.
 //
-// The consequence is that those two fields are absent for everybody here, so
+// The consequence is that the field is absent for everybody here, so
 // ArticleReader re-reads them client-side with the viewer's own cookie. Do NOT
 // "fix" this by forwarding the session into this fetch: that would put one
 // reader's spend in a cache the next reader is served from.
 async function getArticle(dTag: string): Promise<ArticleMetadata | null> {
-  const res = await fetch(`${GATEWAY}/api/v1/articles/${dTag}`, {
+  const res = await fetch(`${GATEWAY}/api/v1/articles/${encodeURIComponent(dTag)}`, {
     next: { revalidate: 60 },
   })
   if (!res.ok) return null
@@ -95,7 +95,11 @@ export async function generateMetadata({ params }: { params: { dTag: string } })
 
 export default async function ArticlePage({ params }: { params: { dTag: string } }) {
   const article = await getArticle(params.dTag)
-  if (!article) return notFound()
+  // Not `notFound()`: the anonymous, cached fetch above cannot tell a wrong
+  // address from a piece the WRITER withdrew that THIS viewer paid for (Writer
+  // 3.4; §0z item 18). The client re-asks with the viewer's cookie and renders
+  // the piece or the not-found copy from the answer.
+  if (!article) return <WithdrawnArticle dTag={params.dTag} />
 
   // Render free-section markdown to HTML on the server
   const freeHtml = article.contentFree
@@ -152,7 +156,6 @@ export default async function ArticlePage({ params }: { params: { dTag: string }
       writerId={article.writer.id}
       subscriptionPricePence={visiblePublication(article)?.subscriptionPricePence ?? article.writer.subscriptionPricePence}
       writerSpendThisMonthPence={article.writerSpendThisMonthPence ?? undefined}
-      nudgeShownThisMonth={article.nudgeShownThisMonth ?? false}
       preRenderedFreeHtml={freeHtml}
       publicationName={visiblePublication(article)?.name ?? undefined}
       publicationSlug={visiblePublication(article)?.slug ?? undefined}

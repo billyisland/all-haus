@@ -1,7 +1,7 @@
 {
   "name": "@platform-pub/gateway",
   "version": "0.1.0",
-  "description": "API gateway \u2014 auth, session management, and service proxy for all.haus",
+  "description": "API gateway — auth, session management, and service proxy for all.haus",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -23,6 +23,7 @@
     "dotenv": "^17.3.1",
     "fastify": "^4.26.0",
     "jsdom": "^29.1.1",
+    "marked": "^14.1.4",
     "nostr-tools": "^2.3.0",
     "pg": "^8.20.0",
     "pino": "^8.19.0",

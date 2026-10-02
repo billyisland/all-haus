@@ -67,7 +67,7 @@ export const PALETTE_REGISTRY: PaletteEntry[] = [
   { slug: 'trust-amber', hex: '#EF9F27', label: 'Trust pip — partial / moderate' },
   { slug: 'klein-blue', hex: '#002FA7', label: 'Traffology provenance accent (IKB)' },
   { slug: 'cream', hex: '#F5F4F0', label: 'Forall ceremony card' },
-  { slug: 'cream-hover', hex: '#FAFAF7', label: 'Playscript reply hover tint' },
+  { slug: 'cream-hover', hex: '#FAFAF7', label: 'Row hover tint (unused since the playscript was retired)' },
   { slug: 'off-white', hex: '#FAFAFA', label: 'Provenance bar ground' },
   { slug: 'blush', hex: '#F5D5D6', label: 'Profile avatar gradient start' },
   { slug: 'blush-deep', hex: '#E8A5A7', label: 'Profile avatar gradient end' },
@@ -95,30 +95,30 @@ export const PALETTE_REGISTRY: PaletteEntry[] = [
   // "two shades of the hue + a contrasting accent interior" dark grammar is
   // superseded — those contrasting grounds (rose/coral/teal/violet) fought each
   // other across side-by-side feeds. Light variants are unchanged.
-  { slug: 'spring-walls', hex: '#2F7D4A', label: 'Feed scheme Spring (light) — walls & bar (fresh green)' },
-  { slug: 'spring-interior', hex: '#DCEBCF', label: 'Feed scheme Spring (light) — interior (tinted green ground)' },
-  { slug: 'spring-card', hex: '#F4F8EC', label: 'Feed scheme Spring (light) — card surface' },
-  { slug: 'spring-walls-dk', hex: '#2C8350', label: 'Feed scheme Spring (dark) — walls & bar (clean green spine; the seasonal identity)' },
-  { slug: 'spring-interior-dk', hex: '#18211B', label: 'Feed scheme Spring (dark) — interior (shared dark ground, faint green tint — coheres with the other seasons)' },
-  { slug: 'spring-card-dk', hex: '#222E26', label: 'Feed scheme Spring (dark) — card surface (lifted dark neutral, faint green tint)' },
-  { slug: 'summer-walls', hex: '#0E5DB0', label: 'Feed scheme Summer (light) — walls & bar (intense blue)' },
-  { slug: 'summer-interior', hex: '#F2D89E', label: 'Feed scheme Summer (light) — interior (warm sand ground)' },
-  { slug: 'summer-card', hex: '#FCF3DD', label: 'Feed scheme Summer (light) — card surface' },
-  { slug: 'summer-walls-dk', hex: '#2B6FA8', label: 'Feed scheme Summer (dark) — walls & bar (clean azure spine; the seasonal identity)' },
-  { slug: 'summer-interior-dk', hex: '#161E26', label: 'Feed scheme Summer (dark) — interior (shared dark ground, faint blue tint — coheres with the other seasons)' },
-  { slug: 'summer-card-dk', hex: '#1E2A38', label: 'Feed scheme Summer (dark) — card surface (lifted dark neutral, faint blue tint)' },
-  { slug: 'autumn-walls', hex: '#B5461E', label: 'Feed scheme Autumn (light) — walls & bar (bold ember)' },
-  { slug: 'autumn-interior', hex: '#E9C9B4', label: 'Feed scheme Autumn (light) — interior (clay ground)' },
-  { slug: 'autumn-card', hex: '#FBEFE3', label: 'Feed scheme Autumn (light) — card surface' },
-  { slug: 'autumn-walls-dk', hex: '#B0492A', label: 'Feed scheme Autumn (dark) — walls & bar (clean ember/terracotta spine; the seasonal identity)' },
-  { slug: 'autumn-interior-dk', hex: '#211A16', label: 'Feed scheme Autumn (dark) — interior (shared dark ground, faint warm tint — coheres with the other seasons)' },
-  { slug: 'autumn-card-dk', hex: '#322620', label: 'Feed scheme Autumn (dark) — card surface (lifted dark neutral, faint warm tint)' },
-  { slug: 'winter-walls', hex: '#6A4FBC', label: 'Feed scheme Winter (dark) — walls & bar (clean indigo-violet spine; the seasonal identity)' },
-  { slug: 'winter-interior', hex: '#1C1A24', label: 'Feed scheme Winter (dark) — interior (shared dark ground, faint violet tint — coheres with the other seasons)' },
-  { slug: 'winter-card', hex: '#28253A', label: 'Feed scheme Winter (dark) — card surface (lifted dark neutral, faint violet tint)' },
-  { slug: 'winter-walls-lt', hex: '#2B3756', label: 'Feed scheme Winter (light) — walls & bar (deep slate indigo frame)' },
-  { slug: 'winter-interior-lt', hex: '#D8DDEA', label: 'Feed scheme Winter (light) — interior (cool blue-grey ground)' },
-  { slug: 'winter-card-lt', hex: '#EFF2F8', label: 'Feed scheme Winter (light) — card surface (clean cool white)' },
+  { slug: 'spring-walls', hex: '#2F7D4A', label: 'Channel scheme Spring (light) — walls & bar (fresh green)' },
+  { slug: 'spring-interior', hex: '#DCEBCF', label: 'Channel scheme Spring (light) — interior (tinted green ground)' },
+  { slug: 'spring-card', hex: '#F4F8EC', label: 'Channel scheme Spring (light) — card surface' },
+  { slug: 'spring-walls-dk', hex: '#2C8350', label: 'Channel scheme Spring (dark) — walls & bar (clean green spine; the seasonal identity)' },
+  { slug: 'spring-interior-dk', hex: '#18211B', label: 'Channel scheme Spring (dark) — interior (shared dark ground, faint green tint — coheres with the other seasons)' },
+  { slug: 'spring-card-dk', hex: '#222E26', label: 'Channel scheme Spring (dark) — card surface (lifted dark neutral, faint green tint)' },
+  { slug: 'summer-walls', hex: '#0E5DB0', label: 'Channel scheme Summer (light) — walls & bar (intense blue)' },
+  { slug: 'summer-interior', hex: '#F2D89E', label: 'Channel scheme Summer (light) — interior (warm sand ground)' },
+  { slug: 'summer-card', hex: '#FCF3DD', label: 'Channel scheme Summer (light) — card surface' },
+  { slug: 'summer-walls-dk', hex: '#2B6FA8', label: 'Channel scheme Summer (dark) — walls & bar (clean azure spine; the seasonal identity)' },
+  { slug: 'summer-interior-dk', hex: '#161E26', label: 'Channel scheme Summer (dark) — interior (shared dark ground, faint blue tint — coheres with the other seasons)' },
+  { slug: 'summer-card-dk', hex: '#1E2A38', label: 'Channel scheme Summer (dark) — card surface (lifted dark neutral, faint blue tint)' },
+  { slug: 'autumn-walls', hex: '#B5461E', label: 'Channel scheme Autumn (light) — walls & bar (bold ember)' },
+  { slug: 'autumn-interior', hex: '#E9C9B4', label: 'Channel scheme Autumn (light) — interior (clay ground)' },
+  { slug: 'autumn-card', hex: '#FBEFE3', label: 'Channel scheme Autumn (light) — card surface' },
+  { slug: 'autumn-walls-dk', hex: '#B0492A', label: 'Channel scheme Autumn (dark) — walls & bar (clean ember/terracotta spine; the seasonal identity)' },
+  { slug: 'autumn-interior-dk', hex: '#211A16', label: 'Channel scheme Autumn (dark) — interior (shared dark ground, faint warm tint — coheres with the other seasons)' },
+  { slug: 'autumn-card-dk', hex: '#322620', label: 'Channel scheme Autumn (dark) — card surface (lifted dark neutral, faint warm tint)' },
+  { slug: 'winter-walls', hex: '#6A4FBC', label: 'Channel scheme Winter (dark) — walls & bar (clean indigo-violet spine; the seasonal identity)' },
+  { slug: 'winter-interior', hex: '#1C1A24', label: 'Channel scheme Winter (dark) — interior (shared dark ground, faint violet tint — coheres with the other seasons)' },
+  { slug: 'winter-card', hex: '#28253A', label: 'Channel scheme Winter (dark) — card surface (lifted dark neutral, faint violet tint)' },
+  { slug: 'winter-walls-lt', hex: '#2B3756', label: 'Channel scheme Winter (light) — walls & bar (deep slate indigo frame)' },
+  { slug: 'winter-interior-lt', hex: '#D8DDEA', label: 'Channel scheme Winter (light) — interior (cool blue-grey ground)' },
+  { slug: 'winter-card-lt', hex: '#EFF2F8', label: 'Channel scheme Winter (light) — card surface (clean cool white)' },
   // Appended, not inserted next to `crimson`: position in this list is
   // canonical (see the header — "colour 07" must keep meaning the same thing),
   // so a new slug goes on the end.
@@ -152,7 +152,7 @@ export const PALETTE_REGISTRY: PaletteEntry[] = [
   // NEVER inverts: like the seasonal surface slugs it is chosen by
   // `paletteFor`, never flipped by `html.dark`, and it must stay out of
   // DARK_SLUGS.
-  { slug: 'basic-walls-dk', hex: '#646460', label: 'Feed scheme Basic (dark) — walls, bar & quote embed (neutral spine at the seasons\' matched luminance). NEVER inverts' },
+  { slug: 'basic-walls-dk', hex: '#646460', label: 'Channel scheme Basic (dark) — walls, bar & quote embed (neutral spine at the seasons\' matched luminance). NEVER inverts' },
 ]
 
 export const PALETTE_STORAGE_KEY = 'ah:palette-overrides'

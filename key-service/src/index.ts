@@ -1,13 +1,11 @@
 import "dotenv/config";
 import Fastify from "fastify";
-import sensible from "@fastify/sensible";
-import rateLimit from "@fastify/rate-limit";
-import { keyRoutes } from "./routes/keys.js";
+import { buildApp } from "./app.js";
 import { pool } from "@platform-pub/shared/db/client.js";
 import logger, { pinoConfig } from "@platform-pub/shared/lib/logger.js";
 import {
   requireEnv,
-  requireEnvMinLength,
+  requireHexKeyBytes,
 } from "@platform-pub/shared/lib/env.js";
 
 // =============================================================================
@@ -21,34 +19,19 @@ import {
 // Validate required env vars at startup — fail fast
 requireEnv("INTERNAL_SECRET");
 requireEnv("DATABASE_URL");
-requireEnvMinLength("KMS_MASTER_KEY_HEX", 32);
+// 32 BYTES = 64 hex characters, which is what the cipher parses. The old
+// `requireEnvMinLength(…, 32)` counted CHARACTERS, so a 32-character key
+// passed startup and threw at the first real use.
+requireHexKeyBytes("KMS_MASTER_KEY_HEX", 32);
+// The NIP-44 service keypair (lib/nip44.ts) — 32-byte secp256k1 secret key.
+// It was not boot-checked at all, so a missing or malformed one first
+// surfaced as a failed key wrap on a reader's paid unlock.
+requireHexKeyBytes("PLATFORM_SERVICE_PRIVKEY", 32);
 
 const app = Fastify({ logger: pinoConfig });
 
 async function start() {
-  await app.register(sensible);
-
-  // Rate limiting — protects the key issuance endpoint from key-fishing
-  await app.register(rateLimit, {
-    max: 10,
-    timeWindow: "1 minute",
-    keyGenerator: (req) => {
-      // Rate limit per reader, not per IP (readers behind NAT / VPNs)
-      const readerId = req.headers["x-reader-id"];
-      return typeof readerId === "string" ? readerId : req.ip;
-    },
-    errorResponseBuilder: () => ({
-      error: "RATE_LIMITED",
-      message: "Too many key requests — slow down",
-    }),
-  });
-
-  await app.register(keyRoutes, { prefix: "/api/v1" });
-
-  app.get("/health", async () => {
-    await pool.query("SELECT 1");
-    return { status: "ok", service: "key-service" };
-  });
+  await buildApp(app);
 
   const shutdown = async (signal: string) => {
     logger.info({ signal }, "Shutting down");

@@ -31,6 +31,10 @@ type Helpers = Parameters<Task>[1]
 //     counts `retry_count` (retries). Abstracted behind `attemptsOf`/`maxOf`.
 //   - the backoff curve: relay is min(2^n min, 1h) ±jitter; cross-post is
 //     delay·2^(n-1) no jitter. Abstracted behind `computeBackoff`.
+//   - what counts as a TERMINAL failure: the far end's own vocabulary (an
+//     atproto HTTP status vs a NIP-01 `OK: false` prefix). Abstracted behind
+//     `isTerminal`; what is shared is the CONSEQUENCE — abandon now rather
+//     than spend the row's whole retry budget on a refusal.
 // =============================================================================
 
 export interface OutboundJobSpec<Row> {
@@ -61,6 +65,18 @@ export interface OutboundJobSpec<Row> {
   maxOf: (row: Row) => number
   /** When to run the next attempt, given the upcoming attempt number. */
   computeBackoff: (nextAttempt: number) => Date
+  /**
+   * Did the far end refuse deterministically, having created nothing? Such a
+   * throw goes straight to `onAbandon` — a retry cannot change the answer, and
+   * burning the row's whole retry budget on it only delays it saying so.
+   *
+   * AMBIGUOUS IS THE DEFAULT: omit this (or return false) and every failure is
+   * retried, which is the safe direction — an ambiguous failure may already
+   * have delivered, so it must be retried under the SAME identity rather than
+   * abandoned or re-sent as something new. Supplying this hook is therefore
+   * only ever safe alongside a stable delivery identity.
+   */
+  isTerminal?: (err: unknown) => boolean
 
   /**
    * Persist a retry (worker owns its status vocab + COMMIT). Called when
@@ -70,7 +86,8 @@ export interface OutboundJobSpec<Row> {
   onRetry: (row: Row, nextAttempt: number, nextAt: Date, err: string) => Promise<void>
   /**
    * Persist abandonment (worker owns its status vocab + COMMIT). Called when
-   * `nextAttempt >= maxOf(row)`; no job is rescheduled.
+   * `nextAttempt >= maxOf(row)` OR when `isTerminal` says the far end refused;
+   * no job is rescheduled either way.
    */
   onAbandon: (row: Row, nextAttempt: number, err: string) => Promise<void>
 
@@ -96,7 +113,7 @@ export async function runOutboundJob<Row>(spec: OutboundJobSpec<Row>): Promise<v
       const msg = err instanceof Error ? err.message : String(err)
       const nextAttempt = spec.attemptsOf(row) + 1
 
-      if (nextAttempt >= spec.maxOf(row)) {
+      if (spec.isTerminal?.(err) || nextAttempt >= spec.maxOf(row)) {
         await spec.onAbandon(row, nextAttempt, msg)
         return
       }

@@ -70,19 +70,19 @@ ON CONFLICT (key) DO NOTHING;
 
 -- from 052_universal_feed_external.sql  -- ON CONFLICT added here: the original migration had none
 INSERT INTO platform_config (key, value, description) VALUES
-  ('feed_ingest_rss_interval_seconds',     '300',  'Default RSS polling interval (5 min)'),
+  ('feed_ingest_rss_interval_seconds',     '300',  'A new RSS source''s first polling interval (seconds); adaptive after that, between the min/max dials'),
   ('feed_ingest_rss_min_interval_seconds', '60',   'Minimum RSS polling interval'),
-  ('feed_ingest_ap_interval_seconds',      '120',  'Default ActivityPub outbox polling interval'),
+  ('feed_ingest_ap_interval_seconds',      '120',  'INERT — no reader. Superseded by feed_ingest_ap_default_interval, which ActivityPub polling reads'),
   ('feed_ingest_max_items_per_fetch',      '50',   'Max items to ingest per poll cycle'),
   ('feed_ingest_error_backoff_factor',     '2',    'Exponential backoff multiplier on fetch errors'),
   ('feed_ingest_max_error_count',          '10',   'Deactivate source after N consecutive errors'),
-  ('feed_ingest_daily_cap_default',        '100',  'Default max items/day per source (safety valve)'),
+  ('feed_ingest_daily_cap_default',        '100',  'INERT — reserved, not enforced. The per-source daily item cap was never built (CA-F4)'),
   ('feed_ingest_max_per_host',             '2',    'Max concurrent fetch jobs per hostname'),
   ('feed_ingest_max_concurrent',           '10',   'Global max concurrent fetch jobs'),
   ('outbound_max_retries',                 '3',    'Max retry attempts for outbound cross-posts'),
   ('outbound_retry_delay_seconds',         '30',   'Base delay between outbound retries'),
   ('external_items_retention_days',        '90',   'Days to retain external items before pruning'),
-  ('max_subscriptions_per_user',           '200',  'Max external source subscriptions per user')
+  ('max_subscriptions_per_user',           '200',  'INERT — reserved, not enforced. The per-member source cap was never built (CA-F4)')
 ON CONFLICT (key) DO NOTHING;
 
 -- from 055_universal_feed_atproto.sql
@@ -146,10 +146,35 @@ INSERT INTO platform_config (key, value, description) VALUES
 ON CONFLICT (key) DO NOTHING;
 
 -- from 160_resonance_band_thresholds.sql
+--
+-- RETUNED 2026-09-14 (operator: the marks read too sparse on a mixed feed),
+-- 2.5/4/6 -> 1.8/3/5. Re-measured on the dev corpus of 134,177 scored rows
+-- (90,521 atproto + 43,656 activitypub) simulating the band expression off the
+-- stored `resonance` and `ambient_pctl` — the latter IS the veto, since
+-- pctl >= 0.5 is exactly E >= p50 and pctl >= 0.9 exactly E >= p90:
+--
+--                 band>=1        band 3
+--   old 2.5/4/6   16.7%          2.2%
+--   new 1.8/3/5   24.8%          4.1%      (atproto 27.7 / 4.9,
+--                                           activitypub 18.7 / 2.4)
+--
+-- Sparseness was never only the gate. A THIRD of the corpus can carry no mark
+-- at all — nostr_external and rss produce no ambient row, so their rows stay
+-- NULL by construction (absence, not zero) — so a quarter of SCORED rows is
+-- about 15% of what a mixed feed actually shows. 1.5 was measured too (28.7%)
+-- and refused: a mark on nearly a third of what can carry one stops being a
+-- mark. Band 3 stays the confirmation it was designed as (ADR D2) at ~4%.
+--
+-- ON CONFLICT DO NOTHING, so this reaches FRESH databases only — every
+-- existing DB still holds migration 160's values. Retuning a live one is the
+-- operator act it was designed to be: set the three keys in the admin config
+-- editor, then run `scripts/reband-resonance.sql`, because the band is STORED
+-- and the scorer only ever revisits rows whose counts moved (that script's
+-- header carries the reasoning).
 INSERT INTO platform_config (key, value, description) VALUES
-  ('resonance_band1_min', '2.5', 'Resonance gate for band 1 "noticed" (also requires E >= ambient p50)'),
-  ('resonance_band2_min', '4',   'Resonance gate for band 2 "resonant" (also requires E >= ambient p50)'),
-  ('resonance_band3_min', '6',   'Resonance gate for band 3 "surging" (also requires E >= ambient p90)')
+  ('resonance_band1_min', '1.8', 'Resonance gate for band 1 "noticed" (also requires E >= ambient p50)'),
+  ('resonance_band2_min', '3',   'Resonance gate for band 2 "resonant" (also requires E >= ambient p50)'),
+  ('resonance_band3_min', '5',   'Resonance gate for band 3 "surging" (also requires E >= ambient p90)')
 ON CONFLICT (key) DO NOTHING;
 
 -- from 161_feed_proof_floor.sql
@@ -190,9 +215,29 @@ INSERT INTO platform_config (key, value, description) VALUES
   -- presses the button — D4 Path C, which the modal already words.
   ('arrival_gift_cap_pence',         '200',  'Max article price the paywall-arrival gift will cover (£2.00); above this the piece stays gated'),
   ('tab_settlement_threshold_pence', '800',  'Reader tab threshold that triggers Stripe charge (£8.00)'),
+  -- The cap on what a reader may OWE at one time (Reader Terms 4.4), read by
+  -- the gate pass. Not the same question as the threshold above even though the
+  -- text names one figure for both: the threshold decides when we charge, the
+  -- cap decides when we stop selling. A settlement's charge does not reduce the
+  -- balance until Stripe's webhook confirms it, and before this dial had a
+  -- reader a reader could accrue without limit through that window. This figure
+  -- is NAMED in the published Reader Terms, so moving it changes what the site
+  -- has told its readers and the text moves with it — the procedure is in
+  -- docs/adr/LEGAL-BRAKES.md.
+  ('tab_ceiling_pence',              '800',  'Cap on a reader''s outstanding tab; a read that would exceed it is refused and the tab is collected first (£8.00)'),
   ('monthly_fallback_minimum_pence', '200',  'Minimum balance for time-based settlement trigger (£2.00)'),
   ('monthly_fallback_days',          '30',   'Days since last read before monthly settlement fires'),
   ('writer_payout_threshold_pence',  '2000', 'Writer balance threshold that triggers Stripe Connect transfer (£20.00)'),
+  -- Writer Agreement 9.3 (operator decision A6, 2026-09-16), and BOTH figures
+  -- are NAMED in the published text: "If you remain Unpayable for 6 months, we
+  -- may withdraw your content from sale … after giving you at least 30 days'
+  -- notice". So moving either changes what the site has told its writers and
+  -- the text moves with it — the procedure is in docs/adr/LEGAL-BRAKES.md.
+  -- They are dials rather than constants because the RIGHT figure is a legal
+  -- and commercial judgement the operator may revisit, and because a notice
+  -- period that cannot be lengthened in an emergency is not a notice period.
+  ('unpayable_withdrawal_days',      '180',  'Days a Writer may remain unpayable before their paid access is withdrawn (Writer 9.3: six months)'),
+  ('unpayable_notice_days',          '30',   'Days between the notice and the withdrawal (Writer 9.3: at least 30 days)'),
   ('platform_fee_bps',               '800',  'Platform cut in basis points (800 = 8%)')
 ON CONFLICT (key) DO NOTHING;
 
@@ -287,10 +332,10 @@ ON CONFLICT (key) DO NOTHING;
 -- charge-time-stamped subscription_earning, over Σ writer payouts for the same
 -- window — with headroom above that floor. A threshold chosen without the
 -- baseline fires on day one and gets muted, which is worse than no alert. Note
--- the spend→subscription conversion has been dark since 2026-07-16
--- (SUBSCRIPTION_CONVERT_ENABLED), so a trailing window measures only the live
+-- the spend→subscription conversion was dark from 2026-07-16 and its route
+-- deleted 2026-09-29, so a trailing window measures only the live
 -- logSubscriptionCharge branch — the honest CURRENT floor — and this dial must
--- be revisited if that flag is ever re-lit.
+-- be revisited if a new credit producer is ever written.
 --
 -- `payout_max_slices` bounds the tail, not the ordinary case: transfer volume
 -- grows from O(writers) to roughly O(writers × charges drawn), and a writer
@@ -468,4 +513,76 @@ ON CONFLICT (key) DO NOTHING;
 -- ---------------------------------------------------------------------------
 INSERT INTO platform_config (key, value, description) VALUES
   ('reading_log_retention_days', '7', 'How many days a piece stays in a reader''s Recent reading log, measured on its LATEST open so a piece returned to never ages out. Also the age at which a reading_positions row is swept, which since migration 189 has no other reaper. Read by gateway workers/reading-log-sweep.ts.')
+ON CONFLICT (key) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- Pledge drives — the ceiling on a single pledge (MIRROR-AUDIT §3 Money, S14).
+--
+-- A pledge is a promise that becomes real money at fulfilment: publishing the
+-- article inserts a read_event and debits the pledger's tab by the full amount.
+-- The route bounded it only at `min(1)`, so a slipped decimal point promised
+-- £5,000 as easily as £50 and nothing questioned it until the debt was on
+-- somebody's tab.
+--
+-- £100 is the beta figure and deliberately generous — the point of the cap is
+-- the fat finger and the runaway client, not the enthusiastic backer. It is a
+-- dial rather than a literal because the right ceiling is only knowable by
+-- watching what people actually pledge, and pledges are parked behind
+-- PLEDGES_ENABLED, so there is no distribution to read yet.
+--
+-- Read by gateway routes/drives.ts::pledgeMaxPence, whose in-code fallback is
+-- parity-tested against this line (gateway/tests/config-fallback-parity.test.ts).
+-- ---------------------------------------------------------------------------
+INSERT INTO platform_config (key, value, description) VALUES
+  ('pledge_max_pence', '10000', 'Ceiling on a single pledge to a drive (£100.00). Fulfilment turns a pledge into a tab debit, so this bounds what one gesture can put on a reader''s tab. Read by gateway routes/drives.ts::pledgeMaxPence.')
+ON CONFLICT (key) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- Linked-account notifications (CROSS-NETWORK-ROUNDTRIP-ADR rung C).
+--
+-- feed-ingest's linked_notifications_poll asks every active Bluesky/Mastodon
+-- presence's own network "what was addressed to this person" and brings the
+-- replies, mentions and quotes home as notifications.
+--
+-- The INTERVAL is how stale a notification may be before a member sees it, and
+-- how many authenticated requests we spend on their behalf (one list call per
+-- presence per interval, plus a lookup per Mastodon reply). 300s is a guess
+-- until there is a distribution to read: a reply twenty minutes late reads as
+-- broken, one five minutes late as ordinary.
+--
+-- STALE INTERVALS is the liveness threshold: a presence whose poll has not
+-- SUCCEEDED for this many intervals is counted DOWN on /admin/overview (the
+-- heartbeat is `network_presences.notifications_polled_at`, stamped only on a
+-- success). Six is past ordinary jitter and a transient outage at the far end.
+--
+-- BACKFILL HOURS bounds a presence's FIRST poll: without it, linking an old
+-- account would dump its whole history into the panel as new. Three days
+-- catches a reply sent while the member was away from the platform, which is
+-- the case the rung exists for.
+--
+-- The poller (feed-ingest tasks/linked-notifications-poll.ts) reads the
+-- interval and the backfill; the dashboard (gateway routes/admin-dashboard.ts)
+-- reads the interval and the stale threshold. The fallbacks in both are
+-- parity-tested against this file.
+-- ---------------------------------------------------------------------------
+INSERT INTO platform_config (key, value, description) VALUES
+  ('linked_notifications_poll_seconds',     '300', 'How often (seconds) feed-ingest polls each active Bluesky/Mastodon presence for replies, mentions and quotes addressed to its member. Read by feed-ingest linked-notifications-poll.ts and gateway admin-dashboard.ts.'),
+  ('linked_notifications_stale_intervals',  '6',   'A presence whose notification poll has not succeeded for this many poll intervals is counted DOWN on /admin/overview. Read by gateway admin-dashboard.ts.'),
+  ('linked_notifications_backfill_hours',   '72',  'How far back a presence''s FIRST notification poll reaches, so linking an account does not replay its whole history as new. Read by feed-ingest linked-notifications-poll.ts.')
+ON CONFLICT (key) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- The key export waits after an email change (migration 273).
+--
+-- Login is by email and the export's confirmation is mailed to the account's
+-- current address, so a change of address is the one act that moves that
+-- channel. For this many days after a change nobody has undone, the export is
+-- paused, and the old address's undo link stays good for the same length. The
+-- custodial key cannot be rotated, so the undo has to land before the key can
+-- leave. Seven days is long enough for a member who reads email weekly; an
+-- exchange-style 72 hours is the shorter end. 0 turns the hold off. Read by
+-- gateway lib/email-change-hold.ts; its fallback is parity-tested.
+-- ---------------------------------------------------------------------------
+INSERT INTO platform_config (key, value, description) VALUES
+  ('email_change_export_hold_days', '7', 'Days after a sign-in email change during which the account export is paused, and for which the old address''s undo link stays valid. 0 turns the hold off. Read by gateway lib/email-change-hold.ts.')
 ON CONFLICT (key) DO NOTHING;

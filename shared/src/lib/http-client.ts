@@ -195,24 +195,39 @@ async function resolveAndValidateHost(
   allowPrivate = false,
 ): Promise<ResolvedHost> {
   // Short-circuit literal IPs so safeFetch('http://10.0.0.1') still gets
-  // caught — dns.resolve* only works on hostnames. Use net.isIP* rather than
-  // regex so non-canonical IPv6 forms ("[::1]" stripped of brackets, etc.)
-  // aren't silently treated as hostnames and fall through to DNS.
-  if (net.isIPv4(hostname)) {
-    if (!allowPrivate && isPrivateIpv4(hostname)) {
+  // caught — dns.resolve* only works on hostnames. `net.isIP*` rather than a
+  // regex, so non-canonical forms are classified by the same parser the socket
+  // layer uses instead of by a pattern somebody wrote out.
+  //
+  // BRACKETS ARE STRIPPED FIRST, and the comment here used to claim they
+  // already had been. `new URL('http://[::1]/').hostname` is `[::1]` — WITH the
+  // brackets, which is what every caller passes in — and `net.isIPv6('[::1]')`
+  // is false, so a bracketed literal fell through to DNS, resolved to nothing,
+  // and was refused. That is the right answer for `[::1]` and the WRONG answer
+  // for `[2606:4700:4700::1111]`: a perfectly ordinary public IPv6 address, in
+  // the one URL form IPv6 has, refused as unresolvable — the failure is
+  // closed, so nothing has broken visibly, but the guard was not doing the job
+  // it was written to do and its own comment said it was.
+  const literal =
+    hostname.startsWith("[") && hostname.endsWith("]")
+      ? hostname.slice(1, -1)
+      : hostname;
+
+  if (net.isIPv4(literal)) {
+    if (!allowPrivate && isPrivateIpv4(literal)) {
       throw new Error(
-        `Hostname ${hostname} resolves to private IP ${hostname}`,
+        `Hostname ${hostname} resolves to private IP ${literal}`,
       );
     }
-    return { address: hostname, family: 4 };
+    return { address: literal, family: 4 };
   }
-  if (net.isIPv6(hostname)) {
-    if (!allowPrivate && isPrivateIpv6(hostname)) {
+  if (net.isIPv6(literal)) {
+    if (!allowPrivate && isPrivateIpv6(literal)) {
       throw new Error(
-        `Hostname ${hostname} resolves to private IP ${hostname}`,
+        `Hostname ${hostname} resolves to private IP ${literal}`,
       );
     }
-    return { address: hostname, family: 6 };
+    return { address: literal, family: 6 };
   }
 
   try {
@@ -288,6 +303,25 @@ export interface SafeFetchOptions {
   method?: string;
   body?: string | Uint8Array;
   redirect?: "follow" | "manual";
+  /**
+   * Per-hop request signing (HTTP Signatures, `lib/http-signature.ts`).
+   *
+   * A HOOK RATHER THAN A HEADER, BECAUSE A SIGNATURE IS ABOUT ONE HOP. The
+   * signed set is `(request-target) host date`, so a signature minted for the
+   * URL the caller asked for verifies against NOTHING once this client follows
+   * a redirect — and an outbox page that redirects apex → www is ordinary. It
+   * is called once per hop, after the hop's URL and method are settled, and
+   * what it returns overlays the caller's headers for that hop alone.
+   *
+   * It also sits INSIDE the pin for the reason pinning lives here at all: a
+   * caller cannot sign a request through this module and forget to route it
+   * through the validated lookup, because there is no other way in. Returning
+   * null is how "not configured" is said, and it is not an error.
+   */
+  signRequest?: (req: {
+    method: string;
+    url: string;
+  }) => Record<string, string> | null;
 }
 
 export interface SafeFetchResult {
@@ -331,13 +365,29 @@ export async function safeFetch(
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
 
+    // Signed LAST and per hop, so it overlays whatever the caller sent and is
+    // computed against the URL actually being fetched. It deliberately sits
+    // after the cross-origin credential strip above: a signature is not a
+    // credential the strip is protecting — it authorises nothing and discloses
+    // nothing — and the new host is exactly who the next hop must be signed
+    // for.
+    const hopHeaders = options.signRequest
+      ? {
+          ...currentHeaders,
+          ...(options.signRequest({
+            method: currentMethod,
+            url: currentUrl,
+          }) ?? {}),
+        }
+      : currentHeaders;
+
     try {
       const response = await undiciFetch(currentUrl, {
         method: currentMethod,
         headers: {
           "User-Agent": USER_AGENT,
           Accept: "*/*",
-          ...currentHeaders,
+          ...hopHeaders,
         },
         body: currentBody,
         signal: controller.signal,
@@ -481,7 +531,28 @@ export async function safeFetch(
 // Scheme must be ws:/wss:, hostname must not resolve to a private/reserved IP.
 export interface PinnedWebSocketOptions {
   lookup: LookupFunction;
+  maxPayload: number;
 }
+
+// The largest single frame we will buffer from a relay (MIRROR-AUDIT §3
+// *Security*, S16). `ws` defaults to 100 MiB and buffers a frame WHOLE before
+// any handler sees it, so a relay could hand any of our workers 100 MiB of
+// resident memory per socket, per message — and relay URLs are user-steerable
+// (an nprofile's TLVs, a remote `.well-known/nostr.json`, a source's own hints),
+// so "a relay" means "a host somebody typed into a form".
+//
+// 1 MiB against strfry's own `maxEventSize = 524288` (relay/strfry.conf): twice
+// the largest event we ourselves will accept, which leaves room for a batched
+// EVENT envelope and for a peer relay configured more generously than ours,
+// while keeping the ceiling two orders of magnitude below the default. An
+// oversized frame closes the socket with 1009, which every caller here already
+// treats as a dead relay.
+//
+// It lives in the returned options, beside `lookup`, for the reason the pin
+// does: a caller cannot open a socket through this module and forget it. Both
+// are properties of "we are connecting to somewhere we do not control", and
+// neither is a decision a call site should be making.
+export const WS_MAX_PAYLOAD_BYTES = 1024 * 1024;
 
 export interface PinnedWebSocketConfig {
   maxLength?: number;
@@ -515,6 +586,7 @@ export async function pinnedWebSocketOptions(
   const expectedHost = parsed.hostname;
 
   return {
+    maxPayload: WS_MAX_PAYLOAD_BYTES,
     lookup: ((hostname: string, opts: any, cb: any) => {
       if (hostname !== expectedHost) {
         cb(

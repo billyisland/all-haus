@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from
 import pg from "pg";
 import {
   dedupCtes,
-  DEDUP_SUPPRESS_FILTER,
+  dedupSuppressFilter,
   DEDUP_PROVENANCE_LATERAL,
   dedupApplicableExistsSql,
 } from "../src/lib/dedup-sql.js";
@@ -35,10 +35,10 @@ const DB_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
 // production's seeded value; the floor cases at the foot of the file vary it.
 const DEFAULT_FLOOR = 0.9;
 
-// `matched` is the host query's pre-LIMIT candidate set; here we feed it the
+// `source_pool` is the host query's deliverable, pre-cut candidate set; here we feed it the
 // seeded feed_items directly so the dedup CTEs run over exactly our fixtures.
 const SUPPRESSED_SQL = `
-  WITH RECURSIVE matched AS (
+  WITH RECURSIVE source_pool AS (
     SELECT id AS fi_id, TRUE AS allow_replies FROM feed_items WHERE id = ANY($2::uuid[])
   ),
   ${dedupCtes(3)}
@@ -49,7 +49,7 @@ const SUPPRESSED_SQL = `
 // allow_replies — $3 lists the fi_ids whose (stub) feed membership disallows
 // replies, mirroring the host's `m.allow_replies` join column.
 const SUPPRESSED_SQL_REPLY_GATED = `
-  WITH RECURSIVE matched AS (
+  WITH RECURSIVE source_pool AS (
     SELECT id AS fi_id, (id <> ALL($3::uuid[])) AS allow_replies
     FROM feed_items WHERE id = ANY($2::uuid[])
   ),
@@ -59,16 +59,16 @@ const SUPPRESSED_SQL_REPLY_GATED = `
 
 // Survivors + their provenance, exercising the real suppress filter + lateral.
 const SURVIVORS_SQL = `
-  WITH RECURSIVE matched AS (
+  WITH RECURSIVE source_pool AS (
     SELECT id AS fi_id, TRUE AS allow_replies FROM feed_items WHERE id = ANY($2::uuid[])
   ),
   ${dedupCtes(3)},
   scored AS (
     SELECT fi.id AS fi_id, fi.source_id, ei.dedup_fingerprint AS fp
     FROM feed_items fi
-    JOIN matched m ON m.fi_id = fi.id
+    JOIN source_pool m ON m.fi_id = fi.id
     JOIN external_items ei ON ei.id = fi.external_item_id
-    WHERE TRUE ${DEDUP_SUPPRESS_FILTER}
+    WHERE TRUE ${dedupSuppressFilter("fi.id")}
   )
   SELECT scored.fi_id, prov.also_on
   FROM scored

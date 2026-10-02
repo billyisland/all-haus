@@ -25,17 +25,25 @@
 // =============================================================================
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { ReportButton } from "../ui/ReportButton";
+import { MuteBlockControls } from "../social/MuteBlockControls";
 import { useRouter } from "next/navigation";
 import { useAuth } from "../../stores/auth";
+import { auth as authApi } from "../../lib/api/auth";
+import { mapSubscribeError } from "../../lib/subscribe-errors";
+import { TermsConsent } from "../legal/TermsConsent";
 import { useResolvedDark } from "../../stores/colorScheme";
 import type { FeedScheme } from "../workspace/tokens";
+import type { ProfileFocus } from "../../stores/profileOverlay";
 import {
   messages as messagesApi,
+  subscriptions as subscriptionsApi,
   trust as trustApi,
   type TrustProfileResponse,
   type WriterProfile,
 } from "../../lib/api";
-import { useFollows, useFollowState } from "../../stores/follows";
+import { useFollowState } from "../../stores/follows";
+import { ProfileFollowControl } from "./ProfileFollowControl";
 import { routeToOverlay } from "../../lib/workspace/overlays";
 import { trustEnabled } from "../../lib/featureFlags";
 import { TrustProfile } from "../trust/TrustProfile";
@@ -51,6 +59,14 @@ import {
   protocolChipLabel,
   type ProfileIdentity,
 } from "./ProfileChrome";
+import { TERMS_PURPOSE, termsVersionMismatch, TERMS_ACCEPT_FAILED } from "../../content/terms-consent";
+import {
+  UNSUBSCRIBE_FAILED,
+  SUBSCRIBED,
+  SUBSCRIBE_ACCEPT,
+  subscribeMonthlyLabel,
+  subscribeAnnualLabel,
+} from "../../content/ledger";
 
 interface SubStatus {
   subscribed: boolean;
@@ -60,18 +76,28 @@ interface SubStatus {
   currentPeriodEnd?: string;
 }
 
+// The bar's text actions — Mute, Block, Report — share one register.
+const BAR_TEXT_ACTION =
+  "font-mono text-mono-xs uppercase tracking-[0.02em] hover:opacity-80";
+
 export function NativeProfileBody({
   username,
   writer,
   onClose,
   minHeight,
   scheme,
+  focus,
+  tab = null,
 }: {
   username: string;
   writer: WriterProfile;
   /** The overlay register's alone — the standalone page has nothing to close. */
   onClose?: () => void;
   minHeight?: string;
+  /** The conversation the pane was opened ON — overlay register only. */
+  focus?: ProfileFocus | null;
+  /** The view the pane was asked to open on — see `ProfileOpenOptions.tab`. */
+  tab?: string | null;
   /** The launching feed's colourway (overlay register only): the pane wears it
    *  entire. Absent on the standalone page and on feed-agnostic launches. */
   scheme?: FeedScheme | null;
@@ -86,11 +112,16 @@ export function NativeProfileBody({
 
   const isOwnProfile = user?.username === username;
   const following = useFollowState(writer.id);
-  const [followLoading, setFollowLoading] = useState(false);
   const [msgLoading, setMsgLoading] = useState(false);
   const [subStatus, setSubStatus] = useState<SubStatus | null>(null);
   const [subLoading, setSubLoading] = useState(false);
   const [subError, setSubError] = useState<string | null>(null);
+  // The Reader Terms refusal (§0z item 5). Holds the PERIOD that was pressed,
+  // because accepting resumes that press rather than asking for it again — and
+  // the consent REPLACES the two subscribe buttons while it is up.
+  const [subNeedsTerms, setSubNeedsTerms] = useState<"monthly" | "annual" | null>(null);
+  const [termsChecked, setTermsChecked] = useState(false);
+  const [acceptingTerms, setAcceptingTerms] = useState(false);
   const [showVouchModal, setShowVouchModal] = useState(false);
   const [trustData, setTrustData] = useState<TrustProfileResponse | null>(null);
   const [trustKey, setTrustKey] = useState(0);
@@ -99,15 +130,16 @@ export function NativeProfileBody({
   useEffect(() => {
     if (!user) return;
     let cancelled = false;
-    fetch(`/api/v1/subscriptions/check/${writer.id}`, {
-      credentials: "include",
-    })
-      .then((res) => (res.ok ? res.json() : null))
+    subscriptionsApi
+      .check(writer.id)
       .then((data) => {
-        if (!cancelled && data) setSubStatus(data);
+        if (!cancelled) setSubStatus(data);
       })
-      .catch(() => {
-        if (!cancelled) setSubStatus({ subscribed: false });
+      .catch((err) => {
+        // A check that FAILED asserts nothing: offering Subscribe to somebody
+        // who may already be subscribed would be a claim we cannot make, so
+        // the row stays unknown (hidden) rather than reading "not subscribed".
+        console.error("Subscription check failed:", err);
       });
     return () => {
       cancelled = true;
@@ -124,32 +156,27 @@ export function NativeProfileBody({
       .catch(() => {});
   }, [writer.id, trustKey]);
 
-  const handleToggleFollow = useCallback(async () => {
-    if (!user) return;
-    setFollowLoading(true);
-    try {
-      if (following) await useFollows.getState().unfollow(writer.id);
-      else await useFollows.getState().follow(writer.id);
-    } catch (err) {
-      console.error("Follow error:", err);
-    } finally {
-      setFollowLoading(false);
-    }
-  }, [user, following, writer.id]);
 
+  // Open the messages overlay in place inside the workspace; navigate to it on
+  // a standalone /:username page. Going through `routeToOverlay` is what makes
+  // the button work at all: this pane is nearly always ALREADY on /reader, and
+  // a router.push to the pathname you are on re-runs nothing — so the plain
+  // push it used to do opened no surface anywhere (S19). The helper answers
+  // false off the workspace, where MessagesOverlay is not mounted, so the push
+  // still carries it there and the mount-time dispatcher opens it.
   const handleMessage = useCallback(async () => {
     if (!user) return;
     setMsgLoading(true);
+    let href = "/reader?overlay=messages";
     try {
       const result = await messagesApi.createConversation([writer.id]);
-      router.push(
-        `/reader?overlay=messages&conversation=${result.conversationId}`,
-      );
+      href = `/reader?overlay=messages&conversation=${encodeURIComponent(result.conversationId)}`;
     } catch {
-      router.push("/reader?overlay=messages");
+      // Fall through to the inbox with nothing selected.
     } finally {
       setMsgLoading(false);
     }
+    if (!routeToOverlay(href)) router.push(href);
   }, [user, writer.id, router]);
 
   const handleSubscribe = useCallback(
@@ -158,30 +185,23 @@ export function NativeProfileBody({
       setSubLoading(true);
       setSubError(null);
       try {
-        const res = await fetch(`/api/v1/subscriptions/${writer.id}`, {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ period }),
+        const data = await subscriptionsApi.subscribe(writer.id, { period });
+        setSubNeedsTerms(null);
+        setSubStatus({
+          subscribed: true,
+          status: "active",
+          pricePence: data.pricePence,
+          currentPeriodEnd: data.currentPeriodEnd,
         });
-        if (res.ok) {
-          const data = await res.json();
-          setSubStatus({
-            subscribed: true,
-            status: "active",
-            pricePence: data.pricePence,
-            currentPeriodEnd: data.currentPeriodEnd,
-          });
-        } else if (res.status === 402) {
-          // card_required: subscriptions charge the reading tab, which needs a
-          // card on file to be collectable.
-          setSubError("Add a payment card in Settings to subscribe.");
-        } else {
-          setSubError("Subscription failed — try again.");
-        }
       } catch (err) {
-        console.error("Subscribe error:", err);
-        setSubError("Subscription failed — try again.");
+        // One mapper for every subscribe surface (lib/subscribe-errors.ts).
+        // A card-holder who has never been shown the Reader Terms gets the
+        // acceptance in place of the buttons, and on accept the period they
+        // pressed is re-sent; every other refusal — a dropped connection
+        // included — is a sentence.
+        const view = mapSubscribeError(err);
+        if (view.needsTerms) setSubNeedsTerms(period);
+        else setSubError(view.message);
       } finally {
         setSubLoading(false);
       }
@@ -189,24 +209,50 @@ export function NativeProfileBody({
     [user, writer.id],
   );
 
+  // ACCEPT, THEN RESUME THE PRESS. The version is the server's own `current`
+  // off the auth store, and `/auth/me` is refreshed before the retry so the
+  // row cannot loop on a stale session — the same shape as the paywall gate's
+  // `handleAcceptReaderTerms`. A refused acceptance (the text moved between
+  // render and press) is SHOWN, and the member is asked again.
+  const handleAcceptTerms = useCallback(async () => {
+    const version = user?.terms.reader.current;
+    const period = subNeedsTerms;
+    if (!version || !period) return;
+    setAcceptingTerms(true);
+    setSubError(null);
+    try {
+      await authApi.acceptTerms("reader", version);
+      await useAuth.getState().fetchMe();
+      setSubNeedsTerms(null);
+      setTermsChecked(false);
+      await handleSubscribe(period);
+    } catch (err) {
+      const code = (err as { body?: { error?: string } })?.body?.error;
+      setSubError(
+        code === "terms_version_mismatch"
+          ? termsVersionMismatch('reader')
+          : TERMS_ACCEPT_FAILED,
+      );
+      await useAuth.getState().fetchMe();
+    } finally {
+      setAcceptingTerms(false);
+    }
+  }, [user, subNeedsTerms, handleSubscribe]);
+
   const handleUnsubscribe = useCallback(async () => {
     if (!user) return;
     setSubLoading(true);
+    setSubError(null);
     try {
-      const res = await fetch(`/api/v1/subscriptions/${writer.id}`, {
-        method: "DELETE",
-        credentials: "include",
+      const data = await subscriptionsApi.unsubscribe(writer.id);
+      setSubStatus({
+        subscribed: true,
+        status: "cancelled",
+        currentPeriodEnd: data.accessUntil,
       });
-      if (res.ok) {
-        const data = await res.json();
-        setSubStatus({
-          subscribed: true,
-          status: "cancelled",
-          currentPeriodEnd: data.accessUntil,
-        });
-      }
     } catch (err) {
       console.error("Unsubscribe error:", err);
+      setSubError(UNSUBSCRIBE_FAILED);
     } finally {
       setSubLoading(false);
     }
@@ -264,15 +310,15 @@ export function NativeProfileBody({
       >
         {msgLoading ? "…" : "Message"}
       </BarButton>
-      <BarButton
-        data-explain="profile.follow"
+      {/* Follow is the feed picker, not a bare graph toggle: a profile is a
+          feed-less surface, so nothing here can decide which feed a follow
+          lands in and the reader is asked (§9.16). The live store value is
+          handed in as the snapshot, so the picker's label and this surface's
+          cannot disagree. */}
+      <ProfileFollowControl
+        target={{ type: "user", id: writer.id, isFollowing: following }}
         palette={palette}
-        variant={following ? "secondary" : "primary"}
-        onClick={handleToggleFollow}
-        disabled={followLoading}
-      >
-        {followLoading ? "…" : following ? "Following" : "Follow"}
-      </BarButton>
+      />
     </>
   );
 
@@ -303,8 +349,30 @@ export function NativeProfileBody({
               ? "…"
               : subStatus.status === "cancelled"
                 ? `Access until ${new Date(subStatus.currentPeriodEnd!).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}`
-                : "Subscribed"}
+                : SUBSCRIBED}
           </button>
+        ) : subNeedsTerms ? (
+          // THE TERMS REFUSAL REPLACES THE SUBSCRIBE BUTTONS, it does not sit
+          // beside them: two live primaries for one blocked act would leave
+          // the member pressing the one that cannot work. One button, and it
+          // says what the press does.
+          <div className="w-full">
+            <TermsConsent
+              kind="reader"
+              checked={termsChecked}
+              onChange={setTermsChecked}
+              purpose={TERMS_PURPOSE.subscribe}
+              state={user?.terms.reader ?? null}
+              disabled={acceptingTerms}
+            />
+            <button
+              onClick={handleAcceptTerms}
+              disabled={!termsChecked || acceptingTerms || subLoading}
+              className="btn-accent py-1.5 px-4 text-ui-xs disabled:opacity-50 transition-colors"
+            >
+              {acceptingTerms || subLoading ? "…" : SUBSCRIBE_ACCEPT}
+            </button>
+          </div>
         ) : (
           <>
             <button
@@ -314,7 +382,7 @@ export function NativeProfileBody({
             >
               {subLoading
                 ? "…"
-                : `Subscribe £${(monthlyPence / 100).toFixed(2)}/mo`}
+                : subscribeMonthlyLabel(monthlyPence)}
             </button>
             {discount > 0 && (
               <button
@@ -322,7 +390,7 @@ export function NativeProfileBody({
                 disabled={subLoading}
                 className="btn-soft py-1.5 px-4 text-ui-xs disabled:opacity-50 transition-colors"
               >
-                {subLoading ? "…" : `£${(annualPence / 100).toFixed(2)}/yr`}
+                {subLoading ? "…" : subscribeAnnualLabel(annualPence)}
               </button>
             )}
           </>
@@ -357,7 +425,34 @@ export function NativeProfileBody({
           avatarUrl={writer.avatar}
           name={writer.displayName ?? username}
           handle={`@${username}`}
-          actions={actions}
+          actions={
+            // The action slot is a ROW, because a profile carries more than
+            // one act: whatever the host supplied (Message / Follow / Edit),
+            // and — since L6.3 — reporting the person, which is the whole
+            // reason D1 §9.2 says reporting covers more than content. Not on
+            // your own profile, where there is nobody to report to.
+            // W2 put Mute and Block in the same row, in Report's register, and
+            // behind the same gate plus a session: they are acts on a
+            // relationship, and a logged-out reader has none to act on.
+            <div className="flex items-center gap-3">
+              {actions}
+              {user && user.id !== writer.id && (
+                <MuteBlockControls
+                  userId={writer.id}
+                  name={writer.displayName ?? `@${username}`}
+                  initial={writer.viewer}
+                  triggerClassName={BAR_TEXT_ACTION}
+                />
+              )}
+              {user?.id !== writer.id && (
+                <ReportButton
+                  targetProfileId={writer.id}
+                  label="Report"
+                  triggerClassName={BAR_TEXT_ACTION}
+                />
+              )}
+            </div>
+          }
           onClose={onClose}
         />
       }
@@ -400,6 +495,8 @@ export function NativeProfileBody({
         isOwnProfile={isOwnProfile}
         palette={palette}
         inOverlay={!!onClose}
+        focus={focus}
+        tab={tab}
       />
     </ProfileSurface>
   );

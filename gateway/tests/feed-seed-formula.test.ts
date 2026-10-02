@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import { holdDefaultSeed } from "./default-seed-lock.js";
 import pg from "pg";
 import Fastify from "fastify";
 
@@ -68,6 +69,8 @@ describe.skipIf(!DB_URL)("the default seed", () => {
   beforeAll(async () => {
     client = new pg.Client({ connectionString: DB_URL });
     await client.connect();
+    // The seed is a singleton another suite also parks (default-seed-lock.ts).
+    await holdDefaultSeed(client);
     const { rows } = await client.query<{ id: string }>(
       `UPDATE feed_formulas SET is_default_seed = FALSE
         WHERE is_default_seed RETURNING id`,

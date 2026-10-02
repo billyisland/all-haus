@@ -3,6 +3,7 @@
 import React, { useState, useEffect } from 'react'
 import { publications as pubApi, type PublicationMember } from '../../lib/api'
 import { useResolverInput } from '../../hooks/useResolverInput'
+import { useConfirm } from '../ui/ConfirmDialog'
 
 interface Props {
   publicationId: string
@@ -49,11 +50,12 @@ export function MembersTab({ publicationId, publicationName, canManageMembers, i
 
   // Leave
   const [leaving, setLeaving] = useState(false)
+  const { ask, dialog } = useConfirm()
 
   useEffect(() => {
     pubApi.getMembers(publicationId)
       .then(res => setMembers(res.members))
-      .catch(() => setError('Failed to load members.'))
+      .catch(() => setError('Couldn’t load the members. Please try again.'))
       .finally(() => setLoading(false))
   }, [publicationId])
 
@@ -84,17 +86,27 @@ export function MembersTab({ publicationId, publicationName, canManageMembers, i
       ri.reset()
       setInvitePick(null)
     } catch {
-      setInviteMsg('Failed to send invite.')
+      setInviteMsg('Couldn’t send the invitation. Please try again.')
     } finally {
       setInviting(false)
     }
   }
 
-  async function handleRemove(memberId: string) {
+  // Confirmed: it takes another member's editorial access away, it is
+  // one press from an unlabelled ✕ in a row, and re-inviting them is a
+  // separate flow they have to accept again. Same rule as Delete article
+  // (MIRROR-AUDIT §2.15) — the destructive side is the one that must ask.
+  async function handleRemove(e: React.MouseEvent<HTMLElement>, memberId: string) {
+    const ok = await ask(e.currentTarget, {
+      title: 'Remove this member?',
+      body: 'They lose editorial access to the publication immediately. Their published articles stay where they are, and re-adding them means a fresh invitation they have to accept.',
+      confirmLabel: 'Remove',
+    })
+    if (!ok) return
     try {
       await pubApi.removeMember(publicationId, memberId)
       setMembers(prev => prev.filter(m => m.id !== memberId))
-    } catch { setError('Failed to remove member.') }
+    } catch { setError('Couldn’t remove this member. Please try again.') }
   }
 
   function startEditRole(member: PublicationMember) {
@@ -114,20 +126,25 @@ export function MembersTab({ publicationId, publicationName, canManageMembers, i
       setMembers(prev => prev.map(m => m.id === memberId ? { ...m, role: editRole } : m))
       setEditingId(null)
     } catch {
-      setError('Failed to update role.')
+      setError('Couldn’t change their role. Please try again.')
     } finally {
       setSavingRole(false)
     }
   }
 
-  async function handleLeave() {
-    if (!confirm(`Leave ${publicationName}? Your articles will remain in the publication but you will lose editorial access.`)) return
+  async function handleLeave(e: React.MouseEvent<HTMLElement>) {
+    const ok = await ask(e.currentTarget, {
+      title: `Leave ${publicationName}?`,
+      body: 'Your articles stay in the publication, but you lose editorial access to it.',
+      confirmLabel: 'Leave',
+    })
+    if (!ok) return
     setLeaving(true)
     try {
       await pubApi.leave(publicationId)
       window.location.href = '/reader?overlay=dashboard'
     } catch {
-      setError('Failed to leave publication.')
+      setError('Couldn’t leave this publication. Please try again.')
       setLeaving(false)
     }
   }
@@ -137,6 +154,7 @@ export function MembersTab({ publicationId, publicationName, canManageMembers, i
 
   return (
     <div className="space-y-6">
+      {dialog}
       {/* Member list */}
       <div className="overflow-x-auto ah-scrollbar bg-glasshouse-well">
         <table className="w-full text-ui-xs">
@@ -184,7 +202,7 @@ export function MembersTab({ publicationId, publicationName, canManageMembers, i
                               disabled={savingRole}
                               className="text-ui-xs text-black font-medium disabled:opacity-50"
                             >
-                              {savingRole ? '...' : 'Save'}
+                              {savingRole ? '…' : 'Save'}
                             </button>
                             <button
                               onClick={cancelEditRole}
@@ -201,7 +219,7 @@ export function MembersTab({ publicationId, publicationName, canManageMembers, i
                             >
                               Change role
                             </button>
-                            <button onClick={() => handleRemove(m.id)} className="text-grey-300 hover:text-black">
+                            <button onClick={(e) => handleRemove(e, m.id)} className="text-grey-300 hover:text-black">
                               Remove
                             </button>
                           </>
@@ -223,7 +241,7 @@ export function MembersTab({ publicationId, publicationName, canManageMembers, i
           disabled={leaving}
           className="text-ui-xs text-grey-300 hover:text-black transition-colors disabled:opacity-50"
         >
-          {leaving ? 'Leaving...' : 'Leave this publication'}
+          {leaving ? 'Leaving…' : 'Leave this publication'}
         </button>
       )}
 
@@ -293,7 +311,7 @@ export function MembersTab({ publicationId, publicationName, canManageMembers, i
               </select>
             </div>
             <button type="submit" disabled={inviting} className="btn text-sm disabled:opacity-50">
-              {inviting ? 'Sending...' : 'Send invite'}
+              {inviting ? 'Sending…' : 'Send invite'}
             </button>
           </form>
           {inviteMsg && <p className="text-ui-xs text-grey-600 mt-2">{inviteMsg}</p>}

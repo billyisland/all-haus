@@ -43,8 +43,33 @@ const enqueueMock = vi.fn();
 
 const ARTICLE_ID = "aaaaaaaa-0000-4000-8000-00000000aaaa";
 
+/** What the pre-upsert `SELECT … FOR UPDATE` finds: an EDIT, or a first publish. */
+let priorEventId: string | null = null;
+/** What the PRE-SIGNING read of the prior row's `published_at` finds (CA-B3):
+ *  the live piece's first-publication date, or nothing. Answered off the pool,
+ *  since it runs before the transaction — it has to, for the NIP-23 tag. */
+let priorPublishedAt: Date | null = null;
+const poolQueries: Call[] = [];
+function poolQuery(sql: string, params: unknown[] = []) {
+  // The writer gate's read (lib/writer-gate.ts). Every author in this file is
+  // an admitted writer; the reader cases live in writer-gate.test.ts.
+  if (sql.includes("AS can_write")) return Promise.resolve({ rows: [{ can_write: true }], rowCount: 1 });
+  poolQueries.push({ sql, params });
+  if (sql.includes("SELECT published_at FROM articles"))
+    return Promise.resolve({
+      rows: priorPublishedAt ? [{ published_at: priorPublishedAt }] : [],
+      rowCount: priorPublishedAt ? 1 : 0,
+    });
+  return Promise.resolve({ rows: [], rowCount: 0 });
+}
+
 function scriptedQuery(sql: string, params: unknown[] = []) {
   txCalls.push({ sql, params });
+  if (sql.includes("SELECT nostr_event_id FROM articles"))
+    return Promise.resolve({
+      rows: priorEventId ? [{ nostr_event_id: priorEventId }] : [],
+      rowCount: priorEventId ? 1 : 0,
+    });
   if (sql.includes("INSERT INTO articles"))
     return Promise.resolve({ rows: [{ id: ARTICLE_ID }], rowCount: 1 });
   if (sql.includes("SELECT display_name"))
@@ -62,7 +87,7 @@ function scriptedQuery(sql: string, params: unknown[] = []) {
 }
 
 vi.mock("@platform-pub/shared/db/client.js", () => ({
-  pool: { query: vi.fn() },
+  pool: { query: (sql: string, params: unknown[] = []) => poolQuery(sql, params) },
   withTransaction: (cb: (c: { query: typeof scriptedQuery }) => Promise<unknown>) => {
     txClient = { query: scriptedQuery };
     return cb(txClient as { query: typeof scriptedQuery });
@@ -182,9 +207,12 @@ beforeEach(() => {
   txCalls = [];
   signedTemplates = [];
   txClient = null;
+  priorEventId = null;
   emailMock.mockClear();
   driveMock.mockClear();
   enqueueMock.mockClear();
+  priorPublishedAt = null;
+  poolQueries.length = 0;
 });
 
 // =============================================================================
@@ -245,6 +273,42 @@ describe("publishPersonalArticle — the date split", () => {
     );
   });
 
+  it("an EDIT keeps the first-publication date — tag and both columns — unless a date is passed (CA-B3)", async () => {
+    // A re-publish of a live d-tag through publish-now or the scheduler used
+    // to re-date the piece to now and bump it to the top of every feed. The
+    // prior date is read BEFORE the event is signed, so the tag and the two
+    // columns still hold one instant.
+    const FIRST = new Date("2024-06-01T12:00:00.000Z");
+    priorEventId = "event-old";
+    priorPublishedAt = FIRST;
+    await publishPersonalArticle({ ...INPUT, nostrDTag: "d-live" });
+
+    expect(tagValue(signedTemplates[0], "published_at")).toBe(
+      String(Math.floor(FIRST.getTime() / 1000)),
+    );
+    expect(publishedAtParam("articles")).toEqual(FIRST);
+    expect(publishedAtParam("feed_items")).toEqual(FIRST);
+    // …and the read happened on the pool, before any transaction statement.
+    const read = poolQueries.find((c) => c.sql.includes("SELECT published_at FROM articles"))!;
+    expect(read.params).toEqual([INPUT.writerId, "d-live"]);
+    expect(signedTemplates).toHaveLength(1);
+  });
+
+  it("an explicit publishedAt on an edit still overwrites (ARCHIVE-IMPORT §VII)", async () => {
+    priorEventId = "event-old";
+    priorPublishedAt = new Date("2024-06-01T12:00:00.000Z");
+    await publishPersonalArticle({ ...INPUT, nostrDTag: "d-live" }, { publishedAt: BACKDATE });
+    expect(tagValue(signedTemplates[0], "published_at")).toBe(String(BACKDATE_EPOCH));
+    expect(publishedAtParam("articles")).toEqual(BACKDATE);
+    // No need to ask the prior row when the caller has said.
+    expect(poolQueries.some((c) => c.sql.includes("SELECT published_at FROM articles"))).toBe(false);
+  });
+
+  it("a draft with no d-tag is a first publish and never asks for a prior date", async () => {
+    await publishPersonalArticle({ ...INPUT, nostrDTag: null });
+    expect(poolQueries.some((c) => c.sql.includes("SELECT published_at FROM articles"))).toBe(false);
+  });
+
   it("converges published_at on BOTH upserts' conflict arms, not just the inserts", async () => {
     // The test above pins the INSERT arms only, and both upserts are re-entered
     // by design: ARCHIVE-IMPORT-ADR §VII converges an import re-run through the
@@ -269,6 +333,16 @@ describe("publishPersonalArticle — the suppressions", () => {
     await publishPersonalArticle(INPUT);
     expect(emailMock).toHaveBeenCalledTimes(1);
     expect(emailMock.mock.calls[0][1]).toBe(ARTICLE_ID);
+  });
+
+  it("emails nobody on an EDIT, even with every option at its default", async () => {
+    // The scheduler passes no options, so a scheduled edit of a live piece
+    // reached this function as `sendEmail` true and emailed every subscriber
+    // again (MODERNHAUS-ADR §E4.3). The publisher decides off the same prior
+    // row the re-key reads; the default-options call IS the scheduler's.
+    priorEventId = "event-of-the-live-piece";
+    await publishPersonalArticle(INPUT);
+    expect(emailMock).not.toHaveBeenCalled();
   });
 
   it("does not touch pledge drives when matchDrives is false", async () => {
@@ -303,5 +377,62 @@ describe("publishPersonalArticle — the suppressions", () => {
     // outbox row) left the suite green.
     expect(txClient).not.toBeNull();
     expect(enqueueMock.mock.calls[0][0]).toBe(txClient);
+  });
+});
+
+describe("publishPersonalArticle — an edit carries its conversation (§2.8)", () => {
+  function rekeyCalls() {
+    return txCalls.filter(
+      (c) => c.sql.includes("UPDATE comments") && c.sql.includes("target_event_id"),
+    );
+  }
+
+  it("re-keys the conversation onto the new event id, inside the transaction", async () => {
+    // A NIP-23 edit signs a NEW event, and the upsert writes its id over the
+    // old one — so without this, every comment, vote and tally on the piece is
+    // orphaned, silently, on every edit.
+    priorEventId = "the-previous-event-id";
+    await publishPersonalArticle(INPUT);
+
+    const calls = rekeyCalls();
+    expect(calls).toHaveLength(1);
+    // Onto the new id, off the old one — and the new id is the one that was
+    // just signed, not anything the caller supplied.
+    expect(calls[0].params[1]).toBe("the-previous-event-id");
+    expect(calls[0].params[0]).toBe(signedTemplates[0] && "event-1");
+
+    // BEFORE the upsert would be wrong and AFTER the transaction would be
+    // worse: the article row and the conversation must move together or not at
+    // all. Ordering inside `txCalls` is the evidence that they are one.
+    const upsertAt = txCalls.findIndex((c) => c.sql.includes("INSERT INTO articles"));
+    const rekeyAt = txCalls.findIndex((c) => c.sql.includes("UPDATE comments"));
+    expect(upsertAt).toBeGreaterThanOrEqual(0);
+    expect(rekeyAt).toBeGreaterThan(upsertAt);
+  });
+
+  it("reads the old id BEFORE the upsert, and locks it", async () => {
+    // `xmax = 0` only says AFTERWARDS whether a row existed, which is too late
+    // to have kept its id. `FOR UPDATE` because a concurrent publish of the same
+    // d-tag would otherwise interleave and re-key onto the loser's event.
+    priorEventId = "the-previous-event-id";
+    await publishPersonalArticle(INPUT);
+
+    const readAt = txCalls.findIndex((c) =>
+      c.sql.includes("SELECT nostr_event_id FROM articles"),
+    );
+    const upsertAt = txCalls.findIndex((c) => c.sql.includes("INSERT INTO articles"));
+    expect(readAt).toBeGreaterThanOrEqual(0);
+    expect(readAt).toBeLessThan(upsertAt);
+    expect(txCalls[readAt].sql).toContain("FOR UPDATE");
+  });
+
+  it("re-keys NOTHING on a first publish", async () => {
+    // There is nothing to move, and a stray match on an absent old id would
+    // capture another article's conversation — which is why the guard is the
+    // PRIOR ROW and not `is_new`.
+    priorEventId = null;
+    await publishPersonalArticle(INPUT);
+
+    expect(rekeyCalls()).toHaveLength(0);
   });
 });

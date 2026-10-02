@@ -1,4 +1,3 @@
-import { UUID_RE } from "../lib/uuid.js";
 import type { FastifyInstance } from "fastify";
 import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
 import { requireAuth } from "../middleware/auth.js";
@@ -8,6 +7,7 @@ import {
   assertIdentityLink,
   unlinkIdentityPair,
 } from "../lib/identity-link-ops.js";
+import { isUuid } from "../lib/request-inputs.js";
 
 // =============================================================================
 // Cross-source identity links — Slice 8 P2 ("Link to…" / "Unlink")
@@ -75,13 +75,24 @@ export async function identityLinkRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const { authorId } = req.params;
       const viewerId = req.session!.sub;
+      // `typeof`, not truthiness: `{"protocol": 5}` is truthy, and
+      // `validateTarget` dispatches on it with a `switch` that would fall to
+      // `default` — but the atproto/nostr arms `.test()` whatever they are
+      // handed, which stringifies rather than refusing, and the rss/activitypub
+      // arms hand it to `new URL()`. Nothing here is safe on a non-string, and
+      // the values are persisted.
       const protocol = req.body?.protocol;
       const sourceUri = req.body?.sourceUri;
 
-      if (!UUID_RE.test(authorId)) {
-        return reply.status(400).send({ error: "Invalid author id" });
+      if (!isUuid(authorId)) {
+        return reply.status(404).send({ error: "We couldn't find that author." });
       }
-      if (!protocol || !sourceUri || !validateTarget(protocol, sourceUri)) {
+      if (
+        typeof protocol !== "string" ||
+        typeof sourceUri !== "string" ||
+        sourceUri.length > 2048 ||
+        !validateTarget(protocol, sourceUri)
+      ) {
         return reply.status(400).send({ error: "Invalid link target" });
       }
 
@@ -140,7 +151,7 @@ export async function identityLinkRoutes(app: FastifyInstance) {
         if (result.selfLink) {
           return reply
             .status(400)
-            .send({ error: "Cannot link an author to itself" });
+            .send({ error: "You can't link an author to themselves." });
         }
 
         // The new chip the surface appends without a refetch.
@@ -155,7 +166,7 @@ export async function identityLinkRoutes(app: FastifyInstance) {
         });
       } catch (err) {
         logger.error({ err, authorId }, "Identity link create failed");
-        return reply.status(500).send({ error: "Link failed" });
+        return reply.status(500).send({ error: "Couldn't link them. Please try again." });
       }
     },
   );
@@ -180,8 +191,8 @@ export async function identityLinkRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const { linkId } = req.params;
       const viewerId = req.session!.sub;
-      if (!UUID_RE.test(linkId)) {
-        return reply.status(400).send({ error: "Invalid link id" });
+      if (!isUuid(linkId)) {
+        return reply.status(404).send({ error: "We couldn't find that link." });
       }
 
       try {
@@ -200,7 +211,7 @@ export async function identityLinkRoutes(app: FastifyInstance) {
           [linkId],
         );
         if (!link) {
-          return reply.status(404).send({ error: "Link not found" });
+          return reply.status(404).send({ error: "We couldn't find that link." });
         }
 
         // Actionable iff the row is the viewer's own or a global fact; another
@@ -209,10 +220,10 @@ export async function identityLinkRoutes(app: FastifyInstance) {
         const isOwn = link.owner_id === viewerId;
         const isGlobal = link.owner_id === null;
         if (!isOwn && !isGlobal) {
-          return reply.status(404).send({ error: "Link not found" });
+          return reply.status(404).send({ error: "We couldn't find that link." });
         }
         if (isOwn && link.link_type === "user_unlinked") {
-          return reply.status(404).send({ error: "Link not found" });
+          return reply.status(404).send({ error: "We couldn't find that link." });
         }
 
         // The link row is stored ordered (source_a_id < source_b_id), so pass the
@@ -229,7 +240,7 @@ export async function identityLinkRoutes(app: FastifyInstance) {
         return reply.status(204).send();
       } catch (err) {
         logger.error({ err, linkId }, "Identity link delete failed");
-        return reply.status(500).send({ error: "Unlink failed" });
+        return reply.status(500).send({ error: "Couldn't unlink them. Please try again." });
       }
     },
   );

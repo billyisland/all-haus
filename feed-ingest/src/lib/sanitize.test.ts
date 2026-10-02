@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import {
   EMBED_IFRAME_HOSTS,
   sanitizeArticleContent,
@@ -168,15 +168,24 @@ describe("sanitizeArticleContent — players", () => {
   });
 });
 
-describe("EMBED_IFRAME_HOSTS ⊆ nginx frame-src", () => {
+// nginx.conf is deliberately not mirrored (public-manifest.txt: it is the
+// production topology), so on the public tree this file does not exist and the
+// read below would fail the whole suite AT COLLECTION — not just this describe.
+// Skipped when absent, never weakened: the pair check's entire value is that it
+// fails when the allowlist and the CSP disagree. Here the file is always
+// present, so nothing skips and CI's fail-on-skip stays honest.
+const NGINX_CONF = new URL("../../../nginx.conf", import.meta.url);
+const nginxConf = existsSync(NGINX_CONF)
+  ? readFileSync(NGINX_CONF, "utf8")
+  : null;
+
+describe.skipIf(nginxConf === null)("EMBED_IFRAME_HOSTS ⊆ nginx frame-src", () => {
   // The two lists are a PAIR: the sanitiser passing an iframe the browser then
   // refuses renders an empty box, and there is no error anywhere to say so.
   // Both nginx blocks carry the directive, and both must carry every host.
-  const nginx = readFileSync(
-    new URL("../../../nginx.conf", import.meta.url),
-    "utf8",
+  const directives = [...(nginxConf ?? "").matchAll(/frame-src ([^";]+)/g)].map(
+    (m) => m[1],
   );
-  const directives = [...nginx.matchAll(/frame-src ([^";]+)/g)].map((m) => m[1]);
 
   it("finds a frame-src directive in each of the two server blocks", () => {
     expect(directives).toHaveLength(2);

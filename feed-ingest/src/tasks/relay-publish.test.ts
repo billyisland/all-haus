@@ -20,6 +20,11 @@ vi.mock('../adapters/nostr-outbound.js', () => ({
   publishNostrToRelaysDetailed: publishMock,
 }))
 
+// The adapter's own terminal marker. Imported from the real module (not
+// re-declared) so a rename of the property the classifier reads breaks the
+// test rather than leaving it agreeing with its own copy.
+const { TerminalDeliveryError } = await import('../lib/outbound-errors.js')
+
 // The detailed adapter resolves to { eventId, succeeded, failed }. Helper to
 // build that shape; by default every target relay accepted.
 function ok(relayUrls: string[], failed: string[] = []) {
@@ -52,6 +57,9 @@ function baseRow(overrides: Record<string, unknown> = {}) {
     status: 'pending',
     attempts: 0,
     max_attempts: 10,
+    // Postgres's `next_attempt_at <= now()`. Default true: a freshly enqueued
+    // row has next_attempt_at DEFAULT now(), so it is due at once.
+    due: true,
     ...overrides,
   }
 }
@@ -120,7 +128,7 @@ describe('relayPublish', () => {
 
   it('sends successfully → UPDATE status=sent', async () => {
     const calls = scriptClient(baseRow())
-    publishMock.mockResolvedValueOnce(SIGNED_EVENT.id)
+    publishMock.mockResolvedValueOnce(ok(['wss://relay.test']))
 
     await relayPublish({ outboxId: baseRow().id }, makeHelpers())
 
@@ -287,7 +295,7 @@ describe('relayPublish', () => {
     const row = baseRow({ entity_type: 'article_deletion', attempts: 0 })
     publishMock
       .mockRejectedValueOnce(new Error('relay blip'))
-      .mockResolvedValueOnce(row.signed_event.id)
+      .mockResolvedValueOnce(ok(row.target_relay_urls))
 
     // First attempt: failed
     const firstCalls = scriptClient(row)
@@ -300,11 +308,79 @@ describe('relayPublish', () => {
 
     // Second attempt: the redrive picks it up — row.status is now 'failed',
     // which the worker accepts.
-    const secondCalls = scriptClient({ ...row, status: 'failed', attempts: 1 })
+    const secondCalls = scriptClient({ ...row, status: 'failed', attempts: 1, due: true })
     await relayPublish({ outboxId: row.id }, makeHelpers())
 
     const secondUpdate = secondCalls.find(c => /^UPDATE relay_outbox/i.test(c.sql))
     expect(secondUpdate?.sql).toMatch(/status = 'sent'/)
     expect(publishMock).toHaveBeenCalledTimes(2)
+  })
+
+  // ---------------------------------------------------------------------------
+  // The backoff guard. A retry job and a redrive sweep can both be enqueued for
+  // the same window; the second used to run straight after the first failed and
+  // burn an attempt with no wait at all.
+  // ---------------------------------------------------------------------------
+  it('leaves a not-yet-due row alone rather than burning an attempt', async () => {
+    const calls = scriptClient(baseRow({ status: 'failed', attempts: 3, due: false }))
+    const helpers = makeHelpers()
+
+    await relayPublish({ outboxId: baseRow().id }, helpers)
+
+    // No publish, no state change, no rescheduling: the redrive cron will pick
+    // the row up on the minute after next_attempt_at passes.
+    expect(publishMock).not.toHaveBeenCalled()
+    expect(calls.filter(c => /^UPDATE/i.test(c.sql))).toHaveLength(0)
+    expect(helpers.addJob).not.toHaveBeenCalled()
+    expect(calls.at(-1)?.sql).toBe('ROLLBACK')
+  })
+
+  it('asks Postgres whether the row is due, never a JS Date', async () => {
+    // The column holds microseconds and a JS Date holds milliseconds, so the
+    // comparison belongs in SQL (the precision invariant). This pins WHERE the
+    // question is asked: the claim SELECT must carry the predicate itself.
+    const calls = scriptClient(baseRow())
+    publishMock.mockResolvedValueOnce(ok(['wss://relay.test']))
+
+    await relayPublish({ outboxId: baseRow().id }, makeHelpers())
+
+    const select = calls.find(c => /^SELECT id, entity_type/i.test(c.sql))
+    expect(select?.sql).toMatch(/next_attempt_at <= now\(\)/)
+  })
+
+  // ---------------------------------------------------------------------------
+  // Terminal vs ambiguous. Both branches below are FAR below max_attempts, so
+  // the status is decided by the classification and not by the retry budget —
+  // which is the whole difference the fix makes.
+  // ---------------------------------------------------------------------------
+  it('abandons at once on a terminal rejection, well below max_attempts', async () => {
+    const calls = scriptClient(baseRow({ attempts: 1, max_attempts: 10 }))
+    publishMock.mockRejectedValueOnce(
+      new TerminalDeliveryError('All relays rejected or timed out (wss://relay.test: Relay rejected event: blocked: pubkey not allowed)'),
+    )
+    const helpers = makeHelpers()
+
+    await relayPublish({ outboxId: baseRow().id }, helpers)
+
+    const updates = calls.filter(c => /^UPDATE relay_outbox/i.test(c.sql))
+    expect(updates).toHaveLength(1)
+    expect(updates[0].sql).toMatch(/status = 'abandoned'/)
+    expect(updates[0].params[1]).toBe(2)
+    expect(helpers.addJob).not.toHaveBeenCalled()
+  })
+
+  it('retries an ambiguous rejection at the same attempt count', async () => {
+    // The control for the case above: identical row, identical position in the
+    // retry budget, a plain Error instead of the terminal marker.
+    const calls = scriptClient(baseRow({ attempts: 1, max_attempts: 10 }))
+    publishMock.mockRejectedValueOnce(new Error('All relays rejected or timed out (wss://relay.test: Relay publish timeout)'))
+    const helpers = makeHelpers()
+
+    await relayPublish({ outboxId: baseRow().id }, helpers)
+
+    const updates = calls.filter(c => /^UPDATE relay_outbox/i.test(c.sql))
+    expect(updates).toHaveLength(1)
+    expect(updates[0].sql).toMatch(/status = 'failed'/)
+    expect(helpers.addJob).toHaveBeenCalledOnce()
   })
 })

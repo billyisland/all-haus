@@ -1,7 +1,8 @@
 'use client'
 
-import { useState } from 'react'
+import React, { useState } from 'react'
 import { drives, type PledgeDrive } from '../../lib/api'
+import { useConfirm } from '../ui/ConfirmDialog'
 
 export function DriveCard({ drive, onUpdate }: { drive: PledgeDrive; onUpdate: () => void }) {
   const [acting, setActing] = useState(false)
@@ -12,24 +13,32 @@ export function DriveCard({ drive, onUpdate }: { drive: PledgeDrive; onUpdate: (
     drive.fundingTargetPence ? (drive.fundingTargetPence / 100).toFixed(2) : ''
   )
   const [editError, setEditError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const { ask, dialog } = useConfirm()
 
   const target = drive.fundingTargetPence ?? 0
   const progressPct = target > 0
     ? Math.min(100, Math.round((drive.currentTotalPence / target) * 100))
     : 0
 
-  async function handleCancel() {
-    if (!confirm('Cancel this drive? Pledges will be released.')) return
-    setActing(true)
+  async function handleCancel(e: React.MouseEvent<HTMLElement>) {
+    const ok = await ask(e.currentTarget, {
+      title: 'Cancel this drive?',
+      body: 'Every pledge on it is released and nobody is charged. This cannot be undone.',
+      confirmLabel: 'Cancel drive',
+    })
+    if (!ok) return
+    setActing(true); setActionError(null)
     try { await drives.cancel(drive.id); onUpdate() }
-    catch { alert('Failed to cancel drive.') }
+    catch { setActionError('Couldn\u2019t cancel the drive \u2014 nothing changed. Try again.') }
     finally { setActing(false) }
   }
 
   async function handlePin() {
     setActing(true)
+    setActionError(null)
     try { await drives.togglePin(drive.id); onUpdate() }
-    catch { alert('Failed to update pin.') }
+    catch { setActionError('Couldn\u2019t update the pin. Try again.') }
     finally { setActing(false) }
   }
 
@@ -95,7 +104,7 @@ export function DriveCard({ drive, onUpdate }: { drive: PledgeDrive; onUpdate: (
 
         <div className="flex gap-3 pt-2">
           <button onClick={handleSaveEdit} disabled={acting} className="btn text-sm disabled:opacity-50">
-            {acting ? 'Saving...' : 'Save'}
+            {acting ? 'Saving…' : 'Save'}
           </button>
           <button onClick={() => { setEditing(false); setEditError(null) }} className="text-ui-xs text-grey-400 hover:text-black">
             Cancel
@@ -167,6 +176,8 @@ export function DriveCard({ drive, onUpdate }: { drive: PledgeDrive; onUpdate: (
           </button>
         </div>
       )}
+      {actionError && <p className="mt-2 text-ui-xs text-crimson">{actionError}</p>}
+      {dialog}
     </div>
   )
 }

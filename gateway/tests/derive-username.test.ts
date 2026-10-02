@@ -191,3 +191,25 @@ describe("deriveUsername — everything it returns is a legal username", () => {
 //   · slice the base to 30 before suffix → 1 fail (the 30-char overflow case)
 //   · drop the availability read         → 2 fail (taken-base + params cases)
 // -----------------------------------------------------------------------------
+
+// A DERIVED HANDLE IS NEVER THE ADDRESS OF A PAGE (MODERNHAUS-ADR §R2.10;
+// shared/src/auth/reserved-usernames.ts). A member whose display name is
+// "Settings" would otherwise be handed `/settings` — the settings page, never
+// their profile. An exact reserved name is treated as taken; a name under a
+// shadowing prefix (`/rss…`, `/actor…`) is skipped, since no suffix rescues it.
+describe("deriveUsername — reserved addresses", () => {
+  it("suffixes an exactly reserved base, as it would a taken one", async () => {
+    const got = await deriveUsername("someone@example.com", "Settings");
+    expect(got).toMatch(/^settings-[0-9a-f]{6}$/);
+    expect(got).toMatch(USERNAME_RE);
+  });
+
+  it("skips a base under a shadowing prefix and falls back to the email", async () => {
+    expect(await deriveUsername("marguerite@example.com", "RSS Weekly")).toBe("marguerite");
+  });
+
+  it("never lands under a shadowing prefix even when both candidates are", async () => {
+    const got = await deriveUsername("actorjane@example.com", "Relay Fan");
+    expect(got).toMatch(/^user-[0-9a-f]{6}$/);
+  });
+});

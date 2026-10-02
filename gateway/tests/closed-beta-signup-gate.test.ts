@@ -30,7 +30,7 @@ vi.mock("@platform-pub/shared/auth/accounts.js", () => ({
   signup: (...a: unknown[]) => signup(...(a as [])),
   // Permissive stand-in: the gate under test must refuse BEFORE parsing, and
   // the reopened case needs any payload to pass through to signup().
-  SignupSchema: z.object({}).passthrough(),
+  signupSchema: () => z.object({}).passthrough(),
   getAccount: vi.fn(),
   updateProfile: vi.fn(),
   connectStripeAccount: vi.fn(),

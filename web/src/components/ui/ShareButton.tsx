@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useState } from 'react'
+import { useRef, useState, type RefObject } from 'react'
 import { copyOrReveal } from '../../hooks/useCopyLink'
 import { AnchoredPopover } from './AnchoredPopover'
 
@@ -34,7 +34,9 @@ interface ShareButtonProps {
   url: string
   title: string
   dark?: boolean  // kept for API compat
-  onGiftLink?: () => void
+  /** Handed the Share trigger, so the gift-link panel hangs off the control
+   *  the author pressed rather than a scrim of its own. */
+  onGiftLink?: (anchorRef: RefObject<HTMLElement | null>) => void
 }
 
 const PANEL_W = 176
@@ -128,7 +130,7 @@ export function ShareButton({ url, title, onGiftLink }: ShareButtonProps) {
         aria-expanded={open}
         aria-label="Share"
       >
-        {copied ? 'Copied!' : 'Share'}
+        {copied ? 'Copied' : 'Share'}
       </button>
 
       <AnchoredPopover
@@ -143,13 +145,13 @@ export function ShareButton({ url, title, onGiftLink }: ShareButtonProps) {
       >
         {failedUrl ? (
           <div className="px-3 py-2">
-            <p className="text-ui-xs text-crimson mb-1.5">Couldn&rsquo;t copy — take it by hand:</p>
+            <p className="text-ui-xs text-crimson mb-1.5">Your browser wouldn&rsquo;t let us copy it. Here&rsquo;s the link to copy yourself:</p>
             <input
               type="text"
               readOnly
               value={failedUrl}
               onFocus={(e) => e.currentTarget.select()}
-              aria-label="Link — copy it by hand"
+              aria-label="Link to copy yourself"
               className="w-full bg-white px-2 py-1 font-mono text-mono-xs text-black"
             />
           </div>
@@ -178,7 +180,7 @@ export function ShareButton({ url, title, onGiftLink }: ShareButtonProps) {
             {/* Whitespace, never a rule — the sitewide no-thin-line invariant. */}
             <div className="my-1.5" />
             <button
-              onClick={(e) => { e.preventDefault(); e.stopPropagation(); setOpen(false); onGiftLink() }}
+              onClick={(e) => { e.preventDefault(); e.stopPropagation(); setOpen(false); onGiftLink(triggerRef) }}
               className="w-full text-left px-3 py-2 text-ui-xs text-black hover:bg-grey-200 transition-colors"
             >
               Gift link

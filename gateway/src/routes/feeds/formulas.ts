@@ -6,13 +6,22 @@ import logger from "@platform-pub/shared/lib/logger.js";
 import { getPlatformConfig } from "../../lib/platform-config.js";
 import { publicationsEnabled } from "@platform-pub/shared/lib/env.js";
 import {
-  UUID_RE,
   createFeedForOwner,
   loadFeed,
   tagged,
   ENQUEUE_SPACING_MS,
 } from "./shared.js";
-import { addSource, type AddSourceInput } from "./sources.js";
+import {
+  addSource,
+  accountArrivedSql,
+  compareSourceLabels,
+  type AddSourceInput,
+} from "./sources.js";
+import {
+  isPublicSourceProtocol,
+  type PublicSourceProtocol,
+} from "../../lib/public-source-protocols.js";
+import { isUuid } from "../../lib/request-inputs.js";
 
 // =============================================================================
 // Feed sharing — a feed's composition as a transmissible object
@@ -90,17 +99,13 @@ export function formulasEnabled(): boolean {
 // The allow-list is unchanged by the live-link amendment and still bounds what
 // a link can EVER expose (L1's accepted cost is the feed's future composition,
 // not a widening of what may travel).
-const PORTABLE_PROTOCOLS = [
-  "rss",
-  "nostr_external",
-  "atproto",
-  "activitypub",
-] as const;
-type PortableProtocol = (typeof PORTABLE_PROTOCOLS)[number];
-
-function isPortableProtocol(p: string | null): p is PortableProtocol {
-  return p !== null && (PORTABLE_PROTOCOLS as readonly string[]).includes(p);
-}
+// The list itself moved to lib/public-source-protocols.ts (S16), which is now
+// also what `GET /sources/:id` and add-by-`externalSourceId` ask before handing
+// a row to a member who is not already a subscriber. Same list, same reason —
+// its header carries both callers and what would make them diverge. The local
+// names are kept so the reading of the call sites below is unchanged.
+const isPortableProtocol = isPublicSourceProtocol;
+type PortableProtocol = PublicSourceProtocol;
 
 // The shareable source cap (§6). A tuning dial, not a constant: what the
 // right number is depends on redeem latency, which is a property of live
@@ -123,7 +128,7 @@ export async function formulaMaxSources(): Promise<number> {
 
 interface FeedSourceForFreeze {
   source_type: "account" | "publication" | "external_source" | "tag";
-  weight: string;
+  throughput: string;
   sampling_mode: string;
   exclude_replies: boolean;
   tag_name: string | null;
@@ -139,6 +144,8 @@ interface FeedSourceForFreeze {
   external_display_name: string | null;
   external_avatar: string | null;
   external_relay_urls: string[] | null;
+  /** An account admit created whose owner has not arrived (`accountArrivedSql`). */
+  account_unarrived: boolean;
 }
 
 /**
@@ -158,7 +165,7 @@ export interface FrozenSource {
   protocol: PortableProtocol | null;
   displayName: string | null;
   avatarUrl: string | null;
-  weight: string;
+  throughput: string;
   samplingMode: string;
   excludeReplies: boolean;
 }
@@ -172,7 +179,7 @@ export interface FrozenSource {
  */
 export function freezeSource(row: FeedSourceForFreeze): FrozenSource | null {
   const tuning = {
-    weight: row.weight,
+    throughput: row.throughput,
     samplingMode: row.sampling_mode,
     excludeReplies: row.exclude_replies,
   };
@@ -261,11 +268,12 @@ export function freezeSource(row: FeedSourceForFreeze): FrozenSource | null {
 }
 
 /**
- * Read a feed's sources in the form `freezeSource` consumes, in composer order.
+ * Read a feed's sources in the form `freezeSource` consumes.
  *
- * Composer order (§11): feed_sources has no ordering column, so position comes
- * from created_at with id as the tiebreak, the same ORDER BY loadFeedSources
- * uses, so a link's page lists sources in the order the author sees them.
+ * This ORDER BY is not the order a link's page shows: composer order (§11) is
+ * alphabetical by rendered label, and the label is not a column here either,
+ * so `freezeFeedSources` applies it after freezing. created_at/id survives as
+ * the stable floor under that sort, which is what keeps `position` total.
  *
  * `feed_sources.muted_at` is deliberately NOT filtered — a muted source is
  * still part of the composition; muting is a per-feed display control on the
@@ -276,14 +284,15 @@ async function loadFeedSourcesForFreeze(
   feedId: string,
 ): Promise<FeedSourceForFreeze[]> {
   const { rows } = await client.query<FeedSourceForFreeze>(
-    `SELECT fs.source_type, fs.weight, fs.sampling_mode, fs.exclude_replies, fs.tag_name,
+    `SELECT fs.source_type, fs.throughput, fs.sampling_mode, fs.exclude_replies, fs.tag_name,
        acc.nostr_pubkey AS account_pubkey, acc.display_name AS account_display_name,
        acc.username AS account_username, acc.avatar_blossom_url AS account_avatar,
        pub.nostr_pubkey AS publication_pubkey, pub.name AS publication_name,
        pub.logo_blossom_url AS publication_avatar,
        xs.protocol::text AS external_protocol, xs.source_uri AS external_source_uri,
        xs.display_name AS external_display_name, xs.avatar_url AS external_avatar,
-       xs.relay_urls AS external_relay_urls
+       xs.relay_urls AS external_relay_urls,
+       NOT ${accountArrivedSql("acc")} AS account_unarrived
      FROM feed_sources fs
      LEFT JOIN accounts acc ON acc.id = fs.account_id
      LEFT JOIN publications pub ON pub.id = fs.publication_id
@@ -324,15 +333,36 @@ export async function freezeFeedSources(
   client: { query: typeof pool.query },
   feedId: string,
   maxSources: number,
+  opts: { includeUnarrived?: boolean } = {},
 ): Promise<FeedProjection> {
   const rows = await loadFeedSourcesForFreeze(client, feedId);
   const sources: FrozenSource[] = [];
   let excludedCount = 0;
   for (const row of rows) {
+    // A member admit created who has not yet arrived is named to nobody
+    // (RESHAPE-PLAN-2026-10 §A.2.6), and a share link's page is somebody. So
+    // the source is counted into the excluded figure — honestly, the same as
+    // any source that cannot travel — and starts travelling the day they
+    // arrive, because a link is live. The ONE caller that opts out is the
+    // seed cut: the operator is the one person who should see the whole
+    // composition, and seeding the cohort is exactly what the cut is for.
+    if (row.account_unarrived && !opts.includeUnarrived) {
+      excludedCount++;
+      continue;
+    }
     const f = freezeSource(row);
     if (f) sources.push(f);
     else excludedCount++;
   }
+  // Composer order, by the label the recipient will read — the same comparator
+  // the composer's own list uses, so the author's copy and the link's page
+  // cannot disagree about the order any more than they do about the row set.
+  // Sorting AFTER the exclusion loop is deliberate: what travels is decided by
+  // `freezeSource` alone, never by where a row landed, and the cap refuses
+  // rather than truncates, so the order moves nothing in or out.
+  sources.sort((a, b) =>
+    compareSourceLabels(frozenSourceLabel(a), frozenSourceLabel(b)),
+  );
   return {
     sources,
     excludedCount,
@@ -345,6 +375,12 @@ export async function freezeFeedSources(
   };
 }
 
+// The one spelling of a frozen source's label, so the order it is sorted into
+// is the order of the strings actually rendered.
+function frozenSourceLabel(f: FrozenSource) {
+  return f.sourceType === "tag" ? `#${f.tagValue}` : (f.displayName ?? f.tagValue);
+}
+
 // What a recipient sees. Deliberately display-only: a link's page is a
 // composition, never content, and nobody's items appear on it (§3).
 function frozenSourceToResponse(f: FrozenSource, position: number) {
@@ -352,7 +388,7 @@ function frozenSourceToResponse(f: FrozenSource, position: number) {
     position,
     kind: f.sourceType,
     protocol: f.protocol,
-    label: f.sourceType === "tag" ? `#${f.tagValue}` : (f.displayName ?? f.tagValue),
+    label: frozenSourceLabel(f),
     avatar: f.avatarUrl,
   };
 }
@@ -417,6 +453,7 @@ export async function freezeFeedIntoFormula(
     client,
     params.feedId,
     params.maxSources,
+    { includeUnarrived: true },
   );
   if (refusal)
     return {
@@ -451,7 +488,7 @@ export async function freezeFeedIntoFormula(
     await client.query(
       `INSERT INTO feed_formula_sources
          (formula_id, position, tag_kind, tag_value, tag_hint, source_type,
-          protocol, display_name, avatar_url, weight, sampling_mode, exclude_replies)
+          protocol, display_name, avatar_url, throughput, sampling_mode, exclude_replies)
        VALUES ($1, $2, $3, $4, $5, $6, $7::external_protocol, $8, $9, $10, $11, $12)`,
       [
         f.id,
@@ -463,7 +500,7 @@ export async function freezeFeedIntoFormula(
         s.protocol,
         s.displayName,
         s.avatarUrl,
-        s.weight,
+        s.throughput,
         s.samplingMode,
         s.excludeReplies,
       ],
@@ -648,6 +685,16 @@ function linkToResponse(
 // Redeem
 // ---------------------------------------------------------------------------
 
+/** What a replay did: `skipped*` are expected outcomes, never failures. */
+export interface PopulateResult {
+  added: number;
+  failed: RedeemFailure[];
+  /** The composition named the owner themselves (§A.2.3). */
+  skippedSelf: number;
+  /** The composition named a member who has since deleted their account. */
+  skippedGone: number;
+}
+
 export interface RedeemFailure {
   position: number;
   label: string;
@@ -740,9 +787,11 @@ export async function populateFeedFromSources(
   feedId: string,
   ownerId: string,
   sources: FrozenSource[],
-): Promise<{ added: number; failed: RedeemFailure[] }> {
+): Promise<PopulateResult> {
   const failed: RedeemFailure[] = [];
   let added = 0;
+  let skippedSelf = 0;
+  let skippedGone = 0;
   for (let i = 0; i < sources.length; i++) {
     const s = sources[i];
     const label = s.displayName ?? s.tagValue;
@@ -770,6 +819,31 @@ export async function populateFeedFromSources(
         failed.push({ position: i, label, reason: "unresolvable" });
         continue;
       }
+      // TWO ACCOUNT SOURCES ARE SKIPPED AND COUNTED, NEVER FAILED
+      // (RESHAPE-PLAN-2026-10 §A.2.3). Both are expected, and the failure
+      // list must stay a witness to real failures — seedStarterFeeds logs it
+      // at error level for every new member it is non-empty for.
+      //
+      //  · SELF. Admission appends each new member to the seed, so every
+      //    cohort member's own seed names them. `addSource` refuses a
+      //    self-source (SELF_SOURCE), which is right, and this is where the
+      //    refusal is anticipated rather than reported. It sits in this
+      //    shared loop, so a share link whose composition names its redeemer
+      //    gets the same answer (it used to come back as `error`).
+      //  · GONE. A cohort member who later deletes their account would
+      //    otherwise be a dead source in every later newcomer's feed. Only
+      //    `deleted` is terminal; a suspension is temporary and is left to
+      //    addSource like any other source.
+      if (input.sourceType === "account") {
+        if (input.accountId === ownerId) {
+          skippedSelf++;
+          continue;
+        }
+        if (input.accountStatus === "deleted") {
+          skippedGone++;
+          continue;
+        }
+      }
       const result = await addSource(feedId, ownerId, input, {
         // skipProbe deliberately NOT set (§6): a source can have rotted since
         // the author added it, so a genuinely new identity is probed.
@@ -785,13 +859,13 @@ export async function populateFeedFromSources(
         ),
       });
       // Tuning travels with the composition (§5). addSource's insert takes only
-      // the target, so the weight/sampling/replies triple is applied straight
+      // the target, so the throughput/sampling/replies triple is applied straight
       // after — scoped to the row it just minted in the feed this call just
       // created, so there is nothing else it could touch.
       await pool.query(
-        `UPDATE feed_sources SET weight = $2, sampling_mode = $3, exclude_replies = $4
+        `UPDATE feed_sources SET throughput = $2, sampling_mode = $3, exclude_replies = $4
           WHERE id = $1`,
-        [result.source.id, s.weight, s.samplingMode, s.excludeReplies],
+        [result.source.id, s.throughput, s.samplingMode, s.excludeReplies],
       );
       added++;
     } catch (err) {
@@ -817,7 +891,7 @@ export async function populateFeedFromSources(
       );
     }
   }
-  return { added, failed };
+  return { added, failed, skippedSelf, skippedGone };
 }
 
 /**
@@ -832,7 +906,7 @@ export async function populateFeedFromFormula(
   feedId: string,
   ownerId: string,
   formulaId: string,
-): Promise<{ added: number; failed: RedeemFailure[] }> {
+): Promise<PopulateResult> {
   const { rows } = await pool.query<{
     tag_kind: FrozenSource["tagKind"];
     tag_value: string;
@@ -841,12 +915,12 @@ export async function populateFeedFromFormula(
     protocol: string | null;
     display_name: string | null;
     avatar_url: string | null;
-    weight: string;
+    throughput: string;
     sampling_mode: string;
     exclude_replies: boolean;
   }>(
     `SELECT tag_kind, tag_value, tag_hint, source_type, protocol::text AS protocol,
-            display_name, avatar_url, weight, sampling_mode, exclude_replies
+            display_name, avatar_url, throughput, sampling_mode, exclude_replies
        FROM feed_formula_sources WHERE formula_id = $1 ORDER BY position ASC`,
     [formulaId],
   );
@@ -864,7 +938,7 @@ export async function populateFeedFromFormula(
       protocol: isPortableProtocol(r.protocol) ? r.protocol : null,
       displayName: r.display_name,
       avatarUrl: r.avatar_url,
-      weight: r.weight,
+      throughput: r.throughput,
       samplingMode: r.sampling_mode,
       excludeReplies: r.exclude_replies,
     })),
@@ -883,13 +957,17 @@ export async function populateFeedFromFormula(
  */
 async function resolveFormulaSource(
   s: FrozenSource,
-): Promise<AddSourceInput | null> {
+): Promise<(AddSourceInput & { accountStatus?: string }) | null> {
   if (s.sourceType === "account") {
-    const { rows } = await pool.query<{ id: string }>(
-      `SELECT id FROM accounts WHERE nostr_pubkey = $1`,
+    // The status rides along so the replay can skip a deleted member rather
+    // than hand addSource a target it will refuse.
+    const { rows } = await pool.query<{ id: string; status: string }>(
+      `SELECT id, status FROM accounts WHERE nostr_pubkey = $1`,
       [s.tagValue],
     );
-    return rows[0] ? { sourceType: "account", accountId: rows[0].id } : null;
+    return rows[0]
+      ? { sourceType: "account", accountId: rows[0].id, accountStatus: rows[0].status }
+      : null;
   }
   if (s.sourceType === "publication") {
     const { rows } = await pool.query<{ id: string }>(
@@ -937,14 +1015,14 @@ export function registerFeedFormulaRoutes(app: FastifyInstance) {
     "/feeds/:id/formula",
     { preHandler: requireAuth },
     async (req, reply) => {
-      if (!formulasEnabled()) return reply.status(404).send({ error: "Not found" });
+      if (!formulasEnabled()) return reply.status(404).send({ error: "We couldn't find that." });
       const ownerId = req.session!.sub;
       const { id } = req.params;
-      if (!UUID_RE.test(id))
-        return reply.status(400).send({ error: "Invalid feed id" });
+      if (!isUuid(id))
+        return reply.status(404).send({ error: "We couldn't find that channel." });
 
       const feed = await loadFeed(id, ownerId);
-      if (!feed) return reply.status(404).send({ error: "Feed not found" });
+      if (!feed) return reply.status(404).send({ error: "We couldn't find that channel." });
 
       const cap = await formulaMaxSources();
       const projection = await freezeFeedSources(pool, id, cap);
@@ -971,14 +1049,14 @@ export function registerFeedFormulaRoutes(app: FastifyInstance) {
     "/feeds/:id/formula",
     { preHandler: requireAuth },
     async (req, reply) => {
-      if (!formulasEnabled()) return reply.status(404).send({ error: "Not found" });
+      if (!formulasEnabled()) return reply.status(404).send({ error: "We couldn't find that." });
       const ownerId = req.session!.sub;
       const { id } = req.params;
-      if (!UUID_RE.test(id))
-        return reply.status(400).send({ error: "Invalid feed id" });
+      if (!isUuid(id))
+        return reply.status(404).send({ error: "We couldn't find that channel." });
 
       const feed = await loadFeed(id, ownerId);
-      if (!feed) return reply.status(404).send({ error: "Feed not found" });
+      if (!feed) return reply.status(404).send({ error: "We couldn't find that channel." });
 
       const link = await mintLinkForFeed(id, ownerId);
       const cap = await formulaMaxSources();
@@ -1012,7 +1090,7 @@ export async function formulaPublicRoutes(app: FastifyInstance) {
   // the probe and rewriting its DEPLOYMENT.md row for nothing.
   // -------------------------------------------------------------------------
   app.get("/my/formulas", { preHandler: requireAuth }, async (req, reply) => {
-    if (!formulasEnabled()) return reply.status(404).send({ error: "Not found" });
+    if (!formulasEnabled()) return reply.status(404).send({ error: "We couldn't find that." });
     const { rows } = await pool.query<LinkRow>(
       `${LINK_SELECT}
         WHERE ff.author_id = $1 AND ff.kind = 'link' AND ff.revoked_at IS NULL
@@ -1051,14 +1129,14 @@ export async function formulaPublicRoutes(app: FastifyInstance) {
     "/formulas/:token",
     { preHandler: optionalAuth },
     async (req, reply) => {
-      if (!formulasEnabled()) return reply.status(404).send({ error: "Not found" });
+      if (!formulasEnabled()) return reply.status(404).send({ error: "We couldn't find that." });
       const {
         rows: [f],
       } = await pool.query<LinkRow>(
         `${LINK_SELECT} WHERE ff.token = $1 AND ff.kind = 'link'`,
         [req.params.token],
       );
-      if (!f) return reply.status(404).send({ error: "Formula not found" });
+      if (!f) return reply.status(404).send({ error: "We couldn't find that link." });
       // A withdrawn link, and a link whose feed is gone, both render as their
       // own sentence and nothing else: projecting the composition of a feed the
       // author has withdrawn would publish exactly what they took down.
@@ -1089,7 +1167,7 @@ export async function formulaPublicRoutes(app: FastifyInstance) {
     "/formulas/:token/redeem",
     { preHandler: requireAuth },
     async (req, reply) => {
-      if (!formulasEnabled()) return reply.status(404).send({ error: "Not found" });
+      if (!formulasEnabled()) return reply.status(404).send({ error: "We couldn't find that." });
       const ownerId = req.session!.sub;
       const {
         rows: [f],
@@ -1098,7 +1176,7 @@ export async function formulaPublicRoutes(app: FastifyInstance) {
           WHERE ff.token = $1 AND ff.kind = 'link'`,
         [req.params.token],
       );
-      if (!f) return reply.status(404).send({ error: "Formula not found" });
+      if (!f) return reply.status(404).send({ error: "We couldn't find that link." });
 
       let result;
       try {
@@ -1118,20 +1196,20 @@ export async function formulaPublicRoutes(app: FastifyInstance) {
         if (code === "SOURCE_FEED_GONE")
           return reply.status(410).send({
             error: "source_feed_gone",
-            message: "The feed this link points at no longer exists.",
+            message: "The channel this link points at no longer exists.",
           });
         if (code === "FORMULA_EMPTY")
           return reply.status(410).send({
             error: "formula_empty",
-            message: "This feed has nothing in it that can be shared yet.",
+            message: "This channel has nothing in it that can be shared yet.",
           });
         if (code === "FORMULA_TOO_LARGE")
           return reply.status(410).send({
             error: "formula_too_large",
-            message: "This feed carries more sources than a link may.",
+            message: "This channel has too many sources to share as a link.",
           });
         if (code === "FORMULA_NOT_FOUND")
-          return reply.status(404).send({ error: "Formula not found" });
+          return reply.status(404).send({ error: "We couldn't find that link." });
         throw err;
       }
       logger.info(
@@ -1162,10 +1240,10 @@ export async function formulaPublicRoutes(app: FastifyInstance) {
     "/formulas/:id",
     { preHandler: requireAuth },
     async (req, reply) => {
-      if (!formulasEnabled()) return reply.status(404).send({ error: "Not found" });
+      if (!formulasEnabled()) return reply.status(404).send({ error: "We couldn't find that." });
       const { id } = req.params;
-      if (!UUID_RE.test(id))
-        return reply.status(400).send({ error: "Invalid formula id" });
+      if (!isUuid(id))
+        return reply.status(404).send({ error: "We couldn't find that link." });
 
       // The designated default seed cannot be revoked (D11). The schema CHECK
       // backs this refusal — this 409 exists to say WHY rather than let a
@@ -1192,7 +1270,7 @@ export async function formulaPublicRoutes(app: FastifyInstance) {
             message:
               "This composition seeds every new account. Designate a replacement before revoking it.",
           });
-        return reply.status(404).send({ error: "Formula not found" });
+        return reply.status(404).send({ error: "We couldn't find that link." });
       }
       return reply.status(204).send();
     },

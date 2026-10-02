@@ -387,3 +387,76 @@ describe("safeFetch — 304 Not Modified is not a redirect (§8.14)", () => {
     expect(res.headers.get("etag")).toBe('"v2"');
   });
 });
+
+// =============================================================================
+// Per-hop request signing (`signRequest`)
+//
+// HTTP Signatures sign `(request-target)` and `host`, so a signature minted for
+// the URL the CALLER asked for verifies against nothing once this client
+// follows a redirect — and an outbox that redirects apex → www is ordinary
+// fediverse plumbing. The hook therefore has to be called once per hop, with
+// that hop's own URL, and its output has to reach the transport.
+//
+// MUTATION CHECK: hoist the `signRequest` call out of the loop (compute it once
+// from `url`) and "re-signs each hop against that hop's own URL" fails; apply
+// the signature BEFORE the cross-origin strip and "survives the cross-origin
+// credential strip" fails.
+// =============================================================================
+
+describe("safeFetch — signRequest is per hop", () => {
+  it("re-signs each hop against that hop's own URL", async () => {
+    undiciFetch
+      .mockResolvedValueOnce(redirectTo(301, "https://origin-a.example/moved"))
+      .mockResolvedValueOnce(okResponse());
+
+    const seen: Array<{ method: string; url: string }> = [];
+    await safeFetch("https://origin-a.example/resource", {
+      signRequest: (req) => {
+        seen.push(req);
+        return { Signature: `sig-for:${req.url}` };
+      },
+    });
+
+    // Once per hop, each with the URL actually being fetched …
+    expect(seen).toEqual([
+      { method: "GET", url: "https://origin-a.example/resource" },
+      { method: "GET", url: "https://origin-a.example/moved" },
+    ]);
+    // … and what it returned is what the transport was handed.
+    expect(hopHeaders(0).signature).toBe(
+      "sig-for:https://origin-a.example/resource",
+    );
+    expect(hopHeaders(1).signature).toBe(
+      "sig-for:https://origin-a.example/moved",
+    );
+  });
+
+  it("survives the cross-origin credential strip, because it is not a credential", async () => {
+    // A signature authorises nothing and discloses nothing — it says who is
+    // asking. The new host is precisely who the next hop must be signed FOR, so
+    // stripping it would leave a cross-origin hop unsigned and 401ing, which is
+    // the failure the whole feature exists to fix.
+    undiciFetch
+      .mockResolvedValueOnce(redirectTo(302, "https://origin-b.example/there"))
+      .mockResolvedValueOnce(okResponse());
+
+    await safeFetch("https://origin-a.example/resource", {
+      headers: { Authorization: TOKEN },
+      signRequest: (req) => ({ Signature: `sig-for:${req.url}` }),
+    });
+
+    expect(hopHeaders(1).authorization).toBeUndefined();
+    expect(hopHeaders(1).signature).toBe(
+      "sig-for:https://origin-b.example/there",
+    );
+  });
+
+  it("a null from the hook is 'not configured', not an error", async () => {
+    undiciFetch.mockResolvedValueOnce(okResponse());
+    const res = await safeFetch("https://origin-a.example/resource", {
+      signRequest: () => null,
+    });
+    expect(res.ok).toBe(true);
+    expect(hopHeaders(0).signature).toBeUndefined();
+  });
+});

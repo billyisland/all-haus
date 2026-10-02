@@ -10,7 +10,7 @@ const mockPoolQuery = vi.fn()
 // Per-transaction recorded client.query calls live here so assertions can read
 // exactly what the renewal transaction issued.
 let txCalls: Array<{ sql: string; params: any[] }> = []
-const withTransactionImpl = vi.fn(async (cb: (client: any) => Promise<any>) => {
+const runTransaction = async (cb: (client: any) => Promise<any>) => {
   const client = {
     query: (sql: string, params: any[] = []) => {
       txCalls.push({ sql, params })
@@ -18,7 +18,8 @@ const withTransactionImpl = vi.fn(async (cb: (client: any) => Promise<any>) => {
     },
   }
   return cb(client)
-})
+}
+const withTransactionImpl = vi.fn(runTransaction)
 
 vi.mock('@platform-pub/shared/db/client.js', () => ({
   pool: { query: (...args: any[]) => mockPoolQuery(...args) },
@@ -37,9 +38,11 @@ vi.mock('@platform-pub/shared/lib/relay-outbox.js', () => ({
 
 const sendSubscriptionRenewedEmail = vi.fn(async () => undefined)
 const sendSubscriptionExpiryWarningEmail = vi.fn(async () => undefined)
+const sendSubscriptionLapsedNotForSaleEmail = vi.fn(async () => undefined)
 vi.mock('@platform-pub/shared/lib/subscription-emails.js', () => ({
   sendSubscriptionRenewedEmail: (...a: any[]) => sendSubscriptionRenewedEmail(...a),
   sendSubscriptionExpiryWarningEmail: (...a: any[]) => sendSubscriptionExpiryWarningEmail(...a),
+  sendSubscriptionLapsedNotForSaleEmail: (...a: any[]) => sendSubscriptionLapsedNotForSaleEmail(...a),
 }))
 
 const logSubscriptionCharge = vi.fn(async () => undefined)
@@ -70,7 +73,12 @@ function writerSub(overrides: Record<string, any> = {}) {
     writer_standard_price: 500,
     writer_annual_discount_pct: 15,
     reader_stripe_customer_id: 'cus_test',
+    reader_card_action_required_at: null,
     period_anchor_day: 1,
+    // COALESCE(w.status, p.status) — the target the reader is paying for.
+    target_status: 'active',
+    // Writer 9.3 (§0z item 10): set, and the renewal is a sale we no longer make.
+    writer_paid_access_withdrawn_at: null,
     ...overrides,
   }
 }
@@ -93,12 +101,33 @@ function routePool(renewableRows: any[]) {
 describe('expireAndRenewSubscriptions — renewal', () => {
   beforeEach(() => {
     mockPoolQuery.mockReset()
-    withTransactionImpl.mockClear()
+    // mockClear alone leaves a previous test's mockImplementation in place: the
+    // both-attempts-fail case installs a throwing transaction, and every later
+    // test that needs a working one then silently exercises the failure path
+    // instead. Restore the default explicitly.
+    withTransactionImpl.mockReset()
+    withTransactionImpl.mockImplementation(runTransaction)
     signSubscriptionEvent.mockClear()
     enqueueRelayPublish.mockClear()
     sendSubscriptionRenewedEmail.mockClear()
+    sendSubscriptionLapsedNotForSaleEmail.mockClear()
     logSubscriptionCharge.mockClear()
     txCalls = []
+  })
+
+  it("lapses, uncharged, when the writer's paid access is withdrawn — and the reader is told why (Writer 9.3)", async () => {
+    routePool([writerSub({ writer_paid_access_withdrawn_at: new Date('2026-08-01T00:00:00Z') })])
+    await expireAndRenewSubscriptions()
+
+    // Pre-fix: charged and renewed — a sale to a writer we cannot pay, which
+    // then opened the pieces the stamp refuses to sell.
+    expect(logSubscriptionCharge).not.toHaveBeenCalled()
+    expect(sendSubscriptionRenewedEmail).not.toHaveBeenCalled()
+    const expire = mockPoolQuery.mock.calls.find(
+      (c) => /SET status = 'expired'/.test(c[0] as string) && (c[1] as any[])[0] === 'sub-w',
+    )
+    expect(expire).toBeDefined()
+    expect(sendSubscriptionLapsedNotForSaleEmail).toHaveBeenCalledWith('reader-1', 'writer-1')
   })
 
   it('charges the full renewal price via logSubscriptionCharge (F1: tab, not free_allowance)', async () => {
@@ -302,5 +331,97 @@ describe('expireAndRenewSubscriptions — renewal', () => {
     )
     expect(expired).toBeDefined()
     expect(expired![1]).toEqual(['sub-w'])
+  })
+
+  it('expires a renewal whose card has terminally declined, without charging', async () => {
+    // Reader Terms 6.1, the renewal half. The card is on file and settlement
+    // has already backed off it, so a renewal charge would be tab debt we have
+    // been told we cannot collect — landing on a reader who is being shown
+    // "your reading tab is paused". The card-less arm above catches a reader
+    // with no card at all; this is the one whose card is there and dead.
+    routePool([writerSub({ reader_card_action_required_at: new Date() })])
+    await expireAndRenewSubscriptions()
+
+    expect(withTransactionImpl).not.toHaveBeenCalled()
+    expect(logSubscriptionCharge).not.toHaveBeenCalled()
+    expect(sendSubscriptionRenewedEmail).not.toHaveBeenCalled()
+    const expired = mockPoolQuery.mock.calls.find(
+      (c) =>
+        /SET status = 'expired'/.test(c[0]) &&
+        /current_period_end < now\(\)/.test(c[0]) &&
+        /status = 'active'/.test(c[0]),
+    )
+    expect(expired).toBeDefined()
+    expect(expired![1]).toEqual(['sub-w'])
+  })
+
+  it('the renewable SELECT reads the card-action flag at all', async () => {
+    // The gate above can only work if the column is in the query. A fixture
+    // carries whatever field the test author typed, so the flag would "work"
+    // in this suite while production selected nothing to read.
+    routePool([writerSub()])
+    await expireAndRenewSubscriptions()
+
+    const select = mockPoolQuery.mock.calls.find(
+      (c) => /FROM subscriptions s/.test(c[0]) && /auto_renew = TRUE/.test(c[0]),
+    )
+    expect(select).toBeDefined()
+    expect(select![0]).toMatch(/card_action_required_at/)
+  })
+
+  // ---------------------------------------------------------------------------
+  // The target must still be live (S14). Every one of these renewed and charged
+  // before the gate: the SELECT left-joins both targets and read neither status.
+  // ---------------------------------------------------------------------------
+
+  it.each([['suspended'], ['deleted'], ['deactivated'], ['moderated']])(
+    'expires rather than charges when the writer account is %s',
+    async (status) => {
+      routePool([writerSub({ target_status: status })])
+      await expireAndRenewSubscriptions()
+
+      expect(withTransactionImpl).not.toHaveBeenCalled()
+      expect(logSubscriptionCharge).not.toHaveBeenCalled()
+      expect(sendSubscriptionRenewedEmail).not.toHaveBeenCalled()
+      const expired = mockPoolQuery.mock.calls.find(
+        (c) =>
+          /SET status = 'expired'/.test(c[0]) &&
+          /current_period_end < now\(\)/.test(c[0]),
+      )
+      expect(expired).toBeDefined()
+      expect(expired![1]).toEqual(['sub-w'])
+    },
+  )
+
+  it('expires when the target row is absent entirely (LEFT JOIN gave NULL)', async () => {
+    routePool([writerSub({ target_status: null })])
+    await expireAndRenewSubscriptions()
+
+    expect(logSubscriptionCharge).not.toHaveBeenCalled()
+    expect(
+      mockPoolQuery.mock.calls.find((c) => /SET status = 'expired'/.test(c[0])),
+    ).toBeDefined()
+  })
+
+  it('the SELECT reads a status for BOTH targets, not just the writer', async () => {
+    // A structural pin, and it is the half a row fixture cannot state: the gate
+    // above is driven by `target_status`, which only means anything if the query
+    // that feeds it COALESCEs the publication's status in beside the writer's.
+    // Without the publication arm a publication subscription reads NULL and
+    // would expire every live publication sub the day publications come back.
+    routePool([])
+    await expireAndRenewSubscriptions()
+
+    const select = mockPoolQuery.mock.calls.find(
+      (c) => /FROM subscriptions s/.test(c[0]) && /auto_renew = TRUE/.test(c[0]),
+    )
+    expect(select).toBeDefined()
+    expect(select![0]).toMatch(/COALESCE\(w\.status::text, p\.status\) AS target_status/)
+  })
+
+  it('renews normally for an active writer (the control)', async () => {
+    routePool([writerSub({ target_status: 'active' })])
+    await expireAndRenewSubscriptions()
+    expect(logSubscriptionCharge).toHaveBeenCalledOnce()
   })
 })

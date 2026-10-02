@@ -43,7 +43,7 @@ const external = (tier: BiddabilityTier) =>
     originCounts: { like: 1, reply: 2, repost: 3 },
   });
 
-const ALL_LEVELS: Level[] = ["focal", "feed", "thread-parent", "thread-reply", "quoted", "condensed"];
+const ALL_LEVELS: Level[] = ["focal", "feed", "thread-parent", "thread-reply", "quoted", "condensed", "preview"];
 
 describe("LEVEL_SPEC table", () => {
   it("has a row for every level", () => {
@@ -192,6 +192,61 @@ describe("resolveSpec — condensed level", () => {
   });
 });
 
+// WORKSPACE-QUEUE-ADR §VII.5 (B5): a queue preview row. `condensed` with the
+// cells that make a row a glance: its provenance line, no actions, no origin
+// counts, no quote, no timestamp, a warning that cannot be revealed, and a
+// click that walks the queue — EXCEPT on an article, which opens the reader
+// directly (D6). Both click cases are pinned, because either alone passes
+// against the wrong rule: a table cell of `reader-pane` would pass the article
+// case, and dropping the article override would pass the note case.
+describe("resolveSpec — preview level (the queue's rows)", () => {
+  it("a note row walks to its feed", () => {
+    expect(resolveSpec("preview", "A", native).click).toBe("focus");
+    expect(resolveSpec("preview", "B", external("B")).click).toBe("focus");
+  });
+  it("an article row opens the reader pane (D6)", () => {
+    expect(resolveSpec("preview", "A", makePost({ type: "article" })).click).toBe("reader-pane");
+  });
+  it("differs from condensed in exactly the documented cells", () => {
+    const differs = (Object.keys(LEVEL_SPEC.condensed) as (keyof typeof LEVEL_SPEC.condensed)[])
+      .filter((k) => LEVEL_SPEC.condensed[k] !== LEVEL_SPEC.preview[k])
+      .sort();
+    expect(differs).toEqual(
+      ["click", "haus", "originCounters", "originTag", "quoteEmbed", "timestamp", "warningReveal"].sort(),
+    );
+  });
+  it("shows no actions, counts, quote, media or time; names its provenance", () => {
+    const r = resolveSpec("preview", "B", external("B"));
+    expect(r.haus).toBe("none");
+    expect(r.originCounters).toBe("none");
+    expect(r.quoteEmbed).toBe("none");
+    expect(r.media).toBe("none");
+    expect(r.showReport).toBe(false);
+    expect(r.showOriginTag).toBe(true);
+    expect(r.showTime).toBe(false);
+    expect(r.warningReveal).toBe(false);
+  });
+  it("a tier-D row moves no time onto its provenance line either", () => {
+    const tierD: Post = {
+      ...native,
+      author: { ...native.author, id: null, pubkey: null, displayName: null, handle: null },
+      origin: { ...native.origin, protocol: "rss", sourceName: "A Blog" },
+    };
+    const r = resolveSpec("preview", "D", tierD);
+    expect(r.showByline).toBe(false);
+    expect(r.originTagTime).toBe(false);
+    // …where a feed card does, so the gate is the level's.
+    expect(resolveSpec("feed", "D", tierD).originTagTime).toBe(true);
+  });
+  it("every other level keeps its time and its SHOW CONTENT", () => {
+    for (const lvl of ALL_LEVELS.filter((l) => l !== "preview")) {
+      const r = resolveSpec(lvl, "A", native);
+      expect(r.showTime, lvl).toBe(true);
+      expect(r.warningReveal, lvl).toBe(true);
+    }
+  });
+});
+
 describe("resolveSpec — all.haus available at every tier (§7)", () => {
   for (const t of ["A", "B", "C", "D"] as BiddabilityTier[]) {
     it(`tier ${t} keeps haus=full at feed level`, () => {
@@ -200,12 +255,28 @@ describe("resolveSpec — all.haus available at every tier (§7)", () => {
   }
 });
 
-describe("resolveSpec — report is native-only", () => {
+// L6.3 REVERSED THIS, and the old expectation is kept below as the thing that
+// changed. Reporting was native-only because `moderation_reports` could hold a
+// Nostr event id or an account id and nothing else — an external card had no
+// identifier to be reported WITH, so withholding the control was the honest
+// thing to do. `target_post_id` (migration 223) is `feed_items.post_id`, which
+// every card carries whatever it is made of, so the reason is gone and the
+// restriction goes with it. D1 §9.2 says reporting covers "native, DM, and
+// ingested", and the workspace is mostly ingested.
+describe("resolveSpec — report follows the LEVEL, at every tier", () => {
   it("native feed shows report", () => {
     expect(resolveSpec("feed", "A", native).showReport).toBe(true);
   });
-  it("external tier-A feed does NOT show report", () => {
-    expect(resolveSpec("feed", "A", external("A")).showReport).toBe(false);
+  for (const t of ["A", "B", "C", "D"] as BiddabilityTier[]) {
+    it(`external tier ${t} feed shows report too`, () => {
+      expect(resolveSpec("feed", t, external(t)).showReport).toBe(true);
+    });
+  }
+  it("a quoted card still offers nothing — the level decides", () => {
+    // The card underneath the quote is the one that can be reported; two
+    // controls for one post would file two reports about the same thing.
+    expect(resolveSpec("quoted", "A", native).showReport).toBe(false);
+    expect(resolveSpec("quoted", "A", external("A")).showReport).toBe(false);
   });
 });
 

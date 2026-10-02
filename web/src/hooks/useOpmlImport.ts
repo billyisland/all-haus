@@ -9,6 +9,7 @@ import {
 } from '../lib/api'
 import { apiErrorMessage } from '../lib/api/client'
 import { useFeedArrivals } from '../stores/feedArrivals'
+import { OPML_START_FAILED } from '../content/networks'
 
 // =============================================================================
 // useOpmlImport — start an OPML import and follow its progress (FOLLOW-GRAPH-
@@ -60,9 +61,7 @@ export function useOpmlImport(): UseOpmlImport {
         res.runs.forEach((r) => arrivals.announce(r.feed))
         return true
       } catch (err) {
-        setError(
-          apiErrorMessage(err) ?? 'Could not read that file — try again.',
-        )
+        setError(apiErrorMessage(err) ?? OPML_START_FAILED)
         return false
       } finally {
         setStarting(false)

@@ -2,10 +2,12 @@ import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { pool, withTransaction } from '@platform-pub/shared/db/client.js'
 import { requireAuth } from '../../middleware/auth.js'
+import { requireWriter } from '../../lib/writer-gate.js'
 import { requirePublicationPermission, requirePublicationOwner } from '../../middleware/publication-auth.js'
 import { generateKeypair } from '../../lib/key-custody-client.js'
 import logger from '@platform-pub/shared/lib/logger.js'
 import { ROLE_DEFAULTS } from './shared.js'
+import { zodValidationError } from '@platform-pub/shared/lib/validation.js'
 
 // =============================================================================
 // Publication CRUD + caller memberships
@@ -43,10 +45,10 @@ export async function publicationCoreRoutes(app: FastifyInstance) {
   // POST /publications — Create a new publication
   // ---------------------------------------------------------------------------
 
-  app.post('/publications', { preHandler: requireAuth }, async (req, reply) => {
+  app.post('/publications', { preHandler: [requireAuth, requireWriter] }, async (req, reply) => {
     const parsed = CreatePublicationSchema.safeParse(req.body)
     if (!parsed.success) {
-      return reply.status(400).send({ error: parsed.error.flatten() })
+      return reply.status(400).send(zodValidationError(parsed.error))
     }
 
     const userId = req.session!.sub
@@ -121,7 +123,7 @@ export async function publicationCoreRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const parsed = UpdatePublicationSchema.safeParse(req.body)
       if (!parsed.success) {
-        return reply.status(400).send({ error: parsed.error.flatten() })
+        return reply.status(400).send(zodValidationError(parsed.error))
       }
 
       const { id } = req.params

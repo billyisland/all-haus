@@ -29,13 +29,29 @@ import {
 } from "../../lib/workspace/layout";
 import { prefersReducedMotion } from "../../lib/workspace/motion";
 import {
+  captureCardAnchor,
+  preserveCardPosition,
+  restoreCardAnchor,
+  type CardAnchor,
+} from "../../lib/workspace/preserveCardPosition";
+import {
+  createFeedLoads,
+  loadPageOne,
+  type PageOneResult,
+} from "../../lib/workspace/feedLoads";
+import {
+  FEED_PAGE_SIZE,
+  mergeFirstPage,
+  type MergeOutcome,
+} from "../../lib/workspace/feedMerge";
+import { planReveal } from "../../lib/workspace/queueReveal";
+import { flushSync } from "react-dom";
+import {
   workspaceFeeds as workspaceFeedsApi,
-  follows as followsApi,
   auth,
   type WorkspaceFeed,
   type WorkspaceFeedSource,
 } from "../../lib/api";
-import type { PipStatus } from "../../lib/ndk";
 import { Vessel } from "./Vessel";
 import {
   ExplainProvider,
@@ -47,11 +63,11 @@ import { useExplain } from "../../stores/explain";
 import { ExplainOverlay } from "./ExplainOverlay";
 import { AboutOverlay } from "./AboutOverlay";
 import { PostCardInteractive } from "../post/PostCardInteractive";
+import { PostCard } from "../post/PostCard";
 import { PostThread } from "../post/PostThread";
 import type { CardContext } from "../post/chassis";
 import type { Post } from "../../lib/post/types";
-import { quotePreviewContent } from "../../lib/post/quote-preview";
-import { originWebUrl } from "../../lib/post/origin-url";
+import { quoteTargetFromPost } from "../../lib/post/quote-target";
 import {
   paletteFor,
   normalizeBrightness,
@@ -63,13 +79,12 @@ import {
 import { useColorScheme } from "../../stores/colorScheme";
 import { ForallMenu, type ForallAction } from "./ForallMenu";
 import { NavBar, NAV_BAR_H } from "./NavBar";
-import { Muster } from "./Muster";
+import { Muster, type MusterFeed } from "./Muster";
 import { useMobileActiveFeed } from "../../stores/mobileActiveFeed";
+import { useQueueFocal } from "../../stores/queueFocal";
 import { useFeedArrivals } from "../../stores/feedArrivals";
-import { Composer, type ReplyTarget } from "./Composer";
+import { Composer } from "./Composer";
 import type { QuoteTarget } from "../../lib/publishNote";
-import { getCachedWriterName, resolveWriterName } from "../../hooks/useWriterName";
-import { PipPanel } from "./PipPanel";
 import { NewFeedPrompt } from "./NewFeedPrompt";
 import { FeedComposer } from "./FeedComposer";
 import { ForallCeremony } from "./ForallCeremony";
@@ -83,7 +98,6 @@ import {
   LazyLedgerOverlay as LedgerOverlay,
   LazySettingsOverlay as SettingsOverlay,
   LazyLibraryOverlay as LibraryOverlay,
-  LazyNetworkOverlay as NetworkOverlay,
 } from "./LazyOverlays";
 import { useReader, type ReaderNavEntry } from "../../stores/reader";
 import { useCompose } from "../../stores/compose";
@@ -97,15 +111,52 @@ import { MergeFeedConfirm } from "./MergeFeedConfirm";
 import { MobileWorkspace } from "./MobileWorkspace";
 import { useIsMobile } from "../../hooks/useIsMobile";
 import { useGlasshousePresence } from "../../stores/glasshouse";
+import { useFeedSeen, useFeedSeenMark, type SeenMark } from "../../stores/feedSeen";
+import { useSeenPolling } from "../../hooks/useSeenPolling";
+
+/** The queue's background read of every feed (the operator, 2026-09-26: "every
+ *  seven minutes, plus an extra pull each time the user does a refresh"). */
+const QUEUE_PREFETCH_MS = 7 * 60_000;
+import {
+  QueueView,
+  type QueueFeed,
+  type QueueViewHandle,
+} from "./queue/QueueView";
+import { useUnreadCounts } from "../../stores/unread";
 import { useLightbox } from "../../stores/lightbox";
+import { originWebUrl } from "../../lib/post/origin-url";
+import { sourcePageId } from "../../lib/post/source-page";
 
 const FLOOR = "var(--ah-bone)"; // grey-100 per Step 1 / Colour tokens committed
-const DEFAULT_FEED_NAME = "Founder's feed";
+const DEFAULT_FEED_NAME = "Founder's channel";
+// A queue preview layer shows at most this many rows (WORKSPACE-QUEUE-ADR
+// §VII.5): a glance at a feed ahead, never a second place to read it.
+const PREVIEW_ROW_CAP = 60;
 
 /** Px of pan before the virtualization band is re-read (hysteresis dead band).
  *  Well under the one-viewport mount margin, so a vessel is never parked while
  *  any part of it is on screen. */
 const VIRT_QUANT = 200;
+
+function matchItemToSource(
+  item: Post,
+  sources: WorkspaceFeedSource[],
+): string | undefined {
+  // External card → its all.haus external_sources row; native → the author
+  // account. (tag/publication sources have no per-card drag handle, as before.)
+  if (item.externalSourceId) {
+    return sources.find(
+      (s) =>
+        s.sourceType === "external_source" &&
+        s.externalSourceId === item.externalSourceId,
+    )?.id;
+  }
+  const authorId = item.author.accountId;
+  if (!authorId) return undefined;
+  return sources.find(
+    (s) => s.sourceType === "account" && s.accountId === authorId,
+  )?.id;
+}
 
 // Map a feed Post to a reader-skip entry — articles only (the reader-pane click
 // targets), mirroring openReaderFromPost's native/external split. Non-articles
@@ -122,32 +173,31 @@ function articleToReaderEntry(p: Post): ReaderNavEntry | null {
       preview: { title: p.body.title, summary: p.body.summary },
     };
   }
+  // The resolved WEB url, never `origin.uri` verbatim: for RSS that column is
+  // `guid ?? link`, and a guid is very often not a URL (`urn:uuid:…`, `tag:…`,
+  // a bare integer) — handed one the extractor answers "Could not extract", and
+  // a hostile one would have been rendered as an href. The card's own `→` has
+  // always gone through this helper, so until now the card and the reader
+  // disagreed about whether the same post had a permalink. No permalink ⇒ no
+  // entry, so the piece also drops out of the skip sequence rather than
+  // stranding the ears on a page that cannot load.
+  const url = originWebUrl(p);
+  if (!url) return null;
   return {
     kind: "external",
     postId: p.id,
-    url: p.origin.uri,
+    url,
     title: p.body.title,
     siteName: p.origin.sourceName,
     // The reader bar's inward link (`/source/:id`) — the same target the card's
     // provenance line offers, carried over so the pane names the thing the
     // reader subscribed to and not just the site (BYLINE-AND-PROVENANCE D7).
-    sourceId: p.externalSourceId ?? null,
+    sourceId: sourcePageId(p),
     // The item's own enclosures — the pane plays a video the origin page may
     // have no player for (the card already did; the pane did not).
     media: p.body.media ?? null,
   };
 }
-
-// Friendly origin label shown on the quoted-mini when quoting an external post
-// (mirrors PostOriginTag / SourceAttribution). Falls back to the source name,
-// then the upper-cased protocol.
-const EXTERNAL_QUOTE_LABEL: Record<string, string> = {
-  atproto: "BLUESKY",
-  activitypub: "FEDIVERSE",
-  nostr_external: "NOSTR",
-  rss: "RSS",
-  email: "EMAIL",
-};
 
 // Slice 9: first-login ceremony plays once per user. Storage flag survives
 // across logouts on the same browser; the responsive (new-feed) ceremony has
@@ -238,9 +288,21 @@ interface VesselState {
   loadingMore?: boolean;
 }
 
+// The feed's own scroller, where it has one: a floor vessel, or the queue's
+// focal entry (the only one whose list can hold an open conversation). The
+// queue mounts its neighbours' lists too, and a post can be a card in two of
+// them, so a search of the whole document could hold the wrong one still.
+// Mobile has none — its page scrolls the document — and walks up instead.
+function feedScroller(feedId: string): HTMLElement | null {
+  const id = CSS.escape(feedId);
+  return document.querySelector<HTMLElement>(
+    `[data-vessel-id="${id}"] [data-vessel-scroll], ` +
+      `[data-queue-entry="focal"][data-queue-feed="${id}"] [data-vessel-scroll]`,
+  );
+}
 
 export function WorkspaceView() {
-  const { user, loading } = useAuth();
+  const { user, loading, outage, fetchMe } = useAuth();
   const router = useRouter();
   // MOBILE-LAYOUT-ADR: mobile is not a reflow of the canvas — it is a
   // different interaction model over the same feeds. This switch swaps the
@@ -250,6 +312,35 @@ export function WorkspaceView() {
   // On mobile every feed follows the GLOBAL light/dark toggle (uniform), not
   // its per-feed scheme; on desktop feeds keep their scheme (light-islanded).
   const globalDark = useColorScheme((s) => s.dark);
+
+  // THE DOCUMENT NEVER OVERSCROLLS SIDEWAYS WHILE THE WORKSPACE IS MOUNTED.
+  // The floor's own `overscroll-behavior-x: contain` only bites while the floor
+  // is ACTUALLY scrollable — a taut floor narrower than the viewport (two or
+  // three feeds on a wide screen: the common case) is not, so the browser
+  // ignores it and hands a sideways swipe to its back/forward gesture. On a
+  // surface where sideways is how both the feeds and the floor move, that reads
+  // as the workspace randomly navigating away — and in the queue, whose primary
+  // gesture IS a horizontal drag, Safari's back-swipe would be live on every
+  // step. Nothing here scrolls the DOCUMENT sideways, so the document's
+  // horizontal overscroll can only ever be that gesture; refuse it for as long
+  // as the workspace is mounted, and hand it back on the way out so the rest of
+  // the site keeps it. Lifted out of `Floor` (WORKSPACE-QUEUE-ADR §VI.4) so it
+  // covers both modes from one home.
+  useEffect(() => {
+    const html = document.documentElement;
+    const prev = html.style.overscrollBehaviorX;
+    html.style.overscrollBehaviorX = "none";
+    return () => {
+      html.style.overscrollBehaviorX = prev;
+    };
+  }, []);
+
+  // The desktop workspace IS the queue (WORKSPACE-QUEUE-ADR §XI, C2); mobile
+  // is the pager. The floor's branches below are unreachable and go at C3 —
+  // kept until then so a failed real-trackpad pass reverts in one commit.
+  const queueMode = !isMobile;
+  const queueRef = useRef<QueueViewHandle>(null);
+  const setQueueFocal = useQueueFocal((s) => s.set);
   const [vessels, setVessels] = useState<VesselState[]>([]);
   const [bootstrap, setBootstrap] = useState<"loading" | "ready" | "error">(
     "loading",
@@ -277,16 +368,37 @@ export function WorkspaceView() {
   const composeReqOpen = useCompose((s) => s.isOpen);
   const composeReqMode = useCompose((s) => s.mode);
   useEffect(() => {
-    if (composeReqOpen && composeReqMode === "note") {
-      setReplyTarget(null);
-      setQuoteTarget(null);
-      setComposerOpen("note");
-    }
+    if (!composeReqOpen) return;
+    // BOTH MODES, because the surfaces that request one are the same surfaces
+    // in either register. A profile, a source or a tag is a body that renders
+    // both as its own page and inside a globally-mounted overlay over this
+    // floor — so its Quote asks the store, and whichever composer is up
+    // answers. Bridging only `note` left every one of those requests setting
+    // state nothing was listening to (the `routeToOverlay` fault, one surface
+    // over): the button did nothing at all, silently, in both registers.
+    // (REPLY is no longer a mode: it is written in the card's own footer.)
+    // A note request after a supersede resumes the kept draft, target and all
+    // (see `composerSuspendedRef`); a quote request names its own target.
+    const { quoteTarget: qt } = useCompose.getState();
+    if (composeReqMode === "quote") setQuoteTarget(qt);
+    else if (!composerSuspendedRef.current) setQuoteTarget(null);
+    composerSuspendedRef.current = false;
+    setComposerOpen("note");
   }, [composeReqOpen, composeReqMode]);
-  const [replyTarget, setReplyTarget] = useState<ReplyTarget | null>(null);
-  // Quote target — set when Quote is clicked on a card; the composer publishes a
-  // NIP-18 quote note embedding it. Mutually exclusive with replyTarget.
+  // Quote target — set when Quote is clicked on a card; the composer publishes
+  // a NIP-18 quote note embedding it.
   const [quoteTarget, setQuoteTarget] = useState<QuoteTarget | null>(null);
+  // True between a SUPERSEDE of the composer and its next opening. The
+  // composer kept the draft; a plain reopen (New note, ⌘K) must keep the
+  // quote target that draft was written about, or it publishes as a note —
+  // the store's `suspended`, for the composer this view owns. A card's Quote
+  // names its own target and does not read it.
+  const composerSuspendedRef = useRef(false);
+  const openNoteComposer = useCallback(() => {
+    if (!composerSuspendedRef.current) setQuoteTarget(null);
+    composerSuspendedRef.current = false;
+    setComposerOpen("note");
+  }, []);
   // ⌘K / Ctrl+K opens the note composer — parity with Nav's global hotkey,
   // which can't fire here because Nav is unmounted in the chromeless
   // workspace. No-ops while the article editor overlay is up (the Glasshouse
@@ -302,14 +414,12 @@ export function WorkspaceView() {
         if (useEditorOverlay.getState().isOpen) return;
         e.preventDefault();
         if (composerOpenRef.current) return;
-        setReplyTarget(null);
-        setQuoteTarget(null);
-        setComposerOpen("note");
+        openNoteComposer();
       }
     }
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, []);
+  }, [openNoteComposer]);
   // At most one conversation is expanded per feed. This maps a feed id to its
   // single open card: `key` (`feedItemId ?? id`) is the card slot, `root` is the
   // post the conversation is rooted on — normally the card's own post, but the
@@ -317,34 +427,152 @@ export function WorkspaceView() {
   // quote expands with full seniority, no trace of its host). Opening another
   // card in the same feed replaces the entry, collapsing the previous one.
   const [expandedByFeed, setExpandedByFeed] = useState<
-    Record<string, { key: string; root: string }>
+    Record<string, { key: string; root: string; host: string }>
   >({});
-  // Drop a feed's expansion entry. Called on refresh (a reload collapses the
-  // open conversation) and on delete/merge — a vessel that no longer exists
-  // must not leave its key behind, or a feed later minted with the same id
-  // would open pre-expanded onto a stale card.
-  const clearExpandedFor = useCallback((feedId: string) => {
-    setExpandedByFeed((prev) => {
+  // Mirror, so the weeding below can read the entry a handler is about to
+  // replace without threading it through every call site.
+  const expandedRef = useRef(expandedByFeed);
+  expandedRef.current = expandedByFeed;
+
+  // ── WEEDING A CONVERSATION'S BYSTANDERS OUT OF THE FEED ────────────────────
+  // A conversation pulls in its ancestors and replies, and those same posts are
+  // very often cards elsewhere in the same feed — so a reader who follows a
+  // thread and closes it finds the rest of their log scattered with things they
+  // have just read in context. On collapse, the posts they SAW inside the
+  // conversation stop being cards in that feed.
+  //
+  // SEEN, never merely rendered. `PostThread` reports visibility, not mount
+  // (see its seen-marking effect): a thread mounts its whole ancestor chain and
+  // a page of replies at once, and weeding the ones the reader scrolled past
+  // would silently delete unread posts from their feed.
+  //
+  // The HOST card stays. It is the reader's place in the log at the exact
+  // moment the log changes shape, and it is not what was bothering anyone.
+  //
+  // SESSION-SCOPED, on purpose. It is held here and nowhere else, so it
+  // survives a pull-to-refresh (which is what the complaint is actually about —
+  // a refresh that put them all back would be no fix) and is gone on reload.
+  // Reading state that followed the member across devices belongs in the same
+  // class as `accounts.onboarded_at` and would be a server-side record; this is
+  // deliberately the smaller thing first, because whether the behaviour is
+  // wanted at all is a question only the screen can answer.
+  const [weededByFeed, setWeededByFeed] = useState<Record<string, Set<string>>>(
+    {},
+  );
+  // What the open conversation has reported so far, per feed — uncommitted
+  // until it closes, because a conversation still open has not finished being
+  // read. A ref, not state: it is written on every scroll and must not render.
+  const seenInThreadRef = useRef<Map<string, Set<string>>>(new Map());
+  const noteSeenInThread = useCallback((feedId: string, postId: string) => {
+    const byFeed = seenInThreadRef.current;
+    const set = byFeed.get(feedId);
+    if (set) set.add(postId);
+    else byFeed.set(feedId, new Set([postId]));
+  }, []);
+  // One STABLE reporter per feed. `PostThread` keys its visibility observer on
+  // this identity, and the thread re-renders on every scroll (the gutter
+  // pointers' clash state), so a fresh closure per render would tear the
+  // observer down and rebuild it several times a second.
+  const seenHandlers = useRef<Map<string, (postId: string) => void>>(new Map());
+  const seenHandlerFor = useCallback(
+    (feedId: string) => {
+      const existing = seenHandlers.current.get(feedId);
+      if (existing) return existing;
+      const handler = (postId: string) => noteSeenInThread(feedId, postId);
+      seenHandlers.current.set(feedId, handler);
+      return handler;
+    },
+    [noteSeenInThread],
+  );
+  // Close out a feed's conversation: bank what was seen (minus the host) and
+  // hold the host card still while the cards around it go. Every path that
+  // drops or REPLACES an expansion entry calls this first — a swap to another
+  // card in the same feed is a collapse of the first one.
+  const settleExpansion = useCallback((feedId: string) => {
+    const seen = seenInThreadRef.current.get(feedId);
+    seenInThreadRef.current.delete(feedId);
+    if (!seen || seen.size === 0) return;
+    const host = expandedRef.current[feedId]?.host ?? null;
+    const openedOn = expandedRef.current[feedId]?.root ?? null;
+    const restore = host ? preserveCardPosition(host, feedScroller(feedId)) : null;
+    setWeededByFeed((prev) => {
+      const next = new Set(prev[feedId]);
+      const before = next.size;
+      for (const id of seen) if (id !== host) next.add(id);
+      return next.size === before ? prev : { ...prev, [feedId]: next };
+    });
+    // THE RESTORE IS FOR A COLLAPSE, NOT FOR A SWAP. Every caller settles the
+    // outgoing conversation and swaps the new one in within the same commit,
+    // so by the time this rAF runs another conversation may already be
+    // opening — and if its thread is in cache `PostThread` has already fired
+    // its smooth `scrollIntoView` in the synchronous passive flush. Adding a
+    // delta to `scrollTop` aborts an in-flight smooth scroll, so the newcomer
+    // would never arrive. Chrome and Firefox hide it (scroll anchoring makes
+    // the delta ~0, and the `< 1` guard then skips it); Safari, which has no
+    // anchoring and is the browser this file exists for, puts the view back on
+    // the card that just closed.
+    if (restore)
+      requestAnimationFrame(() => {
+        const nowOn = expandedRef.current[feedId]?.root ?? null;
+        if (nowOn !== null && nowOn !== openedOn) return;
+        restore();
+      });
+  }, []);
+
+  // A feed that no longer exists drops its weeding too. `clearExpandedFor` is
+  // not the place for this — it also runs on every refresh, and surviving a
+  // refresh is the whole point of holding the set here — so the two teardowns
+  // are separate and only delete/merge calls this one.
+  const forgetFeedReadState = useCallback((feedId: string) => {
+    seenInThreadRef.current.delete(feedId);
+    seenHandlers.current.delete(feedId);
+    setWeededByFeed((prev) => {
       if (!(feedId in prev)) return prev;
       const next = { ...prev };
       delete next[feedId];
       return next;
     });
   }, []);
-  // A single global tick: bumped after a reply publishes so any open PostThread
-  // busts its cache and refetches (replaces the legacy per-target refresh map).
-  const [threadRefreshTick, setThreadRefreshTick] = useState(0);
-  const [pipPanel, setPipPanel] = useState<{
-    pubkey: string;
-    status?: PipStatus;
-    rect: DOMRect;
-    // Slice 14: which feed the panel was opened from. The volume bar's commit
-    // surface scopes per-feed-per-author, so the panel needs to know which
-    // ⊔ contributed the click.
+
+  // Drop a feed's expansion entry. Called on refresh (a reload collapses the
+  // open conversation) and on delete/merge — a vessel that no longer exists
+  // must not leave its key behind, or a feed later minted with the same id
+  // would open pre-expanded onto a stale card.
+  const clearExpandedFor = useCallback((feedId: string) => {
+    settleExpansion(feedId);
+    setExpandedByFeed((prev) => {
+      if (!(feedId in prev)) return prev;
+      const next = { ...prev };
+      delete next[feedId];
+      return next;
+    });
+  }, [settleExpansion]);
+
+  // A PREVIEW ROW OPENS ITS CONVERSATION AS THE QUEUE ARRIVES (operator,
+  // 2026-09-27). The click walks to the row's feed and asks for that card's
+  // conversation, which is opened only once the walk has come to rest on the
+  // feed — its list live, its anchor already put back — so the thread's own
+  // scroll-in is the last thing to move it. Every settle consumes the request:
+  // one that lands anywhere else (a walk the reader overrode, or one refused
+  // mid-drag) drops it rather than opening it on some later visit.
+  const pendingQueueOpenRef = useRef<{
     feedId: string;
+    key: string;
+    root: string;
   } | null>(null);
-  const [followedPubkeys, setFollowedPubkeys] = useState<Set<string>>(
-    new Set(),
+  const onQueueFocalChange = useCallback(
+    (feedId: string | null) => {
+      setQueueFocal(feedId);
+      const pending = pendingQueueOpenRef.current;
+      pendingQueueOpenRef.current = null;
+      if (!pending || pending.feedId !== feedId) return;
+      settleExpansion(feedId);
+      setExpandedByFeed((prev) => ({
+        ...prev,
+        [feedId]: { key: pending.key, root: pending.root, host: pending.root },
+      }));
+    },
+    [setQueueFocal, settleExpansion],
   );
   const [newFeedOpen, setNewFeedOpen] = useState(false);
   const [feedComposerFor, setFeedComposerFor] = useState<WorkspaceFeed | null>(
@@ -393,19 +621,33 @@ export function WorkspaceView() {
   const resizeSlotLayout = useWorkspace((s) => s.resizeSlot);
   const setVesselBrightness = useWorkspace((s) => s.setVesselBrightness);
   const setVesselDensity = useWorkspace((s) => s.setVesselDensity);
-  const setVesselOrientation = useWorkspace((s) => s.setVesselOrientation);
   const setVesselTextSize = useWorkspace((s) => s.setVesselTextSize);
   const regimented = useWorkspace((s) => s.regimented);
-  const setRegimented = useWorkspace((s) => s.setRegimented);
   const materializeRegimented = useWorkspace((s) => s.materializeRegimented);
 
-  // The reader is the one immersive pane: while it is open it may cover the nav
-  // bar entirely (Glasshouse `coverNavChrome`), so the bar + muster un-mount
-  // and only the z-60 ∀ lockup floats above the reading surface. Every other
-  // pane keeps the bar live (navigation over an open pane —
-  // WORKSPACE-COLUMN-LAYOUT §VI), so this is scoped to the reader alone. One
-  // pane opens at a time, so "reader open" is an unambiguous signal.
+  // The reader, the article editor and the note composer are the THREE
+  // immersive panes: immersion belongs to the surfaces where one piece fills
+  // the whole of your attention — reading it, and writing it at either length.
+  // While one is open it may cover the nav bar entirely (Glasshouse
+  // `coverNavChrome`), so the bar + muster un-mount and only the z-60 ∀ lockup
+  // floats above. Every OTHER pane — messages, dashboard, settings, the FEED
+  // composer — is a panel you dip into while the workspace is still what you
+  // are doing, and keeps the bar live (navigation over an open pane —
+  // WORKSPACE-COLUMN-LAYOUT §VI).
+  //
+  // This gate is not decoration: `coverNavChrome` is a contract, and a pane
+  // that covers the bar while the bar still paints puts the bar on top of the
+  // pane. One Glasshouse opens at a time (the module-level `activeGlasshouse`
+  // registry supersedes whatever was open), so no two can both be true; if
+  // that ever changes the gate is still correct.
+  //
+  // The editor store is global and `EditorOverlay` mounts in `LayoutShell`, a
+  // different tree — same store, so this subscription is correct from either.
+  // It is read REACTIVELY here; the two `getState()` reads elsewhere in this
+  // file are hotkey guards and deliberately non-reactive.
   const readerOpen = useReader((s) => s.isOpen);
+  const editorOpen = useEditorOverlay((s) => s.isOpen);
+  const immersivePaneOpen = readerOpen || editorOpen || !!composerOpen;
 
   // The numeral is persisted rank, not creation order (MOBILE-LAYOUT-ADR
   // §VII). NAV-ROW-MUSTER-ADR §III: the numeral is IDENTITY, assigned over the
@@ -517,40 +759,8 @@ export function WorkspaceView() {
   const geomLayoutRef = useRef(geomLayout);
   geomLayoutRef.current = geomLayout;
 
-  // Ctrl+←/→ jumps the floor to its far end — the keyboard twin of panning a
-  // space whose resting extent is exactly the feeds' span. Plain arrows stay
-  // free (the reader's ←/→ skip, text-field caret movement); Ctrl+arrow inside
-  // an editable field keeps its native word-jump, and an open Glasshouse owns
-  // the keyboard.
-  useEffect(() => {
-    if (isMobile) return;
-    function onKey(e: KeyboardEvent) {
-      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-      if (!e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
-      const t = e.target as HTMLElement | null;
-      if (
-        t?.closest(
-          'input, textarea, select, [contenteditable=""], [contenteditable="true"]',
-        )
-      )
-        return;
-      if (useGlasshousePresence.getState().isOpen) return;
-      // Not while a vessel is held: scrolling the floor under a live framer
-      // drag origin teleports the vessel relative to the ground and lets the
-      // pointer-based merge arming read whatever scrolled under the cursor.
-      if (dragActiveRef.current) return;
-      const floor = floorRef.current;
-      if (!floor) return;
-      e.preventDefault();
-      floor.scrollTo({
-        left:
-          e.key === "ArrowLeft" ? 0 : floor.scrollWidth - floor.clientWidth,
-        behavior: prefersReducedMotion() ? "auto" : "smooth",
-      });
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [isMobile]);
+  // Ctrl+←/→ panned the floor to its far ends. The queue has nothing to pan
+  // (its walk is ←/→, WORKSPACE-QUEUE-ADR §VI), so it went with the mode (C2).
 
   // The local, non-Glasshouse transient surfaces. With `lensSuppress` gone
   // (Slice 4) there is no generic "a modal is open" registry, and these are all
@@ -560,55 +770,13 @@ export function WorkspaceView() {
   localSurfaceOpenRef.current =
     newFeedOpen ||
     !!pendingMerge ||
-    !!pipPanel ||
     !!feedComposerFor ||
     !!composerOpen ||
     !!ceremony;
 
-  // `\` toggles the regimented layout (§V): every visible feed on screen at
-  // once, numeral order, factory width — the parade ground. It is a VIEW, so
-  // the stored layout is untouched and a second press drops straight back to
-  // it. Guarded the way every other global binding here is: never in an
-  // editable field, never with a modifier (so ⌘\ / Ctrl+\ stay free), never
-  // while a Glasshouse pane, the lightbox, one of the local surfaces above or
-  // an Explain program owns the keyboard, and never mid-drag.
-  useEffect(() => {
-    if (isMobile) return;
-    function onKey(e: KeyboardEvent) {
-      if (e.key !== "\\") return;
-      if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
-      const t = e.target as HTMLElement | null;
-      // [role="menu"] covers the open ∀ dropdown (focus sits on a menu row
-      // while it is up — it is neither a Glasshouse nor one of the local
-      // surfaces below, so nothing else guards it).
-      if (
-        t?.closest(
-          'input, textarea, select, [contenteditable=""], [contenteditable="true"], [role="menu"]',
-        )
-      )
-        return;
-      // The frozen floor owns the keyboard while a program runs, and Explain is
-      // not in the Glasshouse presence registry — the pane check alone misses it.
-      if (useExplain.getState().isActive) return;
-      if (useGlasshousePresence.getState().isOpen) return;
-      if (useEditorOverlay.getState().isOpen) return;
-      if (useLightbox.getState().isOpen) return;
-      if (localSurfaceOpenRef.current) return;
-      if (dragActiveRef.current) return;
-      if (resizeActiveRef.current) return;
-      e.preventDefault();
-      const next = !useWorkspace.getState().regimented;
-      setRegimented(next);
-      // Entering the parade jumps to the left edge — the lowest-numbered
-      // VISIBLE feed (which is Feed 1 unless it is minimised; the parade reads
-      // in numeral order but with gaps, NAV-ROW-MUSTER-ADR §III.1).
-      // Instant, not smooth: the whole floor just changed shape under the
-      // scroll position, so there is nothing coherent to animate between.
-      if (next) floorRef.current?.scrollTo({ left: 0, behavior: "auto" });
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [isMobile, setRegimented]);
+  // `\` was the parade ground (§V). Dropped with the floor
+  // (WORKSPACE-QUEUE-ADR §XI.2 R3): the muster and the compact entries are the
+  // overview, and the key is free.
 
   const dragActiveRef = useRef<string | null>(null);
   // What the last drag frame resolved to (§IV.2). One resolver answers both
@@ -663,7 +831,7 @@ export function WorkspaceView() {
     };
     // Re-attach on auth-resolve: the pre-auth frame renders a Floor without
     // the ref, so the listener must bind once the real floor exists.
-  }, [user, loading, isMobile, syncPan]);
+  }, [user?.id, loading, isMobile, syncPan]);
   // Cold start and layout changes. The dead band only fires on real scroll
   // events, so a floor that mounts already scrolled (a browser restoring a
   // position, an auto-pan) would otherwise start with a stale band.
@@ -699,6 +867,61 @@ export function WorkspaceView() {
     }
     return ids;
   }, [geom, panOffset, vp.w]);
+
+  // ── The reading counts (WORKSPACE-QUEUE-ADR §IV) ─────────────────────────
+  // Desktop floor only; mobile is out of scope (§IX), so its cards carry no
+  // mark and nothing there polls, tracks or dwells.
+  //
+  // A floor pan in progress is not attention to any vessel (§IV.4): the flag
+  // rises on the floor's scroll and falls a beat after the last one.
+  const [floorPanning, setFloorPanning] = useState(false);
+  useEffect(() => {
+    const floor = floorRef.current;
+    if (!floor || isMobile) return;
+    let settle: ReturnType<typeof setTimeout> | null = null;
+    function onScroll() {
+      setFloorPanning(true);
+      if (settle) clearTimeout(settle);
+      settle = setTimeout(() => setFloorPanning(false), 200);
+    }
+    floor.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      floor.removeEventListener("scroll", onScroll);
+      if (settle) clearTimeout(settle);
+    };
+  }, [user?.id, loading, isMobile]);
+  // A pane over the floor holds the member's attention, whatever the pointer
+  // happened to be resting on when it opened.
+  const paneOpen = useGlasshousePresence((s) => s.isOpen);
+
+  // The floor polls the counts; the queue reads counts AND page one into its
+  // buffer, on its own slower clock (`prefetchQueueFeed`, below).
+  useSeenPolling(
+    visibleSorted.map((v) => v.feed.id),
+    bootstrap === "ready" && !isMobile && !queueMode,
+  );
+
+  // Forget the passed sets of feeds that are gone (deleted, merged away);
+  // hidden feeds are still live and keep theirs.
+  const liveIdsKey = vessels.map((v) => v.feed.id).join("\0");
+  useEffect(() => {
+    if (bootstrap !== "ready") return;
+    useFeedSeen
+      .getState()
+      .reconcileFeeds(liveIdsKey ? liveIdsKey.split("\0") : []);
+  }, [bootstrap, liveIdsKey]);
+
+  /** After a membership change the member made themselves — a source added,
+   *  removed, re-tuned, moved or merged — the window is refetched at once
+   *  rather than at the next poll (§IV.2). A source's back-catalogue is never
+   *  NEW: the server flags only what was published after the source joined. */
+  function refetchSeen(feedId: string) {
+    if (isMobile) return;
+    useFeedSeen
+      .getState()
+      .fetchWindow(feedId)
+      .catch((err) => console.warn("feedSeen: refetch failed", feedId, err));
+  }
 
   /** Viewport pointer → floor coordinates, the space `geom.rects` live in. */
   const toFloorSpace = useCallback((pointer: { x: number; y: number }) => {
@@ -825,60 +1048,244 @@ export function WorkspaceView() {
       (v) => v.feed.id === target.id,
     );
     if (targetVessel) void loadVesselItems(targetVessel.feed);
+    refetchSeen(target.id);
     removeFeedLayout(source.id);
     clearExpandedFor(source.id);
+    forgetFeedReadState(source.id);
     setPendingMerge(null);
   }
 
-  const loadVesselItems = useCallback(async (feed: WorkspaceFeed) => {
-    // A refresh collapses this vessel's open conversation.
-    clearExpandedFor(feed.id);
+  // PER-FEED LOAD SEQUENCING. A vessel's items + cursor are written by two
+  // things — a page-one load (`loadVesselItems`) and load-more (page N+1) —
+  // and the `loadingMoreRef` latch below only serialises load-more against
+  // itself. So a refresh landing while a load-more was in flight appended the
+  // OLD sequence's page 2 to the NEW page 1 and stamped the old cursor over the
+  // new one: the slice between them is skipped and never revisited, and the
+  // vessel then pages down a sequence that no longer matches what it is
+  // showing. A monotonic token per feed, claimed before the fetch and checked
+  // after it, makes the loser discard its answer instead of merging it.
+  //
+  // The tokens live in `feedLoads` (`lib/workspace/feedLoads.ts`,
+  // WORKSPACE-QUEUE-ADR §VI.5). Not React state: the check has to see the
+  // claim made moments ago in the same tick — the reason `loadingMoreRef` is a
+  // ref too.
+  const [feedLoads] = useState(createFeedLoads);
 
-    let prevIds: Set<string> | null = null;
-    setVessels((prev) =>
-      prev.map((v) => {
-        if (v.feed.id !== feed.id) return v;
-        if (v.status === "ready" && v.items.length > 0) {
-          prevIds = new Set(v.items.map(itemKey));
-        }
-        return { ...v, status: "loading", caughtUp: false };
-      }),
-    );
-    try {
-      const data = await workspaceFeedsApi.items(feed.id);
-      const mapped = data.items ?? [];
-      const caughtUp =
-        prevIds !== null &&
-        mapped.length > 0 &&
-        mapped.every((i) => (prevIds as Set<string>).has(itemKey(i)));
+  // Page one, REPLACING the list: the floor's refresh and every change to what
+  // a feed IS (its sources, its volume, a merge into it), in both modes — the
+  // tail is thrown away, because a merge would keep the posts those changes
+  // removed. The queue's own refreshes never come here: they reveal what the
+  // buffer holds (`revealQueueFeeds`, below).
+  const loadVesselItems = useCallback(
+    async (feed: WorkspaceFeed): Promise<PageOneResult<null>> => {
+      // A refresh collapses this vessel's open conversation.
+      clearExpandedFor(feed.id);
+
+      let prevIds: Set<string> | null = null;
       setVessels((prev) =>
-        prev.map((v) =>
-          v.feed.id === feed.id
-            ? {
-                ...v,
-                feed: data.feed,
-                items: mapped,
-                status: "ready",
-                caughtUp,
-                nextCursor: data.nextCursor ?? null,
-                loadingMore: false,
-              }
-            : v,
+        prev.map((v) => {
+          if (v.feed.id !== feed.id) return v;
+          if (v.status === "ready" && v.items.length > 0) {
+            prevIds = new Set(v.items.map(itemKey));
+          }
+          return { ...v, status: "loading", caughtUp: false };
+        }),
+      );
+      const result = await loadPageOne(
+        feedLoads,
+        feed.id,
+        async () => {
+          const data = await workspaceFeedsApi.items(feed.id, { limit: FEED_PAGE_SIZE });
+          // The page's asOf is a fact about the server's clock whether or not
+          // this answer survives the sequence check: the newest one held is
+          // what a look sends (WORKSPACE-QUEUE-ADR §IV.4).
+          useFeedSeen.getState().noteAsOf(feed.id, data.asOf);
+          return data;
+        },
+        (data): null => {
+          const mapped = data.items ?? [];
+          const caughtUp =
+            prevIds !== null &&
+            mapped.length > 0 &&
+            mapped.every((i) => (prevIds as Set<string>).has(itemKey(i)));
+          setVessels((prev) =>
+            prev.map((v) =>
+              v.feed.id === feed.id
+                ? {
+                    ...v,
+                    feed: data.feed,
+                    items: mapped,
+                    status: "ready",
+                    caughtUp,
+                    nextCursor: data.nextCursor ?? null,
+                    loadingMore: false,
+                  }
+                : v,
+            ),
+          );
+          return null;
+        },
+      );
+      if (result.status === "failed") {
+        console.error("Vessel items load error:", result.error);
+        setVessels((prev) =>
+          prev.map((v) =>
+            v.feed.id === feed.id ? { ...v, status: "error" } : v,
+          ),
+        );
+      }
+      return result;
+    },
+    [clearExpandedFor, feedLoads],
+  );
+
+  // ── The queue's buffer (the operator, 2026-09-26) ───────────────────────
+  // FETCHED ON A TIMER, SHOWN ON A GESTURE. Each visible feed's page one and
+  // window are read every QUEUE_PREFETCH_MS (`useSeenPolling`, below) into a
+  // buffer nothing displays; the window is adopted as it lands, so the badges
+  // are live, but nothing moves. A pull REVEALS the buffer — merged in at
+  // once, with no wait on the network, so the result lands with the gesture
+  // that asked for it — and pokes a fresh read of that feed into the buffer
+  // for next time, which also restarts its clock.
+  //
+  // A buffered page is stamped with the feed's load token when its read
+  // STARTED, and is shown only if no page-one read has been claimed since:
+  // a replace (a source removed, a volume change) would otherwise have the
+  // posts it took away merged back in from an older page.
+  type ItemsPage = Awaited<ReturnType<typeof workspaceFeedsApi.items>>;
+  const bufferRef = useRef(new Map<string, { gen: number; page: ItemsPage }>());
+  // The clock runs one read per feed at a time, but a feed that leaves the
+  // list and rejoins gets a fresh slot: only the newest-started read fills
+  // the buffer.
+  const bufferSeqRef = useRef(new Map<string, number>());
+  const prefetchQueueFeed = useCallback(
+    async (feedId: string) => {
+      const gen = feedLoads.current(feedId);
+      const seq = (bufferSeqRef.current.get(feedId) ?? 0) + 1;
+      bufferSeqRef.current.set(feedId, seq);
+      const [page] = await Promise.all([
+        workspaceFeedsApi.items(feedId, { limit: FEED_PAGE_SIZE }),
+        useFeedSeen.getState().fetchWindow(feedId),
+      ]);
+      useFeedSeen.getState().noteAsOf(feedId, page.asOf);
+      if (bufferSeqRef.current.get(feedId) === seq)
+        bufferRef.current.set(feedId, { gen, page });
+    },
+    [feedLoads],
+  );
+
+  /** Merge pages onto what is loaded, in ONE render, where the two provably
+   *  touch (`mergeFirstPage`). No LOADING… (the list the reader is in stays),
+   *  no caught-up tile (§VII.9: the mouth says it). */
+  const applyMergedPages = useCallback(
+    (pages: Map<string, ItemsPage>): Map<string, MergeOutcome> => {
+      const outcomes = new Map<string, MergeOutcome>();
+      if (pages.size === 0) return outcomes;
+      // A mounted list the reader is part-way down keeps its card: posts
+      // merged in above it must not move it (B4's note). At the very top the
+      // reader is looking at the newest posts, and what arrives there is what
+      // the mouth is about to announce.
+      //
+      // AND A LIST AT THE TOP IS PUT BACK AT THE TOP (operator, 2026-09-27).
+      // A pull only starts there, and it must leave the reader above what it
+      // brought, never below it — but two things carry the view down onto the
+      // old first card: the browser's own scroll anchoring, and the collapse
+      // of an open conversation (`settleExpansion`), which holds its host card
+      // still one frame after the new posts land above it. So the top is
+      // pinned now, and again on the next frame, after that hold has run.
+      const holds: { scroller: HTMLElement; anchor: CardAnchor }[] = [];
+      const tops: HTMLElement[] = [];
+      for (const id of pages.keys()) {
+        const scroller = document.querySelector<HTMLElement>(
+          `[data-queue-feed="${CSS.escape(id)}"] [data-vessel-scroll]`,
+        );
+        if (!scroller) continue;
+        if (scroller.scrollTop > 0)
+          holds.push({ scroller, anchor: captureCardAnchor(scroller) });
+        else tops.push(scroller);
+      }
+      const windows = useFeedSeen.getState().windows;
+      flushSync(() =>
+        setVessels((prev) =>
+          prev.map((v) => {
+            const data = pages.get(v.feed.id);
+            if (!data) return v;
+            const r = mergeFirstPage(
+              v.status === "ready" ? v.items : [],
+              data.items ?? [],
+              { pageSize: FEED_PAGE_SIZE, window: windows[v.feed.id]?.items },
+            );
+            outcomes.set(v.feed.id, r.outcome);
+            return {
+              ...v,
+              feed: data.feed,
+              items: r.items,
+              status: "ready",
+              caughtUp: false,
+              nextCursor: r.keepCursor ? v.nextCursor : (data.nextCursor ?? null),
+              loadingMore: false,
+            };
+          }),
         ),
       );
-    } catch (err) {
-      console.error("Vessel items load error:", err);
-      setVessels((prev) =>
-        prev.map((v) =>
-          v.feed.id === feed.id ? { ...v, status: "error" } : v,
-        ),
+      for (const h of holds) if (h.scroller.isConnected) restoreCardAnchor(h.scroller, h.anchor);
+      if (tops.length > 0) {
+        for (const el of tops) el.scrollTop = 0;
+        requestAnimationFrame(() => {
+          for (const el of tops) if (el.isConnected) el.scrollTop = 0;
+        });
+      }
+      return outcomes;
+    },
+    [],
+  );
+
+  // Every QUEUE_PREFETCH_MS, staggered, paused while the tab is hidden, and
+  // on return only the feeds that fell due meanwhile; a pull pokes its feed
+  // at once and restarts its clock.
+  const pokeQueueFeed = useSeenPolling(
+    visibleSorted.map((v) => v.feed.id),
+    bootstrap === "ready" && !isMobile && queueMode,
+    {
+      intervalMs: QUEUE_PREFETCH_MS,
+      fire: prefetchQueueFeed,
+      firstPass: "interval",
+      onReturn: "due",
+    },
+  );
+  /** Show what the buffer holds for these feeds, now, and read each afresh
+   *  for next time (`planReveal` decides which). A feed with nothing shown
+   *  reveals nothing — `null` in the result; a failed one with nothing
+   *  buffered is reloaded instead. */
+  const revealQueueFeeds = useCallback(
+    (feedIds: string[]): Map<string, MergeOutcome | null> => {
+      const plan = planReveal(
+        feedIds,
+        bufferRef.current,
+        (id) => vesselsRef.current.find((x) => x.feed.id === id)?.status,
+        feedLoads.current,
       );
-    }
-  }, [clearExpandedFor]);
+      for (const id of plan.drop) bufferRef.current.delete(id);
+      // Something is shown, so the feed's open conversation collapses.
+      for (const id of plan.show.keys()) clearExpandedFor(id);
+      for (const id of plan.reload) {
+        const v = vesselsRef.current.find((x) => x.feed.id === id);
+        if (v) void loadVesselItems(v.feed);
+      }
+      // One feed is read now; the edge pull's many are spread (the read only
+      // fills the buffer for NEXT time, so nothing waits on it).
+      pokeQueueFeed(plan.poke);
+      const outcomes = applyMergedPages(plan.show);
+      for (const id of plan.reload)
+        outcomes.set(id, { kind: "reloaded", reason: "failed", newCount: 0 });
+      return new Map(feedIds.map((id) => [id, outcomes.get(id) ?? null]));
+    },
+    [applyMergedPages, clearExpandedFor, feedLoads, loadVesselItems, pokeQueueFeed],
+  );
 
   // Feed ids with a load-more request in flight. This is the CONCURRENCY guard;
   // the vessel's own `loadingMore` field is presentation only (it drives the
-  // spinner). React state can't guard here: `vesselsRef` only catches up on
+  // queue's tail line). React state can't guard here: `vesselsRef` only catches up on
   // re-render, so two scroll events firing in the same tick would both read
   // `loadingMore: false` and fetch the same cursor twice, appending a duplicate
   // page. A ref latch flips synchronously, so the second call returns early.
@@ -900,6 +1307,9 @@ export function WorkspaceView() {
       return;
     }
     loadingMoreRef.current.add(feedId);
+    // Read, don't claim: a page appended to the sequence it was read from is
+    // still that sequence. A refresh CLAIMS a new one and this then discards.
+    const gen = feedLoads.current(feedId);
     const cursor = current.nextCursor;
     setVessels((prev) =>
       prev.map((v) =>
@@ -908,6 +1318,8 @@ export function WorkspaceView() {
     );
     try {
       const data = await workspaceFeedsApi.items(feedId, { cursor });
+      useFeedSeen.getState().noteAsOf(feedId, data.asOf);
+      if (!feedLoads.isCurrent(feedId, gen)) return;
       const mapped = data.items ?? [];
       setVessels((prev) =>
         prev.map((v) => {
@@ -924,6 +1336,7 @@ export function WorkspaceView() {
       );
     } catch (err) {
       console.error("Vessel load-more error:", err);
+      if (!feedLoads.isCurrent(feedId, gen)) return;
       setVessels((prev) =>
         prev.map((v) =>
           v.feed.id === feedId ? { ...v, loadingMore: false } : v,
@@ -932,22 +1345,53 @@ export function WorkspaceView() {
     } finally {
       loadingMoreRef.current.delete(feedId);
     }
-  }, []);
+  }, [feedLoads]);
 
   const vesselsRef = useRef(vessels);
   vesselsRef.current = vessels;
 
+  // REFRESH THE WHOLE WORKSPACE — every vessel's first page again, plus the
+  // unread badge the lockup itself carries. Two callers: a publish (so the
+  // piece you just sent appears where it will live) and the nav bar's WORDMARK
+  // (2026-09-14 — ForallMenu's `onRefreshAll`, the desktop twin of mobile's
+  // per-feed pull-to-refresh, which was the canvas's only refresh gesture) —
+  // on the FLOOR only since 2026-09-26: in the queue the wordmark opens the
+  // menu, and the edge pull is the reveal.
+  //
+  // It is deliberately NOT a re-bootstrap: the bootstrap effect also restores
+  // layout, appearance and the first-run gates, and re-running it to fetch
+  // posts would move the furniture under someone who asked for new posts. What
+  // refreshes is what changes on its own — items, and what is unread.
   function refreshAll() {
     // Refreshing every vessel collapses every expanded conversation.
     setExpandedByFeed({});
     vesselsRef.current.forEach((v) => void loadVesselItems(v.feed));
+    void useUnreadCounts.getState().fetch();
+  }
+
+  /** A publish. On the floor, every feed's page one again, so the piece
+   *  appears where it will live. In the queue nothing is shown that the
+   *  reader did not pull: every feed is read into its buffer now, so the
+   *  badge says there is something new and the next pull shows it. */
+  function refreshAfterPublish() {
+    if (queueMode) {
+      pokeQueueFeed(visibleSorted.map((v) => v.feed.id));
+      void useUnreadCounts.getState().fetch();
+    } else refreshAll();
+  }
+
+  /** Every visible feed's buffer, shown. Resolves nothing: the answer is in
+   *  memory already. */
+  function revealAllQueueFeeds(): Map<string, MergeOutcome | null> {
+    void useUnreadCounts.getState().fetch();
+    return revealQueueFeeds(
+      vesselsRef.current.filter((v) => !v.feed.hidden).map((v) => v.feed.id),
+    );
   }
 
   function handleForallAction(key: ForallAction) {
     if (key === "new-note") {
-      setReplyTarget(null);
-      setQuoteTarget(null);
-      setComposerOpen("note");
+      openNoteComposer();
       return;
     }
     if (key === "new-feed") {
@@ -1132,35 +1576,66 @@ export function WorkspaceView() {
   function feedDisplayName(feedId: string, feedName: string): string {
     const num = feedNumerals.get(feedId) ?? 1;
     const descriptive = feedName.trim();
-    return descriptive ? `Feed ${num}: ${descriptive}` : `Feed ${num}`;
+    return descriptive ? `Channel ${num}: ${descriptive}` : `Channel ${num}`;
+  }
+
+  // ── The queue (WORKSPACE-QUEUE-ADR Phase B) ─────────────────────────────
+  // What QueueView reads of each feed. Per-feed data stays here (§VI.2).
+  const queueFeeds: QueueFeed[] = liveSorted.map((v) => ({
+    id: v.feed.id,
+    numeral: feedNumerals.get(v.feed.id) ?? 1,
+    name: v.feed.name.trim(),
+    hidden: v.feed.hidden,
+    createdAt: v.feed.createdAt,
+    palette: paletteFor(appearance[v.feed.id]?.brightness, globalDark),
+    caughtUp: v.caughtUp,
+    hasItems: v.status === "ready" && v.items.length > 0,
+    tailNote: v.loadingMore
+      ? "loading"
+      : v.status === "ready" && v.items.length > 0 && !v.nextCursor
+        ? "end"
+        : undefined,
+    fromStarter: v.feed.fromStarter,
+  }));
+
+  // The muster in queue mode shows VISIBLE feeds only (§VII.0 D1): the bars
+  // after the last entry are where hidden feeds live in this mode, so the
+  // close-X roundels would be a second home. Focal is `in` (`QueueMuster`
+  // marks it), everything else `off` — a passed feed is not hidden, so it is
+  // never `minimised`. It does not reorder with the queue.
+  const queueMusterFeeds = visibleSorted.map((v) => ({
+    id: v.feed.id,
+    numeral: feedNumerals.get(v.feed.id) ?? 0,
+    name: v.feed.name.trim(),
+    state: "off" as const,
+  }));
+
+  const walkQueueTo = useCallback((feedId: string) => {
+    useGlasshousePresence.getState().close();
+    queueRef.current?.walkTo(feedId);
+  }, []);
+
+  function handleSourceAdded(feedId: string) {
+    const v = vesselsRef.current.find((x) => x.feed.id === feedId);
+    if (!v) return;
+    void loadVesselItems(v.feed);
+    refetchSeen(feedId);
+    workspaceFeedsApi
+      .listSources(feedId)
+      .then(({ sources }) =>
+        setVessels((prev) =>
+          prev.map((vs) => (vs.feed.id === feedId ? { ...vs, sources } : vs)),
+        ),
+      )
+      .catch(() => {});
   }
 
   const hiddenFeeds = vessels
     .filter((v) => v.feed.hidden)
     .map((v) => ({
       id: v.feed.id,
-      name: v.feed.name.trim() || "Unnamed feed",
+      name: v.feed.name.trim() || "Unnamed channel",
     }));
-
-  function matchItemToSource(
-    item: Post,
-    sources: WorkspaceFeedSource[],
-  ): string | undefined {
-    // External card → its all.haus external_sources row; native → the author
-    // account. (tag/publication sources have no per-card drag handle, as before.)
-    if (item.externalSourceId) {
-      return sources.find(
-        (s) =>
-          s.sourceType === "external_source" &&
-          s.externalSourceId === item.externalSourceId,
-      )?.id;
-    }
-    const authorId = item.author.accountId;
-    if (!authorId) return undefined;
-    return sources.find(
-      (s) => s.sourceType === "account" && s.accountId === authorId,
-    )?.id;
-  }
 
   async function handleCardDrop(targetFeedId: string, raw: string) {
     let payload: { feedId: string; feedSourceId: string };
@@ -1176,22 +1651,29 @@ export function WorkspaceView() {
         payload.feedSourceId,
         targetFeedId,
       );
-      const src = vessels.find((v) => v.feed.id === payload.feedId);
-      const tgt = vessels.find((v) => v.feed.id === targetFeedId);
-      if (src) void loadVesselItems(src.feed);
-      if (tgt) void loadVesselItems(tgt.feed);
-      for (const fid of [payload.feedId, targetFeedId]) {
-        workspaceFeedsApi
-          .listSources(fid)
-          .then(({ sources }) => {
-            setVessels((prev) =>
-              prev.map((v) => (v.feed.id === fid ? { ...v, sources } : v)),
-            );
-          })
-          .catch(() => {});
-      }
+      afterSourceMoved(payload.feedId, targetFeedId);
     } catch (err) {
       console.error("Move source failed:", err);
+    }
+  }
+
+  /** A source left one feed for another — the floor's card drop, or the ⚙
+   *  panel's Move (WORKSPACE-QUEUE-ADR §XI.2 R2). Both feeds change what they
+   *  ARE, so both reload page one, re-ask their counts and re-read their
+   *  source lists. */
+  function afterSourceMoved(fromFeedId: string, toFeedId: string) {
+    for (const fid of [fromFeedId, toFeedId]) {
+      const v = vesselsRef.current.find((x) => x.feed.id === fid);
+      if (v) void loadVesselItems(v.feed);
+      refetchSeen(fid);
+      workspaceFeedsApi
+        .listSources(fid)
+        .then(({ sources }) => {
+          setVessels((prev) =>
+            prev.map((x) => (x.feed.id === fid ? { ...x, sources } : x)),
+          );
+        })
+        .catch(() => {});
     }
   }
 
@@ -1245,9 +1727,11 @@ export function WorkspaceView() {
     // setCeremony({ feedId: feed.id, pace: "responsive", target: slot });
   }
 
+  // An OUTAGE is not an absence (CA-A11): `/auth/me` not answering leaves the
+  // member's standing unknown, and unknown is not "log in again".
   useEffect(() => {
-    if (!loading && !user) router.push("/auth?mode=login");
-  }, [user, loading, router]);
+    if (!loading && !user && !outage) router.push("/auth?mode=login");
+  }, [user, loading, outage, router]);
 
   // Deep-link → overlay. Retired routes (dashboard, messages, notifications)
   // redirect here as /reader?overlay=<name>[&…seed params]; so do the standalone
@@ -1265,43 +1749,57 @@ export function WorkspaceView() {
     const cleaned = new URLSearchParams(window.location.search);
     OVERLAY_PARAM_KEYS.forEach((k) => cleaned.delete(k));
     const qs = cleaned.toString();
-    window.history.replaceState({}, "", `/reader${qs ? `?${qs}` : ""}`);
+    // CARRY NEXT'S OWN STATE FORWARD. A bare `{}` here wipes `__NA` and the
+    // internals tree off the entry a reader will later come BACK to, and the
+    // app router, finding an entry it cannot reconcile, falls back to a full
+    // document navigation — so after any `?overlay=` arrival (every
+    // notification link, the /messages and /settings shims) the first Back out
+    // of a pane RELOADED THE WHOLE WORKSPACE, losing every in-memory surface
+    // with it. Measured, because none of it is visible from the code: after
+    // this line the entry's state keys were `[]`, against
+    // `["__NA","__PRIVATE_NEXTJS_INTERNALS_TREE"]` on a bare /reader.
+    //
+    // Next merges its keys into a `pushState` (measured too — a raw push of
+    // `{mine:true}` comes back carrying all three) and does NOT merge them
+    // into a `replaceState`, which is the asymmetry this line fell into.
+    // The tree stays correct across the write: the document has not navigated,
+    // only the query string has changed.
+    window.history.replaceState(
+      window.history.state,
+      "",
+      `/reader${qs ? `?${qs}` : ""}`,
+    );
     openOverlayFromParams(seed);
   }, []);
 
-  // Slice 12: fetch the user's followed pubkeys once on mount so the pip
-  // panel can render its initial follow state without a per-open round-trip.
-  // Failure is non-fatal — panel just defaults to "not following."
-  useEffect(() => {
-    if (!user) return;
-    let cancelled = false;
-    followsApi
-      .listPubkeys()
-      .then(({ pubkeys }) => {
-        if (cancelled) return;
-        setFollowedPubkeys(new Set(pubkeys));
-      })
-      .catch(() => {
-        if (!cancelled) setFollowedPubkeys(new Set());
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [user]);
+  // EVERY EFFECT BELOW IS KEYED ON THE MEMBER'S ID, NEVER THE `user` OBJECT
+  // (CA-A12, 2026-09-29). `fetchMe` always sets a NEW object, and it is called
+  // after an unlock, a card connect, a profile edit, a username change and the
+  // age gate — so keyed on the object, each of those re-ran the bootstrap
+  // below: `setBootstrap("loading")`, every vessel unmounted, every feed back
+  // to page one, the scroll lost behind the pane that caused it. A member's
+  // identity is the only thing these effects are about.
 
   // Hydrate the workspace store from localStorage as soon as the user is
   // known. Bootstrap below depends on hydration so default-slot writes don't
   // overwrite a stored layout.
   useEffect(() => {
     if (user) hydrate(user.id);
-  }, [user, hydrate]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, hydrate]);
+  // The reading counts' device set, beside it (WORKSPACE-QUEUE-ADR §IV.5).
+  useEffect(() => {
+    if (user) useFeedSeen.getState().hydrate(user.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id]);
 
   // Bootstrap: one aggregate call returns the feed list plus, per feed, its
   // sources + first page of items (performance audit #3) — collapsing the old
   // list()+per-feed listSources()+items() fan-out into a single round trip.
   // Feeds absent from `vessels` (a freshly minted default, or a server-side
   // hydration hiccup) fall back to the per-vessel lazy loaders below.
-  // Re-runs only when the authenticated user changes.
+  // Re-runs only when the authenticated MEMBER changes (their id) — never on
+  // a re-fetched `user` object.
   useEffect(() => {
     if (!user || !hydrated) return;
     let cancelled = false;
@@ -1329,6 +1827,9 @@ export function WorkspaceView() {
         // lazy fallback below.
         const initial: VesselState[] = list.map((feed) => {
           const v = vesselData[feed.id];
+          // The bootstrap is the items page by another door, so it carries
+          // each vessel's asOf too.
+          if (v) useFeedSeen.getState().noteAsOf(feed.id, v.asOf);
           if (v) {
             return {
               feed,
@@ -1424,7 +1925,10 @@ export function WorkspaceView() {
         // superseding what the user explicitly navigated to would be rude. The
         // gate is server-side and survives, so it simply offers on a later
         // mount; nothing is consumed by not showing it here.
-        if (user.onboardedAt === null && !useGlasshousePresence.getState().isOpen) {
+        // Read fresh off the store: the closure's `user` is the render this
+        // effect last ran in, and the effect is keyed on the id alone.
+        const onboardedAt = useAuth.getState().user?.onboardedAt ?? null;
+        if (onboardedAt === null && !useGlasshousePresence.getState().isOpen) {
           setTourArmed(true);
         }
 
@@ -1445,25 +1949,47 @@ export function WorkspaceView() {
     return () => {
       cancelled = true;
     };
-  }, [user, hydrated, loadVesselItems]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, hydrated, loadVesselItems]);
 
   // The feed's card list — shared verbatim by the desktop vessel and the
   // mobile full-bleed page (MOBILE-LAYOUT-ADR §III), so the two surfaces
   // cannot drift. Orientation never reaches the cards (it is a chassis
   // property); scheme/density/text size ride the layout store as on desktop.
-  function renderFeedContents(v: VesselState) {
+  //
+  // At `level` "preview" it builds the queue's preview rows instead
+  // (WORKSPACE-QUEUE-ADR §VII.5): the same loaded items in the same order,
+  // capped, as bare cards at the `preview` level — the one path again, so no
+  // row is a `Post` rendered outside `resolveSpec`. A row walks the queue to
+  // its feed; an article's opens the reader (D6).
+  const renderFeedContents = useCallback(
+  (v: VesselState, level: "feed" | "preview" = "feed") => {
+    const preview = level === "preview";
     const look = appearance[v.feed.id] ?? {};
     // Both surfaces render the feed's colourway in the global mode's light or
     // dark variant. Desktop vessels and the mobile pages are both islanded
     // (LIGHT_ISLAND_STYLE), so the derived text slugs the palette references
     // resolve canonical regardless of mode and the variant supplies light/dark.
     const feedPalette = paletteFor(look.brightness, globalDark);
+    // Posts already read inside a conversation in THIS feed stop being cards in
+    // it (see `weededByFeed`). Applied here, at the one place the card list is
+    // built, so the desktop vessel and the mobile page cannot disagree — and so
+    // it also survives a refresh, which replaces `v.items` and leaves the
+    // weeded set standing. A page that weeds away to nothing simply lets the
+    // infinite-scroll sentinel fetch the next one.
+    const weeded = weededByFeed[v.feed.id];
+    const unweeded = weeded?.size
+      ? v.items.filter((i) => !weeded.has(i.id))
+      : v.items;
+    const items = preview ? unweeded.slice(0, PREVIEW_ROW_CAP) : unweeded;
+    const seenHere = seenHandlerFor(v.feed.id);
     return (
       <>
             {v.status === "loading" && <Hint>LOADING…</Hint>}
-            {v.status === "error" && <Hint>COULDN&rsquo;T LOAD FEED</Hint>}
-            {v.status === "ready" &&
-              v.items.length === 0 &&
+            {v.status === "error" && <Hint>COULDN&rsquo;T LOAD CHANNEL</Hint>}
+            {!preview &&
+              v.status === "ready" &&
+              items.length === 0 &&
               (v.sources.length === 0 ? (
                 <EmptyFeedTile
                   variant="no-sources"
@@ -1477,7 +2003,8 @@ export function WorkspaceView() {
                   onAddSources={() => setFeedComposerFor(v.feed)}
                 />
               ))}
-            {v.status === "ready" && v.caughtUp && v.items.length > 0 && (
+            {/* The queue raises none: its mouth says it (§VII.9). */}
+            {!preview && !queueMode && v.status === "ready" && v.caughtUp && items.length > 0 && (
               <EmptyFeedTile
                 variant="caught-up"
                 palette={feedPalette}
@@ -1494,7 +2021,7 @@ export function WorkspaceView() {
               />
             )}
             {v.status === "ready" &&
-              v.items.map((item) =>
+              items.map((item) =>
                 (() => {
                     // UNIVERSAL-POST-ADR Phase 5 — the unified card is the only
                     // feed path. Collapsed cards are PostCardInteractive
@@ -1514,7 +2041,10 @@ export function WorkspaceView() {
                       bodyPx:
                         TEXT_SIZE_PX[look.textSize ?? DEFAULT_TEXT_SIZE],
                       feedId: v.feed.id,
-                      dragData: (() => {
+                      // No card drag in the queue: its targets are columnar
+                      // (§VI.6), and without `dragData` the byline's grab
+                      // handle is not rendered at all, not merely inert.
+                      dragData: queueMode ? undefined : (() => {
                         const fsId = matchItemToSource(item, v.sources);
                         return fsId
                           ? JSON.stringify({
@@ -1527,7 +2057,11 @@ export function WorkspaceView() {
                     // One conversation open per feed: opening this card
                     // replaces whatever was open in this feed; clicking the
                     // open card again collapses it.
-                    const toggleExpand = () =>
+                    const toggleExpand = () => {
+                      // Whether this closes the open conversation or replaces
+                      // it with another, the one that was open is finished:
+                      // bank what its reader saw. A no-op on a cold open.
+                      settleExpansion(v.feed.id);
                       setExpandedByFeed((prev) => {
                         const open = prev[v.feed.id];
                         // Open on this slot but rooted on a post this card
@@ -1543,19 +2077,27 @@ export function WorkspaceView() {
                         // Body click expands the host post (the quoter).
                         return {
                           ...prev,
-                          [v.feed.id]: { key: expandKey, root: post.id },
+                          [v.feed.id]: {
+                            key: expandKey,
+                            root: post.id,
+                            host: post.id,
+                          },
                         };
                       });
+                    };
                     // The focal click is a CLOSE, never the toggle above: while
                     // a quote expansion is open the toggle swings to the host,
                     // and the focal must still collapse the conversation (§4).
-                    const collapseHere = () =>
+                    const collapseHere = () => {
+                      if (expandedHere?.key === expandKey)
+                        settleExpansion(v.feed.id);
                       setExpandedByFeed((prev) => {
                         if (prev[v.feed.id]?.key !== expandKey) return prev;
                         const next = { ...prev };
                         delete next[v.feed.id];
                         return next;
                       });
+                    };
                     // Clicking the embedded quote tile opens the QUOTED post as
                     // the focal of an expanded conversation — full seniority, no
                     // residue of the host that embedded it. Distinct from a body
@@ -1563,92 +2105,35 @@ export function WorkspaceView() {
                     // so the two clicks never collide. The gateway minted a
                     // feed_items twin when the tile hydrated, so /thread resolves
                     // the quoted post's id (post.quotes).
-                    const expandQuote = (quotedPostId: string) =>
+                    const expandQuote = (quotedPostId: string) => {
+                      settleExpansion(v.feed.id);
                       setExpandedByFeed((prev) => ({
                         ...prev,
-                        [v.feed.id]: { key: expandKey, root: quotedPostId },
+                        [v.feed.id]: {
+                          key: expandKey,
+                          root: quotedPostId,
+                          host: post.id,
+                        },
                       }));
-                    const onPipOpen = (
-                      pubkey: string,
-                      rect: DOMRect,
-                      status: typeof post.author.pipStatus | undefined,
-                    ) => setPipPanel({ pubkey, rect, status, feedId: v.feed.id });
-                    // Native reply only (external interact-back is a Phase 2/3
-                    // documented cut). version = the all.haus event id (vote +
-                    // reply target); type picks the kind.
-                    const replyFromPost = (p: Post) => {
-                      setQuoteTarget(null);
-                      setReplyTarget({
-                        eventId: p.version ?? p.id,
-                        eventKind: p.type === "article" ? 30023 : 1,
-                        authorPubkey: p.author.pubkey ?? "",
-                        authorName: "",
-                        excerpt: (p.body.text ?? "").slice(0, 120),
-                      });
-                      setComposerOpen("note");
                     };
                     // Native quote → a NIP-18 quote note that embeds this post.
                     // version = the nostr event id of the thing being quoted.
+                    // An external post quotes by post_id + public URL
+                    // (`quoteTargetFromPost`, shared with the plain register).
                     const quoteFromPost = (p: Post) => {
-                      // External post (no nostr pubkey): quote as a native note
-                      // that references the origin by post_id + public URL,
-                      // rendering the same rich quoted-mini (migration 102).
-                      if (!p.author.pubkey) {
-                        setReplyTarget(null);
-                        setQuoteTarget({
-                          eventId: "",
-                          eventKind: 1,
-                          authorPubkey: "",
-                          isExternal: true,
-                          quotedPostId: p.id,
-                          quotedUrl: originWebUrl(p) ?? undefined,
-                          quotedSource:
-                            p.origin.sourceName ??
-                            EXTERNAL_QUOTE_LABEL[p.origin.protocol] ??
-                            p.origin.protocol.toUpperCase(),
-                          previewTitle: p.body.title ?? undefined,
-                          previewContent: quotePreviewContent(p),
-                          previewAuthorName:
-                            p.author.displayName ?? p.author.handle ?? undefined,
-                        });
-                        setComposerOpen("note");
-                        return;
-                      }
-                      const eventId = p.version ?? p.id;
-                      const pubkey = p.author.pubkey ?? "";
-                      // Native display names aren't on the workspace Post (the
-                      // byline resolves them via useWriterName), so read that
-                      // warm cache for the "Quoting …" banner; fall back to the
-                      // handle, then patch in an async resolve on a cold cache.
-                      const cachedName = pubkey
-                        ? getCachedWriterName(pubkey)
-                        : null;
-                      setReplyTarget(null);
-                      setQuoteTarget({
-                        eventId,
-                        eventKind: p.type === "article" ? 30023 : 1,
-                        authorPubkey: pubkey,
-                        previewTitle: p.body.title ?? undefined,
-                        previewContent: quotePreviewContent(p),
-                        previewAuthorName:
-                          p.author.displayName ?? cachedName ?? p.author.handle ?? undefined,
-                      });
+                      setQuoteTarget(quoteTargetFromPost(p));
                       setComposerOpen("note");
-                      if (pubkey && !p.author.displayName && !cachedName) {
-                        void resolveWriterName(pubkey).then((info) => {
-                          if (!info) return;
-                          setQuoteTarget((prev) =>
-                            prev && prev.eventId === eventId
-                              ? { ...prev, previewAuthorName: info.displayName }
-                              : prev,
-                          );
-                        });
-                      }
                     };
                     // Article click → reader pane (§3.1 / Phase R). Native by
                     // d-tag (/article/<dTag>), external by URL (/read/<postId>).
                     // Actions are stable refs, so getState() avoids subscribing.
                     const openReaderFromPost = (p: Post) => {
+                      // An article OPENED has been seen, wherever it was opened
+                      // from — a card, a preview row, a thread (operator,
+                      // 2026-09-27; amends WORKSPACE-QUEUE-ADR §IV.7, where only
+                      // a pass marked). A post outside the window is a no-op.
+                      if (!isMobile)
+                        useFeedSeen.getState().markPassed(v.feed.id, p.id);
                       const reader = useReader.getState();
                       // Frame the reader in the launching feed's COLOURWAY (not a
                       // colour — the pane re-derives bar, ⊓ and ear arrows off one
@@ -1656,7 +2141,7 @@ export function WorkspaceView() {
                       // source link opens a surface), and hand it the feed's
                       // article list so the skip ears step through them in place.
                       const frame = { frameScheme: ctx.palette.scheme };
-                      const entries = v.items
+                      const entries = unweeded
                         .map(articleToReaderEntry)
                         .filter((e): e is ReaderNavEntry => e !== null);
                       const index = entries.findIndex((e) => e.postId === p.id);
@@ -1683,22 +2168,65 @@ export function WorkspaceView() {
                           frameScheme: frame.frameScheme,
                         });
                     };
-                    const collapsedCard = (
+                    if (preview) {
+                      // Bare `PostCard`, as for any non-interactive render.
+                      // `compact` density whatever the feed's, so every row is
+                      // the level's one line in the tight shell — a headline
+                      // feed would otherwise print a note's whole body. The
+                      // mark rides the ctx for the FADE alone: a preview row
+                      // carries no `data-seen-at`, so nothing can pass it.
+                      // A click walks to the feed AND opens this card's
+                      // conversation once it lands (`onQueueFocalChange`).
+                      const walk = () => {
+                        pendingQueueOpenRef.current = {
+                          feedId: v.feed.id,
+                          key: expandKey,
+                          root: post.id,
+                        };
+                        queueRef.current?.walkTo(v.feed.id);
+                      };
+                      return (
+                        <FeedSeenMarked
+                          key={item.id}
+                          feedId={v.feed.id}
+                          postId={post.id}
+                          render={(seen) => (
+                            <PostCard
+                              post={post}
+                              level="preview"
+                              ctx={{ ...ctx, density: "compact", seen }}
+                              onFocus={walk}
+                              onOpenReader={openReaderFromPost}
+                            />
+                          )}
+                        />
+                      );
+                    }
+                    // The reading counts' mark (§IV.8), subscribed per card so a
+                    // pass re-renders the one card whose mark moved. Desktop
+                    // only; the conversation below takes the bare ctx, because
+                    // expanding one never marks anything passed.
+                    const renderCollapsed = (
+                      seen?: SeenMark,
+                    ) => (
                       <PostCardInteractive
                         post={post}
                         level="feed"
                         expanded={false}
-                        ctx={ctx}
-                        onPipOpen={onPipOpen}
+                        ctx={seen === undefined ? ctx : { ...ctx, seen }}
                         onExpand={toggleExpand}
                         onQuoteOpen={expandQuote}
                         onOpenReader={openReaderFromPost}
-                        onReply={
-                          post.author.pubkey
-                            ? () => replyFromPost(post)
-                            : undefined
-                        }
                         onQuote={() => quoteFromPost(post)}
+                      />
+                    );
+                    const collapsedCard = isMobile ? (
+                      renderCollapsed()
+                    ) : (
+                      <FeedSeenMarked
+                        feedId={v.feed.id}
+                        postId={post.id}
+                        render={renderCollapsed}
                       />
                     );
                     if (isExpanded && post.type !== "article") {
@@ -1718,12 +2246,10 @@ export function WorkspaceView() {
                           <PostThread
                             rootPostId={root}
                             ctx={ctx}
+                            onSeen={seenHere}
                             onCollapse={collapseHere}
-                            onReply={replyFromPost}
                             onQuote={quoteFromPost}
                             onOpenReader={openReaderFromPost}
-                            onPipOpen={onPipOpen}
-                            refreshKey={threadRefreshTick}
                           />
                         </Fragment>
                       );
@@ -1733,10 +2259,53 @@ export function WorkspaceView() {
               )}
       </>
     );
-  }
+  },
+  [
+    appearance,
+    globalDark,
+    weededByFeed,
+    expandedByFeed,
+    queueMode,
+    isMobile,
+    settleExpansion,
+    seenHandlerFor,
+  ],
+  );
+
+  // Each desktop vessel's card list, built once per change to what it shows.
+  // A resize or drag frame re-renders this component (`resizePreview`, the
+  // drop stripe) but touches none of these inputs, so every Vessel is handed
+  // the SAME children element and React bails out at the card list — rather
+  // than re-rendering every card on the floor every frame (CA-G9). Mobile and
+  // the queue build theirs on demand through `renderFeedContents` as before.
+  const desktopContents = useMemo(
+    () =>
+      isMobile || queueMode
+        ? null
+        : new Map(vessels.map((v) => [v.feed.id, renderFeedContents(v)])),
+    [isMobile, queueMode, vessels, renderFeedContents],
+  );
 
   if (loading || !user) {
-    return <Floor />;
+    // A first load in an outage says so and offers a retry; it never bounces
+    // to the login page (the effect above) and never spins for a server that
+    // is down (`loading` ended). A retry that answers takes the ordinary path.
+    return (
+      <Floor>
+        {outage && (
+          <CenteredHint>
+            COULDN&rsquo;T REACH ALL.HAUS{" "}
+            <button
+              type="button"
+              className="btn-text"
+              onClick={() => void fetchMe()}
+            >
+              Retry
+            </button>
+          </CenteredHint>
+        )}
+      </Floor>
+    );
   }
 
   return (
@@ -1750,9 +2319,9 @@ export function WorkspaceView() {
           its own opaque pane, exactly as the old row's `navRowH` stayed
           reserved through a reader open. 0 on mobile, which has no desktop
           bar. */}
-      <Floor floorRef={floorRef} insetTop={barH}>
+      <Floor floorRef={floorRef} insetTop={barH} clipX={queueMode}>
       {bootstrap === "loading" && (
-        <CenteredHint>BOOTSTRAPPING WORKSPACE…</CenteredHint>
+        <CenteredHint>LOADING…</CenteredHint>
       )}
       {bootstrap === "error" && (
         <CenteredHint>COULDN&rsquo;T LOAD WORKSPACE</CenteredHint>
@@ -1796,7 +2365,42 @@ export function WorkspaceView() {
           `geom.rects`, which are FINAL canvas coordinates with the first-run
           centring already applied: derivation is the one conversion seam, and
           nothing else converts anywhere. */}
-      {bootstrap === "ready" && !isMobile && (
+      {bootstrap === "ready" && queueMode && (
+        <QueueView
+          ref={queueRef}
+          feeds={queueFeeds}
+          vp={vp}
+          hiddenPalette={paletteFor("basic", globalDark)}
+          attentionElsewhere={paneOpen}
+          renderContents={(feedId) => {
+            const v = vessels.find((x) => x.feed.id === feedId);
+            return v ? renderFeedContents(v) : null;
+          }}
+          renderPreview={(feedId) => {
+            const v = vessels.find((x) => x.feed.id === feedId);
+            return v ? renderFeedContents(v, "preview") : null;
+          }}
+          onReveal={(feedId) => revealQueueFeeds([feedId]).get(feedId) ?? null}
+          onRevealAll={revealAllQueueFeeds}
+          onLoadMore={loadMoreVesselItems}
+          onCaughtUpDismiss={(feedId) =>
+            setVessels((prev) =>
+              prev.map((vs) =>
+                vs.feed.id === feedId ? { ...vs, caughtUp: false } : vs,
+              ),
+            )
+          }
+          onNameClick={(feedId) => {
+            const v = vessels.find((x) => x.feed.id === feedId);
+            if (v) setFeedComposerFor(v.feed);
+          }}
+          onSourceAdded={handleSourceAdded}
+          onHide={(feedId) => void handleSetFeedHidden(feedId, true)}
+          onRestore={handleRestoreHiddenFeed}
+          onFocalChange={onQueueFocalChange}
+        />
+      )}
+      {bootstrap === "ready" && !isMobile && !queueMode && (
         <div
           data-workspace-canvas
           style={{
@@ -1826,19 +2430,7 @@ export function WorkspaceView() {
                 sortRank={v.feed.sortRank}
                 fromStarter={v.feed.fromStarter}
                 onNameClick={() => setFeedComposerFor(v.feed)}
-                onSourceAdded={() => {
-                  void loadVesselItems(v.feed);
-                  workspaceFeedsApi
-                    .listSources(v.feed.id)
-                    .then(({ sources }) =>
-                      setVessels((prev) =>
-                        prev.map((vs) =>
-                          vs.feed.id === v.feed.id ? { ...vs, sources } : vs,
-                        ),
-                      ),
-                    )
-                    .catch(() => {});
-                }}
+                onSourceAdded={() => handleSourceAdded(v.feed.id)}
                 // The derived rect, verbatim — no conversion at this seam.
                 position={{ x: rect.x, y: rect.y }}
                 size={{ w: rect.w, h: rect.h }}
@@ -1868,10 +2460,16 @@ export function WorkspaceView() {
                 onDragEnd={() => handleVesselDragEnd(v.feed.id)}
                 armed={armedMergeTarget === v.feed.id}
                 contentsMounted={visibleIds.has(v.feed.id)}
+                countsSeen
+                inView={musterInView.has(v.feed.id)}
+                attentionElsewhere={floorPanning || paneOpen}
+                tailSpacer={v.status === "ready" && v.items.length > 0}
                 hidden={ceremony?.feedId === v.feed.id}
                 floorRef={floorRef}
                 onCardDrop={(raw) => handleCardDrop(v.feed.id, raw)}
-                onRefresh={() => loadVesselItems(v.feed)}
+                onRefresh={async () => {
+                  await loadVesselItems(v.feed);
+                }}
                 onLoadMore={loadMoreVesselItems}
                 caughtUp={v.caughtUp}
                 onCaughtUpDismiss={() =>
@@ -1884,7 +2482,7 @@ export function WorkspaceView() {
                   )
                 }
               >
-                {renderFeedContents(v)}
+                {desktopContents?.get(v.feed.id)}
               </Vessel>
               );
             })}
@@ -1892,15 +2490,21 @@ export function WorkspaceView() {
       )}
       {/* The nav bar (§VI) — chrome only; the lockup docks into its left end
           via ForallMenu anchor="row" below. Desktop only: the mobile bar
-          carries its own wordmark. Un-mounted while the reader is open so the
-          immersive reading pane can cover the toolbar region; the ∀ lockup
-          (z-60, rendered below) still floats over it. */}
-      {!isMobile && !readerOpen && <NavBar />}
+          carries its own wordmark. Un-mounted while either immersive pane is
+          open (reader or editor) so it can cover the toolbar region; the ∀
+          lockup (z-60, rendered below) still floats over it. */}
+      {!isMobile && !immersivePaneOpen && <NavBar />}
       {/* The muster (NAV-ROW-MUSTER-ADR §IV) — a separate fixed layer over the
           bar band, docked at its right end and clearing the lockup. Desktop
           only: the mobile indicator strip is the pip strip in its own bar.
-          Hidden with the bar under an open reader. */}
-      {!isMobile && !readerOpen && <Muster feeds={musterFeeds} onGoTo={goToFeed} />}
+          Hidden with the bar under either immersive pane. */}
+      {!isMobile && !immersivePaneOpen && (
+        queueMode ? (
+          <QueueMuster feeds={queueMusterFeeds} onGoTo={walkQueueTo} />
+        ) : (
+          <Muster feeds={musterFeeds} onGoTo={goToFeed} />
+        )
+      )}
       <ForallMenu
         onAction={handleForallAction}
         hiddenFeeds={hiddenFeeds}
@@ -1912,26 +2516,26 @@ export function WorkspaceView() {
           const v = vessels.find((x) => x.feed.id === feedId);
           if (v) setFeedComposerFor(v.feed);
         }}
+        onRefreshAll={queueMode ? undefined : refreshAll}
         anchor={isMobile ? "bar" : "row"}
       />
       <Composer
         open={!!composerOpen}
-        replyTarget={replyTarget}
         quoteTarget={quoteTarget}
         onClose={() => {
+          composerSuspendedRef.current = false;
           setComposerOpen(false);
-          setReplyTarget(null);
           setQuoteTarget(null);
           // Keep the global compose store (the bridge trigger) in sync so a
           // re-open request from outside this component fires the effect again.
           if (useCompose.getState().isOpen) useCompose.getState().close();
         }}
-        onPublished={refreshAll}
-        onReplied={() => {
-          // Bump the global thread tick so an open PostThread busts its cache and
-          // refetches, surfacing the just-published reply.
-          setThreadRefreshTick((t) => t + 1);
+        onSuspend={() => {
+          composerSuspendedRef.current = true;
+          setComposerOpen(false);
+          if (useCompose.getState().isOpen) useCompose.getState().suspend();
         }}
+        onPublished={refreshAfterPublish}
       />
       <NewFeedPrompt
         open={newFeedOpen}
@@ -1947,11 +2551,6 @@ export function WorkspaceView() {
         }
         density={
           feedComposerFor ? appearance[feedComposerFor.id]?.density : undefined
-        }
-        orientation={
-          feedComposerFor
-            ? appearance[feedComposerFor.id]?.orientation
-            : undefined
         }
         textSize={
           feedComposerFor ? appearance[feedComposerFor.id]?.textSize : undefined
@@ -2000,14 +2599,17 @@ export function WorkspaceView() {
               setVesselDensity(feedId, prevDensity ?? DEFAULT_DENSITY);
             });
         }}
-        // Orientation is a canvas property with no spatial substrate on the
-        // phone (§VI) — the control doesn't render on mobile.
-        onOrientationChange={
-          isMobile
-            ? undefined
-            : (next) =>
-                feedComposerFor &&
-                setVesselOrientation(feedComposerFor.id, next)
+        // Merge, rehomed from the floor's vessel-on-vessel drop
+        // (WORKSPACE-QUEUE-ADR §XI.2 R1): the panel closes and the same
+        // MergeFeedConfirm asks, so there is one question and one failure path.
+        onMergeInto={(target) => {
+          if (!feedComposerFor) return;
+          const source = feedComposerFor;
+          setFeedComposerFor(null);
+          setPendingMerge({ source, target });
+        }}
+        onSourceMoved={(fromFeedId, toFeedId) =>
+          afterSourceMoved(fromFeedId, toFeedId)
         }
         onTextSizeChange={(next) =>
           feedComposerFor && setVesselTextSize(feedComposerFor.id, next)
@@ -2027,6 +2629,7 @@ export function WorkspaceView() {
         onSourcesChanged={() => {
           if (!feedComposerFor) return;
           void loadVesselItems(feedComposerFor);
+          refetchSeen(feedComposerFor.id);
           workspaceFeedsApi
             .listSources(feedComposerFor.id)
             .then(({ sources }) =>
@@ -2052,6 +2655,7 @@ export function WorkspaceView() {
           setVessels((prev) => prev.filter((v) => v.feed.id !== feedId));
           removeFeedLayout(feedId);
           clearExpandedFor(feedId);
+          forgetFeedReadState(feedId);
           setFeedComposerFor(null);
         }}
       />
@@ -2075,41 +2679,6 @@ export function WorkspaceView() {
         // successor because the state it repaired is unreachable.
         onClose={() => setPendingMerge(null)}
         onConfirm={handleMergeConfirm}
-      />
-      <PipPanel
-        open={!!pipPanel}
-        pubkey={pipPanel?.pubkey ?? ""}
-        pipStatus={pipPanel?.status}
-        feedId={pipPanel?.feedId}
-        anchorRect={
-          pipPanel
-            ? {
-                top: pipPanel.rect.top,
-                left: pipPanel.rect.left,
-                bottom: pipPanel.rect.bottom,
-                right: pipPanel.rect.right,
-              }
-            : null
-        }
-        initialIsFollowing={
-          pipPanel ? followedPubkeys.has(pipPanel.pubkey) : false
-        }
-        onClose={() => setPipPanel(null)}
-        onFollowChanged={(pk, isFollowing) => {
-          setFollowedPubkeys((prev) => {
-            const next = new Set(prev);
-            if (isFollowing) next.add(pk);
-            else next.delete(pk);
-            return next;
-          });
-        }}
-        onVolumeChanged={(feedId) => {
-          // Mute state is honoured by the items query (slice 4); refetch the
-          // affected vessel so a freshly-muted author drops from the visible
-          // set without a manual reload.
-          const target = vessels.find((v) => v.feed.id === feedId);
-          if (target) void loadVesselItems(target.feed);
-        }}
       />
       {ceremony && (
         <ForallCeremony
@@ -2142,7 +2711,6 @@ export function WorkspaceView() {
       <LedgerOverlay />
       <SettingsOverlay />
       <LibraryOverlay />
-      <NetworkOverlay />
       {/* Desktop only — the Explain engine must never mount on the mobile
           branch (EXPLAIN build-plan §2, ADR §Surface). AboutOverlay mounts on
           BOTH branches: desktop reaches it via the menu's About row and the D3
@@ -2158,8 +2726,15 @@ export function WorkspaceView() {
           step. That sheet is now deleted, so this is the only route left and
           an unoffered tour is an unfindable one.
 
-          DESKTOP ONLY, like <ExplainOverlay> above and for the same reason: the
-          six beats annotate the floor, which the mobile branch does not have.
+          DESKTOP ONLY, like <ExplainOverlay> above and for the same reason:
+          the beats annotate the workspace, which the mobile pager does not
+          lay out the same way (and the tour has never covered it).
+
+          AND QUEUE ONLY (T1, WORKSPACE-QUEUE-ADR §XI.6). The beats describe
+          the queue and anchor on its focal entry, so on the floor the
+          controller is not mounted at all: a member whose device still says
+          `columns` keeps `tourArmed` — and `onboarded_at` unstamped — until
+          they are in the queue, and meets the tour there.
 
           `tourArmed` is the MEMBER-level half of the gate (`onboarded_at` NULL
           + bootstrap settled + no ceremony playing); the controller adds the
@@ -2170,8 +2745,8 @@ export function WorkspaceView() {
           nothing (no seen-flag, no `onboarded_at` stamp), so the sequence can
           be watched more than once. See FirstRunPreview for why it is a
           separate component and why the gate is a hostname. */}
-      {!isMobile && <FirstRunPreview />}
-      {!isMobile && tourArmed && user && (
+      {queueMode && <FirstRunPreview />}
+      {queueMode && tourArmed && user && (
         <FirstRunController
           userId={user.id}
           armed
@@ -2183,10 +2758,29 @@ export function WorkspaceView() {
   );
 }
 
+/** The muster in queue mode, and the queue focal's only reader: a settle
+ *  re-renders this and not the workspace (`stores/queueFocal.ts`). */
+function QueueMuster({
+  feeds,
+  onGoTo,
+}: {
+  feeds: MusterFeed[];
+  onGoTo: (feedId: string) => void;
+}) {
+  const focal = useQueueFocal((s) => s.feedId);
+  return (
+    <Muster
+      feeds={feeds.map((f) => (f.id === focal ? { ...f, state: "in" as const } : f))}
+      onGoTo={onGoTo}
+    />
+  );
+}
+
 function Floor({
   children,
   floorRef,
   insetTop = 0,
+  clipX = false,
 }: {
   children?: React.ReactNode;
   floorRef?: React.RefObject<HTMLDivElement>;
@@ -2210,28 +2804,17 @@ function Floor({
    *  document stays exactly one viewport tall. The floor's own height is
    *  shortened to match either way. 0 on mobile. */
   insetTop?: number;
+  /** Queue mode: the box does not scroll sideways at all. `clip`, not
+   *  `hidden` — `hidden` still lets the browser scroll it to a focused
+   *  descendant (§VI.1). */
+  clipX?: boolean;
 }) {
   // Register the floor as an explainable root (EXPLAIN-ADR D4). Inert outside an
   // ExplainProvider (the loading/redirect Floor), so this is a no-op there.
   const ref = useExplainable("floor", { ref: floorRef });
 
-  // The floor's own `overscroll-behavior-x: contain` only bites while the floor
-  // is ACTUALLY scrollable — a taut floor narrower than the viewport (two or
-  // three feeds on a wide screen: the common case) is not, so the browser
-  // ignores it and hands a sideways swipe to its back/forward gesture. On a
-  // surface where sideways is how both the feeds and the floor move, that reads
-  // as the workspace randomly navigating away. Nothing here scrolls the
-  // DOCUMENT sideways, so the document's horizontal overscroll can only ever be
-  // that gesture; refuse it for as long as the workspace is mounted, and hand it
-  // back on the way out so the rest of the site keeps it.
-  useEffect(() => {
-    const html = document.documentElement;
-    const prev = html.style.overscrollBehaviorX;
-    html.style.overscrollBehaviorX = "none";
-    return () => {
-      html.style.overscrollBehaviorX = prev;
-    };
-  }, []);
+  // The `<html>` overscroll pin that used to live here is WorkspaceView's now
+  // (WORKSPACE-QUEUE-ADR §VI.4), so it covers the queue as well as the floor.
   return (
     <div
       ref={ref}
@@ -2246,8 +2829,8 @@ function Floor({
         // transform — a transform here would establish a containing block and
         // capture the position:fixed ∀ chrome (and the mobile bar), dragging
         // them around with the canvas instead of leaving them pinned.
-        overflowX: "auto",
-        overflowY: "hidden",
+        overflowX: clipX ? "clip" : "auto",
+        overflowY: clipX ? "clip" : "hidden",
         overscrollBehaviorX: "contain",
       }}
     >
@@ -2342,4 +2925,20 @@ function Hint({ children }: { children: React.ReactNode }) {
       {children}
     </div>
   );
+}
+
+/** One feed card's reading-count mark, as its own subscription: the selector
+ *  returns a primitive, so a pass elsewhere in the feed re-renders nothing
+ *  here (WORKSPACE-QUEUE-ADR §IV.8). */
+function FeedSeenMarked({
+  feedId,
+  postId,
+  render,
+}: {
+  feedId: string;
+  postId: string;
+  render: (seen: SeenMark) => React.ReactNode;
+}) {
+  const seen = useFeedSeenMark(feedId, postId);
+  return <>{render(seen)}</>;
 }

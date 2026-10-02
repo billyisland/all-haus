@@ -1,20 +1,11 @@
 // =============================================================================
 // Traffology API Client
 //
-// Typed fetch wrappers for the Traffology gateway routes.
-// Uses the same /api/v1 base and cookie-based auth as the main API client.
+// Typed wrappers for the Traffology gateway routes, through the one client
+// (`request()`, lib/api/client) and its one base URL (CA-J2).
 // =============================================================================
 
-const API_BASE = '/api/v1'
-
-async function request<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, { credentials: 'include' })
-  if (!res.ok) {
-    const body = await res.json().catch(() => null)
-    throw new Error(body?.error ?? `Traffology API error ${res.status}`)
-  }
-  return res.json()
-}
+import { request } from './api/client'
 
 // =============================================================================
 // Types

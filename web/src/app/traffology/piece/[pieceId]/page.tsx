@@ -36,7 +36,7 @@ export default function TraffologyPiecePage() {
   }, [user, pieceId])
 
   if (authLoading || !user || loading) return <PieceSkeleton />
-  if (!data) return <div className="py-20 text-center text-ui-sm text-grey-400">Piece not found.</div>
+  if (!data) return <div className="py-20 text-center text-ui-sm text-grey-400">We couldn’t find that piece.</div>
 
   const { piece, sources, observations } = data
   const rendered = observations.map(renderObservation)
@@ -129,7 +129,7 @@ function SummaryStrip({ piece }: { piece: PieceDetail['piece'] }) {
     : '\u2014'
 
   const items = [
-    { label: 'Readers', value: (piece.total_readers ?? 0).toLocaleString() },
+    { label: 'Readers', value: (piece.total_readers ?? 0).toLocaleString('en-GB') },
     { label: 'Rank', value: rank },
     { label: 'Top source', value: topSource },
     { label: 'Conversions', value: `${piece.paid_conversions ?? 0} paid` },
@@ -179,7 +179,7 @@ function SourceRow({
     <div>
       <div
         onClick={onSelect}
-        className={`grid items-center cursor-pointer py-1 border-b border-grey-200 transition-colors ${
+        className={`grid items-center cursor-pointer py-1 transition-colors ${
           isSelected ? 'bg-grey-100' : ''
         }`}
         style={{ gridTemplateColumns: '128px 1fr 46px' }}
@@ -213,13 +213,13 @@ function SourceRow({
 
         {/* Count */}
         <div className="text-[12px] font-bold text-black text-right tabular-nums">
-          {source.reader_count.toLocaleString()}
+          {source.reader_count.toLocaleString('en-GB')}
         </div>
       </div>
 
       {/* Expanded detail */}
       {isSelected && (
-        <div className="bg-grey-100 py-2.5 px-2.5 border-b border-grey-200" style={{ paddingLeft: 128 }}>
+        <div className="bg-grey-100 py-2.5 px-2.5" style={{ paddingLeft: 128 }}>
           <div className="text-[12px] text-grey-600 leading-relaxed">
             {source.reader_count} of {totalReaders} total readers
             ({Math.round((source.reader_count / totalReaders) * 100)}%).

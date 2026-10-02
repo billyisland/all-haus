@@ -3,6 +3,17 @@
 import { useRef, useState } from 'react'
 import { useAuth } from '../../stores/auth'
 import { AnchoredPopover } from './AnchoredPopover'
+import { request, failureSentence } from '../../lib/api/client'
+import { REPORT_CATEGORIES, type ReportPriority } from '../../lib/api/admin'
+import {
+  REPORT_CATEGORY_LABEL,
+  REPORT_TITLE,
+  REPORT_NOTES_PLACEHOLDER,
+  REPORT_SUBMIT,
+  REPORT_FAILED,
+  REPORT_FOOTNOTE,
+  reportReceipt,
+} from '../../content/report'
 
 // =============================================================================
 // ReportButton — twinned with ShareButton on the reader's action row, and read
@@ -27,42 +38,83 @@ import { AnchoredPopover } from './AnchoredPopover'
 //     way as everything else.
 //
 // TWO TYPE REGISTERS, ONE COMPONENT. It is mounted on the reader's action row
-// (13px sans) and inside a playscript reply's action row (11px mono caps, whose
-// Reply/Delete siblings simply inherit the row and add a hover). So the trigger
-// class is the caller's seam: it defaults to `.btn-text-muted` — the house's
-// secondary text-link action, which is what the reader row wants and what Share
-// wears — and the playscript row passes its own, exactly as its siblings do.
-// The alternative was a second copy of this panel.
+// (13px sans), inside a playscript reply's action row (11px mono caps), on
+// every workspace card, on a DM thread header and on a profile pane. So the
+// trigger class is the caller's seam: it defaults to `.btn-text-muted` — the
+// house's secondary text-link action, which is what the reader row wants and
+// what Share wears — and the rows with their own register pass their own,
+// exactly as their siblings do. The alternative was five copies of this panel.
+//
+// ── WHAT L6.3 CHANGED, AND WHY EACH HALF MATTERED ────────────────────────────
+//
+// ANYTHING CAN BE REPORTED, because until now almost nothing could. This panel
+// existed on an article page and on a playscript reply and nowhere else: not on
+// a workspace card, not on an external item (of which the workspace is mostly
+// made), not on a DM, not on a profile. D1 §9.2 says reporting covers all
+// content — "native, DM, and ingested" — so the control follows the content,
+// and the five target props below are the five things this site shows.
+// `targetPostId` is the one that unlocks the workspace: `feed_items.post_id`
+// is the one identity spanning native and external items, so a card can report
+// itself whatever it is made of.
+//
+// TWELVE CATEGORIES, because four could not carry the triage table. D7 §2 gives
+// CSAM and terrorism 24 hours and everything else illegal 72 — a distinction a
+// reporter could not make when the only illegal option was "illegal content".
+// The list is D1 §9.2's priority offences, gravest first, and it is imported
+// from `lib/api/admin` rather than retyped here, so there is one copy in this
+// workspace and a test holds it against the gateway's. The words — labels,
+// deadlines, receipt — live in `content/report.ts`, shared with modernhaus.
+//
+// THE PANEL NO LONGER PROMISES 48 HOURS, because we never promised 48 hours:
+// the published figures are 24h, 72h and 7 days depending on what was reported.
+// So the receipt reads the deadline off the RESPONSE — the gateway derives the
+// priority from the category and sends the date back — rather than printing a
+// constant that was true of nothing.
 // =============================================================================
 
 interface ReportButtonProps {
+  /** Native content, by its Nostr event id — never an external card's
+   *  `version`, which is a content hash and not an event (§0z item 6). */
   targetNostrEventId?: string
+  /** An account, as the subject of a complaint. */
   targetAccountId?: string
+  /** Any post the workspace can show — `feed_items.post_id`, external included. */
+  targetPostId?: string
+  /** A DM thread. The reporter must be in it; the gateway checks. */
+  targetConversationId?: string
+  /** A profile, as distinct from the account's content. */
+  targetProfileId?: string
   /** Overrides the trigger's type/colour where the host row sets its own
    *  register. Omit on any surface without one. */
   triggerClassName?: string
+  /** The trigger's word. A card's action row says "Report"; a DM header and a
+   *  profile bar say what they are reporting, because there the object is not
+   *  the thing the row is about. */
+  label?: string
 }
 
-const CATEGORIES = [
-  { value: 'illegal_content', label: 'Illegal content' },
-  { value: 'harassment', label: 'Targeted harassment or non-consensual intimate imagery' },
-  { value: 'spam', label: 'Spam or inauthentic behaviour' },
-  { value: 'other', label: 'Other' },
-] as const
-
 const PANEL_W = 320
+
+interface Receipt {
+  priority: ReportPriority
+  triageDeadline: string
+}
 
 export function ReportButton({
   targetNostrEventId,
   targetAccountId,
+  targetPostId,
+  targetConversationId,
+  targetProfileId,
   triggerClassName = 'btn-text-muted',
+  label = 'Report',
 }: ReportButtonProps) {
   const { user } = useAuth()
   const [open, setOpen] = useState(false)
   const [category, setCategory] = useState<string>('')
   const [notes, setNotes] = useState('')
   const [submitting, setSubmitting] = useState(false)
-  const [submitted, setSubmitted] = useState(false)
+  const [receipt, setReceipt] = useState<Receipt | null>(null)
   const [error, setError] = useState<string | null>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
 
@@ -74,23 +126,29 @@ export function ReportButton({
     setError(null)
 
     try {
-      const res = await fetch('/api/v1/reports', {
+      const body = await request<Receipt | null>('/reports', {
         method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           targetNostrEventId,
           targetAccountId,
+          targetPostId,
+          targetConversationId,
+          targetProfileId,
           category,
           notes: notes.trim() || undefined,
         }),
       })
 
-      if (!res.ok) throw new Error('Report submission failed')
-
-      setSubmitted(true)
-    } catch {
-      setError('Something went wrong. Please try again.')
+      // The deadline is the SERVER's — it derives the priority from the
+      // category and owns the figure. A copy computed here would be a second
+      // spelling of a published commitment.
+      setReceipt(
+        body?.priority && body?.triageDeadline
+          ? body
+          : { priority: 'P1', triageDeadline: '' }
+      )
+    } catch (err) {
+      setError(failureSentence(err, REPORT_FAILED))
     } finally {
       setSubmitting(false)
     }
@@ -104,9 +162,9 @@ export function ReportButton({
         className={triggerClassName}
         aria-haspopup="dialog"
         aria-expanded={open}
-        aria-label={submitted ? 'Report submitted' : 'Report this content'}
+        aria-label={receipt ? 'Report submitted' : 'Report this content'}
       >
-        {submitted ? 'Reported' : 'Report'}
+        {receipt ? 'Reported' : label}
       </button>
 
       <AnchoredPopover
@@ -119,30 +177,36 @@ export function ReportButton({
         ariaLabel="Report content"
         className="p-4"
       >
-        {submitted ? (
+        {receipt ? (
           // The receipt lives IN the panel and closes like everything else, so
           // the row keeps the control the reader just used. It stays readable
           // on a re-open — a reader who wants to know whether it went through
           // should be able to look.
           <p className="text-ui-xs text-grey-600 leading-relaxed">
-            Report submitted. We&rsquo;ll review it within 48 hours.
+            {reportReceipt(receipt.priority)}
           </p>
         ) : (
           <>
-            <h3 className="text-ui-sm font-medium text-black mb-3">Report content</h3>
+            <h3 className="text-ui-sm font-medium text-black mb-3">{REPORT_TITLE}</h3>
 
-            <div className="space-y-2 mb-3">
-              {CATEGORIES.map((cat) => (
-                <label key={cat.value} className="flex items-start gap-2 cursor-pointer">
+            {/* Twelve options where there were four, so the list scrolls
+                rather than growing the panel past the screen on a phone. The
+                scroll marker is opted into, because this IS a list somebody
+                reads down (the sitewide silent-scrollbar rule's exception). */}
+            <div className="ah-scrollbar max-h-[14rem] overflow-y-auto space-y-2 mb-3">
+              {REPORT_CATEGORIES.map((cat) => (
+                <label key={cat} className="flex items-start gap-2 cursor-pointer">
                   <input
                     type="radio"
                     name="report-category"
-                    value={cat.value}
-                    checked={category === cat.value}
+                    value={cat}
+                    checked={category === cat}
                     onChange={(e) => setCategory(e.target.value)}
                     className="mt-0.5 h-3.5 w-3.5"
                   />
-                  <span className="text-ui-xs text-grey-600 leading-tight">{cat.label}</span>
+                  <span className="text-ui-xs text-grey-600 leading-tight">
+                    {REPORT_CATEGORY_LABEL[cat]}
+                  </span>
                 </label>
               ))}
             </div>
@@ -154,7 +218,7 @@ export function ReportButton({
             <textarea
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
-              placeholder="Additional details (optional)"
+              placeholder={REPORT_NOTES_PLACEHOLDER}
               rows={2}
               maxLength={2000}
               className="w-full bg-white px-2.5 py-1.5 text-ui-xs mb-3"
@@ -170,7 +234,7 @@ export function ReportButton({
                 disabled={!category || submitting}
                 className="btn-accent btn-sm disabled:opacity-50"
               >
-                {submitting ? 'Submitting…' : 'Submit report'}
+                {submitting ? 'Submitting…' : REPORT_SUBMIT}
               </button>
               {/* Cancel stays as a labelled action — this is a paired action
                   dialog, the one case the floating-✕ rule exempts — but it is
@@ -184,7 +248,7 @@ export function ReportButton({
                 hatch so it still scales with the global type size (an
                 arbitrary px value would not). */}
             <p className="mt-3 text-[0.6875rem] text-grey-600 leading-snug">
-              Reports are reviewed by a human within 48 hours. Submitting a report does not automatically remove content.
+              {REPORT_FOOTNOTE}
             </p>
           </>
         )}

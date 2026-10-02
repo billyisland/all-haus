@@ -1,6 +1,9 @@
 import { RichText } from "@atproto/api";
 import { escapeHtml } from "@platform-pub/shared/lib/text.js";
-import { sanitizeContent } from "@platform-pub/shared/lib/sanitize.js";
+import {
+  httpUrlOrNull,
+  sanitizeContent,
+} from "@platform-pub/shared/lib/sanitize.js";
 import type { DetectedRepost } from "../lib/repost-edge.js";
 
 // =============================================================================
@@ -222,15 +225,15 @@ function renderHtml(record: BskyPostRecord): string {
     const text = escapeHtml(segment.text);
     if (segment.isLink() && segment.link) {
       parts.push(
-        `<a href="${escapeAttr(segment.link.uri)}" rel="nofollow noopener">${text}</a>`,
+        `<a href="${escapeHtml(segment.link.uri)}" rel="nofollow noopener">${text}</a>`,
       );
     } else if (segment.isMention() && segment.mention) {
       parts.push(
-        `<a href="https://bsky.app/profile/${escapeAttr(segment.mention.did)}" rel="nofollow noopener">${text}</a>`,
+        `<a href="https://bsky.app/profile/${escapeHtml(segment.mention.did)}" rel="nofollow noopener">${text}</a>`,
       );
     } else if (segment.isTag() && segment.tag) {
       parts.push(
-        `<a href="https://bsky.app/hashtag/${escapeAttr(segment.tag.tag)}" rel="nofollow noopener">${text}</a>`,
+        `<a href="https://bsky.app/hashtag/${escapeHtml(segment.tag.tag)}" rel="nofollow noopener">${text}</a>`,
       );
     } else {
       parts.push(text);
@@ -242,10 +245,6 @@ function renderHtml(record: BskyPostRecord): string {
   // RichText walk (embeds, mentions with arbitrary URIs), the sanitiser is
   // already in the path.
   return sanitizeContent(parts.join("").replace(/\n/g, "<br>"));
-}
-
-function escapeAttr(s: string): string {
-  return escapeHtml(s).replace(/'/g, "&#39;");
 }
 
 // =============================================================================
@@ -279,10 +278,14 @@ function extractMedia(
   };
 
   const appendExternal = (ext: BskyExternalEmbed) => {
+    // A link preview's target is whatever the remote author put in the record;
+    // it is rendered as an `href`, so it is refused here rather than stored.
+    const uri = httpUrlOrNull(ext.external.uri);
+    if (!uri) return;
     const thumb = cdnImageUrl(did, ext.external.thumb, "feed_thumbnail");
     media.push({
       type: "link",
-      url: ext.external.uri,
+      url: uri,
       thumbnail: thumb ?? undefined,
       title: ext.external.title || undefined,
       description: ext.external.description || undefined,

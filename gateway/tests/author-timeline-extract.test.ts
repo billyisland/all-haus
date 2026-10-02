@@ -2,7 +2,6 @@ import { describe, it, expect } from "vitest";
 import {
   extractAtprotoTimelineNodes,
   extractMastodonTimelineNodes,
-  actorHandleFromUri,
 } from "../src/lib/author-timeline-hydration.js";
 
 // =============================================================================
@@ -89,6 +88,7 @@ describe("extractAtprotoTimelineNodes", () => {
 
 describe("extractMastodonTimelineNodes", () => {
   const ACTOR = "https://mastodon.example/users/author";
+  const ORIGIN = "https://mastodon.example";
   const status = (over: Record<string, unknown> = {}, id = "1") => ({
     id,
     uri: `https://mastodon.example/users/author/statuses/${id}`,
@@ -108,7 +108,7 @@ describe("extractMastodonTimelineNodes", () => {
   });
 
   it("maps a status, keys on the federated uri, pins author_uri to the stable handle", () => {
-    const nodes = extractMastodonTimelineNodes([status()], ACTOR);
+    const nodes = extractMastodonTimelineNodes([status()], ACTOR, ORIGIN);
     expect(nodes).toHaveLength(1);
     expect(nodes[0]).toMatchObject({
       sourceItemUri: "https://mastodon.example/users/author/statuses/1",
@@ -128,8 +128,18 @@ describe("extractMastodonTimelineNodes", () => {
     const nodes = extractMastodonTimelineNodes(
       [status(), reply, reblog, dupe],
       ACTOR,
+      ORIGIN,
     );
     expect(nodes).toHaveLength(1);
+  });
+
+  it("skips a status claiming an id on another host, and never keys on its web url (CA-A10)", () => {
+    const hostile = status({ uri: "https://mastodon.social/users/victim/statuses/9" }, "5");
+    const noUri = status({ uri: undefined }, "6");
+    const nodes = extractMastodonTimelineNodes([status(), hostile, noUri], ACTOR, ORIGIN);
+    expect(nodes.map((n) => n.sourceItemUri)).toEqual([
+      "https://mastodon.example/users/author/statuses/1",
+    ]);
   });
 
   it("maps media attachments", () => {
@@ -142,18 +152,10 @@ describe("extractMastodonTimelineNodes", () => {
       },
       "4",
     );
-    const nodes = extractMastodonTimelineNodes([withMedia], ACTOR);
+    const nodes = extractMastodonTimelineNodes([withMedia], ACTOR, ORIGIN);
     expect(nodes[0].media).toEqual([
       { type: "image", url: "https://m.example/i.jpg", thumbnail: "https://m.example/t.jpg", alt: "alt" },
       { type: "link", url: "https://m.example/a.mp3", thumbnail: undefined, alt: undefined },
     ]);
-  });
-});
-
-describe("actorHandleFromUri", () => {
-  it("extracts from /@name and /users/name shapes", () => {
-    expect(actorHandleFromUri("https://m.example/@alice")).toBe("alice");
-    expect(actorHandleFromUri("https://m.example/users/bob")).toBe("bob");
-    expect(actorHandleFromUri("https://m.example/nothing")).toBeNull();
   });
 });

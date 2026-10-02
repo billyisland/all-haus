@@ -45,7 +45,16 @@ function ran(fragment: string): boolean {
 function scriptedQuery(sql: string, params: unknown[] = []) {
   calls.push({ sql, params });
 
-  if (sql.includes("FROM external_authors WHERE id = $1")) {
+  // Keyed on the table plus the projection rather than on `FROM external_authors
+  // WHERE id = $1` as one string: §0z item 15 put the npub block-out between
+  // those two clauses, so the old fragment stopped matching, this branch stopped
+  // answering, and every assertion here read an empty row — the house rule's own
+  // trap, a mock that pins a statement's TEXT rather than what identifies it.
+  if (
+    sql.includes("FROM external_authors") &&
+    sql.includes("stable_handle") &&
+    sql.includes("WHERE id = $1")
+  ) {
     const id = params[0];
     if (id === EXTERNAL) {
       return Promise.resolve({
@@ -133,6 +142,13 @@ function scriptedQuery(sql: string, params: unknown[] = []) {
   // the viewer-derived follow check
   if (sql.includes("SELECT 1 FROM follows WHERE follower_id = $1")) {
     return Promise.resolve({ rows: [{ exists: true }], rowCount: 1 });
+  }
+  // the viewer's own mute/block state (lib/blocks.ts `viewerRelation`, W2)
+  if (sql.includes("FROM mutes  WHERE muter_id   = $1")) {
+    return Promise.resolve({
+      rows: [{ muted: true, blocked: false }],
+      rowCount: 1,
+    });
   }
   // tier-C's source lookup (public fields + the viewer's subscription row)
   if (sql.includes("FROM external_sources es") && sql.includes("es.description")) {
@@ -235,6 +251,8 @@ describe("GET /author/:id/profile — anonymous readers", () => {
     // The relationship is not stated, and not asked for.
     expect(body.followTarget).toBeUndefined();
     expect(ran("SELECT 1 FROM follows WHERE follower_id = $1")).toBe(false);
+    expect(body.viewerRelation).toBeUndefined();
+    expect(ran("FROM mutes  WHERE muter_id   = $1")).toBe(false);
     await app.close();
   });
 
@@ -274,6 +292,12 @@ describe("GET /author/:id/profile — signed-in readers are unchanged", () => {
       id: NATIVE,
       isFollowing: true,
     });
+    // W2: the viewer's own mute/block state rides beside the follow, keyed
+    // viewer-then-subject (the order is the direction — reversed, it would
+    // report the block the SUBJECT set, which is the oracle).
+    expect(body.viewerRelation).toEqual({ muted: true, blocked: false });
+    const rel = calls.find((c) => c.sql.includes("FROM mutes  WHERE muter_id   = $1"));
+    expect(rel?.params).toEqual([VIEWER, NATIVE]);
     await app.close();
   });
 

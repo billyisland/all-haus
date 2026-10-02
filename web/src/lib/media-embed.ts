@@ -65,3 +65,62 @@ export function embedFrameSrc(url: string): string | null {
 
   return null;
 }
+
+// =============================================================================
+// articleEmbed — what a bare provider URL on its own line becomes in a BODY
+// (the native article renderer, `renderMarkdown`). The video half is `embedFrameSrc` above; Spotify is the one
+// provider an article takes that a feed's media block never carries, so it
+// lives here rather than there.
+//
+// `isEmbeddableUrl` (lib/media.ts) is DEFINED as "this returns non-null", so
+// the editor's embed button, its paste rule, the markdown ruler that re-forms
+// an embed on reload and the composers' previews can never again claim a
+// provider the renderer does not render (walkthrough A4: the prompt promised
+// four, the renderer drew one, and the other three published as bare links).
+// Every src below must be in `TRUSTED_IFRAME_PREFIXES` (lib/markdown.ts) and in
+// nginx.conf's `frame-src`, both blocks — pinned by media-embed.test.ts.
+// =============================================================================
+
+const SPOTIFY_TYPES = new Set(["track", "album", "playlist", "episode", "show", "artist"]);
+
+function spotifyEmbed(u: URL): { type: string; id: string } | null {
+  if (u.hostname !== "open.spotify.com") return null;
+  // /track/ID · /intl-de/track/ID · /embed/track/ID
+  const m = /^\/(?:intl-[a-z-]+\/)?(?:embed\/)?([a-z]+)\/([A-Za-z0-9]+)\/?$/.exec(u.pathname);
+  if (!m || !SPOTIFY_TYPES.has(m[1])) return null;
+  return { type: m[1], id: m[2] };
+}
+
+export interface ArticleEmbed {
+  src: string;
+  /** `video` sizes 16:9; `audio` is the provider's fixed-height player. */
+  kind: "video" | "audio";
+  /** Pixel height for an `audio` embed. */
+  height?: number;
+}
+
+export function articleEmbed(url: string): ArticleEmbed | null {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+
+  const video = embedFrameSrc(url);
+  if (video) return { src: video, kind: "video" };
+
+  const sp = spotifyEmbed(u);
+  if (sp) {
+    // Spotify's own compact heights: a single item is the 152 strip, a
+    // collection the 352 list.
+    const single = sp.type === "track" || sp.type === "episode";
+    return {
+      src: `https://open.spotify.com/embed/${sp.type}/${encodeURIComponent(sp.id)}`,
+      kind: "audio",
+      height: single ? 152 : 352,
+    };
+  }
+  return null;
+}

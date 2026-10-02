@@ -71,7 +71,7 @@ export default function InviteAcceptPage() {
     pubApi
       .getInvite(token)
       .then(setInvite)
-      .catch(() => setError('Invite not found or expired.'))
+      .catch(() => setError('We can’t find this invitation.'))
       .finally(() => setLoading(false))
   }, [token])
 
@@ -90,7 +90,7 @@ export default function InviteAcceptPage() {
         )
       }, 1500)
     } catch {
-      setError('Failed to accept invite.')
+      setError('We couldn’t accept the invitation. Please try again.')
     } finally {
       setAccepting(false)
     }
@@ -101,7 +101,7 @@ export default function InviteAcceptPage() {
       <PublicShell>
         <PublicVessel>
           <PublicCard style={{ padding: 0 }}>
-            <IndeterminateSlab label="Loading invitation" />
+            <IndeterminateSlab />
           </PublicCard>
         </PublicVessel>
       </PublicShell>
@@ -113,13 +113,12 @@ export default function InviteAcceptPage() {
       <PublicShell>
         <PublicVessel>
           <PublicCard>
-            <PublicTitle>Publications aren’t available</PublicTitle>
+            <PublicTitle>Publications are paused</PublicTitle>
             <div style={{ marginTop: 10 }}>
               <PublicBody>
-                all.haus isn’t running publications at the moment, so this
-                invitation can’t be accepted. Nothing has been lost — the
-                invitation is still on file, and whoever sent it can tell you
-                when titles are open again.
+                all.haus isn’t running publications for now, so this
+                invitation can’t be accepted yet. Nothing is lost: it stays on
+                file, and whoever sent it can tell you when they reopen.
               </PublicBody>
             </div>
           </PublicCard>
@@ -141,8 +140,8 @@ export default function InviteAcceptPage() {
             <PublicTitle>This invitation isn’t valid</PublicTitle>
             <div style={{ marginTop: 10 }}>
               <PublicBody>
-                {error} Invitations expire, and they can only be accepted once —
-                if someone forwarded you this link, ask them for a fresh one.
+                {error} Invitations expire and work only once, so if someone
+                forwarded you this link, ask them for a fresh one.
               </PublicBody>
             </div>
           </PublicCard>
@@ -237,13 +236,15 @@ export default function InviteAcceptPage() {
           <PublicCard>
             <div style={{ marginBottom: 16 }}>
               <PublicBody>
-                Log in to accept. all.haus is in closed beta, so invitations can
-                only be accepted by people who already have an account.
+                all.haus is in closed beta, so only people who already have an
+                account can accept an invitation.
               </PublicBody>
             </div>
             <PublicButton
               full
-              href={`/auth?mode=login&redirect=/invite/${token}`}
+              // No `redirect=`: dead, and the forbidden `returnTo` shape
+              // (lib/auth-return.ts).
+              href="/auth?mode=login"
             >
               Log in to accept
             </PublicButton>

@@ -37,7 +37,10 @@
 // instead would put stone-600 standfirsts on a dark ground in dark mode.
 // =============================================================================
 
+import { useEffect, useState } from "react";
 import { useAboutOverlay } from "../../stores/aboutOverlay";
+import { publishedFigures } from "../../lib/api/published-figures";
+import type { PublishedFigures } from "../../lib/published-figures";
 import { Glasshouse } from "./Glasshouse";
 import { AboutContent } from "../../app/about/AboutContent";
 import { PublicPaletteProvider } from "../public/palette";
@@ -48,6 +51,7 @@ import {
   type VesselPalette,
 } from "./tokens";
 import { useResolvedDark } from "../../stores/colorScheme";
+import { useDiscCloseActive } from "../../stores/glasshouse";
 
 /** The pane's slug — the one thing its bar has to say. */
 const SLUG = "About all.haus";
@@ -57,6 +61,23 @@ export function AboutOverlay() {
   const close = useAboutOverlay((s) => s.close);
   const dark = useResolvedDark();
   const palette = globalContentPalette(dark);
+  // The cut and the allowance are dials, read when the pane opens. The body
+  // waits for the answer rather than rendering numberless sentences that then
+  // grow a figure under the reader; a failed read settles as null, which is
+  // the numberless copy.
+  const [figures, setFigures] = useState<PublishedFigures | null | undefined>(
+    undefined,
+  );
+  useEffect(() => {
+    if (!isOpen) return;
+    let live = true;
+    void publishedFigures().then((f) => {
+      if (live) setFigures(f);
+    });
+    return () => {
+      live = false;
+    };
+  }, [isOpen]);
   if (!isOpen) return null;
 
   // 720 = the `prose` measure the standalone page sets (PublicShell), so the
@@ -87,7 +108,9 @@ export function AboutOverlay() {
         style={{ maxHeight: `calc(var(--gh-h) - ${PANE_BAR_H}px)` }}
       >
         <PublicPaletteProvider value={palette}>
-          <AboutContent inOverlay />
+          {figures !== undefined && (
+            <AboutContent figures={figures} inOverlay />
+          )}
         </PublicPaletteProvider>
       </div>
     </Glasshouse>
@@ -108,6 +131,7 @@ function AboutBar({
   onClose: () => void;
   palette: VesselPalette;
 }) {
+  const discClose = useDiscCloseActive();
   return (
     <div
       className="ah-pane-bar"
@@ -123,15 +147,20 @@ function AboutBar({
       <span className="label-ui" style={{ flex: "1 1 auto", minWidth: 0 }}>
         {SLUG}
       </span>
-      <button
-        type="button"
-        onClick={onClose}
-        aria-label="Close"
-        className="ah-pane-bar-close"
-        style={{ color: "inherit" }}
-      >
-        ✕
-      </button>
+      {/* On the mobile workspace the ∀ disc has already flipped to this
+          sheet's X, so the bar draws none (stores/glasshouse.ts::
+          useDiscCloseActive — the declaration, not `isMobile`). */}
+      {!discClose && (
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close"
+          className="ah-pane-bar-close"
+          style={{ color: "inherit" }}
+        >
+          ✕
+        </button>
+      )}
     </div>
   );
 }

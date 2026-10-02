@@ -5,10 +5,14 @@ import {
   adminDashboard,
   type AdminOverview,
   type AdminAllocationCoverage,
+  type AdminReaderCredits,
+  type AdminRefundResult,
 } from '../../../lib/api'
+import { ApiError } from '../../../lib/api/client'
 import { formatPence, timeAgo } from '../../../lib/format'
 import { AdminShell } from '../../../components/admin/AdminShell'
 import { StatCard, StatGrid, StatSection } from '../../../components/admin/Stat'
+import { useConfirm } from '../../../components/ui/ConfirmDialog'
 
 /** Basis points as a percentage. 10000 bps = 100%. */
 function pct(bps: number): string {
@@ -19,25 +23,74 @@ export default function AdminOverviewPage() {
   const [data, setData] = useState<AdminOverview | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [acting, setActing] = useState<string | null>(null)
+  const { ask, dialog } = useConfirm()
   const [actionResult, setActionResult] = useState<string | null>(null)
   // Segregation is its own fetch across a service boundary (gateway → payment
   // service). Kept out of the overview's state so an unreachable payment
   // service costs this panel and not the whole money dashboard.
   const [segregation, setSegregation] = useState<AdminAllocationCoverage | null>(null)
   const [segregationError, setSegregationError] = useState(false)
+  // Reading tabs in credit (W1). Its own fetch for the segregation reason: it
+  // crosses the same service boundary, and an unreachable payment service must
+  // cost this banner rather than the whole money dashboard. Its failure is
+  // rendered in WORDS below and never as "nobody is in credit" — an outage that
+  // wears an all-clear is the exact shape this detector exists to end.
+  const [credits, setCredits] = useState<AdminReaderCredits | null>(null)
+  const [creditsError, setCreditsError] = useState(false)
 
+  // The refund action (L3.1). Three pieces of state and no more: which payable
+  // is ARMED (the reason field is open on it), what the operator has typed, and
+  // which one is in flight. Armed-then-send rather than a bare button: this is
+  // the only control on the dashboard that moves money outward, and the reason
+  // it demands is the record — asking for it in the same gesture is what stops
+  // the field being a formality somebody fills with a space.
+  const [armedCredit, setArmedCredit] = useState<string | null>(null)
+  const [refundReason, setRefundReason] = useState('')
+  const [refundingCredit, setRefundingCredit] = useState<string | null>(null)
+  const [refundOutcome, setRefundOutcome] = useState<string | null>(null)
+
+  // Releasing a payout halt (L5.2). The same armed-then-send shape as the
+  // refund above, and for the same reason: this is the control that lets every
+  // writer's money start moving again after the books were flagged bad, and the
+  // reason it demands is the record. `armedHalt` is `'global'` or an account
+  // id, so the two granularities cannot both be armed at once — an operator
+  // typing a reason is answering one question, not two.
+  const [armedHalt, setArmedHalt] = useState<string | null>(null)
+  const [haltReason, setHaltReason] = useState('')
+  const [resuming, setResuming] = useState(false)
+  const [resumeOutcome, setResumeOutcome] = useState<string | null>(null)
+
+  // The manual triggers (walkthrough A17). Armed-then-sent like the two above:
+  // each runs a whole cron cycle early, and at the card networks that is
+  // indistinguishable from a decision, so the reason is the record.
+  const [armedTrigger, setArmedTrigger] = useState<'settlements' | 'payouts' | null>(null)
+  const [triggerReason, setTriggerReason] = useState('')
+
+  // The three reads are independent, so they go at once and each lands or
+  // fails alone (CA-G10) — they were awaited in series.
   const load = useCallback(async () => {
-    try {
-      setData(await adminDashboard.overview())
+    const [overview, segregation, credits] = await Promise.allSettled([
+      adminDashboard.overview(),
+      adminDashboard.allocationCoverage(),
+      adminDashboard.readerCredits(),
+    ])
+    if (overview.status === 'fulfilled') {
+      setData(overview.value)
       setError(null)
-    } catch {
-      setError('Failed to load the overview.')
+    } else {
+      setError('Couldn’t load the overview. Please reload the page to try again.')
     }
-    try {
-      setSegregation(await adminDashboard.allocationCoverage())
+    if (segregation.status === 'fulfilled') {
+      setSegregation(segregation.value)
       setSegregationError(false)
-    } catch {
+    } else {
       setSegregationError(true)
+    }
+    if (credits.status === 'fulfilled') {
+      setCredits(credits.value)
+      setCreditsError(false)
+    } else {
+      setCreditsError(true)
     }
   }, [])
 
@@ -45,16 +98,116 @@ export default function AdminOverviewPage() {
     void load()
   }, [load])
 
+  // ---------------------------------------------------------------------------
+  // The refund (L3.1; Reader Terms 4.3). The one outward money movement an
+  // operator can make from this dashboard.
+  //
+  // EVERY ENDING IS SPELLED OUT, because each one is a different thing to do
+  // next — and one of them is "we do not know". `unknown` reaches here when the
+  // gateway could not confirm the outcome, and it must never be worded as a
+  // failure: the request left, and telling an operator it failed invites a
+  // second press that would refund twice. It asks them to reload instead,
+  // which is the only honest instruction available.
+  // ---------------------------------------------------------------------------
+  function refundSentence(r: AdminRefundResult): string {
+    switch (r.kind) {
+      case 'refunded':
+        return `Refunded ${formatPence(r.amountPence)} — Stripe refund ${r.refundId}. The money is on its way back to the card it came from.`
+      case 'not_found':
+        return 'That payable no longer exists. Reload.'
+      case 'not_open':
+        return `Nothing to refund — the payable is already ${r.status}. Reload.`
+      case 'in_flight':
+        return `A refund on this payable is already in flight (since ${timeAgo(r.since)}). Leave it: the resume sweep finishes it, and a second press cannot make a second refund.`
+      case 'untraceable':
+        return `Not refundable automatically: ${r.why}`
+      case 'refund_failed':
+        return `Stripe refused it (${r.reason}). Nothing was sent. The reason is on the payable.`
+      case 'refunded_raced_release':
+        // The money DID go. Reported as a refusal it would invite a second
+        // press, which is the one outcome worth preventing here.
+        return `Refunded ${formatPence(r.amountPence)} (Stripe refund ${r.refundId}) — but the payable was closed by a reversal while it was in flight, so the reader has both the money back and the restored debt. This needs a person: docs/runbooks/reader-tab-credit.md.`
+      case 'unknown':
+        return r.error
+    }
+  }
+
+  async function sendRefund(creditId: string) {
+    const reason = refundReason.trim()
+    if (reason === '') return
+    setRefundingCredit(creditId)
+    setRefundOutcome(null)
+    try {
+      const result = await adminDashboard.refundReaderCredit(creditId, reason)
+      setRefundOutcome(refundSentence(result))
+      setArmedCredit(null)
+      setRefundReason('')
+    } finally {
+      setRefundingCredit(null)
+      // Re-read whatever happened, INCLUDING after an unknown outcome: the row
+      // itself is the authority on whether the money went, and this is the
+      // reload the `unknown` sentence asks for.
+      try {
+        setCredits(await adminDashboard.readerCredits())
+        setCreditsError(false)
+      } catch {
+        setCreditsError(true)
+      }
+    }
+  }
+
+  async function sendResume(target: string) {
+    const reason = haltReason.trim()
+    if (reason === '') return
+    setResuming(true)
+    setResumeOutcome(null)
+    try {
+      const r =
+        target === 'global'
+          ? await adminDashboard.resumePayouts(reason)
+          : await adminDashboard.resumeAccountPayouts(target, reason)
+      // `resumed: false` is the honest report of a release that cleared
+      // nothing — an operator who has just typed the wrong id must not read
+      // "resumed" and stop looking.
+      setResumeOutcome(
+        r.resumed
+          ? target === 'global'
+            ? 'Payouts resumed. The next cycle will run.'
+            : 'That account is paying again.'
+          : 'Nothing was frozen under that id — nothing changed.'
+      )
+      setArmedHalt(null)
+      setHaltReason('')
+      await load()
+    } catch {
+      // The release MAY have happened: the request left and nothing here knows
+      // whether it arrived. Reload before pressing again.
+      setResumeOutcome('The payment service could not be reached — reload before trying again.')
+    } finally {
+      setResuming(false)
+    }
+  }
+
   // Clearing dead jobs is an operator act and never automatic (§8.15): the rows
   // ARE the evidence, and a retention window would take the cron banner green a
   // week after a quarterly task failed. For the cron arm the clear IS the
   // acknowledgement, which is why that confirm names what is being thrown away.
-  async function reap(scope: 'cron' | 'per_entity') {
-    const prompt =
+  async function reap(anchor: HTMLElement, scope: 'cron' | 'per_entity') {
+    const ok = await ask(
+      anchor,
       scope === 'cron'
-        ? 'Clear the failed scheduled runs? This deletes the only record that they failed — do it once you have read the error and fixed the cause, not to quieten the banner.'
-        : 'Clear the per-source debris? These are individual ingest jobs that will never run again; their sources are unaffected and keep being polled.'
-    if (!window.confirm(prompt)) return
+        ? {
+            title: 'Clear the failed scheduled runs?',
+            body: 'This deletes the only record that they failed — do it once you have read the error and fixed the cause, not to quieten the banner.',
+            confirmLabel: 'Clear',
+          }
+        : {
+            title: 'Clear the per-source debris?',
+            body: 'These are individual ingest jobs that will never run again; their sources are unaffected and keep being polled.',
+            confirmLabel: 'Clear',
+          },
+    )
+    if (!ok) return
     setActing(`reap:${scope}`)
     setActionResult(null)
     try {
@@ -62,40 +215,71 @@ export default function AdminOverviewPage() {
       setActionResult(`Cleared ${r.cleared} dead job${r.cleared === 1 ? '' : 's'}.`)
       await load()
     } catch {
-      setActionResult('Failed to clear the dead jobs.')
+      setActionResult('Couldn’t clear the dead jobs. Please reload to see what’s left.')
     } finally {
       setActing(null)
     }
   }
 
   async function trigger(kind: 'settlements' | 'payouts') {
-    const prompt =
-      kind === 'settlements'
-        ? 'Run the monthly settlement check now? Tabs past the fallback window will be charged.'
-        : 'Run a payout cycle now? Writers over the threshold will be paid.'
-    if (!window.confirm(prompt)) return
+    const reason = triggerReason.trim()
+    if (reason === '') return
     setActing(kind)
     setActionResult(null)
     try {
       if (kind === 'settlements') {
-        const r = await adminDashboard.triggerSettlements()
+        const r = await adminDashboard.triggerSettlements(reason)
         setActionResult(`Settlement check complete — ${r.settlementTriggered} settlement(s) triggered.`)
       } else {
-        const r = await adminDashboard.triggerPayouts()
+        const r = await adminDashboard.triggerPayouts(reason)
         setActionResult(
           `Payout cycle complete — ${r.processed} payout(s), ${formatPence(r.totalPaidPence)} paid.`
         )
       }
+      setArmedTrigger(null)
+      setTriggerReason('')
       await load()
-    } catch {
-      setActionResult(kind === 'settlements' ? 'Settlement check failed.' : 'Payout cycle failed.')
+    } catch (err) {
+      // Only a refusal BEFORE the request reached the payment service means
+      // nothing ran: the reason was refused, or its record could not be
+      // written. Anything else left the gateway, and a cycle can fail or time
+      // out part-way — so it MAY have run, and saying "failed" would invite a
+      // second press (money.md: ambiguity is never reported as a failure).
+      const notRun =
+        err instanceof ApiError && (err.status === 400 || err.body?.error === 'not_recorded')
+      const what = kind === 'settlements' ? 'settlement check' : 'payout cycle'
+      setActionResult(
+        notRun
+          ? `The ${what} was not run — the request could not be recorded.`
+          : `No clear answer from the payment service. The ${what} may have run — reload and check before pressing again.`
+      )
     } finally {
       setActing(null)
     }
   }
 
+  // Folded here rather than added to the gateway payload: the per-protocol
+  // rows already carry both halves, and a total computed beside the rows it
+  // sums cannot disagree with them. `since` is the OLDEST refusal across every
+  // protocol — how long we have been locked out, not how long the most recent
+  // one has been.
+  const unreadableSources = (data?.ingest.protocols ?? []).reduce<{
+    total: number
+    since: string | null
+  }>(
+    (acc, p) => ({
+      total: acc.total + p.refusedSources,
+      since:
+        p.refusedSince && (acc.since === null || p.refusedSince < acc.since)
+          ? p.refusedSince
+          : acc.since,
+    }),
+    { total: 0, since: null },
+  )
+
   return (
     <AdminShell title="Site owner">
+      {dialog}
       {error && <div className="bg-glasshouse-well px-4 py-3 text-ui-xs text-black mb-8">{error}</div>}
       {!data && !error && (
         <div className="space-y-3">
@@ -265,7 +449,7 @@ export default function AdminOverviewPage() {
               <p className="text-ui-xs text-black">
                 {data.ingest.worker.heartbeatAt === null
                   ? 'The feed-ingest worker has never stamped its heartbeat. '
-                  : `The worker stamps a heartbeat every 60 seconds and has not for over ${Math.round(
+                  : `The worker stamps a heartbeat every 60 seconds and hasn’t done so for over ${Math.round(
                       data.ingest.worker.alertSeconds / 60,
                     )} minutes. `}
                 While it is down nothing is ingested from any source, no Nostr events are
@@ -332,6 +516,57 @@ export default function AdminOverviewPage() {
                 {data.payout.haltReason ?? 'Ledger reconciliation flagged a mismatch.'}
                 {data.payout.haltedSince && ` Since ${timeAgo(data.payout.haltedSince)}.`}
               </p>
+              {/* The inverse this banner displayed and did not offer (L5.2).
+                  Armed-then-send: the reason is the record, and asking for it
+                  in the same gesture is what stops the field being a formality.
+                  The release is recorded with the operator's account against
+                  it, which is the point — a freeze lifted with nothing said
+                  about why is not a decision anybody can review. */}
+              <div className="mt-3">
+                {armedHalt === 'global' ? (
+                  <span className="inline-flex flex-wrap items-center gap-3 align-middle">
+                    <input
+                      type="text"
+                      value={haltReason}
+                      onChange={(e) => setHaltReason(e.target.value)}
+                      placeholder="What you reconciled…"
+                      aria-label="Reason for resuming payouts"
+                      className="bg-white px-3 py-1 text-ui-xs text-black focus-ring min-w-[16rem]"
+                    />
+                    <button
+                      type="button"
+                      className="btn-text"
+                      disabled={haltReason.trim() === '' || resuming}
+                      onClick={() => void sendResume('global')}
+                    >
+                      {resuming ? 'Resuming…' : 'Resume payouts'}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-text-muted"
+                      disabled={resuming}
+                      onClick={() => {
+                        setArmedHalt(null)
+                        setHaltReason('')
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn-text"
+                    onClick={() => {
+                      setArmedHalt('global')
+                      setHaltReason('')
+                      setResumeOutcome(null)
+                    }}
+                  >
+                    Resume payouts
+                  </button>
+                )}
+              </div>
             </div>
           )}
 
@@ -348,16 +583,253 @@ export default function AdminOverviewPage() {
               </p>
               <div className="space-y-1">
                 {data.payout.haltedAccounts.map((h) => (
-                  <p key={h.accountId} className="text-ui-xs text-black">
+                  <div key={h.accountId} className="text-ui-xs text-black">
                     <span className="font-medium">{h.displayName ?? h.username ?? h.accountId}</span>
                     {' · '}
                     <span className="label-ui text-grey-600">{h.mismatchClass}</span>
                     {' · '}
                     {h.reason}
                     {` Since ${timeAgo(h.since)}.`}
+                    {armedHalt === h.accountId ? (
+                      <span className="ml-3 inline-flex flex-wrap items-center gap-3 align-middle">
+                        <input
+                          type="text"
+                          value={haltReason}
+                          onChange={(e) => setHaltReason(e.target.value)}
+                          placeholder="What you reconciled…"
+                          aria-label={`Reason for resuming ${h.displayName ?? h.accountId}`}
+                          className="bg-white px-3 py-1 text-ui-xs text-black focus-ring min-w-[14rem]"
+                        />
+                        <button
+                          type="button"
+                          className="btn-text"
+                          disabled={haltReason.trim() === '' || resuming}
+                          onClick={() => void sendResume(h.accountId)}
+                        >
+                          {resuming ? 'Resuming…' : 'Resume'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-text-muted"
+                          disabled={resuming}
+                          onClick={() => {
+                            setArmedHalt(null)
+                            setHaltReason('')
+                          }}
+                        >
+                          Cancel
+                        </button>
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn-text ml-3"
+                        onClick={() => {
+                          setArmedHalt(h.accountId)
+                          setHaltReason('')
+                          setResumeOutcome(null)
+                        }}
+                      >
+                        Resume
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {resumeOutcome && (
+            <p className="text-ui-xs text-grey-600 mb-8">{resumeOutcome}</p>
+          )}
+
+          {creditsError && (
+            <div className="bg-glasshouse-well px-4 py-3 mb-8">
+              <p className="label-ui text-grey-600 mb-1">Reader credits could not be read</p>
+              <p className="text-ui-xs text-black">
+                This is not a report that nobody is owed money — it is no report at all. Check the
+                gateway log for the upstream status.
+              </p>
+            </div>
+          )}
+
+          {/* MONEY WE OVER-COLLECTED AND HAVE NOT SENT BACK.
+              A reading tab can no longer hold a credit (migration 206): an
+              over-collection is moved out into a payable the moment it would
+              exist, so no reader has a spendable claim against future reads.
+              Reader Terms 4.3 — published, live at /reader-terms — says what
+              happens next: we refund it to the card it came from. Why that
+              clause reads the way it does is in docs/adr/LEGAL-BRAKES.md; the
+              operational rule is here.
+
+              WHY IT IS HERE AT ALL. The detector alerts three times a day at
+              FATAL and never halts payouts — deliberately: this is one reader's
+              money, and freezing every writer over it would be the wrong
+              control. But that left a log line as the whole of its surface, so
+              the only operator who ever saw one was an operator already reading
+              logs. The August 2026 double-charge sat at −£14 with every check
+              green, because `reader_balance_parity` passes over a negative tab
+              in silence: it reconciles perfectly.
+
+              THE COUNT IS UNCAPPED AND THE LIST IS NOT. `count` and the money
+              come from an aggregate over every open payable; `accounts` is a
+              sample of the deepest, capped server-side. A capped list read as a
+              total is the silence this exists to end, so the two are never
+              conflated and the shortfall is said out loud.
+
+              Runbook: docs/runbooks/reader-tab-credit.md. */}
+          {credits && credits.count > 0 && (
+            <div className="bg-glasshouse-well px-4 py-3 mb-8">
+              <p className="label-ui text-crimson mb-1">
+                {formatPence(credits.totalCreditPence)} owed back to {credits.count} reader
+                {credits.count === 1 ? '' : 's'}
+              </p>
+              <p className="text-ui-xs text-black mb-2">
+                The platform over-collected this and has not returned it. It is out of their
+                reading tabs, so nobody can spend it down against future reads — but it is still
+                ours to send back, and the resolution depends on the cause. Read the ledger for
+                each account below, then follow{' '}
+                <span className="font-mono">docs/runbooks/reader-tab-credit.md</span>. Payouts are
+                deliberately not halted by this.
+              </p>
+              <div className="space-y-1">
+                {credits.accounts.map((a) => (
+                  <p key={a.accountId} className="text-ui-xs text-black">
+                    <span className="font-medium">
+                      {a.displayName ?? a.username ?? a.accountId}
+                    </span>
+                    {' · '}
+                    <span className="font-mono">{formatPence(a.creditPence)}</span>
+                    {a.payableCount > 1 && ` across ${a.payableCount} over-collections`}
+                    {a.oldestAt && ` · since ${timeAgo(a.oldestAt)}`}
+                    {a.lastSettlementAt && (
+                      <>
+                        {' · last settled '}
+                        {timeAgo(a.lastSettlementAt)}
+                        {a.lastSettlementPence !== null &&
+                          ` for ${formatPence(a.lastSettlementPence)}`}
+                        {a.lastSettlementStatus && ` (${a.lastSettlementStatus})`}
+                      </>
+                    )}
+                    {/* THE PAYABLES, one line each, because the refund acts on
+                        ONE of them and not on a person. A reader with three
+                        over-collections has three separate charges behind them,
+                        and each goes back to the card it came from — refunding
+                        "the reader" would be a figure with no charge under it.
+                        The sum above is these. */}
+                    {a.payables.map((p) => (
+                      <span key={p.creditId} className="block pl-4 text-grey-600">
+                        {'· '}
+                        <span className="font-mono">{formatPence(p.amountPence)}</span>
+                        {p.createdAt && ` · opened ${timeAgo(p.createdAt)}`}
+                        {' · '}
+                        {p.refundInFlight ? (
+                          // Not a button, and not a disabled one: the press is
+                          // not going to become possible on this row — the sweep
+                          // finishes it. Omitting says it does not apply; a
+                          // disabled button would say "not yet".
+                          <span>Refund in flight</span>
+                        ) : armedCredit === p.creditId ? (
+                          <span className="inline-flex flex-wrap items-center gap-3 align-middle">
+                            <input
+                              type="text"
+                              value={refundReason}
+                              onChange={(e) => setRefundReason(e.target.value)}
+                              placeholder="Why this refund…"
+                              aria-label="Reason for this refund"
+                              className="bg-white px-3 py-1 text-ui-xs text-black focus-ring min-w-[16rem]"
+                            />
+                            <button
+                              type="button"
+                              className="btn-text"
+                              disabled={
+                                refundReason.trim() === '' || refundingCredit !== null
+                              }
+                              onClick={() => void sendRefund(p.creditId)}
+                            >
+                              {refundingCredit === p.creditId ? 'Refunding…' : 'Send refund'}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn-text-muted"
+                              disabled={refundingCredit !== null}
+                              onClick={() => {
+                                setArmedCredit(null)
+                                setRefundReason('')
+                              }}
+                            >
+                              Cancel
+                            </button>
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            className="btn-text-danger"
+                            disabled={refundingCredit !== null}
+                            onClick={() => {
+                              setArmedCredit(p.creditId)
+                              setRefundReason('')
+                              setRefundOutcome(null)
+                            }}
+                          >
+                            Refund
+                          </button>
+                        )}
+                        {/* A failed attempt is a fact about this payable and
+                            belongs beside it, not in the outcome line, which is
+                            about the last press. Null here is not "it
+                            succeeded" — a payable that has never been tried
+                            carries nothing either. */}
+                        {p.refundFailureReason && !p.refundInFlight && (
+                          <span className="text-crimson">
+                            {' · last attempt refused: '}
+                            {p.refundFailureReason}
+                          </span>
+                        )}
+                      </span>
+                    ))}
                   </p>
                 ))}
               </div>
+              {/* The sample's own honesty line. Without it the list reads as the
+                  whole population, which for a finding like this is worse than
+                  no list at all. */}
+              {credits.truncated && (
+                <p className="text-ui-xs text-grey-600 mt-2">
+                  Showing the {credits.accounts.length} largest of {credits.count}. The count and
+                  the total above are complete; this list is not.
+                </p>
+              )}
+              {/* WHAT THE BUTTON DOES NOT COVER, said ONCE for the page and
+                  never repeated down the list. A payable whose source is not a
+                  Stripe charge has no payment method to go back to, and the
+                  route says which on the press rather than this surface
+                  guessing — one home for "refundable", in the service that
+                  knows. */}
+              <p className="text-ui-xs text-grey-600 mt-2">
+                Refunding sends the payable back to the card the over-collection came from and
+                closes it. It does not unwind the reads — that money paid for nothing, so
+                nothing is taken back from a Writer. A payable the route cannot trace to a
+                charge is manual, via <span className="font-mono">docs/runbooks/reader-tab-credit.md</span>.
+              </p>
+            </div>
+          )}
+
+          {/* WHAT THE LAST PRESS DID, OUTSIDE THE BANNER — found by driving it.
+              Inside, it lived in a block gated on `credits.count > 0`, and the
+              refund that succeeds is exactly the press that takes the count to
+              zero: the banner and the confirmation disappeared together, on the
+              one path where the confirmation matters most. The operator sent
+              money back and the page said nothing at all.
+
+              It is a fact about the press, not about the population, so it
+              belongs at the page's level and stays until the next press. That
+              includes the answer nobody wants — a refund whose outcome we could
+              not confirm — which must never be the thing that vanishes. */}
+          {refundOutcome && (
+            <div className="bg-glasshouse-well px-4 py-3 mb-8">
+              <p className="label-ui text-grey-600 mb-1">Last refund</p>
+              <p className="text-ui-xs text-black">{refundOutcome}</p>
             </div>
           )}
 
@@ -369,11 +841,6 @@ export default function AdminOverviewPage() {
                 label="Near threshold"
                 value={data.accrual.nearThresholdTabs}
                 detail={`≥ 80% of ${formatPence(data.accrual.settlementThresholdPence)}`}
-              />
-              <StatCard
-                label="Reader credit"
-                value={formatPence(data.accrual.totalCreditPence)}
-                detail="Negative balances (platform owes readers)"
               />
               <StatCard
                 label="Provisional reads"
@@ -590,7 +1057,7 @@ export default function AdminOverviewPage() {
           <div className="slab-rule-4 mb-8" />
           <StatSection
             label="Ingest"
-            helper="Whether content is arriving. The worker figure is the alarm; the per-protocol times are context, not thresholds — two of these protocols are push-driven, so a quiet night is not a fault."
+            helper="Whether content is arriving. The worker figure is the alarm; the per-protocol times are context, not thresholds — two of these protocols are push-driven, so a quiet night is not a fault. Unreadable counts sources we poll and cannot read."
           >
             <StatGrid>
               <StatCard
@@ -603,6 +1070,53 @@ export default function AdminOverviewPage() {
                 }
                 warn={data.ingest.worker.down}
               />
+              {/* HOW MUCH OF THE FEDIVERSE WE CANNOT CURRENTLY READ (§0aa.2).
+                  An instance that refuses even a signed request leaves its
+                  sources ACTIVE, polled on schedule, and silent — which from
+                  every other figure on this page is indistinguishable from
+                  authors who have stopped posting. That is precisely how 381
+                  sources sat dead for three months. It stays on the page at
+                  zero, for the reason the email counts do: a number that only
+                  appears when something is wrong is a number nobody has a
+                  baseline for. */}
+              <StatCard
+                label="Unreadable"
+                value={unreadableSources.total}
+                detail={
+                  unreadableSources.total === 0
+                    ? 'every polled source is readable'
+                    : unreadableSources.since
+                      ? `oldest refused ${timeAgo(unreadableSources.since)}`
+                      : 'refused by their instances'
+                }
+                warn={unreadableSources.total > 0}
+              />
+              {/* REPLIES FROM ELSEWHERE (CROSS-NETWORK-ROUNDTRIP-ADR C4). Each
+                  linked Bluesky/Mastodon account is asked for what was
+                  addressed to its member, and the heartbeat is per account and
+                  stamped only by a poll that worked — so a stopped poller, or
+                  one account failing every time, ages here instead of saying
+                  nothing. Grants from before the notification scopes are
+                  counted apart: the member has to reconnect, and Settings
+                  already asks them to. */}
+              <StatCard
+                label="Replies from elsewhere"
+                value={
+                  data.linkedNotifications.presences === 0
+                    ? 'no linked accounts'
+                    : data.linkedNotifications.down - data.linkedNotifications.awaitingReconnect === 0
+                      ? 'Polling'
+                      : `${data.linkedNotifications.down - data.linkedNotifications.awaitingReconnect} down`
+                }
+                detail={
+                  `${data.linkedNotifications.presences} linked account${data.linkedNotifications.presences === 1 ? '' : 's'}` +
+                  (data.linkedNotifications.awaitingReconnect > 0
+                    ? ` · ${data.linkedNotifications.awaitingReconnect} awaiting reconnect`
+                    : '') +
+                  ` · down after ${Math.round(data.linkedNotifications.staleSeconds / 60)} min without a poll`
+                }
+                warn={data.linkedNotifications.down - data.linkedNotifications.awaitingReconnect > 0}
+              />
               {data.ingest.protocols.map((p) => (
                 <StatCard
                   key={p.protocol}
@@ -612,7 +1126,19 @@ export default function AdminOverviewPage() {
                   // facts, and email is push-delivered so it never fetches at
                   // all. No measurement is not a good measurement.
                   value={p.lastFetchedAt ? timeAgo(p.lastFetchedAt) : 'never'}
-                  detail={`${p.activeSources} active source${p.activeSources === 1 ? '' : 's'}`}
+                  detail={
+                    `${p.activeSources} active source${p.activeSources === 1 ? '' : 's'}` +
+                    (p.refusedSources > 0
+                      ? ` · ${p.refusedSources} unreadable`
+                      : '')
+                  }
+                  // NOT warned, deliberately, though the detail line carries the
+                  // bad news. `warn` paints the VALUE, and the value here is the
+                  // last-fetch time — so warning would render "just now" in
+                  // crimson, which says the timestamp is the fault when the
+                  // timestamp is the one part that is fine. The alarm belongs on
+                  // the card whose value IS the bad number, which is the one
+                  // above. (Seen in a browser; it read as "ingest is broken".)
                 />
               ))}
             </StatGrid>
@@ -805,14 +1331,14 @@ export default function AdminOverviewPage() {
                   <button
                     className="btn-soft"
                     disabled={acting !== null || data.jobs.cron.dead === 0}
-                    onClick={() => void reap('cron')}
+                    onClick={(e) => void reap(e.currentTarget, 'cron')}
                   >
                     {acting === 'reap:cron' ? 'Clearing…' : 'Clear scheduled runs'}
                   </button>
                   <button
                     className="btn-soft"
                     disabled={acting !== null || data.jobs.perEntity.dead === 0}
-                    onClick={() => void reap('per_entity')}
+                    onClick={(e) => void reap(e.currentTarget, 'per_entity')}
                   >
                     {acting === 'reap:per_entity' ? 'Clearing…' : 'Clear per-source debris'}
                   </button>
@@ -826,22 +1352,78 @@ export default function AdminOverviewPage() {
             label="Manual triggers"
             helper="Both run in the payment service exactly as the scheduled crons do."
           >
-            <div className="flex flex-wrap gap-3">
-              <button
-                className="btn-soft"
-                disabled={acting !== null}
-                onClick={() => void trigger('settlements')}
-              >
-                {acting === 'settlements' ? 'Running…' : 'Run monthly settlement check'}
-              </button>
-              <button
-                className="btn-soft"
-                disabled={acting !== null || data.payout.halted}
-                onClick={() => void trigger('payouts')}
-              >
-                {acting === 'payouts' ? 'Running…' : 'Run payout cycle'}
-              </button>
-            </div>
+            {armedTrigger === null ? (
+              <div className="flex flex-wrap gap-3">
+                <button
+                  className="btn-soft"
+                  disabled={acting !== null}
+                  onClick={() => {
+                    setArmedTrigger('settlements')
+                    setTriggerReason('')
+                    setActionResult(null)
+                  }}
+                >
+                  Run monthly settlement check
+                </button>
+                <button
+                  className="btn-soft"
+                  disabled={acting !== null || data.payout.halted}
+                  onClick={() => {
+                    setArmedTrigger('payouts')
+                    setTriggerReason('')
+                    setActionResult(null)
+                  }}
+                >
+                  Run payout cycle
+                </button>
+              </div>
+            ) : (
+              <div>
+                <p className="text-ui-xs text-black mb-2">
+                  {armedTrigger === 'settlements'
+                    ? 'Tabs past the fallback window will be charged.'
+                    : 'Writers over the threshold will be paid.'}{' '}
+                  Your reason is recorded against your account.
+                </p>
+                <span className="inline-flex flex-wrap items-center gap-3 align-middle">
+                  <input
+                    type="text"
+                    value={triggerReason}
+                    onChange={(e) => setTriggerReason(e.target.value)}
+                    placeholder="Why now…"
+                    aria-label={
+                      armedTrigger === 'settlements'
+                        ? 'Reason for running the settlement check'
+                        : 'Reason for running the payout cycle'
+                    }
+                    className="bg-white px-3 py-1 text-ui-xs text-black focus-ring min-w-[16rem]"
+                  />
+                  <button
+                    type="button"
+                    className="btn-text"
+                    disabled={triggerReason.trim() === '' || acting !== null}
+                    onClick={() => void trigger(armedTrigger)}
+                  >
+                    {acting !== null
+                      ? 'Running…'
+                      : armedTrigger === 'settlements'
+                        ? 'Run settlement check'
+                        : 'Run payout cycle'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-text-muted"
+                    disabled={acting !== null}
+                    onClick={() => {
+                      setArmedTrigger(null)
+                      setTriggerReason('')
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </span>
+              </div>
+            )}
             {actionResult && <p className="text-ui-xs text-grey-600 mt-3">{actionResult}</p>}
           </StatSection>
         </>

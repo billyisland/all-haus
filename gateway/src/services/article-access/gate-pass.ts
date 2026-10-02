@@ -2,11 +2,14 @@ import { createHmac } from "crypto";
 import { pool } from "@platform-pub/shared/db/client.js";
 import { requireEnv } from "@platform-pub/shared/lib/env.js";
 import logger from "@platform-pub/shared/lib/logger.js";
+import { keyServiceHeaders } from "../../lib/key-service-client.js";
 import { checkArticleAccess } from "./access-check.js";
 import {
   recordSubscriptionRead,
   recordPurchaseUnlock,
 } from "./unlock-records.js";
+import { readerTermsOutstanding } from "../../lib/terms-gate.js";
+import { writerAdmittedSql } from "../../lib/writer-gate.js";
 
 // =============================================================================
 // Gate-pass orchestrator
@@ -20,6 +23,10 @@ import {
 //   2. Check for free access (own / member / unlock / subscription) →
 //      issue key without charging if granted
 //   3. Reject invitation_only articles
+//   3a. Refuse a piece whose Writer's paid access has been withdrawn — after
+//       every free path, so nothing already paid for is taken away
+//   3b. Refuse a card-holding reader who has not accepted the current Reader
+//       Terms — after every free path, before any money
 //   4. Get-or-create reader's tab + compute keyed reader pubkey hash
 //   5. Call payment service /gate-pass to charge & record the read
 //   6. Persist permanent unlock so a key-issuance failure on retry is free
@@ -30,7 +37,6 @@ const KEY_SERVICE_URL = requireEnv("KEY_SERVICE_URL");
 const PAYMENT_SERVICE_URL = requireEnv("PAYMENT_SERVICE_URL");
 const READER_HASH_KEY = requireEnv("READER_HASH_KEY");
 const INTERNAL_SERVICE_TOKEN = requireEnv("INTERNAL_SERVICE_TOKEN");
-const INTERNAL_SECRET = requireEnv("INTERNAL_SECRET");
 
 interface GatePassInput {
   readerId: string;
@@ -54,6 +60,14 @@ type GatePassResult =
   | { kind: "not_gated" }
   | { kind: "misconfigured" }
   | { kind: "invitation_required" }
+  /**
+   * The Writer has been unpayable long enough that paid access to their work
+   * has been withdrawn (Writer 9.3). Not an error and not the reader's
+   * problem: the piece is simply not on sale. It returns the day the Writer
+   * becomes payable — nothing is deleted.
+   */
+  | { kind: "not_for_sale" }
+  | { kind: "reader_terms_required" }
   | { kind: "payment_required"; error: string }
   | { kind: "key_issuance_failed_after_payment"; readEventId: string | null }
   | { kind: "service_unreachable" }
@@ -72,9 +86,23 @@ export async function performGatePass(
       price_pence: number;
       access_mode: string;
       publication_id: string | null;
+      paid_access_withdrawn_at: Date | null;
+      writer_admitted: boolean;
+      deleted_at: Date | null;
     }>(
-      `SELECT id, writer_id, price_pence, access_mode, publication_id
-       FROM articles WHERE nostr_event_id = $1 AND deleted_at IS NULL AND published_at IS NOT NULL`,
+      // The writer's withdrawal stamp rides this lookup (L5.6, migration 211):
+      // it is read on every paywalled pass and a second query for a column that
+      // is NULL for everybody would be a round trip per unlock.
+      //
+      // So does the writer-access fact (READER-WRITER-SPLIT-ADR §5), for the
+      // same reason: Step 3a refuses a sale by a reader exactly as it refuses
+      // one by a writer we cannot pay.
+      `SELECT a.id, a.writer_id, a.price_pence, a.access_mode, a.publication_id,
+              w.paid_access_withdrawn_at, ${writerAdmittedSql("w")} AS writer_admitted,
+              a.deleted_at
+       FROM articles a
+       JOIN accounts w ON w.id = a.writer_id
+       WHERE a.nostr_event_id = $1 AND a.published_at IS NOT NULL`,
       [nostrEventId],
     );
 
@@ -83,6 +111,46 @@ export async function performGatePass(
     }
 
     const article = articleRow.rows[0];
+
+    // Step 1c: A WITHDRAWN PIECE OPENS ONLY FOR A READER WHO ALREADY BOUGHT
+    // IT (Writer 3.4 / 13.3; §0z item 18). Until 2026-09-18 the lookup above
+    // filtered `deleted_at IS NULL`, so a withdrawal — the writer's delete,
+    // their closure, a moderation rung — answered `not_found` before the
+    // already-unlocked free path could run, and the clause that readers keep
+    // what they paid for was kept by nothing. The ONLY grant here is an
+    // `article_unlocks` row — a read that already happened, whatever paid for
+    // it: a purchase, a gift link, or a subscription read
+    // (`recordSubscriptionRead` writes one too, with its `subscription_id`).
+    // What does NOT grant is
+    // the writer's own-content path (they withdrew it), a LIVE subscription
+    // (access to what is on sale, and this is not), or a new purchase
+    // (nothing withdrawn is sold). The key is re-issued as it is for any
+    // already-unlocked read; no money moves.
+    if (article.deleted_at !== null) {
+      const unlocked = await pool.query(
+        `SELECT 1 FROM article_unlocks WHERE reader_id = $1 AND article_id = $2`,
+        [readerId, article.id],
+      );
+      if (unlocked.rows.length === 0) {
+        return { kind: "not_found" };
+      }
+      const keyResult = await fetchContentKey(nostrEventId, readerId, readerPubkey);
+      if (!keyResult.ok) {
+        return { kind: "service_error" };
+      }
+      return {
+        kind: "success",
+        body: {
+          readEventId: null,
+          readState: "already_unlocked",
+          encryptedKey: keyResult.body.encryptedKey,
+          algorithm: keyResult.body.algorithm,
+          isReissuance: true,
+          ciphertext: keyResult.body.ciphertext ?? undefined,
+        },
+      };
+    }
+
     if (article.access_mode === "public") {
       return { kind: "not_gated" };
     }
@@ -156,6 +224,46 @@ export async function performGatePass(
     // Step 3: Invitation-only — no purchase path
     if (article.access_mode === "invitation_only") {
       return { kind: "invitation_required" };
+    }
+
+    // Step 3a: this piece is not for sale, because we cannot pay its Writer
+    // (Writer Agreement 9.3; L5.6). After the free-access path and never
+    // before it: the writer reading their own work, a reader re-opening what
+    // they have already paid for, and a subscriber all pass above — withdrawing
+    // a sale must not take away anything anybody already has. Beside Step 3
+    // rather than beside Step 3b because it is the same KIND of fact: this
+    // object cannot be bought, whoever is asking. And before the terms gate,
+    // because asking a reader to accept the Reader Terms in order to buy
+    // something that is not for sale sends them to do something pointless.
+    //
+    // A piece by a READER is the same kind of fact (READER-WRITER-SPLIT-ADR
+    // §5): a reader is not sold. No reader can hold a live article once the
+    // publish doors refuse them, so this closes the case rather than meeting
+    // it; `!== true` so a lookup that failed to carry the column refuses.
+    if (
+      article.paid_access_withdrawn_at !== null ||
+      article.writer_admitted !== true
+    ) {
+      return { kind: "not_for_sale" };
+    }
+
+    // Step 3b: the Reader Terms are what the reading tab runs on, and a reader
+    // who registered a card before the text existed has never been shown it.
+    // They are asked once, here, at the first read that would cost them money.
+    //
+    // WHY IT SITS HERE AND NOT BESIDE STEP 1b. The deliverability refusal is
+    // about the ARTICLE, so it belongs before everything; this one is about a
+    // SALE, so it belongs after every path on which no sale happens. Above it
+    // are the writer reading their own piece, a reader re-opening something
+    // they have already paid for, and a subscriber reading on a subscription
+    // they bought under the text they DID accept — turning any of those away
+    // would be withholding content that is already theirs to settle a question
+    // about a future purchase. Below it, every remaining path charges.
+    //
+    // No money moves either way: Step 4 opens the tab and Step 5 is the charge,
+    // and both are past this return.
+    if (await readerTermsOutstanding(readerId)) {
+      return { kind: "reader_terms_required" };
     }
 
     // Step 4: Get-or-create reader's tab + compute pubkey hash
@@ -291,22 +399,25 @@ async function fetchContentKey(
   readerId: string,
   readerPubkey: string,
 ): Promise<KeyServiceFetchResult> {
-  const res = await fetch(
-    `${KEY_SERVICE_URL}/api/v1/articles/${nostrEventId}/key`,
-    {
+  // The reader is a HEADER on this call and the body is `{}`, so the binding's
+  // subject terms are what stop a captured request being pointed at somebody
+  // else's reader id — see lib/key-service-client.ts.
+  const path = `/api/v1/articles/${nostrEventId}/key`;
+  const rawBody = JSON.stringify({});
+  const res = await fetch(`${KEY_SERVICE_URL}${path}`, {
+    method: "POST",
+    headers: keyServiceHeaders({
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-internal-secret": INTERNAL_SECRET,
-        "x-reader-id": readerId,
-        "x-reader-pubkey": readerPubkey,
-      },
-      // Timeout after payment is safe: the unlock row is already persisted,
-      // so the reader's retry re-issues the key without re-charging.
-      signal: AbortSignal.timeout(15_000),
-      body: JSON.stringify({}),
-    },
-  );
+      path,
+      rawBody,
+      json: true,
+      identity: { readerId, readerPubkey },
+    }),
+    // Timeout after payment is safe: the unlock row is already persisted,
+    // so the reader's retry re-issues the key without re-charging.
+    signal: AbortSignal.timeout(15_000),
+    body: rawBody,
+  });
 
   if (!res.ok) {
     const body = await res.json().catch(() => null);

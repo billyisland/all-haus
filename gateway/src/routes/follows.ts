@@ -3,72 +3,34 @@ import { pool } from '@platform-pub/shared/db/client.js'
 import { requireAuth } from '../middleware/auth.js'
 import { markFollowListDirty } from '../lib/discovery-publish.js'
 import logger from '@platform-pub/shared/lib/logger.js'
+import { isUuid } from '../lib/request-inputs.js'
 
 // =============================================================================
 // Follow Routes
 //
-// POST   /follows/:writerId    — follow a writer
-// DELETE /follows/:writerId    — unfollow a writer
+// DELETE /follows/:writerId    — unfollow a writer (the legacy exit for a
+//                                pre-convergence row with no source to remove)
 // GET    /follows/pubkeys      — list followed writer pubkeys (for feed filter)
 // GET    /follows              — list followed writers with display info
 //
 // Follow relationships are stored in the platform DB (follows table) and
 // also published as kind 3 contact list events to the relay. The DB is the
 // source of truth for feed assembly; the relay events enable portability.
+// A follow is CREATED only by adding an account source to a feed
+// (`POST /workspace/feeds/:id/sources`, feeds.md) — never here.
 // =============================================================================
 
 export async function followRoutes(app: FastifyInstance) {
 
-  // ---------------------------------------------------------------------------
-  // POST /follows/:writerId — follow a writer
-  // ---------------------------------------------------------------------------
-
-  app.post<{ Params: { writerId: string } }>(
-    '/follows/:writerId',
-    { preHandler: requireAuth },
-    async (req, reply) => {
-      const followerId = req.session!.sub
-      const { writerId } = req.params
-
-      if (followerId === writerId) {
-        return reply.status(400).send({ error: 'Cannot follow yourself' })
-      }
-
-      // Verify the target account exists and is active
-      const writerCheck = await pool.query<{ id: string }>(
-        `SELECT id FROM accounts WHERE id = $1 AND status = 'active'`,
-        [writerId]
-      )
-
-      if (writerCheck.rows.length === 0) {
-        return reply.status(404).send({ error: 'User not found' })
-      }
-
-      // Upsert — idempotent
-      await pool.query(
-        `INSERT INTO follows (follower_id, followee_id)
-         VALUES ($1, $2)
-         ON CONFLICT (follower_id, followee_id) DO NOTHING`,
-        [followerId, writerId]
-      )
-
-      // Notify the writer they have a new follower (fire-and-forget)
-      pool.query(
-        `INSERT INTO notifications (recipient_id, actor_id, type)
-         VALUES ($1, $2, 'new_follower')
-         ON CONFLICT DO NOTHING`,
-        [writerId, followerId]
-      ).catch((err) => logger.warn({ err }, 'Failed to insert new_follower notification'))
-
-      // Coalesced kind-3 republish — the scheduler sweep rebuilds from state.
-      markFollowListDirty(followerId).catch((err) =>
-        logger.warn({ err, followerId }, 'Failed to mark follow list dirty'))
-
-      logger.info({ followerId, writerId }, 'Follow created')
-
-      return reply.status(200).send({ ok: true })
-    }
-  )
+  // NO POST (CA-I3, 2026-09-29). `POST /follows/:writerId` wrote a `follows`
+  // row and a `new_follower` notification with no `feed_sources` write — the
+  // state feeds.md forbids (a follow is a CHOSEN SOURCE, written by
+  // `POST /workspace/feeds/:id/sources` beside the source, in one
+  // transaction). The web client deliberately had no `follow` (its comment
+  // says so, pinned by `follow-feed-frontier.test.ts`) and modernhaus only
+  // ever DELETEs here, so the route was dead as a feature and live as a back
+  // door. Its guards — self, active, blocks both ways — live in `addSource`'s
+  // account arm now, pinned by `follow-is-a-chosen-source.test.ts`.
 
   // ---------------------------------------------------------------------------
   // DELETE /follows/:writerId — unfollow a writer
@@ -80,6 +42,9 @@ export async function followRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const followerId = req.session!.sub
       const { writerId } = req.params
+      if (!isUuid(writerId)) {
+        return reply.status(404).send({ error: 'not_found' })
+      }
 
       await pool.query(
         'DELETE FROM follows WHERE follower_id = $1 AND followee_id = $2',
@@ -133,6 +98,15 @@ export async function followRoutes(app: FastifyInstance) {
       })
     }
   )
+
+  // ---------------------------------------------------------------------------
+  // GET /follows — list followed writers with display info
+  //
+  // Used by the settings/profile page to show who the reader follows.
+  // ---------------------------------------------------------------------------
+
+  // NO `GET /follows/followers` either (CA-I3): the followers list the web
+  // renders reads `/writers/:username/followers`, and nothing called this.
 
   // ---------------------------------------------------------------------------
   // GET /follows — list followed writers with display info
@@ -233,13 +207,16 @@ export async function followRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const followerId = req.session!.sub
       const { id: publicationId } = req.params
+      if (!isUuid(publicationId)) {
+        return reply.status(404).send({ error: 'not_found' })
+      }
 
       const pubCheck = await pool.query(
         `SELECT id FROM publications WHERE id = $1 AND status = 'active'`,
         [publicationId]
       )
       if (pubCheck.rows.length === 0) {
-        return reply.status(404).send({ error: 'Publication not found' })
+        return reply.status(404).send({ error: "We couldn't find that publication." })
       }
 
       await pool.query(
@@ -260,6 +237,9 @@ export async function followRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const followerId = req.session!.sub
       const { id: publicationId } = req.params
+      if (!isUuid(publicationId)) {
+        return reply.status(404).send({ error: 'not_found' })
+      }
 
       await pool.query(
         'DELETE FROM publication_follows WHERE follower_id = $1 AND publication_id = $2',

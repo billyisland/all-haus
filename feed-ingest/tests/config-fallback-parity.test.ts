@@ -29,6 +29,16 @@ vi.mock("../src/lib/platform-config.js", () => ({
   getPlatformConfig: async () => configMock.current,
 }));
 
+// loadFeedWeights (feed-scores-refresh) reads `platform_config` through the
+// POOL rather than getPlatformConfig, so the mock above does not reach it. Its
+// own mock is what makes its block below drive the fallback path instead of
+// whatever the live database happens to hold — which is the difference between
+// pinning the shipping fallback and pinning the seed data.
+const poolRows = { current: [] as { key: string; value: string }[] };
+vi.mock("@platform-pub/shared/db/client.js", () => ({
+  pool: { query: async () => ({ rows: poolRows.current, rowCount: poolRows.current.length }) },
+}));
+
 const { loadResonanceParams } = await import("../src/lib/resonance.js");
 
 describe("resonance fallbacks vs config-defaults.sql", () => {
@@ -100,5 +110,53 @@ describe("jetstream replay cap fallback vs config-defaults.sql", () => {
       configMock.current = new Map([["feed_ingest_atproto_max_replay_hours", junk]]);
       expect(await loadMaxReplayHours()).toBe(24);
     }
+  });
+});
+
+describe("feed-score weight fallbacks vs config-defaults.sql", () => {
+  beforeEach(() => {
+    poolRows.current = [];
+  });
+
+  // These five moved here on 2026-09-14. `feed_gravity` used to be parity-tested
+  // through the gateway's loadProofBlendParams, which stopped reading it when the
+  // age decay went with feed-level ranking (migration 202) — and the four
+  // feed_weight_* dials had never been covered anywhere. loadFeedWeights is the
+  // shipping fallback path for all five, so it is where they belong.
+  it("every feed-score fallback matches the seeded default", async () => {
+    const { loadFeedWeights } = await import("../src/tasks/feed-scores-refresh.js");
+    const w = await loadFeedWeights();
+    expect(
+      diffAgainstDefaults({
+        feed_gravity: w.gravity,
+        feed_weight_reaction: w.reaction,
+        feed_weight_reply: w.reply,
+        feed_weight_quote_comment: w.quoteComment,
+        feed_weight_gate_pass: w.gatePass,
+      }),
+    ).toEqual([]);
+  });
+
+  it("a retuned value wins over the fallback", async () => {
+    const { loadFeedWeights } = await import("../src/tasks/feed-scores-refresh.js");
+    poolRows.current = [{ key: "feed_gravity", value: "2.25" }];
+    expect((await loadFeedWeights()).gravity).toBe(2.25);
+  });
+});
+
+describe("linked-notification dial fallbacks vs config-defaults.sql", () => {
+  // CROSS-NETWORK-ROUNDTRIP-ADR rung C. Driven through `dialInt`, the poll
+  // task's own reader, against an empty table — the shipping fallback path.
+  it("every fallback matches the seeded default, a seeded value wins, a malformed one falls back", async () => {
+    const { dialInt } = await import("../src/tasks/linked-notifications-poll.js");
+    const empty = new Map<string, string>();
+    expect(
+      diffAgainstDefaults({
+        linked_notifications_poll_seconds: dialInt(empty, "linked_notifications_poll_seconds"),
+        linked_notifications_backfill_hours: dialInt(empty, "linked_notifications_backfill_hours"),
+      }),
+    ).toEqual([]);
+    expect(dialInt(new Map([["linked_notifications_poll_seconds", "120"]]), "linked_notifications_poll_seconds")).toBe(120);
+    expect(dialInt(new Map([["linked_notifications_poll_seconds", "5 min"]]), "linked_notifications_poll_seconds")).toBe(300);
   });
 });

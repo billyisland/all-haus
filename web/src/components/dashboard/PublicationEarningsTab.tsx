@@ -32,7 +32,7 @@ export function PublicationEarningsTab({ publicationId }: Props) {
         <SummaryCard label="Net earnings" value={fmt(summary.netPence)} />
         <SummaryCard label="Pending" value={fmt(summary.pendingPence)} />
         <SummaryCard label="Paid out" value={fmt(summary.paidPence)} />
-        <SummaryCard label="Paid reads" value={summary.readCount.toLocaleString()} />
+        <SummaryCard label="Paid reads" value={summary.readCount.toLocaleString('en-GB')} />
         {summary.subscriptionNetPence > 0 && (
           <SummaryCard label="From subscriptions" value={fmt(summary.subscriptionNetPence)} />
         )}

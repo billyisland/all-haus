@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import { pool, withTransaction } from '@platform-pub/shared/db/client.js'
-import { signEvent, nip44EncryptBatch, nip44Decrypt } from '../lib/key-custody-client.js'
-import { enqueueRelayPublish, type SignedNostrEvent } from '@platform-pub/shared/lib/relay-outbox.js'
+import { nip44EncryptBatch, nip44DecryptBatch } from '../lib/key-custody-client.js'
 import logger from '@platform-pub/shared/lib/logger.js'
+import { parseTimestampCursor } from '@platform-pub/shared/lib/timestamp-cursor.js'
+import { blockExistsWithAny, blockPairSql } from '../lib/blocks.js'
 
 // =============================================================================
 // Messages Service
@@ -27,16 +28,16 @@ export async function createConversation(
   creatorId: string,
   memberIds: string[]
 ): Promise<ServiceResult<{ conversationId: string }>> {
-  const allMembers = [creatorId, ...memberIds.filter(id => id !== creatorId)]
+  // Distinct: `(conversation_id, user_id)` is the membership PK, so a repeated
+  // id in the request reached the INSERT as a unique violation and answered
+  // 500 (CA-D7). A set, not a refusal — naming a friend twice is not a mistake
+  // worth telling anybody about.
+  const allMembers = [creatorId, ...new Set(memberIds.filter(id => id !== creatorId))]
 
-  const blockCheck = await pool.query<{ blocked_id: string }>(
-    `SELECT blocked_id FROM blocks
-     WHERE (blocker_id = $1 AND blocked_id = ANY($2))
-        OR (blocked_id = $1 AND blocker_id = ANY($2))`,
-    [creatorId, memberIds]
-  )
-  if (blockCheck.rows.length > 0) {
-    return { ok: false, status: 403, error: 'Cannot create conversation with blocked users' }
+  // Blocks, BOTH ways, through the one home — see lib/blocks.ts. One neutral
+  // refusal, so neither party learns which way the block runs.
+  if (await blockExistsWithAny(creatorId, memberIds)) {
+    return { ok: false, status: 403, error: "You can't start a conversation with one of these people." }
   }
 
   // Conversation identity is the participant set, not a fresh UUID: reuse an
@@ -44,71 +45,59 @@ export async function createConversation(
   // fewer) so a second message to the same friend continues the existing thread
   // instead of spawning a duplicate. (Member set is unique per conversation —
   // (conversation_id, user_id) is the PK — so array_agg yields the exact set.)
+  //
+  // The read and the two writes are ONE transaction under a per-member-set
+  // advisory lock, and both halves of that are load-bearing. Unlocked, two
+  // concurrent "message this friend" presses both miss the reuse lookup and
+  // mint two conversations for the same pair — the exact duplicate this
+  // function exists to prevent, reachable by a double-click. Un-transacted, a
+  // failure between the `conversations` INSERT and the `conversation_members`
+  // one leaves a conversation with NO members: invisible to every list (they
+  // all join through membership), unreachable, and permanent. Same shape as
+  // `addSource`'s owner-scoped lock serialising a read-then-write.
   const sortedMembers = [...allMembers].sort()
-  const existing = await pool.query<{ conversation_id: string }>(
-    `SELECT conversation_id
-       FROM conversation_members
-      GROUP BY conversation_id
-     HAVING array_agg(user_id ORDER BY user_id) = $1::uuid[]
-      LIMIT 1`,
-    [sortedMembers]
-  )
-  if (existing.rows.length > 0) {
-    const conversationId = existing.rows[0].conversation_id
-    logger.info({ conversationId, creatorId, memberCount: allMembers.length }, 'Conversation reused')
-    return { ok: true, data: { conversationId } }
-  }
+  return withTransaction(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [sortedMembers.join(',')])
 
-  const conv = await pool.query<{ id: string }>(
-    'INSERT INTO conversations (created_by) VALUES ($1) RETURNING id',
-    [creatorId]
-  )
-  const conversationId = conv.rows[0].id
-
-  const memberValues = allMembers
-    .map((_, i) => `($1, $${i + 2})`)
-    .join(', ')
-  await pool.query(
-    `INSERT INTO conversation_members (conversation_id, user_id) VALUES ${memberValues}`,
-    [conversationId, ...allMembers]
-  )
-
-  logger.info({ conversationId, creatorId, memberCount: allMembers.length }, 'Conversation created')
-  return { ok: true, data: { conversationId } }
-}
-
-export async function addConversationMembers(
-  conversationId: string,
-  actorId: string,
-  memberIds: string[]
-): Promise<ServiceResult<{ ok: true }>> {
-  const membership = await pool.query(
-    'SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2',
-    [conversationId, actorId]
-  )
-  if (membership.rowCount === 0) {
-    return { ok: false, status: 403, error: 'Not a member of this conversation' }
-  }
-
-  const blockCheck = await pool.query(
-    `SELECT blocked_id FROM blocks
-     WHERE (blocker_id = $1 AND blocked_id = ANY($2))
-        OR (blocked_id = $1 AND blocker_id = ANY($2))`,
-    [actorId, memberIds]
-  )
-  if (blockCheck.rows.length > 0) {
-    return { ok: false, status: 403, error: 'Cannot add blocked users' }
-  }
-
-  for (const memberId of memberIds) {
-    await pool.query(
-      `INSERT INTO conversation_members (conversation_id, user_id)
-       VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-      [conversationId, memberId]
+    const existing = await client.query<{ conversation_id: string }>(
+      // Only conversations the first member is IN can match the exact set
+      // (CA-G3): pre-filtered through idx_conv_members_user, the grouping runs
+      // over that member's conversations rather than every membership row on
+      // the platform, under the advisory lock.
+      `SELECT conversation_id
+         FROM conversation_members
+        WHERE conversation_id IN (
+          SELECT conversation_id FROM conversation_members
+           WHERE user_id = ($1::uuid[])[1]
+        )
+        GROUP BY conversation_id
+       HAVING array_agg(user_id ORDER BY user_id) = $1::uuid[]
+        LIMIT 1`,
+      [sortedMembers]
     )
-  }
+    if (existing.rows.length > 0) {
+      const conversationId = existing.rows[0].conversation_id
+      logger.info({ conversationId, creatorId, memberCount: allMembers.length }, 'Conversation reused')
+      return { ok: true, data: { conversationId } }
+    }
 
-  return { ok: true, data: { ok: true } }
+    const conv = await client.query<{ id: string }>(
+      'INSERT INTO conversations (created_by) VALUES ($1) RETURNING id',
+      [creatorId]
+    )
+    const conversationId = conv.rows[0].id
+
+    const memberValues = allMembers
+      .map((_, i) => `($1, $${i + 2})`)
+      .join(', ')
+    await client.query(
+      `INSERT INTO conversation_members (conversation_id, user_id) VALUES ${memberValues}`,
+      [conversationId, ...allMembers]
+    )
+
+    logger.info({ conversationId, creatorId, memberCount: allMembers.length }, 'Conversation created')
+    return { ok: true, data: { conversationId } }
+  })
 }
 
 interface InboxConversation {
@@ -134,8 +123,9 @@ export async function listInbox(userId: string): Promise<InboxConversation[]> {
     // listed members of a group convo without dropping the whole conversation
     // (the old WHERE m.muter_id IS NULL filtered pre-aggregate and took the
     // convo with it). HAVING drops 1:1 DMs when the sole counterparty is
-    // muted. Blocks mirror the send path: a convo with any member who has
-    // blocked the viewer disappears, because send would 403 anyway.
+    // muted. Blocks mirror the send path, BOTH ways and through the one home
+    // (lib/blocks.ts): a convo with any member the viewer is block-paired with
+    // disappears, because every send into it would 403 anyway.
     `SELECT c.id AS conversation_id, c.last_message_at, c.created_at,
             COALESCE(unread.cnt, 0)::int AS unread_count,
             COALESCE(array_agg(a.id) FILTER (WHERE m.muter_id IS NULL), '{}'::uuid[]) AS member_ids,
@@ -153,10 +143,9 @@ export async function listInbox(userId: string): Promise<InboxConversation[]> {
      LEFT JOIN mutes m ON m.muter_id = $1 AND m.muted_id = cm.user_id
      WHERE NOT EXISTS (
        SELECT 1 FROM conversation_members cmb
-       JOIN blocks b ON b.blocker_id = cmb.user_id
        WHERE cmb.conversation_id = c.id
          AND cmb.user_id != $1
-         AND b.blocked_id = $1
+         AND ${blockPairSql('$1', 'cmb.user_id')}
      )
      GROUP BY c.id, unread.cnt
      HAVING COUNT(*) FILTER (WHERE m.muter_id IS NULL) > 0
@@ -209,7 +198,7 @@ export async function loadConversationMessages(
     [conversationId, userId]
   )
   if (membership.rowCount === 0) {
-    return { ok: false, status: 403, error: 'Not a member of this conversation' }
+    return { ok: false, status: 403, error: "You're not part of this conversation." }
   }
 
   // Group-DM shape: one logical send produces N rows (one per recipient). The
@@ -220,8 +209,17 @@ export async function loadConversationMessages(
   const params: any[] = [conversationId, userId, limit]
   let whereClause = 'dm.conversation_id = $1 AND (dm.recipient_id = $2 OR dm.sender_id = $2)'
   if (before) {
-    params.push(before)
-    whereClause += ` AND dm.created_at < $4`
+    // Carried as `created_at::text`, fed back as `$4::timestamptz` — the value
+    // is never a JS Date, which holds milliseconds where timestamptz holds
+    // microseconds. Descending cursor, `<`: truncating down would SKIP the
+    // messages inside the lost microsecond, not repeat them. See the header of
+    // shared/lib/timestamp-cursor.ts.
+    const cursor = parseTimestampCursor(before)
+    if (!cursor) {
+      return { ok: false, status: 400, error: 'Invalid cursor' }
+    }
+    params.push(cursor)
+    whereClause += ` AND dm.created_at < $4::timestamptz`
   }
 
   const { rows } = await pool.query<{
@@ -238,6 +236,7 @@ export async function loadConversationMessages(
     reply_to_counterparty_pubkey: string | null
     read_at: Date | null
     created_at: Date
+    created_at_exact: string
     like_count: string
     liked_by_me: boolean
   }>(
@@ -248,6 +247,7 @@ export async function loadConversationMessages(
               sa.nostr_pubkey AS sender_pubkey,
               ra.nostr_pubkey AS recipient_pubkey,
               dm.content_enc, dm.reply_to_id, dm.read_at, dm.created_at,
+              dm.created_at::text AS created_at_exact,
               rsa.username AS reply_to_sender_username,
               rdm.content_enc AS reply_to_content_enc,
               CASE WHEN rdm.sender_id = $2 THEN rra.nostr_pubkey ELSE rsa.nostr_pubkey END AS reply_to_counterparty_pubkey,
@@ -256,7 +256,10 @@ export async function loadConversationMessages(
        FROM direct_messages dm
        JOIN accounts sa ON sa.id = dm.sender_id
        JOIN accounts ra ON ra.id = dm.recipient_id
+       -- Scoped to the conversation, so a reply_to_id written before the send
+       -- guard (CA-D7) cannot surface another conversation's message here.
        LEFT JOIN direct_messages rdm ON rdm.id = dm.reply_to_id
+                                    AND rdm.conversation_id = dm.conversation_id
        LEFT JOIN accounts rsa ON rsa.id = rdm.sender_id
        LEFT JOIN accounts rra ON rra.id = rdm.recipient_id
        WHERE ${whereClause}
@@ -270,7 +273,7 @@ export async function loadConversationMessages(
   )
 
   const nextCursor = rows.length === limit
-    ? rows[rows.length - 1].created_at.toISOString()
+    ? rows[rows.length - 1].created_at_exact
     : null
 
   const messages = rows.map<ConversationMessage>(r => ({
@@ -314,7 +317,23 @@ export async function sendMessage(
     [conversationId, senderId]
   )
   if (membership.rowCount === 0) {
-    return { ok: false, status: 403, error: 'Not a member of this conversation' }
+    return { ok: false, status: 403, error: "You're not part of this conversation." }
+  }
+
+  // A reply names a message IN THIS CONVERSATION, or nothing (CA-D7). Unchecked,
+  // a known id from somebody else's conversation was stored and then JOINED on
+  // read — returning that message's ciphertext, its sender's username and the
+  // counterparty's pubkey to every member here — and an unknown id hit the FK
+  // and answered 500. One answer for both, so the refusal is not an oracle for
+  // which message ids exist. Asked before the key-custody round-trip.
+  if (replyToId) {
+    const target = await pool.query(
+      'SELECT 1 FROM direct_messages WHERE id = $1 AND conversation_id = $2',
+      [replyToId, conversationId]
+    )
+    if (target.rowCount === 0) {
+      return { ok: false, status: 400, error: 'That message is not in this conversation' }
+    }
   }
 
   const members = await pool.query<{ user_id: string }>(
@@ -322,18 +341,20 @@ export async function sendMessage(
     [conversationId, senderId]
   )
   if (members.rows.length === 0) {
-    return { ok: false, status: 400, error: 'No recipients in conversation' }
+    return { ok: false, status: 400, error: "There's nobody in this conversation who can receive that." }
   }
 
   const recipientIds = members.rows.map(r => r.user_id)
 
-  const blockCheck = await pool.query(
-    `SELECT blocker_id FROM blocks
-     WHERE blocker_id = ANY($1) AND blocked_id = $2`,
-    [recipientIds, senderId]
-  )
-  if (blockCheck.rows.length > 0) {
-    return { ok: false, status: 403, error: 'You are blocked by one or more recipients' }
+  // Blocks, BOTH ways — see lib/blocks.ts for why the second direction is the
+  // one that mattered here. This asked only "did a recipient block me?", so a
+  // blocker could keep sending one-way messages to somebody who could not
+  // reply; the block made the other party mute rather than making the pair
+  // silent. The old copy ("You are blocked by one or more recipients") also
+  // named the direction, which discloses to whichever party did NOT set the
+  // block both that one exists and who set it.
+  if (await blockExistsWithAny(senderId, recipientIds)) {
+    return { ok: false, status: 403, error: "You can't send messages to this conversation." }
   }
 
   const pubkeyRows = await pool.query<{ id: string; nostr_pubkey: string | null }>(
@@ -359,7 +380,7 @@ export async function sendMessage(
     }
   }
   if (deliverable.length === 0) {
-    return { ok: false, status: 400, error: 'No deliverable recipients' }
+    return { ok: false, status: 400, error: "There's nobody in this conversation who can receive that." }
   }
 
   // One key-custody round-trip for the whole send — the service decrypts the
@@ -406,10 +427,6 @@ export async function sendMessage(
     return inserted.rows.map(r => r.id)
   })
 
-  publishConversationPulse(senderId, conversationId).catch(err => {
-    logger.error({ err, conversationId }, 'Conversation-pulse publish failed (non-fatal)')
-  })
-
   return { ok: true, data: { messageIds, skippedRecipientIds } }
 }
 
@@ -424,7 +441,7 @@ export async function markMessageRead(
     [messageId, userId]
   )
   if (result.rowCount === 0) {
-    return { ok: false, status: 404, error: 'Message not found' }
+    return { ok: false, status: 404, error: "We couldn't find that message." }
   }
   return { ok: true, data: { ok: true } }
 }
@@ -438,7 +455,7 @@ export async function markConversationReadAll(
     [conversationId, userId]
   )
   if (membership.rowCount === 0) {
-    return { ok: false, status: 403, error: 'Not a member of this conversation' }
+    return { ok: false, status: 403, error: "You're not part of this conversation." }
   }
 
   const result = await pool.query(
@@ -467,7 +484,7 @@ export async function toggleMessageReaction(
     [messageId, userId]
   )
   if (membership.rowCount === 0) {
-    return { ok: false, status: 403, error: 'Not a participant' }
+    return { ok: false, status: 403, error: "You're not part of this conversation." }
   }
 
   // DELETE-then-INSERT, wrapped in one txn, so a concurrent toggle can't leave a
@@ -512,21 +529,59 @@ interface DecryptResult {
   error?: string
 }
 
+/**
+ * ONE HOP PER CHUNK, NOT PER MESSAGE.
+ *
+ * This fanned out one key-custody request per message, which is fine for a
+ * page of a thread and is not fine for the export (L7.1), where the batch is a
+ * member's whole history: key-custody's per-signer budget is 120/min
+ * (`key-custody/src/lib/rate-limit.ts`), so past that point every remaining
+ * message came back `plaintext: null` — an archive whose tail is a column of
+ * failures, which reads as "these messages are corrupt" rather than "we asked
+ * too fast". The chunk bound is key-custody's own schema cap, and the chunks go
+ * sequentially: the point is to stop hammering the service, so issuing them all
+ * at once would put the fan-out back one level up.
+ *
+ * A PARTIAL OUTCOME IS NOT A TOTAL ONE. A chunk that throws — the service down,
+ * the budget spent — fails only its own messages, each carrying the error, and
+ * the loop continues; one bad ciphertext inside a chunk fails only itself. The
+ * caller sees which messages it did not get, never a short list it might read
+ * as the whole.
+ */
 export async function decryptBatch(
   readerId: string,
   messages: DecryptRequest[]
 ): Promise<DecryptResult[]> {
-  const results = await Promise.allSettled(
-    messages.map(async (msg) => {
-      const { plaintext } = await nip44Decrypt(readerId, msg.counterpartyPubkey, msg.ciphertext)
-      return { id: msg.id, plaintext }
-    })
-  )
-  return results.map((r, i) =>
-    r.status === 'fulfilled'
-      ? r.value
-      : { id: messages[i].id, plaintext: null, error: 'Decryption failed' }
-  )
+  const CHUNK = 500
+  const out: DecryptResult[] = []
+
+  for (let i = 0; i < messages.length; i += CHUNK) {
+    const chunk = messages.slice(i, i + CHUNK)
+    try {
+      // The reader decrypts with their OWN key, so actor and owner are the
+      // same account here (L6.6, `key_access_log`). Stated rather than
+      // defaulted — see key-custody-client.
+      const { results } = await nip44DecryptBatch(
+        readerId,
+        chunk.map(m => ({ senderPubkey: m.counterpartyPubkey, ciphertext: m.ciphertext })),
+        readerId,
+      )
+      chunk.forEach((msg, j) => {
+        const plaintext = results[j]?.plaintext ?? null
+        out.push(
+          plaintext === null
+            ? { id: msg.id, plaintext: null, error: "Couldn't decrypt that message." }
+            : { id: msg.id, plaintext }
+        )
+      })
+    } catch {
+      for (const msg of chunk) {
+        out.push({ id: msg.id, plaintext: null, error: "Couldn't decrypt that message." })
+      }
+    }
+  }
+
+  return out
 }
 
 // -----------------------------------------------------------------------------
@@ -613,32 +668,4 @@ export async function removeDmPriceOverride(ownerId: string, targetUserId: strin
     'DELETE FROM dm_pricing WHERE owner_id = $1 AND target_id = $2',
     [ownerId, targetUserId]
   )
-}
-
-// Publishes a "conversation pulse" — an empty kind-14 carrying only the
-// internal conversation id. This is NOT NIP-17. Real NIP-17 requires a
-// kind-13 seal around the content and a kind-1059 gift-wrap per recipient
-// (content remains encrypted at rest on the relay). The pulse exists only
-// so clients watching the relay can see "this conversation had activity at
-// time T" without content; real message content lives in `direct_messages`
-// as NIP-44 ciphertexts. If/when proper gift-wrap ships it should be a
-// separate function — do not expand this one.
-async function publishConversationPulse(senderId: string, conversationId: string): Promise<void> {
-  try {
-    const event = await signEvent(senderId, {
-      kind: 14,
-      content: '',
-      tags: [['conversation', conversationId]],
-      created_at: Math.floor(Date.now() / 1000),
-    })
-    await withTransaction(async (client) => {
-      await enqueueRelayPublish(client, {
-        entityType: 'conversation_pulse',
-        signedEvent: event as SignedNostrEvent,
-      })
-    })
-    logger.debug({ conversationId, eventId: event.id }, 'Conversation pulse enqueued')
-  } catch (err) {
-    logger.error({ err, conversationId }, 'Failed to enqueue conversation pulse')
-  }
 }

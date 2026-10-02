@@ -5,10 +5,10 @@ import type { Post } from "./types";
 //
 // Quoting a post writes a small frozen copy of what was quoted (notes.quoted_*),
 // so the inset can be drawn without re-fetching the original. That snapshot is
-// what the reader eventually sees IN FULL: `web/CLAUDE.md` › "Expansion is
-// transitive" makes an expanded card show its inset whole, so whatever we cut
-// here is text nobody can ever reach from the quoting note — the truncation is
-// permanent in a way a render-time clamp is not.
+// what the reader eventually sees IN FULL: `.claude/rules/web-cards-and-threads.md`
+// › "Expansion is transitive" makes an expanded card show its inset whole, so
+// whatever we cut here is text nobody can ever reach from the quoting note —
+// the truncation is permanent in a way a render-time clamp is not.
 //
 // So the cut follows the post's own kind rather than one flat character budget:
 //

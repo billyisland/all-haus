@@ -1,12 +1,10 @@
 import { sendBroadcastEmail } from './email.js'
 import { pool } from '../db/client.js'
-import {
-  publishEmailSubject,
-  publishEmailText,
-  publishEmailBody,
-  buildUnsubscribeUrl,
-} from './publish-email-template.js'
+import { buildUnsubscribeUrl } from './publish-email-template.js'
+import { renderEmail } from './email/layout.js'
+import { publishNotificationEmail } from './email/templates/publish.js'
 import logger from './logger.js'
+import { requireEnv } from './env.js'
 
 // =============================================================================
 // Publish Notification Emails (v2 — broadcast stream)
@@ -18,9 +16,23 @@ import logger from './logger.js'
 // Enforces a configurable daily send cap for broadcast warm-up.
 // =============================================================================
 
-const APP_URL = process.env.APP_URL ?? 'http://localhost:3010'
+const appUrl = () => requireEnv('APP_URL')
 const CONCURRENCY = 10
-const READER_HASH_KEY = process.env.READER_HASH_KEY ?? ''
+// A CALL, NOT A MODULE CONSTANT, and never `?? ''`.
+//
+// This key MINTS the unsubscribe token in every publish email; `unsubscribe.ts`
+// VERIFIES with `requireEnv('READER_HASH_KEY')`. The empty string is a
+// perfectly well-formed HMAC key, so the fallback did not fail — it minted
+// tokens under a different key from the one that checks them, and did it
+// silently: every unsubscribe link in every affected send would answer
+// "invalid", which reads to the recipient as us ignoring an unsubscribe. And an
+// HMAC keyed on '' is forgeable by anyone who reads this file.
+//
+// Read at CALL TIME rather than at import, so a module's importability does not
+// depend on deployment config — the same shape as `internalSecret()` (S15).
+function readerHashKey(): string {
+  return requireEnv('READER_HASH_KEY')
+}
 
 // ---------------------------------------------------------------------------
 // Daily send cap for broadcast warm-up
@@ -116,24 +128,22 @@ async function sendOneNotification(
   articleUrl: string,
 ): Promise<void> {
   const unsubscribeUrl = buildUnsubscribeUrl(
-    recipient.id, writerId, 'subscription', READER_HASH_KEY
+    recipient.id, writerId, 'subscription', readerHashKey()
   )
-
-  const params = {
-    writerName: writer.displayName,
-    writerAvatarUrl: writer.avatarUrl,
-    title,
-    summary,
-    contentFree,
-    articleUrl,
-    unsubscribeUrl,
-  }
 
   await sendBroadcastEmail({
     to: recipient.email,
-    subject: publishEmailSubject(writer.displayName, title),
-    textBody: publishEmailText(params),
-    htmlBody: publishEmailBody(params),
+    ...renderEmail(
+      publishNotificationEmail({
+        writerName: writer.displayName,
+        writerAvatarUrl: writer.avatarUrl,
+        title,
+        summary,
+        contentFree,
+        articleUrl,
+        unsubscribeUrl,
+      }),
+    ),
   })
 }
 
@@ -171,7 +181,7 @@ export async function sendPublishNotifications(
   }
 
   const recipients = subscribers.slice(0, allowed)
-  const articleUrl = `${APP_URL}/article/${dTag}`
+  const articleUrl = `${appUrl()}/article/${dTag}`
 
   logger.info(
     { writerId, articleId, recipientCount: recipients.length, skippedCount: skipped },

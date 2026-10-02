@@ -2,13 +2,16 @@ import { UUID_RE } from "../lib/uuid.js";
 import type { FastifyInstance } from 'fastify'
 import type { PoolClient } from 'pg'
 import { z } from 'zod'
-import { pool, withTransaction } from '@platform-pub/shared/db/client.js'
+import { pool, withTransaction, loadConfig } from '@platform-pub/shared/db/client.js'
 import { requireAuth, optionalAuth } from '../middleware/auth.js'
+import { requireWriter, writerAdmittedSql } from '../lib/writer-gate.js'
 import { signEvent } from '../lib/key-custody-client.js'
 import { enqueueRelayPublish, type SignedNostrEvent } from '@platform-pub/shared/lib/relay-outbox.js'
 import { applyLedgerDelta } from '@platform-pub/shared/lib/ledger.js'
 import { pledgesEnabled } from '@platform-pub/shared/lib/env.js'
+import { getPlatformConfig } from '../lib/platform-config.js'
 import logger from '@platform-pub/shared/lib/logger.js'
+import { zodValidationError } from '@platform-pub/shared/lib/validation.js'
 
 // =============================================================================
 // Pledge Drive Routes
@@ -54,6 +57,22 @@ const PledgeSchema = z.object({
   amountPence: z.number().int().min(1),
 })
 
+/**
+ * Per-pledge ceiling fallback. A dial (`pledge_max_pence`) rather than a literal
+ * for the usual reason — the right number is only knowable by watching what
+ * people actually pledge — and this is the in-code SECOND copy, parity-tested
+ * against config-defaults.sql in tests/config-fallback-parity.test.ts.
+ */
+const PLEDGE_MAX_PENCE_FALLBACK = 10000
+
+/** The cap a single pledge may not exceed, in pence. */
+export async function pledgeMaxPence(): Promise<number> {
+  const cfg = await getPlatformConfig()
+  const raw = cfg.get('pledge_max_pence')
+  const n = raw === undefined ? NaN : Number(raw)
+  return Number.isFinite(n) && n > 0 ? n : PLEDGE_MAX_PENCE_FALLBACK
+}
+
 export async function driveRoutes(app: FastifyInstance) {
 
   // Pledge drives are parked behind PLEDGES_ENABLED (default OFF, 2026-07-13).
@@ -76,7 +95,7 @@ export async function driveRoutes(app: FastifyInstance) {
     const creatorId = req.session!.sub
     const parsed = CreateDriveSchema.safeParse(req.body)
     if (!parsed.success) {
-      return reply.status(400).send({ error: parsed.error.flatten() })
+      return reply.status(400).send(zodValidationError(parsed.error))
     }
 
     const data = parsed.data
@@ -88,15 +107,18 @@ export async function driveRoutes(app: FastifyInstance) {
         return reply.status(400).send({ error: 'targetWriterId is required for commissions' })
       }
       targetWriterId = data.targetWriterId
+    }
 
-      // Verify target writer exists
-      const writer = await pool.query(
-        'SELECT id FROM accounts WHERE id = $1',
-        [targetWriterId]
-      )
-      if (writer.rowCount === 0) {
-        return reply.status(404).send({ error: 'Target writer not found' })
-      }
+    // The target is who the pledges pay, so a reader is not one: a reader
+    // cannot crowdfund for themselves or be commissioned (READER-WRITER-SPLIT-
+    // ADR §5). One check covers both origins, since a crowdfund's target is
+    // its creator. A fact about the object, so it refuses the whole route.
+    const writer = await pool.query(
+      `SELECT a.id FROM accounts a WHERE a.id = $1 AND ${writerAdmittedSql('a')}`,
+      [targetWriterId]
+    )
+    if (writer.rowCount === 0) {
+      return reply.status(404).send({ error: 'Target writer not found' })
     }
 
     const result = await pool.query<{ id: string }>(
@@ -237,7 +259,7 @@ export async function driveRoutes(app: FastifyInstance) {
       const userId = req.session!.sub
       const parsed = UpdateDriveSchema.safeParse(req.body)
       if (!parsed.success) {
-        return reply.status(400).send({ error: parsed.error.flatten() })
+        return reply.status(400).send(zodValidationError(parsed.error))
       }
 
       const data = parsed.data
@@ -323,20 +345,61 @@ export async function driveRoutes(app: FastifyInstance) {
       const pledgerId = req.session!.sub
       const parsed = PledgeSchema.safeParse(req.body)
       if (!parsed.success) {
-        return reply.status(400).send({ error: parsed.error.flatten() })
+        return reply.status(400).send(zodValidationError(parsed.error))
       }
 
       const { amountPence } = parsed.data
+
+      // A pledge is a PROMISE OF MONEY, and fulfilment makes it real: publishing
+      // the article inserts a read_event and debits the pledger's tab by the
+      // full amount (see fulfillDrive below). Two preconditions the route never
+      // had (MIRROR-AUDIT §3 *Money*, S14) — both about that later debit, so
+      // both belong here, at the only moment the pledger is present to be told.
+      //
+      // 1. A ceiling. `amountPence` was bounded only by `min(1)`, so a slipped
+      //    decimal point pledged £5,000 as easily as £50 and nothing anywhere
+      //    would question it until a stranger's tab carried the debt.
+      const cap = await pledgeMaxPence()
+      if (amountPence > cap) {
+        return reply.status(400).send({
+          error: 'pledge_too_large',
+          message: `A single pledge cannot exceed £${(cap / 100).toFixed(2)}.`,
+        })
+      }
 
       // Run pledge in a transaction
       let pledgeError: { message: string; status: number } | null = null
       let newTotal = 0
 
       await withTransaction(async (client) => {
+        // 2. A card on file — the same collection gate the subscribe routes
+        //    carry, and for the identical reason: fulfilment's tab debit is
+        //    collectible only by settlement, and settlement SKIPS card-less
+        //    accounts. Without it a card-less pledger's promise still funded the
+        //    drive's progress bar, still unlocked the article for them, and
+        //    still accrued the writer an earning — out of money the platform had
+        //    no way to collect. Read inside the transaction, so a card detached
+        //    mid-request cannot slip between the check and the INSERT. 402
+        //    mirrors the subscribe/gate-pass shape.
+        const cardRow = await client.query<{ stripe_customer_id: string | null }>(
+          `SELECT stripe_customer_id FROM accounts WHERE id = $1`,
+          [pledgerId]
+        )
+        if (!cardRow.rows[0]?.stripe_customer_id) {
+          pledgeError = { message: 'card_required', status: 402 }
+          return
+        }
+
         // Verify drive exists and is open
+        // A drive whose target is a reader takes no pledge (READER-WRITER-
+        // SPLIT-ADR §5); the create route refuses one, and this is the same
+        // question asked where the money is promised.
         const drive = await client.query<{ id: string; status: string; funding_target_pence: number | null; current_total_pence: number }>(
-          `SELECT id, status, funding_target_pence, current_total_pence
-           FROM pledge_drives WHERE id = $1 AND status IN ('open', 'funded') FOR UPDATE`,
+          `SELECT d.id, d.status, d.funding_target_pence, d.current_total_pence
+           FROM pledge_drives d
+           JOIN accounts w ON w.id = d.target_writer_id
+           WHERE d.id = $1 AND d.status IN ('open', 'funded') AND ${writerAdmittedSql('w')}
+           FOR UPDATE OF d`,
           [req.params.id]
         )
         if (drive.rows.length === 0) {
@@ -461,7 +524,7 @@ export async function driveRoutes(app: FastifyInstance) {
 
   app.post<{ Params: { id: string } }>(
     '/drives/:id/accept',
-    { preHandler: requireAuth },
+    { preHandler: [requireAuth, requireWriter] },
     async (req, reply) => {
       const writerId = req.session!.sub
       const parsed = AcceptCommissionSchema.safeParse(req.body ?? {})
@@ -809,18 +872,30 @@ async function fulfillDrive(driveId: string): Promise<void> {
   const pledges = pledgesResult.rows
   const batchSize = 50
 
+  // Read once for the whole run, outside the batch transactions (loadConfig
+  // reads the pool, and asking for a second connection while holding row locks
+  // is a way to wait on ourselves).
+  const { platformFeeBps } = await loadConfig()
+
   for (let i = 0; i < pledges.length; i += batchSize) {
     const batch = pledges.slice(i, i + batchSize)
 
     await withTransaction(async (client) => {
       for (const pledge of batch) {
         // 1. Create read_event (enters existing settlement pipeline)
+        //
+        // `fee_bps` is stamped here for the same reason recordGatePass stamps
+        // it (migration 208, L5.1): this row enters the settlement pipeline and
+        // will earn its writer a net computed from the rate, and the rate a
+        // fulfilment happened at is a fact about the fulfilment. Unstamped, a
+        // dial edit between fulfilment and payout would move money a pledger
+        // had already paid.
         const readEvent = await client.query<{ id: string }>(
           `INSERT INTO read_events
-             (reader_id, article_id, writer_id, amount_pence, state)
-           VALUES ($1, $2, $3, $4, 'accrued')
+             (reader_id, article_id, writer_id, amount_pence, state, fee_bps)
+           VALUES ($1, $2, $3, $4, 'accrued', $5)
            RETURNING id`,
-          [pledge.pledger_id, drive.article_id, drive.target_writer_id, pledge.amount_pence]
+          [pledge.pledger_id, drive.article_id, drive.target_writer_id, pledge.amount_pence, platformFeeBps]
         )
 
         // 2. Create article_unlocks — checkArticleAccess() grants access
@@ -834,8 +909,9 @@ async function fulfillDrive(driveId: string): Promise<void> {
         // 3. Update reading_tabs balance (charge becomes real): the pledge debits
         //    the pledger's tab by +amount and posts the mirror pledge_fulfil entry
         //    (−amount, counterparty = the funded writer) as one pair via
-        //    applyLedgerDelta, which UPSERTS the tab — pledging needs no card, so a
-        //    pledger may have no tab row yet (one_tab_per_reader UNIQUE reader_id).
+        //    applyLedgerDelta, which UPSERTS the tab — the pledger is carded (the
+        //    route's collection gate, S14) but may still have no tab row yet, a
+        //    tab being created lazily (one_tab_per_reader UNIQUE reader_id).
         //    The batch txn is the unit of work and fulfilled pledges aren't
         //    re-selected, so this is one entry per pledge, ref = the read_events row.
         const { tabId } = await applyLedgerDelta(client, {

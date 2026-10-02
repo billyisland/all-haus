@@ -20,10 +20,17 @@ import { authorMark, type AuthorMark } from "../../lib/post/resonance";
 // says "big for the BBC, and notable for Bluesky" with one mark to learn
 // instead of two. The size step is degree, in both scopes.
 //
-// Aggression rides the palette's own text ramp — muted `cardMeta` for the
-// modest state, full-strength `cardTitle` for the loud one — never crimson,
-// which means PAID on a card (the left bar) and would make a popular post look
-// like a charged one.
+// THE MARK WEARS ITS FEED. Its colour is the vessel's own WALLS — the colour
+// that makes the ⊔ frame read as this feed — lifted onto the card by the
+// palette (`resonanceMark` / `resonanceMarkLoud`, tokens.ts), so a spring feed
+// flags in green and a winter feed in indigo and the mark belongs to the thing
+// it is standing in. Aggression is a WEIGHT STEP INSIDE THAT ONE HUE (the
+// modest step eased back toward the card ground) plus the glyph's own size, not
+// a jump between two different colours: it used to ride the text ramp
+// (`cardMeta` → `cardTitle`), which was correct for legibility and read as
+// punctuation. Never crimson, which means PAID on a card (the left bar) and
+// would make a popular post look like a charged one — and the hue is the
+// feed's, so it never becomes crimson by accident.
 //
 // It replaced · / ·· / ···, which was recessive AND sat in a cluster whose
 // first element is also a dot (the parked TrustPip), so the two read as one run
@@ -50,10 +57,13 @@ function markStyle(
   level: AuthorMark,
 ): React.CSSProperties {
   return {
-    color: level === "high" ? palette.cardTitle : palette.cardMeta,
-    // A hair of optical size keeps a small glyph from disappearing between
-    // the middle dots of a caps row.
-    fontSize: "1.08em",
+    color: level === "high" ? palette.resonanceMarkLoud : palette.resonanceMark,
+    // The mark sits in a caps row of middle dots and has to out-read them, so
+    // it runs a clear step over its line rather than the hair of optical size
+    // it carried while it was coloured as meta. The loud step takes a further
+    // step, which is the second half of degree — the glyph itself (▴ → ▲) is
+    // the first.
+    fontSize: level === "high" ? "1.34em" : "1.24em",
     lineHeight: 1,
   };
 }
@@ -64,7 +74,7 @@ const MARK_CLASS = "cursor-default select-none";
 // protocol alone: native rows are protocol "nostr" (external nostr is always
 // "nostr_external"), scored against all.haus's own corpus — including a native
 // row with a NULL custodial pubkey, which the old pubkey-first check let fall
-// through to the open-Nostr gloss (§0i.9; isNativePost's pubkey conjunct is
+// through to the open-Nostr gloss (§0i.9; the native-card pubkey conjunct is
 // about byline routing, not baseline membership).
 export function networkLabel(post: Post): string {
   switch (post.origin.protocol) {

@@ -4,7 +4,6 @@ import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
 import { requireAuth } from "../../middleware/auth.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 import {
-  UUID_RE,
   type FeedRow,
   createFeedForOwner,
   feedProvenanceSql,
@@ -14,6 +13,8 @@ import {
 } from "./shared.js";
 import { removeSource } from "./sources.js";
 import { populateFeedFromFormula } from "./formulas.js";
+import { zodValidationError } from "@platform-pub/shared/lib/validation.js";
+import { isUuid } from "../../lib/request-inputs.js";
 
 const createFeedSchema = z.object({
   name: z.string().trim().max(80).default(""),
@@ -267,7 +268,7 @@ export function registerFeedCrudRoutes(app: FastifyInstance) {
       if (!parsed.success) {
         return reply
           .status(400)
-          .send({ error: "Invalid body", details: parsed.error.flatten() });
+          .send(zodValidationError(parsed.error));
       }
       const feed = await createFeedForOwner(ownerId, parsed.data.name);
       return reply.status(201).send({ feed: feedRowToResponse(feed) });
@@ -283,14 +284,14 @@ export function registerFeedCrudRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const ownerId = req.session!.sub;
       const { id } = req.params;
-      if (!UUID_RE.test(id))
-        return reply.status(400).send({ error: "Invalid feed id" });
+      if (!isUuid(id))
+        return reply.status(404).send({ error: "We couldn't find that channel." });
 
       const parsed = patchFeedSchema.safeParse(req.body);
       if (!parsed.success) {
         return reply
           .status(400)
-          .send({ error: "Invalid body", details: parsed.error.flatten() });
+          .send(zodValidationError(parsed.error));
       }
 
       const sets: string[] = [];
@@ -323,7 +324,7 @@ export function registerFeedCrudRoutes(app: FastifyInstance) {
         [id, ownerId, ...vals],
       );
       if (rows.length === 0)
-        return reply.status(404).send({ error: "Feed not found" });
+        return reply.status(404).send({ error: "We couldn't find that channel." });
       return reply.send({ feed: feedRowToResponse(rows[0]) });
     },
   );
@@ -348,11 +349,11 @@ export function registerFeedCrudRoutes(app: FastifyInstance) {
       if (!parsed.success) {
         return reply
           .status(400)
-          .send({ error: "Invalid body", details: parsed.error.flatten() });
+          .send(zodValidationError(parsed.error));
       }
       const ids = parsed.data.feedIds;
       if (new Set(ids).size !== ids.length)
-        return reply.status(400).send({ error: "Duplicate feed ids" });
+        return reply.status(400).send({ error: "Duplicate channel ids" });
 
       const { rows: ownedRows } = await pool.query<{ id: string }>(
         `SELECT id FROM feeds WHERE owner_id = $1`,
@@ -361,7 +362,7 @@ export function registerFeedCrudRoutes(app: FastifyInstance) {
       const owned = new Set(ownedRows.map((r) => r.id));
       if (ids.length !== owned.size || ids.some((id) => !owned.has(id))) {
         return reply.status(409).send({
-          error: "Feed list out of date — refresh and retry",
+          error: "Your channels have changed somewhere else. Please refresh the page and try again.",
         });
       }
 
@@ -395,11 +396,11 @@ export function registerFeedCrudRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const ownerId = req.session!.sub;
       const { id } = req.params;
-      if (!UUID_RE.test(id))
-        return reply.status(400).send({ error: "Invalid feed id" });
+      if (!isUuid(id))
+        return reply.status(404).send({ error: "We couldn't find that channel." });
 
       const feed = await loadFeed(id, ownerId);
-      if (!feed) return reply.status(404).send({ error: "Feed not found" });
+      if (!feed) return reply.status(404).send({ error: "We couldn't find that channel." });
 
       const {
         rows: [{ count }],
@@ -410,7 +411,7 @@ export function registerFeedCrudRoutes(app: FastifyInstance) {
       if (parseInt(count, 10) <= 1)
         return reply
           .status(409)
-          .send({ error: "Cannot delete your only feed" });
+          .send({ error: "You can't delete your only channel." });
 
       // No starter-template guard here any more, and its absence is the point:
       // migration 179 dropped `is_starter_template`, so no feed on this floor
@@ -421,21 +422,30 @@ export function registerFeedCrudRoutes(app: FastifyInstance) {
       // delete (FEED-FORMULAS-ADR D6) — which is why this delete can go back to
       // being an ordinary delete rather than needing a better guard.
 
-      // Tear down external sources through removeSource FIRST (H6). A bare
+      // Tear down derived state through removeSource FIRST (H6). A bare
       // DELETE cascades feed_sources away without passing through the
-      // feed-derived-subscription teardown: the derived external_subscriptions
-      // row would survive, so the source polls forever (the GC keys "orphaned"
-      // on external_subscriptions), the author card stays "Following" with no
+      // feed-derived teardown: the derived external_subscriptions row would
+      // survive, so the source polls forever (the GC keys "orphaned" on
+      // external_subscriptions), the author card stays "Following" with no
       // surface left to undo it, and a nostr_external follow stays on the
       // published kind-3. Each call handles its own last-feed check + advisory
       // lock. recordExclusion:false — deleting a feed isn't a curation edit, and
       // its feed_import_exclusions cascade away with it anyway.
-      const { rows: extSources } = await pool.query<{ id: string }>(
+      //
+      // ACCOUNT sources are in that sweep too, for H6's own reason one column
+      // over: a native follow is now derived from `account` sources (§9.16 as
+      // amended 2026-09-18), so a cascade would leave a `follows` row whose
+      // last source has gone — the writer no longer in any feed, the profile
+      // still reading "Following", and the only way back a legacy-shaped
+      // escape hatch. Deleting the feed that held somebody is how you stop
+      // following them, and this is where that is true.
+      const { rows: derivedSources } = await pool.query<{ id: string }>(
         `SELECT id FROM feed_sources
-          WHERE feed_id = $1 AND source_type = 'external_source'`,
+          WHERE feed_id = $1
+            AND source_type IN ('external_source', 'account')`,
         [id],
       );
-      for (const s of extSources) {
+      for (const s of derivedSources) {
         await removeSource(id, ownerId, s.id, { recordExclusion: false });
       }
 
@@ -444,7 +454,7 @@ export function registerFeedCrudRoutes(app: FastifyInstance) {
         [id, ownerId],
       );
       if (rowCount === 0)
-        return reply.status(404).send({ error: "Feed not found" });
+        return reply.status(404).send({ error: "We couldn't find that channel." });
       return reply.status(204).send();
     },
   );
@@ -462,8 +472,8 @@ export function registerFeedCrudRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const ownerId = req.session!.sub;
       const { id: targetId } = req.params;
-      if (!UUID_RE.test(targetId))
-        return reply.status(400).send({ error: "Invalid feed id" });
+      if (!isUuid(targetId))
+        return reply.status(404).send({ error: "We couldn't find that channel." });
 
       const parsed = z
         .object({ sourceFeedId: z.string().uuid() })
@@ -471,14 +481,14 @@ export function registerFeedCrudRoutes(app: FastifyInstance) {
       if (!parsed.success) {
         return reply
           .status(400)
-          .send({ error: "Invalid body", details: parsed.error.flatten() });
+          .send(zodValidationError(parsed.error));
       }
       const { sourceFeedId } = parsed.data;
 
       if (sourceFeedId === targetId) {
         return reply
           .status(400)
-          .send({ error: "Cannot merge a feed into itself" });
+          .send({ error: "You can't merge a channel into itself." });
       }
 
       try {
@@ -553,18 +563,21 @@ export function registerFeedCrudRoutes(app: FastifyInstance) {
         // 5. Return the updated target feed.
         const updatedFeed = await loadFeed(targetId, ownerId);
         if (!updatedFeed)
-          return reply.status(404).send({ error: "Feed not found" });
+          return reply.status(404).send({ error: "We couldn't find that channel." });
         return reply.send({ feed: feedRowToResponse(updatedFeed) });
       } catch (err) {
         const code = (err as { code?: string } | null)?.code;
         if (code === "NOT_FOUND_TARGET" || code === "NOT_FOUND_SOURCE") {
-          return reply.status(404).send({ error: "Feed not found" });
+          return reply.status(404).send({ error: "We couldn't find that channel." });
         }
+        // Not owned answers exactly as absent, like every other feed route
+        // (they reach it through loadFeed(id, ownerId)): a 403 here told a
+        // caller which of somebody else's feed ids exist.
         if (code === "FORBIDDEN_TARGET" || code === "FORBIDDEN_SOURCE") {
-          return reply.status(403).send({ error: "Feed not owned by you" });
+          return reply.status(404).send({ error: "We couldn't find that channel." });
         }
         logger.error({ err, targetId, sourceFeedId }, "Feed merge failed");
-        return reply.status(500).send({ error: "Feed merge failed" });
+        return reply.status(500).send({ error: "Couldn't merge those channels. Please try again." });
       }
     },
   );

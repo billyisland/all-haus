@@ -23,7 +23,7 @@ const TITLE = 'all.haus — No one should own the public square.'
 // of the sentence — so an overrun deletes exactly the part worth keeping. That
 // is what cost the phrase "from across the open web" its middle two words.
 const DESCRIPTION =
-  'Build feeds from the open web — Bluesky, Mastodon, RSS — sorted by rules you set, not rules set on you. Read what’s worth reading and pay the writer per piece.'
+  'Build channels from the open web — Bluesky, Mastodon, RSS — sorted by rules you set, not rules set on you. Read what’s worth reading and pay the writer per piece.'
 
 export const metadata: Metadata = {
   title: TITLE,
@@ -42,7 +42,7 @@ export const metadata: Metadata = {
 }
 
 const HEADLINE =
-  'all.haus is a writing platform dedicated to three radical propositions:'
+  'all.haus is a new kind of platform dedicated to three radical propositions:'
 
 const PROPOSITIONS = [
   'No one should own the public square',
@@ -51,8 +51,8 @@ const PROPOSITIONS = [
 ]
 
 const PROSE = [
-  'Build omnivorous feeds that pull the whole open social web into one place — Bluesky, Mastodon, Substack, plain old RSS and more. Sort them with rules you set rather than rules set on you. No dopamine hacks, no algorithm optimised for pointless, endless scrolling. A feed is a tool: you need the right one for each job. At all.haus you can create as many as you like.',
-  'Read what’s worth reading and pay a few pence for it. You don’t have to subscribe or make financial commitments you’ll forget to cancel. The money goes to whoever wrote the piece, on terms they set.',
+  'Filter the whole open social web — Bluesky, Mastodon, Substack, RSS and more — into personalised channels that run on rules you set rather than rules set on you. No dopamine hacks, and no algorithm tuned to keep you scrolling. Make as many channels as you like: a content stream is a tool, and different jobs call for different approaches.',
+  'Read what’s worth reading and pay a few pence for it. No subscription, and nothing to forget to cancel. The money goes to whoever wrote the piece, on their terms.',
   'The whole thing runs on Nostr: an open protocol with no company behind it, no servers to seize, and no owner to sell it to someone worse.',
 ]
 
@@ -81,21 +81,21 @@ const PROSE = [
 const FIGURES: Figure[] = [
   {
     key: 'canvas',
-    caption: 'Feeds are objects on a canvas. Size them, stack them, turn them sideways, copy them, share them, hide them, delete them',
+    caption: 'Make as many channels as you like, then copy, share, hide or bin them',
     description:
-      'Four all.haus feeds arranged on one canvas, each framed in a different colour and numbered. A wide one fills the left, its top post carrying a photograph of a city skyline at dusk; below it a fourth feed runs sideways, its cards continuing off the right-hand edge. On the right, a narrow feed of headlines alone sits above a second narrow feed of short posts.',
+      'Four all.haus channels arranged on one canvas, each framed in a different colour and numbered. A wide one fills the left, its top post carrying a photograph of a city skyline at dusk; below it a fourth channel runs sideways, its cards continuing off the right-hand edge. On the right, a narrow channel of headlines alone sits above a second narrow channel of short posts.',
   },
   {
     key: 'omnivore',
-    caption: 'Bluesky, Mastodon, Nostr, RSS and more — bring them all together in one place',
+    caption: 'Bluesky, Mastodon, Nostr, RSS and more, side by side',
     description:
-      'A single all.haus feed in close-up. Four posts sit in one column in the same card style, each labelled with where it came from: a film review from RSS, a Bluesky post quoting a newspaper’s reporting, a Nostr note written at four in the morning, and a paid essay from RSS.',
+      'A single all.haus channel in close-up. Four posts sit in one column in the same card style, each labelled with where it came from: a film review from RSS, a Bluesky post quoting a newspaper’s reporting, a Nostr note written at four in the morning, and a paid essay from RSS.',
   },
   {
     key: 'reader',
-    caption: 'Secure cryptographic paywall, no subscription required. Pay a few pence to read the one piece you’re actually interested in',
+    caption: 'A cryptographic paywall with no subscription attached. Pay for the one piece you actually came for',
     description:
-      'A reading pane floating over a blurred workspace of feeds. Inside it an investigative essay, titled and bylined to a small political review, breaks off a few lines in at a “Keep reading” panel: the price, forty pence, then a button to continue and a link to add a payment card, with a monthly subscription to the same review offered underneath as the alternative.',
+      'A reading pane floating over a blurred workspace of channels. Inside it an investigative essay, titled and bylined to a small political review, breaks off a few lines in at a “Keep reading” panel: the price, forty pence, then a button to continue and a link to add a payment card, with a monthly subscription to the same review offered underneath as the alternative.',
   },
 ]
 

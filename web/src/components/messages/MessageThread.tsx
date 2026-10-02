@@ -1,14 +1,53 @@
 'use client'
 
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { ReportButton } from '../ui/ReportButton'
+import { MuteBlockControls } from '../social/MuteBlockControls'
 import { messages as messagesApi, type DirectMessage, type DecryptedMessage } from '../../lib/api'
 import { useAuth } from '../../stores/auth'
 import { useUnreadCounts } from '../../stores/unread'
-import { useMediaAttachments } from '../../hooks/useMediaAttachments'
-import { MediaPreview } from '../ui/MediaPreview'
-import { MediaContent } from '../ui/MediaContent'
 import { CommissionForm } from '../ui/CommissionForm'
 import { pledgesEnabled } from '../../lib/featureFlags'
+import { apiErrorMessage } from '../../lib/api/client'
+import {
+  MESSAGES_LOAD_OLDER,
+  MESSAGES_THREAD_EMPTY,
+  MESSAGES_UNKNOWN_SENDER,
+  MESSAGES_ENCRYPTED,
+  MESSAGES_COULD_NOT_DECRYPT,
+  MESSAGES_REPLY,
+  MESSAGES_LIKE,
+  MESSAGES_UNLIKE,
+  MESSAGES_REPLY_PLACEHOLDER,
+  MESSAGES_MESSAGE_PLACEHOLDER,
+  MESSAGES_SEND,
+  MESSAGES_SEND_FAILED,
+  messagesReplyingTo,
+  messagesBlockedSentence,
+} from '../../content/messages'
+
+// =============================================================================
+// DIRECT MESSAGES ARE TEXT ONLY (L6.2, decision A1; D1 §5).
+//
+// What was here until now: an image-upload button, a `useMediaAttachments`
+// hook that appended the uploaded URLs to the message body, and `MediaContent`
+// rendering the result — which linkified bare URLs and mounted YouTube
+// iframes. A DM is the one surface where a stranger can put something in front
+// of a member with nobody else in the room, and every one of those three was a
+// way to make that worth doing.
+//
+// All three are gone, and the thread renders `whitespace-pre-wrap` text and
+// nothing else. THAT IS LOAD-BEARING, not tidying: the gateway's link refusal
+// (`containsUrl`) deliberately does not chase a bare `example.com`, because
+// the pattern that catches one also catches "node.js" — and it is safe not to
+// precisely because nothing on this surface turns text into a link. Putting a
+// renderer back here means rethinking the two together.
+//
+// `MediaPreview` is NOT deleted: the note composer still uses it. What is
+// deleted is its mount HERE. `MediaContent` outlived its last caller (the
+// playscript reply) and is gone (CA-I7); `web/tests/dm-text-only.test.ts` is
+// what keeps a renderer of either kind out of this file.
+// =============================================================================
 
 const POLL_INTERVAL = 5_000
 
@@ -46,14 +85,25 @@ export function MessageThread({
   const [loadingMore, setLoadingMore] = useState(false)
   const [content, setContent] = useState('')
   const [sending, setSending] = useState(false)
+  const [sendError, setSendError] = useState<string | null>(null)
   const [replyTo, setReplyTo] = useState<DecryptedMessage | null>(null)
   const [showCommission, setShowCommission] = useState(false)
+  // Whether the VIEWER has blocked the other member — learned from the header
+  // control (W2). Only this direction is ever known here: a block the other
+  // party set is not disclosed, and the send's own neutral refusal covers it.
+  const [iBlocked, setIBlocked] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const latestCreatedAt = useRef<string | null>(null)
-  const media = useMediaAttachments()
+
+  const knownIds = useRef(new Set<string>())
+  // Settled once the first page has landed (or failed): until then a poll
+  // would open page one a second time beside the initial fetch.
+  const initialSettled = useRef(false)
+  useEffect(() => {
+    knownIds.current = new Set(msgs.map(m => m.id))
+  }, [msgs])
 
   async function decryptMessages(encrypted: DirectMessage[]): Promise<DecryptedMessage[]> {
     if (encrypted.length === 0) return []
@@ -100,9 +150,7 @@ export function MessageThread({
 
       if (isInitial) {
         setMsgs(chronological)
-        if (chronological.length > 0) {
-          latestCreatedAt.current = chronological[chronological.length - 1].createdAt
-        }
+        knownIds.current = new Set(chronological.map(m => m.id))
       } else {
         setMsgs(prev => [...chronological, ...prev])
         requestAnimationFrame(() => {
@@ -122,22 +170,26 @@ export function MessageThread({
       await refreshUnread()
       onMessagesRead?.()
     } catch {}
-    finally { setLoading(false); setLoadingMore(false); setDecrypting(false) }
+    finally {
+      if (isInitial) initialSettled.current = true
+      setLoading(false); setLoadingMore(false); setDecrypting(false)
+    }
   }, [conversationId, user?.id])
 
-  // Poll for new messages in the active thread
+  // Poll for new messages in the active thread (CA-E5). There is NO cursor:
+  // the poll reads page one and keeps what this thread does not already hold,
+  // by id. A clock cursor was wrong both ways — the send stamped it with the
+  // CLIENT's clock (the send returns ids only), so a clock ahead of the server
+  // hid the counterpart's next replies; and an empty thread had no cursor at
+  // all, so a recipient who opened the new conversation never saw its first
+  // message without a reload. The id filter runs BEFORE the decrypt: every
+  // decrypt opens a custodial key and leaves a `key_access_log` row, so page
+  // one is never re-opened wholesale every five seconds.
   const pollForNew = useCallback(async () => {
-    if (!latestCreatedAt.current) return
+    if (!initialSettled.current) return
     try {
-      // Fetch messages newer than what we have by getting the first page
-      // and filtering to only truly new ones
       const data = await messagesApi.getMessages(conversationId)
-      if (data.messages.length === 0) return
-
-      // Find messages newer than our latest
-      const newMsgs = data.messages.filter(m =>
-        new Date(m.createdAt) > new Date(latestCreatedAt.current!)
-      )
+      const newMsgs = data.messages.filter(m => !knownIds.current.has(m.id))
       if (newMsgs.length === 0) return
 
       const decrypted = await decryptMessages(newMsgs)
@@ -150,8 +202,6 @@ export function MessageThread({
         return [...prev, ...unique]
       })
 
-      latestCreatedAt.current = chronological[chronological.length - 1].createdAt
-
       // Mark new messages from others as read (batch)
       const hasUnread = newMsgs.some(msg => msg.senderId !== user?.id)
       if (hasUnread) {
@@ -162,17 +212,34 @@ export function MessageThread({
     } catch {}
   }, [conversationId, user?.id])
 
-  // Initial fetch + set up polling
+  // Initial fetch + set up polling. The thread is keyed on its conversation
+  // by its mount (CA-E4), so this runs once per instance. The poll runs only
+  // while the tab is visible, as `AuthProvider`'s does, and polls once on
+  // becoming visible again.
   useEffect(() => {
-    setMsgs([])
-    setReplyTo(null)
-    latestCreatedAt.current = null
-    initialScrollDone.current = false
     void fetchMessages()
 
-    pollRef.current = setInterval(pollForNew, POLL_INTERVAL)
+    const start = () => {
+      if (pollRef.current) return
+      pollRef.current = setInterval(pollForNew, POLL_INTERVAL)
+    }
+    const stop = () => {
+      if (!pollRef.current) return
+      clearInterval(pollRef.current)
+      pollRef.current = null
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void pollForNew()
+        start()
+      } else stop()
+    }
+
+    if (document.visibilityState === 'visible') start()
+    document.addEventListener('visibilitychange', onVisibility)
     return () => {
-      if (pollRef.current) clearInterval(pollRef.current)
+      document.removeEventListener('visibilitychange', onVisibility)
+      stop()
     }
   }, [conversationId])
 
@@ -199,8 +266,9 @@ export function MessageThread({
 
   async function handleSend(e: React.FormEvent) {
     e.preventDefault()
-    const finalContent = media.buildContent(content)
+    const finalContent = content
     if (!finalContent.trim() || sending) return
+    setSendError(null)
     const replyToId = replyTo?.id
 
     // Optimistic update: add the message to the UI immediately
@@ -229,7 +297,6 @@ export function MessageThread({
 
     setMsgs(prev => [...prev, optimisticMsg])
     setContent('')
-    media.reset()
     setReplyTo(null)
     if (inputRef.current) inputRef.current.style.height = 'auto'
     setSending(true)
@@ -237,20 +304,30 @@ export function MessageThread({
     try {
       const result = await messagesApi.send(conversationId, finalContent, replyToId)
       // Replace optimistic message with real ID
-      if (result.messageIds?.[0]) {
-        setMsgs(prev => prev.map(m =>
-          m.id === optimisticId ? { ...m, id: result.messageIds[0] } : m
-        ))
-        latestCreatedAt.current = new Date().toISOString()
+      // The poll may already have brought the real row in while the send was
+      // in flight; then the optimistic copy just goes.
+      const realId = result.messageIds?.[0]
+      if (realId) {
+        setMsgs(prev => prev.some(m => m.id === realId)
+          ? prev.filter(m => m.id !== optimisticId)
+          : prev.map(m => m.id === optimisticId ? { ...m, id: realId } : m))
       }
       if (result.skippedRecipientIds?.length) {
         console.warn('DM send partial: recipients without pubkeys were skipped', result.skippedRecipientIds)
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       // Remove optimistic message on failure
       setMsgs(prev => prev.filter(m => m.id !== optimisticId))
       setContent(finalContent) // Restore the text so user doesn't lose it
       if (replyToId && replyTo) setReplyTo(replyTo)
+      // The gateway's own sentence when it has one. `dm_links_not_allowed` is
+      // the code from `gateway/src/routes/messages.ts`, pinned by
+      // `web/tests/dm-text-only.test.ts` — a code the server went to the
+      // trouble of splitting is one the client has to read, and a retry on the
+      // same body will fail identically, so "try again" would be false.
+      setSendError(
+        apiErrorMessage(err) ?? MESSAGES_SEND_FAILED,
+      )
     } finally {
       setSending(false)
     }
@@ -288,7 +365,6 @@ export function MessageThread({
   function handleChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
     const val = e.target.value
     setContent(val)
-    media.detectEmbeds(val)
     // Auto-resize: reset then expand to scrollHeight
     e.target.style.height = 'auto'
     e.target.style.height = Math.min(e.target.scrollHeight, 160) + 'px'
@@ -321,14 +397,43 @@ export function MessageThread({
           )}
           <p className="text-ui-sm font-sans font-semibold text-black">{memberName}</p>
         </div>
-        {pledgesEnabled() && memberId && (
-          <button
-            onClick={() => setShowCommission(true)}
-            className="text-[12px] font-mono uppercase tracking-[0.04em] text-grey-600 hover:text-black transition-colors"
-          >
-            Commission
-          </button>
-        )}
+        <div className="flex items-center gap-4">
+          {/* REPORT A DM (L6.3; D1 §9.2 covers "native, DM, and ingested").
+              A DM is the one surface where a stranger can put something in
+              front of a member with nobody else in the room — no feed, no
+              queue, no other reader who might notice — which is exactly why
+              the report control has to be ON it and not somewhere else.
+              It names the CONVERSATION and the other member: the gateway
+              refuses a conversation the reporter is not in, and the snapshot
+              deliberately captures neither party's messages (they are read on
+              review, through the audited key path — D7 §4). */}
+          {/* MUTE AND BLOCK THE OTHER MEMBER (W2) — a 1:1 thread only, since
+              with a group there is no one person the header is about. Mute
+              takes the conversation out of the inbox; block also ends the
+              thread for both of you, and the send box below says so. */}
+          {memberId && (
+            <MuteBlockControls
+              userId={memberId}
+              name={memberName}
+              triggerClassName="text-[12px] font-mono uppercase tracking-[0.04em] text-grey-600 hover:text-black transition-colors"
+              onChange={(r) => setIBlocked(r.blocked)}
+            />
+          )}
+          <ReportButton
+            targetConversationId={conversationId}
+            targetAccountId={memberId}
+            label="Report"
+            triggerClassName="text-[12px] font-mono uppercase tracking-[0.04em] text-grey-600 hover:text-black transition-colors"
+          />
+          {pledgesEnabled() && memberId && (
+            <button
+              onClick={() => setShowCommission(true)}
+              className="text-[12px] font-mono uppercase tracking-[0.04em] text-grey-600 hover:text-black transition-colors"
+            >
+              Commission
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Messages */}
@@ -340,7 +445,7 @@ export function MessageThread({
               disabled={loadingMore}
               className="text-[12px] font-sans text-grey-600 hover:text-black"
             >
-              {loadingMore ? 'Loading\u2026' : 'Load older messages'}
+              {loadingMore ? 'Loading\u2026' : MESSAGES_LOAD_OLDER}
             </button>
           </div>
         )}
@@ -348,7 +453,7 @@ export function MessageThread({
         {loading || decrypting ? (
           <div className="space-y-3">{[1,2,3].map(i => <div key={i} className="h-8 animate-pulse bg-grey-100 rounded" />)}</div>
         ) : msgs.length === 0 ? (
-          <p className="text-center text-ui-xs font-sans text-grey-600 py-8">No messages yet. Start the conversation.</p>
+          <p className="text-center text-ui-xs font-sans text-grey-600 py-8">{MESSAGES_THREAD_EMPTY}</p>
         ) : (
           msgs.map(msg => {
             const isMine = msg.senderId === user?.id
@@ -360,10 +465,10 @@ export function MessageThread({
                     <div className={`flex items-start gap-1.5 mb-1 ${isMine ? 'justify-end' : 'justify-start'}`}>
                       <div className="bg-grey-100/60 px-3 py-1.5 border-l-2 border-grey-300">
                         <p className="text-[11px] font-sans font-semibold text-grey-600">
-                          {msg.replyTo.senderUsername ?? 'Unknown'}
+                          {msg.replyTo.senderUsername ?? MESSAGES_UNKNOWN_SENDER}
                         </p>
                         <p className="text-[12px] font-sans text-grey-600 truncate max-w-[200px]">
-                          {msg.replyToContent ?? <span className="italic">Encrypted message</span>}
+                          {msg.replyToContent ?? <span className="italic">{MESSAGES_ENCRYPTED}</span>}
                         </p>
                       </div>
                     </div>
@@ -376,14 +481,16 @@ export function MessageThread({
                       </p>
                     )}
                     {msg.content ? (
-                      <MediaContent
-                        content={msg.content}
-                        variant="message"
-                        textClassName={`text-ui-sm font-sans leading-relaxed whitespace-pre-wrap ${isMine ? 'text-white' : 'text-black'}`}
-                      />
+                      // PLAIN TEXT, and nothing that could turn it into a
+                      // link. See the header.
+                      <p
+                        className={`text-ui-sm font-sans leading-relaxed whitespace-pre-wrap break-words ${isMine ? 'text-white' : 'text-black'}`}
+                      >
+                        {msg.content}
+                      </p>
                     ) : (
                       <p className="text-ui-sm font-sans leading-relaxed whitespace-pre-wrap italic text-grey-600">
-                        Could not decrypt
+                        {MESSAGES_COULD_NOT_DECRYPT}
                       </p>
                     )}
                     <p className={`text-[10px] font-mono mt-1 ${isMine ? 'text-grey-400' : 'text-grey-600'}`}>
@@ -398,7 +505,7 @@ export function MessageThread({
                       onClick={() => handleReply(msg)}
                       className="text-[11px] font-sans text-grey-600 md:opacity-0 md:group-hover:opacity-100 transition-opacity hover:text-black"
                     >
-                      Reply
+                      {MESSAGES_REPLY}
                     </button>
 
                     {/* Like — always visible when liked; hover-reveal when not */}
@@ -406,7 +513,7 @@ export function MessageThread({
                       <button
                         onClick={() => handleToggleLike(msg.id)}
                         className="flex items-center gap-1 text-[12px] text-crimson hover:opacity-70 transition-opacity"
-                        aria-label={msg.likedByMe ? 'Unlike' : 'Like'}
+                        aria-label={msg.likedByMe ? MESSAGES_UNLIKE : MESSAGES_LIKE}
                       >
                         <span>{'\u2665'}</span>
                         <span className="text-[11px] font-mono">{msg.likeCount}</span>
@@ -415,7 +522,7 @@ export function MessageThread({
                       <button
                         onClick={() => handleToggleLike(msg.id)}
                         className="text-[12px] text-grey-600 md:opacity-0 md:group-hover:opacity-100 transition-opacity hover:text-black"
-                        aria-label="Like"
+                        aria-label={MESSAGES_LIKE}
                       >
                         {'\u2661'}
                       </button>
@@ -434,10 +541,10 @@ export function MessageThread({
         <div className="flex items-center gap-2 px-4 py-2 bg-grey-100/80">
           <div className="flex-1 min-w-0 border-l-2 border-crimson pl-2">
             <p className="text-[11px] font-sans font-semibold text-grey-600">
-              Replying to {replyTo.senderDisplayName ?? replyTo.senderUsername}
+              {messagesReplyingTo(replyTo.senderDisplayName ?? replyTo.senderUsername)}
             </p>
             <p className="text-[12px] font-sans text-grey-600 truncate">
-              {replyTo.content ?? 'Encrypted message'}
+              {replyTo.content ?? MESSAGES_ENCRYPTED}
             </p>
           </div>
           <button
@@ -450,26 +557,33 @@ export function MessageThread({
         </div>
       )}
 
-      {/* Media preview strip */}
-      {(media.attachments.length > 0 || media.uploading) && (
-        <div className="px-4 pt-2">
-          <MediaPreview
-            attachments={media.attachments}
-            onRemove={media.removeAttachment}
-            uploading={media.uploading}
-          />
-        </div>
-      )}
-
-      {/* Media error */}
-      {media.error && (
+      {/* A refused send says so, in the server's own words.
+          The optimistic message disappearing and the text reappearing in the
+          box is a signal, but a mute one — and the sender's reasonable reading
+          of it is that the network hiccuped, so they press Send again on the
+          same body and it fails again. This band is the one the media-error
+          strip used to occupy: one error place on this surface, not two. */}
+      {sendError && (
         <div className="px-4 py-1.5 bg-grey-100 text-crimson text-[12px] font-sans flex items-center justify-between">
-          <span>{media.error}</span>
-          <button onClick={media.clearError} className="ml-2 text-grey-600 hover:text-crimson">×</button>
+          <span>{sendError}</span>
+          <button
+            onClick={() => setSendError(null)}
+            aria-label="Dismiss"
+            className="ml-2 text-grey-600 hover:text-crimson"
+          >
+            ×
+          </button>
         </div>
       )}
 
-      {/* Send box */}
+      {/* Send box — or, once the viewer has blocked the other member, the
+          sentence that replaces it: a box whose every send would be refused
+          is a button that cannot do its job. */}
+      {iBlocked ? (
+        <p className={`py-4 flex-shrink-0 pl-4 text-ui-xs font-sans text-grey-600 ${headerRightInset ? 'pr-7' : 'pr-4'}`}>
+          {messagesBlockedSentence(memberName)}
+        </p>
+      ) : (
       <form onSubmit={handleSend} className={`flex items-end gap-2 py-3 flex-shrink-0 pl-4 ${headerRightInset ? 'pr-7' : 'pr-4'}`}>
         <textarea
           ref={inputRef}
@@ -481,32 +595,20 @@ export function MessageThread({
               void handleSend(e)
             }
           }}
-          placeholder={replyTo ? 'Write a reply\u2026' : 'Write a message\u2026'}
+          placeholder={replyTo ? MESSAGES_REPLY_PLACEHOLDER : MESSAGES_MESSAGE_PLACEHOLDER}
           rows={1}
           className="flex-1 bg-glasshouse-well px-3 py-2 text-ui-sm font-sans text-black placeholder-grey-300 resize-none overflow-y-auto"
           style={{ maxHeight: '160px' }}
         />
         <button
-          type="button"
-          onClick={media.triggerImageUpload}
-          disabled={media.uploading}
-          className="text-grey-600 hover:text-black disabled:opacity-40 transition-colors p-1.5"
-          title="Add image"
-        >
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-            <rect x="1.5" y="1.5" width="13" height="13" rx="2" />
-            <circle cx="5.5" cy="5.5" r="1" />
-            <path d="M14.5 10.5L11 7L3.5 14.5" />
-          </svg>
-        </button>
-        <button
           type="submit"
-          disabled={sending || (!content.trim() && media.attachments.length === 0)}
+          disabled={sending || !content.trim()}
           className="btn text-sm disabled:opacity-50"
         >
-          {sending ? '\u2026' : 'Send'}
+          {sending ? '\u2026' : MESSAGES_SEND}
         </button>
       </form>
+      )}
     </div>
   )
 }

@@ -16,9 +16,10 @@ describe('isEmbeddableUrl', () => {
     expect(isEmbeddableUrl('https://www.vimeo.com/123456789')).toBe(true)
   })
 
-  it('matches Twitter/X status URLs', () => {
-    expect(isEmbeddableUrl('https://twitter.com/user/status/123')).toBe(true)
-    expect(isEmbeddableUrl('https://x.com/user/status/123')).toBe(true)
+  it('does NOT match Twitter/X status URLs', () => {
+    // Dropped (walkthrough A4): no tweet renders without Twitter's own script.
+    expect(isEmbeddableUrl('https://twitter.com/user/status/123')).toBe(false)
+    expect(isEmbeddableUrl('https://x.com/user/status/123')).toBe(false)
   })
 
   it('matches Spotify URLs', () => {

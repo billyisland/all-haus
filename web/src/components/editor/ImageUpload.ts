@@ -96,7 +96,9 @@ async function handleFileUpload(
       view.dispatch(transaction)
     }
   } catch (err) {
-    options.onUploadError?.(err instanceof Error ? err : new Error('Upload failed'))
+    // Passed through AS IT CAME, so the editor can word an ApiError with
+    // `failureSentence` rather than show its raw message.
+    options.onUploadError?.(err instanceof Error ? err : new Error('Couldn’t upload that image. Please try again.'))
   } finally {
     options.onUploadEnd?.()
   }

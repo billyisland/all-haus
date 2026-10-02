@@ -3,6 +3,18 @@
 import { useEffect, useRef, useState } from "react";
 import { apiErrorMessage } from "../../lib/api/client";
 import { formulas as formulasApi } from "../../lib/api/formulas";
+import {
+  FEED_CANCEL,
+  FEED_MERGE,
+  FEED_MERGE_ARIA,
+  FEED_MERGE_BEFORE,
+  FEED_MERGE_COMBINED,
+  FEED_MERGE_DELETED,
+  FEED_MERGE_FAILED,
+  FEED_MERGE_INTO,
+  FEED_MERGING,
+  FEED_SHARE_LINK_WILL_STOP,
+} from "../../content/feed-settings";
 
 // Every colour here is in the INVERTING family (`ink`/`white`/`bone`/greys),
 // with the scrim the one deliberate exception: a scrim must DARKEN in both
@@ -11,7 +23,8 @@ import { formulas as formulasApi } from "../../lib/api/formulas";
 // resolves through the `html.dark` inversion — and a never-inverting
 // foreground on top of one (`ink-925` on `white` = 26 26 24 on 30 29 26, a
 // contrast ratio of 1.03:1) is invisible. Foreground and ground must be in the
-// SAME inversion family; see web/CLAUDE.md › Global light/dark mode.
+// SAME inversion family; see `.claude/rules/web-theme.md` › Global light/dark
+// mode.
 const TOKENS = {
   scrim: "rgb(var(--ah-ink-925-rgb) / 0.4)",
   panelBg: "var(--ah-white)",
@@ -92,7 +105,7 @@ export function MergeFeedConfirm({
     } catch (err) {
       // Prefer the server's own copy (the starter-template refusal explains what
       // to do); ApiError.message is the raw "API error 409: {...}" dump.
-      setError(apiErrorMessage(err) ?? "Merge failed.");
+      setError(apiErrorMessage(err) ?? FEED_MERGE_FAILED);
       setMerging(false);
     }
   }
@@ -107,7 +120,7 @@ export function MergeFeedConfirm({
       onMouseDown={onScrimClick}
       role="dialog"
       aria-modal="true"
-      aria-label="Merge feeds"
+      aria-label={FEED_MERGE_ARIA}
       style={{
         position: "fixed",
         inset: 0,
@@ -134,11 +147,14 @@ export function MergeFeedConfirm({
           className="font-sans text-ui-sm leading-[1.5]"
           style={{ color: TOKENS.panelFg, marginBottom: 16 }}
         >
-          Merge <strong>{sourceName}</strong> into <strong>{targetName}</strong>
-          ? Sources will be combined. <strong>{sourceName}</strong> will be
-          deleted.
-          {hasShareLink &&
-            " This feed has a live share link; it will stop working."}
+          {FEED_MERGE_BEFORE}
+          <strong>{sourceName}</strong>
+          {FEED_MERGE_INTO}
+          <strong>{targetName}</strong>
+          {FEED_MERGE_COMBINED}
+          <strong>{sourceName}</strong>
+          {FEED_MERGE_DELETED}
+          {hasShareLink && FEED_SHARE_LINK_WILL_STOP}
         </p>
 
         {/* Own line, not inline beside the buttons: a server refusal is a full
@@ -175,7 +191,7 @@ export function MergeFeedConfirm({
                 cursor: merging ? "default" : "pointer",
               }}
             >
-              Cancel
+              {FEED_CANCEL}
             </button>
             <button
               type="button"
@@ -190,7 +206,7 @@ export function MergeFeedConfirm({
                 cursor: merging ? "default" : "pointer",
               }}
             >
-              {merging ? "Merging…" : "Merge"}
+              {merging ? FEED_MERGING : FEED_MERGE}
             </button>
           </div>
         </div>

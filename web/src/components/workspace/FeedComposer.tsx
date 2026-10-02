@@ -9,9 +9,10 @@ import {
   type FollowImportProtocol,
   type FeedImportBinding,
 } from "../../lib/api";
-import { apiErrorMessage } from "../../lib/api/client";
+import { apiErrorMessage, failureSentence } from "../../lib/api/client";
 import { useEscapeShield } from "../../hooks/useEscapeShield";
 import { useResolverInput } from "../../hooks/useResolverInput";
+import { reportFollowState } from "../../hooks/useFeedFollow";
 import type { MatchOption } from "../../lib/workspace/resolve";
 import { getNetworkCapabilities } from "../../lib/api/linked-accounts";
 import { useFollowImportRun } from "../../hooks/useFollowImportRun";
@@ -19,6 +20,54 @@ import { FollowImportStatus } from "../network/FollowImportStatus";
 import { FeedSyncSection } from "./FeedSyncSection";
 import { FeedFormulaSection } from "./FeedFormulaSection";
 import { formulasAvailable } from "../../lib/api/formulas";
+import {
+  FEED_ADD_NAME,
+  FEED_ADD_SOURCE_LABEL,
+  FEED_CANCEL,
+  FEED_COMPOSER_TITLE,
+  FEED_DELETE,
+  FEED_DELETE_BLOCKED,
+  FEED_DELETE_CONFIRM,
+  FEED_DELETE_FEED,
+  FEED_DELETING,
+  FEED_ERROR_ADD_SOURCE,
+  FEED_ERROR_DELETE,
+  FEED_ERROR_LOAD_SOURCES,
+  FEED_ERROR_MOVE_SOURCE,
+  FEED_ERROR_REMOVE_SOURCE,
+  FEED_ERROR_RENAME,
+  FEED_HIDE,
+  FEED_IMPORT_FOLLOWS,
+  FEED_MERGE_INTO_PICK,
+  FEED_NAME_PLACEHOLDER,
+  FEED_NAME_SAVE,
+  FEED_NAME_SAVING,
+  FEED_NO_NAME,
+  FEED_RENAME,
+  FEED_RESOLVER_MATCHES,
+  FEED_RESOLVER_NO_MATCH,
+  FEED_RESOLVER_PLACEHOLDER,
+  FEED_RESOLVER_SUGGESTIONS,
+  FEED_SHARE_LINK_WILL_STOP,
+  FEED_SOURCES_EMPTY,
+  FEED_SOURCES_LABEL,
+  FEED_SOURCE_MOVE,
+  FEED_SOURCE_MOVE_TO,
+  FEED_SOURCE_MUTE,
+  FEED_SOURCE_NO_REPLIES,
+  FEED_SOURCE_NO_REPLIES_TITLE,
+  FEED_SOURCE_NO_SIGNAL_TITLE,
+  FEED_SOURCE_SAMPLING_LABEL,
+  FEED_SOURCE_SAMPLING_RECENT,
+  FEED_UNHIDE,
+  FEED_UNNAMED,
+  feedNameTooLong,
+  feedSourceMoveTo,
+  feedSourceRemove,
+  feedSourceVolume,
+} from "../../content/feed-settings";
+import { AnchoredPopover } from "../ui/AnchoredPopover";
+import { Pointer } from "../ui/Pointer";
 import { Glasshouse } from "./Glasshouse";
 import { AuthorModal, useAuthorHover } from "../feed/AuthorModal";
 import { openProfileHref, isModifiedClick } from "../ui/ProfileLink";
@@ -28,32 +77,20 @@ import { useColorScheme } from "../../stores/colorScheme";
 import {
   type FeedScheme,
   type Density,
-  type Orientation,
   type TextSize,
   nextDensity,
-  nextOrientation,
   nextTextSize,
   normalizeBrightness,
   normalizeDensity,
   paletteFor,
   SCHEME_OPTIONS,
-  DEFAULT_ORIENTATION,
   DEFAULT_TEXT_SIZE,
 } from "./tokens";
-
-const VOLUME_WEIGHTS = [1.0, 0.25, 0.5, 1.0, 2.0, 4.0];
-function weightToStep(weight: number): number {
-  let best = 3;
-  let bestDelta = Infinity;
-  for (let s = 1; s <= 5; s++) {
-    const d = Math.abs(VOLUME_WEIGHTS[s] - weight);
-    if (d < bestDelta) {
-      bestDelta = d;
-      best = s;
-    }
-  }
-  return best;
-}
+import {
+  VOLUME_THROUGHPUT,
+  throughputToStep,
+  stepPercent,
+} from "../../lib/volume-scale";
 
 // The composer is an always-light Glasshouse surface (warm mid-light pane, dark
 // text), so these are fixed tokens, not a brightness palette. Separation is fill
@@ -65,8 +102,8 @@ function weightToStep(weight: number): number {
 // it, so its ground resolves through the `html.dark` inversion — and a
 // never-inverting foreground on top of one (`ink-925` on `white` = 26 26 24 on
 // 30 29 26, a contrast ratio of 1.03:1) is invisible. Foreground and ground
-// must be in the SAME inversion family; see web/CLAUDE.md › Global light/dark
-// mode.
+// must be in the SAME inversion family; see `.claude/rules/web-theme.md` ›
+// Global light/dark mode.
 const TOKENS = {
   panelBorder: "var(--ah-ink)",
   rowBg: "var(--ah-bone)",
@@ -97,11 +134,9 @@ interface FeedComposerProps {
   // (and, for scheme, the server-side feeds.appearance — feature-debt §3).
   scheme?: FeedScheme;
   density?: Density;
-  orientation?: Orientation;
   textSize?: TextSize;
   onSchemeChange?: (s: FeedScheme) => void;
   onDensityChange?: (d: Density) => void;
-  onOrientationChange?: (o: Orientation) => void;
   onTextSizeChange?: (t: TextSize) => void;
   // Drag-to-rank (MOBILE-LAYOUT-ADR §VII.4): the caller's complete feed set
   // and a commit callback. The rank order is the numeral and the mobile swipe
@@ -113,6 +148,13 @@ interface FeedComposerProps {
   // on desktop it complements the vessel bar's hide button.
   hidden?: boolean;
   onHiddenChange?: (hidden: boolean) => void;
+  // Merge, rehomed from the floor's vessel-on-vessel drop
+  // (WORKSPACE-QUEUE-ADR §XI.2 R1). The panel only CHOOSES the target; the
+  // caller asks the question (MergeFeedConfirm) and owns the write.
+  onMergeInto?: (target: WorkspaceFeed) => void;
+  // A source moved out of this feed by its row's picker (§XI.2 R2), for the
+  // caller to reload both feeds. The move itself is written here.
+  onSourceMoved?: (fromFeedId: string, toFeedId: string) => void;
 }
 
 const NAME_LIMIT = 80;
@@ -127,16 +169,16 @@ export function FeedComposer({
   deleteBlocked,
   scheme,
   density,
-  orientation,
   textSize,
   onSchemeChange,
   onDensityChange,
-  onOrientationChange,
   onTextSizeChange,
   allFeeds,
   onReorder,
   hidden,
   onHiddenChange,
+  onMergeInto,
+  onSourceMoved,
 }: FeedComposerProps) {
   const [sources, setSources] = useState<WorkspaceFeedSource[]>([]);
   const [loading, setLoading] = useState(false);
@@ -186,7 +228,7 @@ export function FeedComposer({
       setSources(data.sources);
       setImportBinding(data.importBinding ?? null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load sources.");
+      setError(failureSentence(err, FEED_ERROR_LOAD_SOURCES));
     } finally {
       setLoading(false);
     }
@@ -223,12 +265,21 @@ export function FeedComposer({
     setBusyKey(opt.key);
     setError(null);
     try {
-      await workspaceFeedsApi.addSource(feed.id, opt.add);
+      const res = await workspaceFeedsApi.addSource(feed.id, opt.add);
+      // TYPING A MEMBER'S NAME HERE IS THE SAME ACT AS PRESSING FOLLOW, so it
+      // tells the shared graph store the same thing (§0ab item 6). The server
+      // has written the `follows` row since the convergence; this path simply
+      // discarded the answer, so a member added from the composer read as not
+      // followed everywhere else on the floor until a reload.
+      reportFollowState(
+        opt.add.sourceType === "account" ? opt.add.accountId : null,
+        res.following,
+      );
       ri.reset();
       await refreshSources(feed.id);
       onSourcesChanged?.();
     } catch (err) {
-      setError(apiErrorMessage(err) ?? "Failed to add source.");
+      setError(apiErrorMessage(err) ?? FEED_ERROR_ADD_SOURCE);
     } finally {
       setBusyKey(null);
     }
@@ -319,7 +370,7 @@ export function FeedComposer({
           }
           onMouseLeave={(e) => (e.currentTarget.style.color = TOKENS.hintFg)}
         >
-          ↳ or import everyone they follow as a new feed
+          {FEED_IMPORT_FOLLOWS}
         </button>
       )}
     </div>
@@ -343,7 +394,7 @@ export function FeedComposer({
     if (!feed || savingName) return;
     const trimmed = nameDraft.trim();
     if (trimmed.length > NAME_LIMIT) {
-      setError(`Name must be ${NAME_LIMIT} characters or fewer.`);
+      setError(feedNameTooLong(NAME_LIMIT));
       return;
     }
     if (trimmed === feed.name) {
@@ -360,7 +411,7 @@ export function FeedComposer({
       onRenamed?.(updated);
       setEditingName(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to rename feed.");
+      setError(failureSentence(err, FEED_ERROR_RENAME));
     } finally {
       setSavingName(false);
     }
@@ -377,7 +428,7 @@ export function FeedComposer({
       // Server copy when there is any — the starter-template refusal explains
       // what to do about it, and ApiError.message is the raw "API error 409:
       // {…}" dump, which explains nothing.
-      setError(apiErrorMessage(err) ?? "Failed to delete feed.");
+      setError(apiErrorMessage(err) ?? FEED_ERROR_DELETE);
       setDeleting(false);
       setConfirmingDelete(false);
     }
@@ -387,12 +438,34 @@ export function FeedComposer({
     if (!feed) return;
     setBusyKey(`remove:${sourceId}`);
     setError(null);
+    // Read BEFORE the removal: the row is gone from `sources` by the time the
+    // response lands, and the account id is what the store is keyed on.
+    const removedAccountId =
+      sources.find((s) => s.id === sourceId)?.accountId ?? null;
     try {
-      await workspaceFeedsApi.removeSource(feed.id, sourceId);
+      const res = await workspaceFeedsApi.removeSource(feed.id, sourceId);
+      reportFollowState(removedAccountId, res.following);
       await refreshSources(feed.id);
       onSourcesChanged?.();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to remove source.");
+      setError(failureSentence(err, FEED_ERROR_REMOVE_SOURCE));
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  async function handleMove(sourceId: string, targetFeedId: string) {
+    if (!feed) return;
+    setBusyKey(`move:${sourceId}`);
+    setError(null);
+    try {
+      await workspaceFeedsApi.moveSource(feed.id, sourceId, targetFeedId);
+      setSources((prev) => prev.filter((s) => s.id !== sourceId));
+      onSourceMoved?.(feed.id, targetFeedId);
+    } catch (err) {
+      // The route's own sentence where it has one ("Target feed already has
+      // this source", the 409 a duplicate earns).
+      setError(failureSentence(err, FEED_ERROR_MOVE_SOURCE));
     } finally {
       setBusyKey(null);
     }
@@ -400,11 +473,18 @@ export function FeedComposer({
 
   if (!open || !feed) return null;
 
-  const showAppearance =
-    onSchemeChange ||
-    onDensityChange ||
-    onOrientationChange ||
-    onTextSizeChange;
+  const showAppearance = onSchemeChange || onDensityChange || onTextSizeChange;
+
+  // Every OTHER feed, in the member's order, hidden ones included and marked:
+  // a hidden feed is a real feed, so it can take a source or a merge.
+  const otherFeeds = [...(allFeeds ?? [])]
+    .filter((f) => f.id !== feed.id)
+    .sort(
+      (a, b) =>
+        a.sortRank - b.sortRank ||
+        a.createdAt.localeCompare(b.createdAt) ||
+        a.id.localeCompare(b.id),
+    );
 
   return (
     <Glasshouse
@@ -413,7 +493,7 @@ export function FeedComposer({
       // An untitled feed is an ordinary feed (migration 190), so the label
       // cannot end in the name — it would announce "Feed composer:" and stop.
       // The visible title already says "No name"; this is its spoken twin.
-      ariaLabel={`Feed composer: ${feed.name.trim() || "unnamed feed"}`}
+      ariaLabel={`Channel composer: ${feed.name.trim() || "unnamed channel"}`}
       persistKey="feed-composer"
     >
       {/* Right padding clears the Glasshouse ✕ at top-right. data-explain is
@@ -426,7 +506,7 @@ export function FeedComposer({
       >
         <div style={{ marginBottom: 16, paddingRight: 28 }}>
           <div className="label-ui" style={{ color: TOKENS.hintFg }}>
-            Feed composer
+            {FEED_COMPOSER_TITLE}
           </div>
           {editingName ? (
             <div
@@ -452,7 +532,7 @@ export function FeedComposer({
                     cancelRename();
                   }
                 }}
-                placeholder="Optional descriptive name"
+                placeholder={FEED_NAME_PLACEHOLDER}
                 className="font-sans text-[18px]"
                 style={{
                   flex: 1,
@@ -476,7 +556,7 @@ export function FeedComposer({
                   cursor: savingName ? "default" : "pointer",
                 }}
               >
-                {savingName ? "Saving…" : "Save"}
+                {savingName ? FEED_NAME_SAVING : FEED_NAME_SAVE}
               </button>
               <button
                 type="button"
@@ -491,7 +571,7 @@ export function FeedComposer({
                   cursor: savingName ? "default" : "pointer",
                 }}
               >
-                Cancel
+                {FEED_CANCEL}
               </button>
             </div>
           ) : (
@@ -523,7 +603,7 @@ export function FeedComposer({
                     fontStyle: "italic",
                   }}
                 >
-                  No name
+                  {FEED_NO_NAME}
                 </div>
               )}
               <button
@@ -538,7 +618,7 @@ export function FeedComposer({
                   cursor: "pointer",
                 }}
               >
-                {feed.name ? "Rename" : "Add name"}
+                {feed.name ? FEED_RENAME : FEED_ADD_NAME}
               </button>
             </div>
           )}
@@ -548,7 +628,7 @@ export function FeedComposer({
           className="label-ui"
           style={{ color: TOKENS.hintFg, marginBottom: 6 }}
         >
-          Sources
+          {FEED_SOURCES_LABEL}
         </div>
         <div
           style={{
@@ -573,8 +653,7 @@ export function FeedComposer({
               className="font-mono text-mono-xs"
               style={{ color: TOKENS.hintFg }}
             >
-              No sources yet — this feed shows the explore stream until you add
-              one.
+              {FEED_SOURCES_EMPTY}
             </div>
           )}
           {sources.map((s) => (
@@ -582,8 +661,12 @@ export function FeedComposer({
               key={s.id}
               source={s}
               feedId={feed.id}
-              busy={busyKey === `remove:${s.id}`}
+              busy={
+                busyKey === `remove:${s.id}` || busyKey === `move:${s.id}`
+              }
               onRemove={() => void handleRemove(s.id)}
+              moveTargets={onSourceMoved ? otherFeeds : []}
+              onMove={(target) => void handleMove(s.id, target.id)}
               onChanged={(updated) => {
                 setSources((prev) =>
                   prev.map((p) => (p.id === updated.id ? updated : p)),
@@ -598,7 +681,7 @@ export function FeedComposer({
           className="label-ui"
           style={{ color: TOKENS.hintFg, marginBottom: 6 }}
         >
-          Add a source
+          {FEED_ADD_SOURCE_LABEL}
         </div>
         <input
           ref={inputRef}
@@ -611,7 +694,7 @@ export function FeedComposer({
               ri.submit();
             }
           }}
-          placeholder="Username, URL, npub, DID, #tag…"
+          placeholder={FEED_RESOLVER_PLACEHOLDER}
           data-explain="feedComposer.addSource"
           className="font-sans text-ui-sm w-full"
           style={{
@@ -629,7 +712,7 @@ export function FeedComposer({
               className="font-mono text-mono-xs"
               style={{ color: TOKENS.hintFg }}
             >
-              RESOLVING…
+              LOOKING IT UP…
             </div>
           )}
           {(ri.doneEmpty || ri.resolveError) && (
@@ -637,8 +720,7 @@ export function FeedComposer({
               className="font-mono text-mono-xs"
               style={{ color: TOKENS.hintFg }}
             >
-              No match. Press Enter to search, or try a full URL, an @username,
-              an npub, or a #tag.
+              {FEED_RESOLVER_NO_MATCH}
             </div>
           )}
           {ri.matches.length > 0 && (
@@ -653,7 +735,7 @@ export function FeedComposer({
                     className="label-ui"
                     style={{ color: TOKENS.hintFg, padding: "2px 10px 0" }}
                   >
-                    Matches
+                    {FEED_RESOLVER_MATCHES}
                   </div>
                 )}
               {ri.sections.matches.map(renderMatchOption)}
@@ -668,7 +750,7 @@ export function FeedComposer({
                         : "2px 10px 0",
                   }}
                 >
-                  Suggestions
+                  {FEED_RESOLVER_SUGGESTIONS}
                 </div>
               )}
               {ri.sections.suggestions.map(renderMatchOption)}
@@ -752,22 +834,6 @@ export function FeedComposer({
                   }
                 />
               )}
-              {onOrientationChange && (
-                <AppearanceControl
-                  label="Orientation"
-                  dataExplain="feedComposer.orientation"
-                  glyph={
-                    <OrientationGlyph
-                      orientation={orientation ?? DEFAULT_ORIENTATION}
-                    />
-                  }
-                  onClick={() =>
-                    onOrientationChange(
-                      nextOrientation(orientation ?? DEFAULT_ORIENTATION),
-                    )
-                  }
-                />
-              )}
               {onTextSizeChange && (
                 <AppearanceControl
                   label="Text size"
@@ -813,7 +879,7 @@ export function FeedComposer({
                 marginBottom: 6,
               }}
             >
-              Feed order
+              Channel order
             </div>
             <FeedRankList
               feeds={allFeeds}
@@ -854,15 +920,31 @@ export function FeedComposer({
                 (e.currentTarget.style.color = TOKENS.hintFg)
               }
             >
-              {hidden ? "Unhide feed" : "Hide feed"}
+              {hidden ? FEED_UNHIDE : FEED_HIDE}
             </button>
           )}
+          {/* Merge deletes THIS feed, so it is offered exactly where Delete
+              is: never for the last visible feed, and not while the delete
+              question is open. */}
+          {onMergeInto &&
+            !deleteBlocked &&
+            !confirmingDelete &&
+            otherFeeds.length > 0 && (
+              <FeedPicker
+                label={FEED_MERGE_INTO_PICK}
+                ariaLabel={FEED_MERGE_INTO_PICK}
+                feeds={otherFeeds}
+                onPick={onMergeInto}
+                dataExplain="feedComposer.merge"
+                trigger="label"
+              />
+            )}
           {deleteBlocked ? (
             <div
               className="font-mono text-mono-xs"
               style={{ color: TOKENS.hintFg }}
             >
-              Can&rsquo;t delete your only feed — create another first.
+              {FEED_DELETE_BLOCKED}
             </div>
           ) : confirmingDelete ? (
             <>
@@ -870,9 +952,8 @@ export function FeedComposer({
                 className="font-mono text-mono-xs"
                 style={{ color: TOKENS.hintFg, marginRight: "auto" }}
               >
-                Delete this feed? Sources are removed; subscriptions are kept.
-                {hasShareLink &&
-                  " This feed has a live share link; it will stop working."}
+                {FEED_DELETE_CONFIRM}
+                {hasShareLink && FEED_SHARE_LINK_WILL_STOP}
               </div>
               <button
                 type="button"
@@ -887,7 +968,7 @@ export function FeedComposer({
                   cursor: deleting ? "default" : "pointer",
                 }}
               >
-                Cancel
+                {FEED_CANCEL}
               </button>
               <button
                 type="button"
@@ -902,7 +983,7 @@ export function FeedComposer({
                   cursor: deleting ? "default" : "pointer",
                 }}
               >
-                {deleting ? "Deleting…" : "Delete"}
+                {deleting ? FEED_DELETING : FEED_DELETE}
               </button>
             </>
           ) : (
@@ -925,43 +1006,12 @@ export function FeedComposer({
                 (e.currentTarget.style.color = TOKENS.removeFg)
               }
             >
-              Delete feed
+              {FEED_DELETE_FEED}
             </button>
           )}
         </div>
       </div>
     </Glasshouse>
-  );
-}
-
-// The orientation glyph depicts the feed container itself as an open ⊔ vessel,
-// open on the side where new items arrive: a tall portrait U open at the top for
-// vertical, the same U on its side open to the LEFT for horizontal (newest items
-// arrive at the left of the newest-first row). A 2px stroke keeps it clear of the
-// sitewide thin-rule ban.
-function OrientationGlyph({ orientation }: { orientation: Orientation }) {
-  const portrait = orientation === "vertical";
-  // Portrait: tall U open at top (left wall, floor, right wall).
-  // Horizontal: wide U on its side open to the LEFT (top wall, right wall, floor).
-  const path = portrait
-    ? "M4.5 1.5 L4.5 14.5 L11.5 14.5 L11.5 1.5"
-    : "M1.5 4.5 L14.5 4.5 L14.5 11.5 L1.5 11.5";
-  return (
-    <svg
-      width={16}
-      height={16}
-      viewBox="0 0 16 16"
-      fill="none"
-      aria-hidden="true"
-    >
-      <path
-        d={path}
-        stroke="currentColor"
-        strokeWidth={2}
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
   );
 }
 
@@ -1328,7 +1378,7 @@ function FeedRankList({
                 flex: 1,
               }}
             >
-              {name || "Unnamed feed"}
+              {name || FEED_UNNAMED}
             </span>
             {f.hidden && (
               <span className="label-ui" style={{ color: TOKENS.hintFg }}>
@@ -1337,7 +1387,7 @@ function FeedRankList({
             )}
             <button
               type="button"
-              aria-label={`Reorder ${name || "unnamed feed"} (drag, or arrow keys)`}
+              aria-label={`Reorder ${name || "unnamed channel"} (drag, or arrow keys)`}
               onPointerDown={(e) => handlePointerDown(e, f.id)}
               onPointerMove={handlePointerMove}
               onPointerUp={handlePointerEnd}
@@ -1436,6 +1486,8 @@ function SourceRow({
   feedId,
   busy,
   onRemove,
+  moveTargets,
+  onMove,
   onChanged,
   onCommitted,
 }: {
@@ -1443,6 +1495,10 @@ function SourceRow({
   feedId: string;
   busy: boolean;
   onRemove: () => void;
+  // The feeds this source may move to (§XI.2 R2) — every other feed the
+  // member has. Empty means no picker: with one feed there is nowhere to go.
+  moveTargets: WorkspaceFeed[];
+  onMove: (target: WorkspaceFeed) => void;
   // Optimistic local update of the composer's source list (no feed reload).
   onChanged: (updated: WorkspaceFeedSource) => void;
   // Fired once after a change is committed server-side, so the parent can
@@ -1451,7 +1507,9 @@ function SourceRow({
 }) {
   const [committing, setCommitting] = useState(false);
   const isMuted = source.mutedAt !== null;
-  const currentStep = isMuted ? 0 : weightToStep(source.weight);
+  const currentStep = isMuted ? 0 : throughputToStep(source.throughput);
+  // Nothing to sample when everything is already coming through.
+  const samplingMoot = isMuted || currentStep === 5;
   const sampling = source.samplingMode;
   const excludeReplies = source.excludeReplies;
 
@@ -1498,7 +1556,8 @@ function SourceRow({
       {
         ...source,
         mutedAt: nextStep === 0 ? new Date().toISOString() : null,
-        weight: nextStep === 0 ? source.weight : VOLUME_WEIGHTS[nextStep],
+        throughput:
+          nextStep === 0 ? source.throughput : VOLUME_THROUGHPUT[nextStep],
       },
       { step: nextStep, muted: nextStep === 0 },
     );
@@ -1591,7 +1650,7 @@ function SourceRow({
           type="button"
           onClick={onRemove}
           disabled={busy}
-          aria-label={`Remove ${label}`}
+          aria-label={feedSourceRemove(label)}
           style={{
             background: "transparent",
             border: "none",
@@ -1621,7 +1680,8 @@ function SourceRow({
         }}
         data-explain="feedComposer.volume"
       >
-        {/* Volume: 0=mute, 1..5 = quieter→louder. Step 3 = default weight. */}
+        {/* Volume: 0=mute, 1..5 = the fraction of this source's posts that
+            reach this feed. Step 5 (everything) is the default. */}
         <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
           {[0, 1, 2, 3, 4, 5].map((s) => {
             const active = !isMuted && s > 0 && s <= currentStep;
@@ -1632,7 +1692,7 @@ function SourceRow({
                 type="button"
                 onClick={() => commitStep(s)}
                 disabled={committing}
-                aria-label={s === 0 ? "Mute" : `Volume ${s}`}
+                aria-label={s === 0 ? FEED_SOURCE_MUTE : feedSourceVolume(stepPercent(s))}
                 style={{
                   width: s === 0 ? 20 : 16,
                   height: 16,
@@ -1655,8 +1715,10 @@ function SourceRow({
           })}
         </div>
 
-        {/* Sampling + no-replies are moot while muted — dimmed but kept in place
-            so unmuting doesn't jump the layout. */}
+        {/* Sampling + no-replies are moot while muted — dimmed but kept in
+            place so unmuting doesn't jump the layout. Sampling is equally moot
+            at full volume: there is no fraction to choose between when every
+            post is coming through. */}
         <div
           style={{
             display: "flex",
@@ -1665,28 +1727,58 @@ function SourceRow({
             opacity: isMuted ? 0.4 : 1,
           }}
         >
-          <div style={{ display: "flex", gap: 3 }}>
+          <div
+            style={{ display: "flex", gap: 3, opacity: samplingMoot ? 0.4 : 1 }}
+          >
             {(["random", "top"] as const).map((mode) => {
               const on = sampling === mode;
               return (
                 <Chip
                   key={mode}
-                  label={mode}
+                  label={
+                    mode === "top" && !source.hasEngagementSignal
+                      ? FEED_SOURCE_SAMPLING_RECENT
+                      : FEED_SOURCE_SAMPLING_LABEL[mode]
+                  }
                   active={on}
-                  disabled={committing || isMuted}
+                  disabled={committing || isMuted || samplingMoot}
                   onClick={() => commitSampling(mode)}
+                  title={
+                    mode === "top" && !source.hasEngagementSignal
+                      ? FEED_SOURCE_NO_SIGNAL_TITLE
+                      : undefined
+                  }
                 />
               );
             })}
           </div>
           <Chip
-            label="no replies"
+            label={FEED_SOURCE_NO_REPLIES}
             active={excludeReplies}
             disabled={committing || isMuted}
             onClick={() => commitExcludeReplies(!excludeReplies)}
-            title="Only freestanding posts — hide replies from this source"
+            title={FEED_SOURCE_NO_REPLIES_TITLE}
           />
         </div>
+
+        {/* Beside the volume and never on the byline: feed management stays
+            out of reading surfaces (WORKSPACE-QUEUE-ADR §XI.2 R2). Full
+            strength even while muted — moving a muted source is still a move,
+            and it arrives muted. */}
+        {moveTargets.length > 0 && (
+          <div style={{ marginLeft: "auto" }}>
+            <FeedPicker
+              label={FEED_SOURCE_MOVE}
+              ariaLabel={feedSourceMoveTo(label)}
+              heading={FEED_SOURCE_MOVE_TO}
+              feeds={moveTargets}
+              onPick={onMove}
+              disabled={busy || committing}
+              dataExplain="feedComposer.move"
+              trigger="chip"
+            />
+          </div>
+        )}
       </div>
 
       {hover.open && hover.id && (
@@ -1702,6 +1794,106 @@ function SourceRow({
         />
       )}
     </div>
+  );
+}
+
+// A feed picker hung off a control in the panel — the source row's Move and the
+// panel's Merge into (WORKSPACE-QUEUE-ADR §XI.2 R1/R2). It only CHOOSES: the
+// caller writes. The list portals out of the pane through AnchoredPopover (the
+// pane clips, and its frame paints over anything inside it), over `paper`
+// because the pane is white and a glasshouse list on it would be white on
+// white. Rows say HIDDEN the way the Follow picker's do.
+function FeedPicker({
+  label,
+  ariaLabel,
+  heading,
+  feeds,
+  onPick,
+  disabled,
+  dataExplain,
+  trigger,
+}: {
+  label: string;
+  ariaLabel: string;
+  /** A line over the list, where the trigger's own word does not say where
+   *  the thing is going ("Move" → "Move to"). */
+  heading?: string;
+  feeds: WorkspaceFeed[];
+  onPick: (feed: WorkspaceFeed) => void;
+  disabled?: boolean;
+  dataExplain: string;
+  /** `chip` sits in a source row's control strip; `label` in the panel's
+   *  bottom row beside Hide and Delete. */
+  trigger: "chip" | "label";
+}) {
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const chip = trigger === "chip";
+  return (
+    <>
+      <button
+        ref={triggerRef}
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        disabled={disabled}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        data-explain={dataExplain}
+        className={
+          chip
+            ? "font-mono text-[10px] uppercase tracking-[0.04em]"
+            : "label-ui"
+        }
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          background: chip ? TOKENS.fieldBg : "transparent",
+          color: TOKENS.hintFg,
+          border: "none",
+          cursor: disabled ? "default" : "pointer",
+          padding: chip ? "3px 7px" : "6px 10px",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {label}
+        <Pointer direction="down" size="sm" className="ml-1" />
+      </button>
+      <AnchoredPopover
+        anchorRef={triggerRef}
+        open={open}
+        onDismiss={() => setOpen(false)}
+        width={220}
+        over="paper"
+        ariaLabel={ariaLabel}
+        className="py-1"
+      >
+        {heading && (
+          <div className="label-ui text-grey-600 px-3 pt-1 pb-1.5">
+            {heading}
+          </div>
+        )}
+        <div style={{ maxHeight: 240, overflowY: "auto" }}>
+          {feeds.map((f) => (
+            <button
+              key={f.id}
+              type="button"
+              onClick={() => {
+                setOpen(false);
+                onPick(f);
+              }}
+              className="flex w-full items-center px-3 py-1.5 text-left text-ui-sm text-black hover:bg-grey-200 transition-colors"
+            >
+              <span className="truncate">
+                {f.name.trim() || FEED_UNNAMED}
+                {f.hidden && (
+                  <span className="label-ui ml-2 text-grey-600">HIDDEN</span>
+                )}
+              </span>
+            </button>
+          ))}
+        </div>
+      </AnchoredPopover>
+    </>
   );
 }
 

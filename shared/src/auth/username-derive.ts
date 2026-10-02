@@ -3,6 +3,7 @@ import {
   USERNAME_MAX_LENGTH,
   USERNAME_MIN_LENGTH,
 } from './username-rule.js'
+import { hasReservedUsernamePrefix, isReservedUsername } from './reserved-usernames.js'
 import { randomBytes } from 'crypto'
 
 // =============================================================================
@@ -71,8 +72,21 @@ function normaliseUsernamePart(raw: string, maxLength: number): string {
  * Everything returned satisfies USERNAME_RE, which is the point: a derived
  * handle outside the change-username rule is one its owner could not retype to
  * keep. And it is a DEFAULT, not a decision taken away: the first change is
- * free and immediate (`username_changed_at` starts NULL, so the 30-day cooldown
- * has not started), and `previous_username` keeps the old handle resolving.
+ * free and immediate — `username_changed_at` starts NULL, so the 30-day
+ * cooldown has not started.
+ *
+ * WHAT A CHANGE DOES NOT YET DO IS KEEP THE OLD HANDLE RESOLVING. The rename
+ * stamps `previous_username` and `username_redirect_until` (90 days), and
+ * nothing anywhere reads either column — every username lookup on the platform
+ * is a bare `WHERE username = $1` — so a member who renames breaks every link
+ * to their old profile immediately. This comment said the opposite in three
+ * files, which is why it went unnoticed. The columns are the substrate for the
+ * redirect rather than the redirect itself, and building it is a decision and
+ * not a patch: `previous_username` carries no uniqueness constraint and a
+ * released handle can be taken by someone else, so a fallback has to say what
+ * happens when a current username and a live redirect name two different
+ * accounts (the current one must win, and an ambiguous pair must resolve to
+ * neither) before it can be added to a lookup.
  *
  * The uniqueness check is advisory, not a guarantee: two concurrent provisions
  * of the same base can both read "free". The UNIQUE constraint on
@@ -97,13 +111,20 @@ export async function deriveUsername(
 
   // A base long enough to stand alone. Display name wins; the email's local
   // part is the fallback.
+  //
+  // A candidate under a SHADOWING PREFIX (`rss…`, `actor…`) is skipped whole,
+  // since no suffix makes `/rss-weekly-a1b2c3` reach a profile
+  // (reserved-usernames.ts). An EXACT reserved name is kept and treated as
+  // taken below: `settings-a1b2c3` is reachable.
   const standalone = [fromDisplayName, fromEmail].find(
-    (c) => c.length >= USERNAME_MIN_LENGTH,
+    (c) => c.length >= USERNAME_MIN_LENGTH && !hasReservedUsernamePrefix(c),
   )
 
   // Otherwise keep whatever usable characters we have and let the suffix carry
   // it over the minimum. `user` is the floor only when there is nothing at all.
-  const shortBase = [fromDisplayName, fromEmail].find((c) => c.length > 0)
+  const shortBase = [fromDisplayName, fromEmail].find(
+    (c) => c.length > 0 && !hasReservedUsernamePrefix(c),
+  )
   const base = (standalone ?? shortBase ?? 'user').slice(
     0,
     standalone ? USERNAME_MAX_LENGTH : MAX_BASE_WITH_SUFFIX,
@@ -119,7 +140,7 @@ export async function deriveUsername(
   )
   const taken = new Set(existing.map((r) => r.username))
 
-  if (!mustSuffix && !taken.has(base)) return base
+  if (!mustSuffix && !taken.has(base) && !isReservedUsername(base)) return base
 
   // Truncate before suffixing so the result still fits. A standalone base can
   // be up to the full 30; adding a suffix to that would overflow.

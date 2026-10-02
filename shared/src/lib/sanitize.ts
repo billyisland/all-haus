@@ -26,6 +26,37 @@ const SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
   allowProtocolRelative: false,
 };
 
+// =============================================================================
+// The same scheme rule as `allowedSchemes` above, for a URL that is stored as a
+// bare STRING rather than inside markup — a link-preview target, a profile's
+// `website`. Those never pass through sanitize-html, so nothing was applying
+// the rule to them: a `javascript:` value from an ingested embed reached the
+// client and React 18 renders it (it only warns that a FUTURE version will
+// block it).
+//
+// Refuse at the point of persistence AND guard at the point of render
+// (`web/src/lib/safeHttpUrl`): ingest-side alone leaves every historical row
+// hostile, render-side alone leaves the value in the database for the next
+// consumer. `null` rather than a placeholder, so the caller drops the field
+// instead of storing a link that goes nowhere.
+// =============================================================================
+
+export function httpUrlOrNull(
+  url: string | null | undefined,
+): string | null {
+  if (!url) return null;
+  const trimmed = url.trim();
+  if (!trimmed) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  return trimmed;
+}
+
 export function sanitizeContent(html: string): string {
   return sanitizeHtml(html, SANITIZE_OPTIONS);
 }
@@ -173,3 +204,57 @@ export function sanitizeArticleContent(html: string): string {
 export function stripHtml(html: string): string {
   return sanitizeHtml(html, { allowedTags: [], allowedAttributes: {} }).trim();
 }
+
+// =============================================================================
+// Does this text contain a link? (L6.2, decision A1; D1 §5)
+//
+// Direct messages are TEXT ONLY. A DM is the one surface on the platform where
+// a stranger can put something in front of a member with nobody else in the
+// room — no feed, no report queue, no other reader who might notice — and a
+// link is what makes that worth doing at scale. So the body is refused where
+// it is WRITTEN, and the composer no longer offers uploads or appends URLs.
+//
+// WHAT IT CATCHES, AND WHY NOT MORE. An explicit scheme (`https://`,
+// `mailto:`, `javascript:`, anything that looks like one) and a `www.` token.
+// It deliberately does NOT try to catch a bare `example.com`, because the
+// pattern that does also refuses "node.js", "vs. UI", a file name and a price
+// in some locales — and a message refused for containing a full stop is a
+// worse failure than the one this is guarding against.
+//
+// THAT LOOSENESS IS ONLY SAFE BECAUSE OF THE OTHER HALF OF THE BUILD. The DM
+// thread renders plain text and nothing else: `MediaContent` is not mounted
+// there any more, so nothing linkifies, nothing embeds and nothing fetches. A
+// bare domain in a DM is inert characters the recipient would have to retype.
+// If a renderer is ever put back on that surface, THIS FUNCTION IS NO LONGER
+// SUFFICIENT and the two have to be rethought together.
+//
+// The refusal is one the sender is TOLD about in plain words, because a
+// message that silently fails to send is a message the sender believes was
+// delivered.
+//
+// What this rests on: `docs/adr/LEGAL-BRAKES.md`.
+// =============================================================================
+
+/**
+ * Three shapes: ANY scheme followed by `//` (RFC 3986's own scheme grammar, so
+ * a scheme nobody has invented yet is caught); a NAMED schemeless scheme; and
+ * a `www.`-prefixed host.
+ *
+ * THE SECOND BRANCH IS A LIST AND NOT A PATTERN, and that is the whole of the
+ * tuning. `[a-z][a-z0-9+.-]*:` — the general scheme shape without the slashes
+ * — matches `Note:something`, `Q:answer` and `ref:12`, which are ordinary
+ * things to type and which a member would then be told contained a link. The
+ * cost of naming the six is that a seventh schemeless scheme gets through; on
+ * a surface that renders plain text and linkifies nothing, what gets through
+ * is characters the recipient would have to retype.
+ */
+const URL_IN_TEXT_RE =
+  /(?:\b[a-z][a-z0-9+.-]*:\/\/)|(?:\b(?:mailto|data|javascript|vbscript|file|tel|sms):[^\s])|(?:\bwww\.[a-z0-9-])/i
+
+export function containsUrl(text: string): boolean {
+  return URL_IN_TEXT_RE.test(text)
+}
+
+/** What a sender whose message was refused is told. */
+export const DM_NO_LINKS_MESSAGE =
+  'Direct messages are text only — take the link out and send it again.'

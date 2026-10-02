@@ -35,7 +35,8 @@ import {
   PublicationMasthead,
   type PubViewName,
 } from "./PublicationMasthead";
-import { EmptyState, LoadFailed, type PubArticle } from "./article-shared";
+import { EmptyState, type PubArticle } from "./article-shared";
+import { LoadFailed } from "../ui/LoadFailed";
 import {
   PubArchive,
   PubHomepage,
@@ -159,7 +160,7 @@ export function PublicationPanel({
     return (
       <div className="mx-auto max-w-feed px-4 sm:px-6 py-12">
         <h1 className="font-sans text-2xl font-medium text-black">
-          Publication not found
+          We couldn’t find that publication.
         </h1>
         <p className="font-sans text-ui-sm text-grey-600 mt-2">
           This publication isn&apos;t available.

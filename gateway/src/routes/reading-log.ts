@@ -5,6 +5,8 @@ import { zodValidationError } from "@platform-pub/shared/lib/validation.js";
 import { requireAuth } from "../middleware/auth.js";
 import { FEED_SELECT, FEED_JOINS } from "../lib/feed-sql.js";
 import { POST_SELECT, POST_JOINS, feedItemToPost } from "../lib/post-mapper.js";
+import { parseLimit, parseOffset } from "../lib/request-inputs.js";
+import { readingLogRetentionDays } from "../workers/reading-log-sweep.js";
 
 // =============================================================================
 // Recent reading (READING-LOG-AND-LIBRARY-ADR)
@@ -119,11 +121,8 @@ export async function readingLogRoutes(app: FastifyInstance) {
   // ---------------------------------------------------------------------------
   app.get("/reading-log", { preHandler: requireAuth }, async (req, reply) => {
     const q = req.query as { limit?: string; offset?: string };
-    const limit = Math.min(
-      MAX_LIMIT,
-      Math.max(1, parseInt(q.limit ?? "50", 10) || 50),
-    );
-    const offset = Math.max(0, parseInt(q.offset ?? "0", 10) || 0);
+    const limit = parseLimit(q.limit, 50, MAX_LIMIT);
+    const offset = parseOffset(q.offset);
 
     const [{ rows }, more] = await Promise.all([
       pool.query<any>(
@@ -163,7 +162,17 @@ export async function readingLogRoutes(app: FastifyInstance) {
         post: feedItemToPost(r),
       }));
 
-    return reply.status(200).send({ items, hasMore: (more.rowCount ?? 0) > 0 });
+    // THE WINDOW IS THE DIAL'S, and it rides the response because the client
+    // has a sentence to write with it ("Nothing read in the last seven days").
+    // That was a literal, so retuning `reading_log_retention_days` would have
+    // left the empty state naming a window nobody uses any more — and this is
+    // the one surface whose entire subject IS the window. Same reader as the
+    // sweep, so the number the copy names is the number the sweep enforces.
+    return reply.status(200).send({
+      items,
+      hasMore: (more.rowCount ?? 0) > 0,
+      retentionDays: await readingLogRetentionDays(),
+    });
   });
 
   // ---------------------------------------------------------------------------

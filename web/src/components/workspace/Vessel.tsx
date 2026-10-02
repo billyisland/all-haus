@@ -35,13 +35,10 @@ import {
   paletteFor,
   DEFAULT_ORIENTATION,
   VESSEL_WALL,
-  VESSEL_PAD,
-  VESSEL_GAP,
   type Brightness,
   type Orientation,
 } from "./tokens";
-import { VesselBar, BAR_H } from "./VesselBar";
-import { PullToRefresh } from "./PullToRefresh";
+import { VesselChassis } from "./VesselChassis";
 import { useColorScheme } from "../../stores/colorScheme";
 import { useExplainable } from "./ExplainProvider";
 
@@ -62,6 +59,13 @@ import { useExplainable } from "./ExplainProvider";
 // left for the newest-first row), so the mouth is the arrival end in both.
 // (Density is a per-feed control too, but it's applied to the cards in
 // WorkspaceView's CardContext, not threaded through the Vessel.)
+//
+// THE ⊔ ITSELF IS `VesselChassis` (WORKSPACE-QUEUE-ADR §VII.2, D3), shared with
+// the queue's `QueueEntry`. What stays here is what only the floor has: the
+// absolutely positioned motion.div and its drag, the edge auto-pan, resize and
+// its auto-grow, card-drop, the parked-height pin — and the floor's rule for
+// ENGAGEMENT, computed here and handed down. The floor's DOM is pinned
+// byte-identical across the split by `Vessel.dom.test.tsx`.
 
 // Side-wall thickness. Exported so overlays launched from a feed (the reader /
 // profile Glasshouse) can frame themselves at the SAME thickness as the feed's
@@ -73,13 +77,6 @@ import { useExplainable } from "./ExplainProvider";
 // `GAP_PX.feed` margin = 20px, not GAP.
 export { VESSEL_WALL as WALL } from "./tokens";
 const WALL = VESSEL_WALL; // px
-const PAD = VESSEL_PAD; // px interior padding (top zone left open per Step 1: "Opening: full width of the vessel interior")
-const GAP = VESSEL_GAP; // px inter-card gap
-
-const ROUNDEL_TOKENS = {
-  bg: "var(--ah-ink-925)",
-  fg: "var(--ah-bone)",
-};
 
 // The size envelope comes from the shared grid module — one definition for the
 // component's clamps and the layout module's SLOT_MIN_*. Minimums per spec
@@ -159,6 +156,19 @@ interface VesselProps {
    *  height — but retained for a caller that passes none). Defaults to
    *  mounted. */
   contentsMounted?: boolean;
+  /** The reading counts run on this vessel (WORKSPACE-QUEUE-ADR §IV): its feed
+   *  cards are tracked as they pass the top edge, and its attention is clocked
+   *  toward a dwell. The desktop floor passes true. */
+  countsSeen?: boolean;
+  /** In the real viewport — the muster's "in", not the three-viewport mount
+   *  band. Engagement needs it (§IV.4). */
+  inView?: boolean;
+  /** Something else holds the member's attention: a floor pan in progress, or
+   *  a pane over the floor. Breaks engagement, and so the dwell clock. */
+  attentionElsewhere?: boolean;
+  /** The list has cards, so it gets a tail the last of them can be scrolled
+   *  past (§IV.7). */
+  tailSpacer?: boolean;
 }
 
 export function Vessel({
@@ -191,6 +201,10 @@ export function Vessel({
   caughtUp,
   onCaughtUpDismiss,
   contentsMounted = true,
+  countsSeen = false,
+  inView = false,
+  attentionElsewhere = false,
+  tailSpacer = false,
 }: VesselProps) {
   const parked = !contentsMounted;
   const dragControls = useDragControls();
@@ -205,10 +219,8 @@ export function Vessel({
     order: sortRank,
     params: { feedName: descriptiveName ?? null, fromStarter: !!fromStarter },
   });
-  const scrollBodyRef = useRef<HTMLDivElement>(null);
   const mx = useMotionValue(position.x);
   const my = useMotionValue(position.y);
-  const [roundelHovered, setRoundelHovered] = useState(false);
   const [liveSize, setLiveSize] = useState<{ w: number; h: number } | null>(
     null,
   );
@@ -221,9 +233,6 @@ export function Vessel({
   // geometry any more (the free-coordinate floor's readFloorRects is gone).
   const measuredHRef = useRef<number | null>(null);
   const [pinnedH, setPinnedH] = useState<number | null>(null);
-  // Scroll position survives a park: the DOM node keeps its scrollTop only for
-  // as long as it has content to scroll.
-  const savedScrollRef = useRef({ top: 0, left: 0 });
   const resizeStateRef = useRef<{
     startX: number;
     startY: number;
@@ -249,65 +258,29 @@ export function Vessel({
   const palette = paletteFor(brightness, globalDark);
   const isHorizontal = effOrientation === "horizontal";
 
+  // ENGAGED (WORKSPACE-QUEUE-ADR §IV.4): in view AND attended to — the pointer
+  // over it, focus inside it, or scrolled/clicked since it last came into
+  // view. Several vessels are in view at once on the floor, so being on screen
+  // is not attention; without this a floor that fits the screen would make
+  // "new" mean "since last session". `touched` is spent when it leaves view.
+  const [hovered, setHovered] = useState(false);
+  const [focusInside, setFocusInside] = useState(false);
+  const [touched, setTouched] = useState(false);
+  useEffect(() => {
+    if (!inView) setTouched(false);
+  }, [inView]);
+  const engaged =
+    countsSeen &&
+    !parked &&
+    !hidden &&
+    inView &&
+    !attentionElsewhere &&
+    (hovered || focusInside || touched);
   const isDraggingRef = useRef(false);
   // Drag raises the vessel above its neighbours so it visibly RIDES OVER an
   // armed merge target rather than disappearing behind it. Transient only —
   // no z-order is persisted, and the resting floor stays flat.
   const [isDragging, setIsDragging] = useState(false);
-  const prevScrollTopRef = useRef(0);
-
-  useEffect(() => {
-    // Parked: the card tree is unmounted and the browser clamps scrollTop to
-    // 0, firing a scroll event — which must not read as "the user scrolled
-    // up" and dismiss an unseen caught-up banner.
-    if (parked || !caughtUp || !onCaughtUpDismiss) return;
-    const el = scrollBodyRef.current;
-    if (!el) return;
-    prevScrollTopRef.current = el.scrollTop;
-    function onScroll() {
-      if (!el) return;
-      if (el.scrollTop < prevScrollTopRef.current) {
-        onCaughtUpDismiss!();
-      }
-      prevScrollTopRef.current = el.scrollTop;
-    }
-    function onWheel(e: WheelEvent) {
-      if (!el) return;
-      if (el.scrollTop === 0 && e.deltaY < 0) {
-        onCaughtUpDismiss!();
-      }
-    }
-    el.addEventListener("scroll", onScroll, { passive: true });
-    el.addEventListener("wheel", onWheel, { passive: true });
-    return () => {
-      el.removeEventListener("scroll", onScroll);
-      el.removeEventListener("wheel", onWheel);
-    };
-  }, [parked, caughtUp, onCaughtUpDismiss]);
-
-  // Infinite scroll: fire onLoadMore when the scroll position nears the end so
-  // older content keeps flowing in. The threshold (a card-or-two ahead of the
-  // edge) makes the load feel seamless. Fires on the active axis only.
-  useEffect(() => {
-    // Parked: the wash is height:100%, so scrollHeight ≈ clientHeight and
-    // "near end" is ALWAYS true — the unmount's scroll-clamp event would
-    // fetch a page for an off-screen feed, and every park cycle another
-    // (§VII: parking tears down nothing and refetches nothing).
-    if (parked || !onLoadMore) return;
-    const el = scrollBodyRef.current;
-    if (!el) return;
-    const THRESHOLD = 320;
-    function onScroll() {
-      if (!el) return;
-      const nearEnd = isHorizontal
-        ? el.scrollWidth - el.scrollLeft - el.clientWidth < THRESHOLD
-        : el.scrollHeight - el.scrollTop - el.clientHeight < THRESHOLD;
-      if (nearEnd) onLoadMore!(feedId);
-    }
-    el.addEventListener("scroll", onScroll, { passive: true });
-    return () => el.removeEventListener("scroll", onScroll);
-  }, [parked, onLoadMore, feedId, isHorizontal]);
-
   // Spring the vessel to its DERIVED rect. Runs on every real geometry change
   // (a neighbour's drop shunted this column, a resize widened the one to the
   // left) and once more explicitly at drag end — a drop that resolves to a
@@ -538,28 +511,6 @@ export function Vessel({
     );
   }, [parked, heightSet]);
 
-  // Hold the scroll position across a park. Recorded continuously while
-  // mounted (the node's own scrollTop is lost with its content), restored
-  // pre-paint on the way back in.
-  useEffect(() => {
-    if (parked) return;
-    const el = scrollBodyRef.current;
-    if (!el) return;
-    const onScroll = () => {
-      savedScrollRef.current = { top: el.scrollTop, left: el.scrollLeft };
-    };
-    el.addEventListener("scroll", onScroll, { passive: true });
-    return () => el.removeEventListener("scroll", onScroll);
-  }, [parked]);
-  useLayoutEffect(() => {
-    if (parked) return;
-    const el = scrollBodyRef.current;
-    if (!el) return;
-    const { top, left } = savedScrollRef.current;
-    if (top) el.scrollTop = top;
-    if (left) el.scrollLeft = left;
-  }, [parked]);
-
   function handleResizePointerDown(event: React.PointerEvent<HTMLDivElement>) {
     if (!onSizeCommit) return;
     event.preventDefault();
@@ -670,21 +621,6 @@ export function Vessel({
     onCardDrop(raw);
   }
 
-  // Wall arrangement per orientation. The bottom wall is replaced by VesselBar,
-  // so only left/right (vertical) or top/right (horizontal) get thin borders.
-  // Horizontal opens on the LEFT, where newest items arrive (newest-first row,
-  // scroll-right-for-older) — the mouth tracks the arrival end, matching the
-  // vertical ⊔ whose open top is where new items drop in.
-  const wallStyle = isHorizontal
-    ? {
-        borderTop: `${WALL}px solid ${palette.walls}`,
-        borderRight: `${WALL}px solid ${palette.walls}`,
-      }
-    : {
-        borderLeft: `${WALL}px solid ${palette.walls}`,
-        borderRight: `${WALL}px solid ${palette.walls}`,
-      };
-
   return (
     <motion.div
       ref={vesselRef}
@@ -693,8 +629,8 @@ export function Vessel({
       role="region"
       aria-label={
         descriptiveName
-          ? `Feed ${numeral}: ${descriptiveName}`
-          : `Feed ${numeral}`
+          ? `Channel ${numeral}: ${descriptiveName}`
+          : `Channel ${numeral}`
       }
       drag
       dragListener={false}
@@ -705,6 +641,18 @@ export function Vessel({
       dragMomentum={false}
       dragElastic={0}
       onPointerDown={startDrag}
+      // Engagement (see `engaged`). Capture, so a press the scroll body stops
+      // from reaching the drag handler — a scrollbar drag, a card click —
+      // still counts as the member touching this feed.
+      onPointerEnter={() => setHovered(true)}
+      onPointerLeave={() => setHovered(false)}
+      onPointerDownCapture={() => setTouched(true)}
+      onWheelCapture={() => setTouched(true)}
+      onFocus={() => setFocusInside(true)}
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null))
+          setFocusInside(false);
+      }}
       onDragStart={() => {
         isDraggingRef.current = true;
         setIsDragging(true);
@@ -749,155 +697,48 @@ export function Vessel({
         pointerEvents: hidden ? "none" : undefined,
       }}
     >
-      {/* The vessel chassis. Position relative so chrome controls (resize +
-          brightness / density / orientation) can pin to its corners. When the
-          user has fixed a height, the body becomes a scroll container;
-          otherwise it grows with content. */}
-      <div
-        data-vessel-chassis
-        onDragOver={handleChassisDragOver}
-        onDragLeave={handleChassisDragLeave}
-        onDrop={handleChassisDrop}
-        style={{
-          position: "relative",
-          ...wallStyle,
-          background: palette.interior,
-          height: chassisH,
-          display: "flex",
-          flexDirection: "column",
-          // A merge-armed vessel answers in its own wall colour (the feed it is
-          // about to absorb becomes part of it). A card-drop target answers in
-          // crimson: the wall colour would be painting the wall its own colour
-          // on two of the four sides, which is no answer at all.
-          outline: isDragTarget
+      <VesselChassis
+        feedId={feedId}
+        numeral={numeral}
+        descriptiveName={descriptiveName}
+        palette={palette}
+        horizontal={isHorizontal}
+        contents={parked ? "parked" : "full"}
+        engaged={engaged}
+        countsSeen={countsSeen}
+        tailSpacer={tailSpacer}
+        height={chassisH}
+        scrolls={heightSet}
+        bodyFills={bodyFills}
+        // A merge-armed vessel answers in its own wall colour (the feed it is
+        // about to absorb becomes part of it). A card-drop target answers in
+        // crimson: the wall colour would be painting the wall its own colour
+        // on two of the four sides, which is no answer at all.
+        outline={
+          isDragTarget
             ? `4px solid ${palette.crimson}`
             : armed
               ? `4px solid ${palette.walls}`
-              : undefined,
-          outlineOffset: -4,
-          transition: "outline-color 120ms ease-out",
+              : undefined
+        }
+        chassisHandlers={{
+          onDragOver: handleChassisDragOver,
+          onDragLeave: handleChassisDragLeave,
+          onDrop: handleChassisDrop,
         }}
-      >
-        {/* Feed numeral — bottom-left corner. Doubles as the vessel name/drag
-            handle (double-click renames, drag repositions) → Explain `vessel.name`. */}
-        <div
-          data-explain="vessel.name"
-          onMouseEnter={() => setRoundelHovered(true)}
-          onMouseLeave={() => setRoundelHovered(false)}
-          onDoubleClick={() => onNameClick?.()}
-          className="select-none font-sans"
-          style={{
-            position: "absolute",
-            bottom: 0,
-            left: 0,
-            width: BAR_H,
-            height: BAR_H,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            color: "var(--ah-white)",
-            fontSize: 22,
-            fontWeight: 600,
-            lineHeight: 1,
-            cursor: "grab",
-            zIndex: 6,
-          }}
-        >
-          {numeral}
-          {descriptiveName && (
-            <div
-              className="label-ui"
-              style={{
-                position: "absolute",
-                left: 0,
-                bottom: "100%",
-                marginBottom: 4,
-                background: ROUNDEL_TOKENS.bg,
-                color: ROUNDEL_TOKENS.fg,
-                padding: "3px 8px",
-                whiteSpace: "nowrap",
-                boxShadow: "0 2px 6px rgba(0, 0, 0, 0.15)",
-                opacity: roundelHovered ? 1 : 0,
-                pointerEvents: "none",
-                transition: "opacity 120ms ease-out",
-              }}
-            >
-              {descriptiveName}
-            </div>
-          )}
-        </div>
-
-        <div
-          ref={scrollBodyRef}
-          data-vessel-scroll=""
-          onPointerDown={(e) => e.stopPropagation()}
-          style={{
-            padding: `${PAD}px`,
-            flex: bodyFills ? "1 1 0" : undefined,
-            minHeight: 0,
-            overflowY: heightSet && !isHorizontal ? "auto" : undefined,
-            overflowX: isHorizontal ? "auto" : undefined,
-            // A horizontal feed OWNS the sideways axis inside its walls. Left to
-            // chain, a swipe toward the mouth ran the feed to its start, then
-            // panned the floor, then — once the floor was also at its end — was
-            // handed to the browser as a back-navigation gesture, so the one
-            // gesture meant three things depending on scroll state you cannot
-            // see. Contained, it means one: scroll the feed, and at the mouth,
-            // pull to refresh. Pan the floor from the floor, the muster, or
-            // Ctrl+←/→.
-            overscrollBehaviorX: isHorizontal ? "contain" : undefined,
-            cursor: "default",
-          }}
-        >
-          {/* The gap lives on the element that actually contains the cards, not
-              on the scroll body (whose only direct child is PullToRefresh). */}
-          {parked ? (
-            // Parked: a flat wash over the interior. No cards, no media, and no
-            // PullToRefresh listeners — the chassis around it is unchanged.
-            <div aria-hidden style={{ width: "100%", height: "100%" }} />
-          ) : onRefresh ? (
-            <PullToRefresh
-              onRefresh={onRefresh}
-              scrollRef={scrollBodyRef}
-              axis={isHorizontal ? "horizontal" : "vertical"}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  flexDirection: isHorizontal ? "row" : "column",
-                  gap: `${GAP}px`,
-                }}
-              >
-                {children}
-              </div>
-            </PullToRefresh>
-          ) : (
-            <div
-              style={{
-                display: "flex",
-                flexDirection: isHorizontal ? "row" : "column",
-                gap: `${GAP}px`,
-              }}
-            >
-              {children}
-            </div>
-          )}
-        </div>
-
-        {/* VesselBar replaces the bottom wall — gear + hide + source input.
-            Appearance controls moved into the FeedComposer modal (task 8). */}
-        <VesselBar
-          feedId={feedId}
-          palette={palette}
-          onSourceAdded={onSourceAdded}
-          onNameClick={onNameClick}
-          onHide={onHide}
-        />
-
-        {onSizeCommit && (
+        numeralCursor="grab"
+        onNameClick={onNameClick}
+        onSourceAdded={onSourceAdded}
+        onHide={onHide}
+        onRefresh={onRefresh}
+        onLoadMore={onLoadMore}
+        caughtUp={caughtUp}
+        onCaughtUpDismiss={onCaughtUpDismiss}
+        overlay={
+          onSizeCommit && (
           <div
             role="button"
-            aria-label="Resize vessel"
+            aria-label="Resize channel"
             data-explain="vessel.resize"
             onPointerDown={handleResizePointerDown}
             onPointerMove={handleResizePointerMove}
@@ -928,8 +769,11 @@ export function Vessel({
               }}
             />
           </div>
-        )}
-      </div>
+          )
+        }
+      >
+        {children}
+      </VesselChassis>
     </motion.div>
   );
 }

@@ -2,7 +2,19 @@
 
 import { useState, useEffect, useRef } from 'react'
 import { ProfileLink } from '../ui/ProfileLink'
-import { formatPrice } from '../../lib/format'
+import { TermsConsent } from '../legal/TermsConsent'
+import type { TermsState } from '../../lib/api/auth'
+import { TERMS_PURPOSE } from '../../content/terms-consent'
+import {
+  paywallGateCopy,
+  PAYWALL_ACCEPT_AND_CONTINUE,
+  paywallCardLink,
+  paywallSubscribeOffer,
+  PAYWALL_SUBSCRIBE,
+  PAYWALL_LOG_IN,
+  PAYWALL_SIGN_UP,
+  PAYWALL_WAITLIST,
+} from '../../content/paywall'
 
 // The hover aside on every "join the waiting list" affordance. One constant so
 // the gate's and the nav bar's cannot drift into two different jokes.
@@ -24,6 +36,12 @@ interface PaywallGateProps {
   unlocking: boolean
   error: string | null
   errorNeedsCard?: boolean
+  /** The gate's third refusal: a card-holder who has never seen the Reader
+   *  Terms. Neither money nor a card is the fix, so it gets its own control. */
+  errorNeedsTerms?: boolean
+  readerTerms?: TermsState | null
+  onAcceptTerms?: () => void
+  acceptingTerms?: boolean
   writerUsername?: string
   writerName?: string
   subscriptionPricePence?: number
@@ -31,7 +49,6 @@ interface PaywallGateProps {
   onSubscribe?: () => void
   subscribing?: boolean
   writerSpendThisMonthPence?: number
-  nudgeShownThisMonth?: boolean
   writerId?: string
 }
 
@@ -39,9 +56,10 @@ export function PaywallGate({
   pricePounds, pricePence, dTag, signupOffer,
   freeAllowanceRemaining, hasPaymentMethod, isLoggedIn,
   onUnlock, unlocking, error, errorNeedsCard,
+  errorNeedsTerms, readerTerms, onAcceptTerms, acceptingTerms,
   writerUsername, writerName, subscriptionPricePence, isSubscribed,
   onSubscribe, subscribing,
-  writerSpendThisMonthPence, nudgeShownThisMonth, writerId,
+  writerSpendThisMonthPence, writerId,
 }: PaywallGateProps) {
   // THE GATE IS AGNOSTIC BETWEEN A STRANGER AND A MEMBER WHO IS LOGGED OUT,
   // and it was not (2026-09-04). Every logged-out variant offered exactly one
@@ -57,43 +75,15 @@ export function PaywallGate({
   // offer of a free read; naming the price mid-sentence keeps the fact and
   // drops the drama, and it means the above-cap variant no longer states the
   // price twice.
-  let heading = 'Keep reading'
-  let subtext: string
-  const buttonLabel = 'Continue reading'
-  let showPrice = false
-  let suggestCard = false
-
-  // The copy must match what the server will actually do (accrual.ts):
-  // card on file → the read accrues to the tab (allowance untouched);
-  // no card → the read draws on the free credit, and is REFUSED once the
-  // price exceeds what's left (the F3 floor). Never claim an article is
-  // "part of your free allowance" when the credit can't cover it.
-  const remainingPounds = (freeAllowanceRemaining / 100).toFixed(2)
-  const coveredByAllowance =
-    pricePence == null || pricePence <= freeAllowanceRemaining
-
-  const welcomeGiftPounds = signupOffer
-    ? (signupOffer.freeAllowancePence / 100).toFixed(2)
-    : null
-  // At or below the ARRIVAL CAP, the piece is free on arrival (D1). The cap is a
-  // dial and never a literal — but it is its OWN dial, and testing against
-  // `freeAllowancePence` (which this did until 2026-09-06) is now wrong in the
-  // direction that matters: the two are £2 and £5, so a £4 piece would be
-  // promised "on the haus" here and then refused by `resolveArrivalGift`, which
-  // is the only thing that actually decides. Above the cap this falls to the
-  // still-gated copy, which is what the reader will meet.
-  const withinArrivalCap =
-    signupOffer != null &&
-    pricePence != null &&
-    pricePence <= signupOffer.arrivalGiftCapPence
-
-  // `formatPrice`, not `formatPence`: this is a price inside a sentence, and
-  // "£0.50 to keep reading" reads as a form field. Falls back to the
-  // already-formatted pounds string, then to no price at all — a gate with an
-  // unknown price still has to say something, and "Keep reading." is it.
-  const priceLabel =
-    pricePence != null ? formatPrice(pricePence) : pricePounds ? `£${pricePounds}` : null
-  const keepReading = priceLabel ? `${priceLabel} to keep reading.` : 'Keep reading.'
+  const { heading, subtext, buttonLabel, showPrice, suggestCard } = paywallGateCopy({
+    isLoggedIn,
+    signupOffer: signupOffer ?? null,
+    hasPaymentMethod,
+    freeAllowanceRemaining,
+    pricePence: pricePence ?? null,
+    pricePounds,
+    writerName,
+  })
 
   // Both logged-out controls carry the arrival intent, and it travels as the
   // article's IDENTIFIER rather than a path or a price (PAYWALL-ARRIVAL §5):
@@ -105,92 +95,28 @@ export function PaywallGate({
   // welcome, both of which are gated server-side on `arrival_article_id`.
   const arrivalQs = dTag ? `?arrival=${encodeURIComponent(dTag)}` : ''
 
-  if (!isLoggedIn && !signupOffer) {
-    // Closed beta (CLOSED-BETA-ADR §IV): no public signup. A logged-out reader
-    // on a shared paywalled article joins the waiting list rather than being
-    // offered an account that can't be created — but LOGGING IN was never
-    // closed, and this branch is the one that is live on production today, so
-    // it is the one where the missing way in cost the most.
-    //
-    // ALSO THE ANSWER WHEN THE PROBE DIDN'T RESOLVE. `signupOffer` is null both
-    // for "the beta is closed" and for "we could not find out", on purpose: the
-    // one thing worse than not making the offer is making it and then 403ing
-    // the reader who accepted it.
-    heading = `${keepReading} Log in to all.haus.`
-    subtext = 'New accounts are invitation-only while we’re in closed beta.'
-  } else if (!isLoggedIn && withinArrivalCap) {
-    // THE SENTENCE THAT DOES THE CONVERTING (§8.4, ruled 2026-09-03: name the
-    // gift at the gate). An offer stated where the reader is standing is what
-    // converts; a surprise is worth less than a reason. The modal on the other
-    // side then confirms it rather than revealing it.
-    heading = `${keepReading} Log in or sign up to all.haus.`
-    subtext = `Make an account and this one’s on the haus — plus a free £${welcomeGiftPounds} reading credit to get you started.`
-  } else if (!isLoggedIn) {
-    // Above the cap (D3). The gift survives whole, by refusal rather than by
-    // arithmetic: a card-less read the allowance can't cover is declined at the
-    // F3 floor, so the piece stays gated and the £5 was never reachable. Do NOT
-    // "improve" this to applying the gift and charging the remainder — that
-    // spends the entire welcome on the single most expensive article the reader
-    // will meet, which is the opposite of what the gift is for.
-    //
-    // THE COPY LEADS WITH THE GIFT AND THEN DECLINES TO SPEND IT, which is the
-    // honest order: the credit is real and this piece is simply outside it. It
-    // no longer says "add a card", and it does not need to — a signup cannot
-    // carry one (`SignupSchema` is two strings; the card lives behind an
-    // authenticated route), so the card is never this screen's next step. What
-    // happens is that they sign up, land on the piece still gated, and meet the
-    // LOGGED-IN card-less branch below, which owns that instruction and states
-    // it with their real remaining figure ("costs more than your remaining free
-    // credit … Add a payment card"). Two screens, each saying the true thing at
-    // the moment it is actionable — rather than one screen promising a step the
-    // reader cannot yet take.
-    heading = `${keepReading} Log in or sign up to all.haus.`
-    subtext = `Make an account and get £${welcomeGiftPounds} of free reading credit. That said, this particular article is priced quite punchily so we’ll have to bill you for it separately. Wonder what makes it so special.`
-  } else if (hasPaymentMethod) {
-    subtext = 'This will be added to your reading tab.'
-    showPrice = true
-  } else if (freeAllowanceRemaining > 0 && coveredByAllowance) {
-    subtext = `This article is part of your free reading credit. You have £${remainingPounds} remaining.`
-  } else if (freeAllowanceRemaining > 0) {
-    subtext = `This article costs more than your remaining free credit (£${remainingPounds}). Add a payment card to keep reading — you only pay for what you read.`
-    showPrice = true
-    suggestCard = true
-  } else {
-    subtext = 'You’ve used your free reading credit. Add a payment card to keep reading — you only pay for what you read.'
-    showPrice = true
-    suggestCard = true
-  }
-
   const showSubscribeOption = isLoggedIn && !isSubscribed && subscriptionPricePence && subscriptionPricePence > 0
   const subPricePounds = subscriptionPricePence ? (subscriptionPricePence / 100).toFixed(2) : null
+  const subscribeOffer = paywallSubscribeOffer(writerName ?? writerUsername ?? '', subscriptionPricePence ?? 0)
 
-  // Subscription nudge logic
+  // The spend note: what this reader has actually paid this writer this
+  // month, set beside the subscription price once it is most of the way
+  // there. It STATES and promises nothing — the copy that said the spend
+  // "converts to your first month" described a conversion route that was a
+  // documented money pump, dark behind a do-not-flip flag, and was deleted
+  // 2026-09-29 (CA-I6) together with the one-shot nudge log that throttled
+  // this paragraph.
   const spendPounds = writerSpendThisMonthPence != null
     ? (writerSpendThisMonthPence / 100).toFixed(2)
     : null
-  const meetsThreshold = writerSpendThisMonthPence != null && subscriptionPricePence != null
+  const showSpendNote = writerSpendThisMonthPence != null && subscriptionPricePence != null
     && writerSpendThisMonthPence >= subscriptionPricePence * 0.7
-  const overThreshold = writerSpendThisMonthPence != null && subscriptionPricePence != null
-    && writerSpendThisMonthPence > subscriptionPricePence
-  const showConversionOffer = meetsThreshold && !overThreshold && !nudgeShownThisMonth
-  const showOverThresholdNote = overThreshold
-
-  // Mark nudge as shown (one-shot per reader/writer/month)
-  const nudgeMarked = useRef(false)
-  useEffect(() => {
-    if (showConversionOffer && writerId && !nudgeMarked.current) {
-      nudgeMarked.current = true
-      fetch('/api/v1/nudge/shown', {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ writerId }),
-      }).catch(err => console.error('Failed to log subscription nudge', err))
-    }
-  }, [showConversionOffer, writerId])
 
   const gateRef = useRef<HTMLDivElement>(null)
   const [animateEllipsis, setAnimateEllipsis] = useState(false)
+  // Never pre-ticked, and reset by nothing: the gate only ever shows this
+  // control once, in response to a refusal the reader has just met.
+  const [termsChecked, setTermsChecked] = useState(false)
 
   useEffect(() => {
     const el = gateRef.current
@@ -236,9 +162,34 @@ export function PaywallGate({
           </div>
         )}
 
-        {isLoggedIn ? (
+        {/* THE TERMS REFUSAL REPLACES THE UNLOCK BUTTON, it does not sit beside
+            it. Two primary actions on one gate — "accept" and "continue" —
+            would let a reader press the one that cannot work, and the press
+            they already made is what the acceptance resumes: accepting IS
+            continuing, so there is one button and it says so. */}
+        {isLoggedIn && errorNeedsTerms && onAcceptTerms ? (
+          <div className="max-w-sm mx-auto text-left">
+            <TermsConsent
+              kind="reader"
+              checked={termsChecked}
+              onChange={setTermsChecked}
+              purpose={TERMS_PURPOSE.read}
+              state={readerTerms ?? null}
+              disabled={acceptingTerms}
+            />
+            <div className="text-center">
+              <button
+                onClick={onAcceptTerms}
+                disabled={!termsChecked || acceptingTerms}
+                className="btn-accent disabled:opacity-50"
+              >
+                {acceptingTerms ? 'Unlocking…' : PAYWALL_ACCEPT_AND_CONTINUE}
+              </button>
+            </div>
+          </div>
+        ) : isLoggedIn ? (
           <button onClick={onUnlock} disabled={unlocking} className="btn-accent disabled:opacity-50">
-            {unlocking ? 'Unlocking...' : buttonLabel}
+            {unlocking ? 'Unlocking…' : buttonLabel}
           </button>
         ) : (
           // BOTH WAYS IN, AT EQUAL WEIGHT — two `.btn`, not an accent and a
@@ -250,29 +201,37 @@ export function PaywallGate({
           // buttons settle both at once.
           <div className="flex flex-wrap gap-3 justify-center">
             <a href={`/auth${arrivalQs}`} className="btn inline-block">
-              Log in
+              {PAYWALL_LOG_IN}
             </a>
             {signupOffer ? (
               <a href={`/auth/signup${arrivalQs}`} className="btn inline-block">
-                Sign up
+                {PAYWALL_SIGN_UP}
               </a>
             ) : (
               // `title` only, not `aria-label`: the aside is a hover reward, and
               // the accessible name should stay the plain thing the link does.
               <a href="/waitlist" title={WAITLIST_HOVER} className="btn inline-block">
-                Join the waiting list
+                {PAYWALL_WAITLIST}
               </a>
             )}
           </div>
         )}
 
-        {/* Add-card affordance whenever a card is the fix (pre-empted by the
-            copy above, or surfaced by a 402 from the unlock attempt). Links to
-            the Settings overlay; a full-page hop lands back in the workspace. */}
-        {isLoggedIn && !hasPaymentMethod && (suggestCard || errorNeedsCard) && (
+        {/* Card affordance whenever a card is the fix (pre-empted by the copy
+            above, or surfaced by a 402 from the unlock attempt). Links to the
+            Settings overlay; a full-page hop lands back in the workspace.
+
+            IT ALSO RENDERS FOR A READER WHO HAS A CARD, and it did not until
+            the tab's own refusals existed. `card_action_required` reaches only
+            card-HOLDERS — their card declined terminally — so the old
+            `!hasPaymentMethod` term switched the link off for exactly the
+            reader the refusal was written for: told to add a working card, on a
+            page with no way to get to one. The label changes with the act,
+            because "add" is wrong for someone replacing a dead card. */}
+        {isLoggedIn && (errorNeedsCard || (!hasPaymentMethod && suggestCard)) && (
           <div className="mt-4">
             <a href="/reader?overlay=settings" className="btn-text">
-              Add a payment card →
+              {paywallCardLink(hasPaymentMethod)} →
             </a>
           </div>
         )}
@@ -281,7 +240,7 @@ export function PaywallGate({
         {showSubscribeOption && (
           <div className="mt-6 pt-6 max-w-sm mx-auto" style={{ borderTop: '4px solid var(--ah-grey-100)' }}>
             <p className="font-sans text-ui-sm text-grey-600 mb-4">
-              Or subscribe to {writerName ?? writerUsername} for <strong>£{subPricePounds}/mo</strong> to read everything
+              {subscribeOffer.before}<strong>{subscribeOffer.price}</strong>{subscribeOffer.after}
             </p>
             {onSubscribe ? (
               <button
@@ -289,21 +248,16 @@ export function PaywallGate({
                 disabled={subscribing}
                 className="btn disabled:opacity-50"
               >
-                {subscribing ? 'Subscribing...' : 'Subscribe'}
+                {subscribing ? 'Subscribing…' : PAYWALL_SUBSCRIBE}
               </button>
             ) : writerUsername ? (
               <ProfileLink href={`/${writerUsername}`} className="btn inline-block">
-                Subscribe
+                {PAYWALL_SUBSCRIBE}
               </ProfileLink>
             ) : null}
 
-            {/* Spend-threshold subscription nudge */}
-            {showConversionOffer && spendPounds && (
-              <p className="mt-4 font-mono text-[12px] text-grey-400">
-                You&apos;ve spent £{spendPounds} on {writerName ?? writerUsername} this month. Subscribe now and that spending converts to your first month.
-              </p>
-            )}
-            {showOverThresholdNote && spendPounds && subPricePounds && (
+            {/* The spend note (see above) */}
+            {showSpendNote && spendPounds && subPricePounds && (
               <p className="mt-4 font-mono text-[12px] text-grey-400">
                 You&apos;ve spent £{spendPounds} on {writerName ?? writerUsername} this month. A subscription is £{subPricePounds}/mo.
               </p>

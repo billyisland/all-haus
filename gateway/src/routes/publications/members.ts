@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { pool, withTransaction } from '@platform-pub/shared/db/client.js'
 import { requireAuth } from '../../middleware/auth.js'
+import { requireWriter } from '../../lib/writer-gate.js'
 import { requirePublicationPermission, requirePublicationOwner } from '../../middleware/publication-auth.js'
 import logger from '@platform-pub/shared/lib/logger.js'
 import { zodValidationError } from '@platform-pub/shared/lib/validation.js'
@@ -19,6 +20,29 @@ import { ROLE_DEFAULTS } from './shared.js'
 // POST   /publications/:id/leave                — Self-remove (non-owner)
 // GET    /publications/invites/:token           — Public invite info
 // =============================================================================
+
+/**
+ * The invite-acceptance upsert. Exported so the DB-backed test executes the
+ * statement the route runs: which columns a resurrected row keeps and which the
+ * conflict rewrites is Postgres's answer to this exact text, and a mocked
+ * `pool.query` dispatching on query text agrees with whatever its fixture says.
+ */
+export const PUBLICATION_MEMBER_ACCEPT_SQL = `INSERT INTO publication_members
+             (publication_id, account_id, role, contributor_type, accepted_at,
+              can_publish, can_edit_others, can_manage_members, can_manage_finances, can_manage_settings)
+           VALUES ($1, $2, $3, $4, now(), $5, $6, $7, $8, $9)
+           ON CONFLICT (publication_id, account_id) DO UPDATE SET
+             role = EXCLUDED.role, contributor_type = EXCLUDED.contributor_type,
+             can_publish = EXCLUDED.can_publish,
+             can_edit_others = EXCLUDED.can_edit_others,
+             can_manage_members = EXCLUDED.can_manage_members,
+             can_manage_finances = EXCLUDED.can_manage_finances,
+             can_manage_settings = EXCLUDED.can_manage_settings,
+             revenue_share_bps = CASE
+               WHEN publication_members.removed_at IS NOT NULL THEN 0
+               ELSE publication_members.revenue_share_bps
+             END,
+             removed_at = NULL, accepted_at = now()`
 
 const InviteMemberSchema = z.object({
   email: z.string().email().optional(),
@@ -141,11 +165,14 @@ export async function publicationMembersRoutes(app: FastifyInstance) {
 
       // If inviting an existing user, create a notification
       if (accountId) {
+        // BINDS THE PUBLICATION (migration 198). Without it, two
+        // publications inviting the same person from the same inviter were ONE
+        // notification — and an invitation is a thing you accept.
         await pool.query(
-          `INSERT INTO notifications (recipient_id, actor_id, type)
-           VALUES ($1, $2, 'pub_invite_received')
+          `INSERT INTO notifications (recipient_id, actor_id, type, publication_id)
+           VALUES ($1, $2, 'pub_invite_received', $3)
            ON CONFLICT DO NOTHING`,
-          [accountId, userId]
+          [accountId, userId, id]
         )
       }
 
@@ -160,7 +187,7 @@ export async function publicationMembersRoutes(app: FastifyInstance) {
 
   app.post<{ Params: { id: string } }>(
     '/publications/:id/members/accept',
-    { preHandler: requireAuth },
+    { preHandler: [requireAuth, requireWriter] },
     async (req, reply) => {
       const { token } = req.body as { token: string }
       if (!token) {
@@ -222,22 +249,28 @@ export async function publicationMembersRoutes(app: FastifyInstance) {
         // from the sums while removed). A manager re-grants the share
         // deliberately via the payroll routes. An already-active member
         // re-accepting keeps their live share untouched.
-        await client.query(
-          `INSERT INTO publication_members
-             (publication_id, account_id, role, contributor_type, accepted_at,
-              can_publish, can_edit_others, can_manage_members, can_manage_finances, can_manage_settings)
-           VALUES ($1, $2, $3, $4, now(), $5, $6, $7, $8, $9)
-           ON CONFLICT (publication_id, account_id) DO UPDATE SET
-             role = EXCLUDED.role, contributor_type = EXCLUDED.contributor_type,
-             revenue_share_bps = CASE
-               WHEN publication_members.removed_at IS NOT NULL THEN 0
-               ELSE publication_members.revenue_share_bps
-             END,
-             removed_at = NULL, accepted_at = now()`,
-          [invite.publication_id, userId, invite.role, invite.contributor_type,
-           perms.can_publish, perms.can_edit_others, perms.can_manage_members,
-           perms.can_manage_finances, perms.can_manage_settings]
-        )
+        //
+        // The five can_* columns ride EXCLUDED too (S14). They were in the
+        // INSERT list and absent from the DO UPDATE, so a resurrected row kept
+        // whatever powers it had when it left: a removed editor-in-chief
+        // re-invited as a contributor came back holding can_manage_members and
+        // can_manage_finances while the row's `role` said contributor — the row
+        // lying about itself, and the finance mandate is what
+        // requirePublicationPermission reads. The permissions must follow the
+        // role the SAME statement writes.
+        //
+        // Safe for an ACTIVE member too, which is why there is no removed_at
+        // CASE here: an invite is one-shot (`accepted_at IS NULL`), expiring,
+        // and re-validated against the inviter's CURRENT permissions a few
+        // lines above, so accepting one is a fresh deliberate grant by someone
+        // who holds every permission it confers. Writing exactly
+        // ROLE_DEFAULTS[invite.role] is precisely what that check proved
+        // allowed — and a downgrade invite now actually downgrades.
+        await client.query(PUBLICATION_MEMBER_ACCEPT_SQL, [
+          invite.publication_id, userId, invite.role, invite.contributor_type,
+          perms.can_publish, perms.can_edit_others, perms.can_manage_members,
+          perms.can_manage_finances, perms.can_manage_settings,
+        ])
 
         await client.query(
           `UPDATE publication_invites SET accepted_at = now() WHERE id = $1`,
@@ -246,9 +279,14 @@ export async function publicationMembersRoutes(app: FastifyInstance) {
       })
 
       // Notify members with can_manage_members
+      // BINDS THE PUBLICATION. Every insert here is a bare
+      // `ON CONFLICT DO NOTHING`, so `idx_notifications_dedup` alone decides
+      // what collapses — and without this column two publications acting on the
+      // same person from the same actor were ONE notification, with the second
+      // silently dropped (migration 198).
       await pool.query(
-        `INSERT INTO notifications (recipient_id, actor_id, type)
-         SELECT pm.account_id, $1, 'pub_member_joined'
+        `INSERT INTO notifications (recipient_id, actor_id, type, publication_id)
+         SELECT pm.account_id, $1, 'pub_member_joined', $2
          FROM publication_members pm
          WHERE pm.publication_id = $2 AND pm.can_manage_members = TRUE
            AND pm.removed_at IS NULL AND pm.account_id != $1
@@ -398,9 +436,11 @@ export async function publicationMembersRoutes(app: FastifyInstance) {
       )
 
       // Notify members with can_manage_members
+      // BINDS THE PUBLICATION (migration 198): without it, the same person
+      // leaving two publications a manager manages was ONE notification.
       await pool.query(
-        `INSERT INTO notifications (recipient_id, actor_id, type)
-         SELECT pm.account_id, $1, 'pub_member_left'
+        `INSERT INTO notifications (recipient_id, actor_id, type, publication_id)
+         SELECT pm.account_id, $1, 'pub_member_left', $2
          FROM publication_members pm
          WHERE pm.publication_id = $2 AND pm.can_manage_members = TRUE
            AND pm.removed_at IS NULL AND pm.account_id != $1
@@ -492,9 +532,11 @@ export async function publicationMembersRoutes(app: FastifyInstance) {
       )
 
       // Notify managers
+      // BINDS THE PUBLICATION (migration 198): without it, the same person
+      // leaving two publications a manager manages was ONE notification.
       await pool.query(
-        `INSERT INTO notifications (recipient_id, actor_id, type)
-         SELECT pm.account_id, $1, 'pub_member_left'
+        `INSERT INTO notifications (recipient_id, actor_id, type, publication_id)
+         SELECT pm.account_id, $1, 'pub_member_left', $2
          FROM publication_members pm
          WHERE pm.publication_id = $2 AND pm.can_manage_members = TRUE
            AND pm.removed_at IS NULL AND pm.account_id != $1

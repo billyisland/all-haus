@@ -21,6 +21,8 @@ import {
   type SyncMember,
 } from "../lib/follow-import.js";
 import { parseOpml, planOpmlImport, OPML_MAX_FEEDS } from "../lib/opml.js";
+import { zodValidationError } from "@platform-pub/shared/lib/validation.js";
+import { isUuid } from "../lib/request-inputs.js";
 
 // =============================================================================
 // Follow-graph import runs (FOLLOW-GRAPH-IMPORT-ADR §11.3).
@@ -94,14 +96,14 @@ export default async function followImportRoutes(app: FastifyInstance) {
     { preHandler: requireAuth },
     async (req, reply) => {
       if (!followImportEnabled())
-        return reply.status(404).send({ error: "Not found" });
+        return reply.status(404).send({ error: "We couldn't find that." });
       const ownerId = req.session!.sub;
 
       const parsed = createImportSchema.safeParse(req.body);
       if (!parsed.success) {
         return reply
           .status(400)
-          .send({ error: "Invalid body", details: parsed.error.flatten() });
+          .send(zodValidationError(parsed.error));
       }
       const { protocol, originIdentity, feedName } = parsed.data;
 
@@ -222,14 +224,14 @@ export default async function followImportRoutes(app: FastifyInstance) {
     { preHandler: requireAuth, bodyLimit: 3 * 1024 * 1024 },
     async (req, reply) => {
       if (!followImportEnabled())
-        return reply.status(404).send({ error: "Not found" });
+        return reply.status(404).send({ error: "We couldn't find that." });
       const ownerId = req.session!.sub;
 
       const parsedBody = opmlImportSchema.safeParse(req.body);
       if (!parsedBody.success) {
         return reply
           .status(400)
-          .send({ error: "Invalid body", details: parsedBody.error.flatten() });
+          .send(zodValidationError(parsedBody.error));
       }
       const { opml, feedName } = parsedBody.data;
 
@@ -249,7 +251,7 @@ export default async function followImportRoutes(app: FastifyInstance) {
       if (plan.feeds.length === 0) {
         return reply.status(422).send({
           error: "empty_opml",
-          message: "No feed URLs found in this file",
+          message: "We couldn't find any feed URLs in that file.",
         });
       }
 
@@ -350,19 +352,19 @@ export default async function followImportRoutes(app: FastifyInstance) {
     { preHandler: requireAuth },
     async (req, reply) => {
       if (!followImportEnabled())
-        return reply.status(404).send({ error: "Not found" });
+        return reply.status(404).send({ error: "We couldn't find that." });
       const ownerId = req.session!.sub;
 
       const parsed = syncSchema.safeParse(req.body);
       if (!parsed.success) {
         return reply
           .status(400)
-          .send({ error: "Invalid body", details: parsed.error.flatten() });
+          .send(zodValidationError(parsed.error));
       }
       const { feedId } = parsed.data;
 
       const feed = await loadFeed(feedId, ownerId);
-      if (!feed) return reply.status(404).send({ error: "Feed not found" });
+      if (!feed) return reply.status(404).send({ error: "We couldn't find that channel." });
 
       const {
         rows: [binding],
@@ -377,7 +379,7 @@ export default async function followImportRoutes(app: FastifyInstance) {
       if (!binding) {
         return reply.status(409).send({
           error: "not_syncable",
-          message: "This feed wasn't imported from a network, so there's nothing to sync",
+          message: "This channel wasn't imported from a network, so there's nothing to sync",
         });
       }
 
@@ -392,7 +394,7 @@ export default async function followImportRoutes(app: FastifyInstance) {
       if (inFlight) {
         return reply.status(409).send({
           error: "sync_in_progress",
-          message: "An import or sync is already running for this feed",
+          message: "This channel is already importing or syncing. Please wait for that to finish.",
         });
       }
 
@@ -533,11 +535,11 @@ export default async function followImportRoutes(app: FastifyInstance) {
     { preHandler: requireAuth },
     async (req, reply) => {
       if (!followImportEnabled())
-        return reply.status(404).send({ error: "Not found" });
+        return reply.status(404).send({ error: "We couldn't find that." });
       const ownerId = req.session!.sub;
       const { id } = req.params;
-      if (!UUID_RE.test(id))
-        return reply.status(400).send({ error: "Invalid import id" });
+      if (!isUuid(id))
+        return reply.status(404).send({ error: "That sync is no longer waiting for you to confirm it." });
 
       const { rows } = await pool.query<FollowImportStatusRow>(
         `UPDATE follow_imports
@@ -550,7 +552,7 @@ export default async function followImportRoutes(app: FastifyInstance) {
       if (rows.length === 0)
         return reply
           .status(404)
-          .send({ error: "No confirmable sync preview with this id" });
+          .send({ error: "That sync is no longer waiting for you to confirm it." });
 
       kickFollowImportSweep().catch((err) =>
         logger.warn({ err, importId: id }, "follow sync kick failed"));
@@ -567,11 +569,11 @@ export default async function followImportRoutes(app: FastifyInstance) {
     { preHandler: requireAuth },
     async (req, reply) => {
       if (!followImportEnabled())
-        return reply.status(404).send({ error: "Not found" });
+        return reply.status(404).send({ error: "We couldn't find that." });
       const ownerId = req.session!.sub;
       const { id } = req.params;
-      if (!UUID_RE.test(id))
-        return reply.status(400).send({ error: "Invalid import id" });
+      if (!isUuid(id))
+        return reply.status(404).send({ error: "That sync is no longer waiting for you to cancel it." });
 
       // Previews only — pending/running/terminal runs are progress history,
       // not cancellable plans.
@@ -583,7 +585,7 @@ export default async function followImportRoutes(app: FastifyInstance) {
       if (rowCount === 0)
         return reply
           .status(404)
-          .send({ error: "No cancellable sync preview with this id" });
+          .send({ error: "That sync is no longer waiting for you to cancel it." });
       return reply.status(204).send();
     },
   );
@@ -596,11 +598,11 @@ export default async function followImportRoutes(app: FastifyInstance) {
     { preHandler: requireAuth },
     async (req, reply) => {
       if (!followImportEnabled())
-        return reply.status(404).send({ error: "Not found" });
+        return reply.status(404).send({ error: "We couldn't find that." });
       const ownerId = req.session!.sub;
       const { id } = req.params;
-      if (!UUID_RE.test(id))
-        return reply.status(400).send({ error: "Invalid import id" });
+      if (!isUuid(id))
+        return reply.status(404).send({ error: "We couldn't find that import." });
 
       const { rows } = await pool.query<FollowImportStatusRow>(
         `SELECT ${STATUS_ROW_COLUMNS}
@@ -609,7 +611,7 @@ export default async function followImportRoutes(app: FastifyInstance) {
         [id, ownerId],
       );
       if (rows.length === 0)
-        return reply.status(404).send({ error: "Import not found" });
+        return reply.status(404).send({ error: "We couldn't find that import." });
       return reply.send({ import: importRowToResponse(rows[0]) });
     },
   );

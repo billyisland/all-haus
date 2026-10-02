@@ -1,59 +1,45 @@
 import type { FastifyInstance } from "fastify";
 import { requireAuth } from "../../middleware/auth.js";
+import { requireWriter } from "../../lib/writer-gate.js";
 import { performGatePass } from "../../services/article-access/index.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 import { KEY_SERVICE_URL, proxyToService } from "./shared.js";
+import { keyServiceHeaders } from "../../lib/key-service-client.js";
+import { READER_TERMS_REQUIRED } from "../../lib/terms-gate.js";
 
 // =============================================================================
-// Vault/key proxies + gate-pass route
+// Vault proxy + gate-pass route
 //
 // POST  /articles/:nostrEventId/vault      — Proxy to key service (vault create)
-// PATCH /articles/:nostrEventId/vault      — Proxy to key service (vault ID update)
-// POST  /articles/:nostrEventId/key        — Proxy to key service (key issuance)
 // POST  /articles/:nostrEventId/gate-pass  — Delegated to article-access orchestrator
+//
+// There is no key-issuance proxy: a reader's key is issued inside the gate
+// pass (`performGatePass` → key-service `POST /key`), never on a bare request
+// (CA-I10 deleted the uncalled `/key` and `PATCH /vault` proxies).
 // =============================================================================
 
 export async function articleGatePassRoutes(app: FastifyInstance) {
   app.post<{ Params: { nostrEventId: string } }>(
     "/articles/:nostrEventId/vault",
-    { preHandler: requireAuth },
+    // Sealing a paywalled body is the browser's paywalled publish path.
+    { preHandler: [requireAuth, requireWriter] },
     async (req, reply) => {
       // Inject writer identity so the key service can verify ownership
-      req.headers["x-writer-id"] = req.session!.sub!;
+      const writerId = req.session!.sub!;
+      req.headers["x-writer-id"] = writerId;
+      const path = `/api/v1/articles/${req.params.nostrEventId}/vault`;
       return proxyToService(
-        `${KEY_SERVICE_URL}/api/v1/articles/${req.params.nostrEventId}/vault`,
+        `${KEY_SERVICE_URL}${path}`,
         "POST",
         req,
         reply,
-      );
-    },
-  );
-
-  app.patch<{ Params: { nostrEventId: string } }>(
-    "/articles/:nostrEventId/vault",
-    { preHandler: requireAuth },
-    async (req, reply) => {
-      // Inject writer identity so the key service can verify ownership
-      req.headers["x-writer-id"] = req.session!.sub!;
-      return proxyToService(
-        `${KEY_SERVICE_URL}/api/v1/articles/${req.params.nostrEventId}/vault`,
-        "PATCH",
-        req,
-        reply,
-      );
-    },
-  );
-
-  app.post<{ Params: { nostrEventId: string } }>(
-    "/articles/:nostrEventId/key",
-    { preHandler: requireAuth },
-    async (req, reply) => {
-      req.headers["x-reader-id"] = req.session!.sub!;
-      return proxyToService(
-        `${KEY_SERVICE_URL}/api/v1/articles/${req.params.nostrEventId}/key`,
-        "POST",
-        req,
-        reply,
+        (rawBody) =>
+          keyServiceHeaders({
+            method: "POST",
+            path,
+            rawBody,
+            identity: { writerId },
+          }),
       );
     },
   );
@@ -101,6 +87,26 @@ export async function articleGatePassRoutes(app: FastifyInstance) {
               error: "invitation_required",
               message:
                 "This is a private article. Contact the author to request access.",
+            });
+          // 403 and not 402, for the reader-terms reason one step further on:
+          // money is not the obstacle and a card will not clear it. The piece
+          // is not on sale. The message says nothing about the writer's Stripe
+          // account — that is between us and them (Writer 9.3; L5.6).
+          case "not_for_sale":
+            return reply.status(403).send({
+              error: "not_for_sale",
+              message:
+                "This piece isn't available to buy at the moment. Nothing has been charged.",
+            });
+          // 403, not 402: money is not the obstacle and a card will not clear
+          // it. The web has a dedicated branch on this code (`mapUnlockError`)
+          // that renders the acceptance in the gate — a 402 would put it on the
+          // add-a-card path, which for this reader is already done.
+          case "reader_terms_required":
+            return reply.status(403).send({
+              error: READER_TERMS_REQUIRED,
+              message:
+                "Before your next paid read, please accept the all.haus Reader Terms.",
             });
           case "payment_required":
             return reply.status(402).send({

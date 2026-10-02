@@ -207,3 +207,41 @@ describe("normaliseAtprotoCommit", () => {
     expect(normaliseAtprotoCommit(commit)).toBeNull();
   });
 });
+
+// The link-preview target is whatever the remote author put in the record, and
+// it is rendered as an `href` (MIRROR-AUDIT-2026-09-08 §2.3). React 18 renders
+// a `javascript:` href — it only logs that a FUTURE version will block it — so
+// the value is refused at the point it would be persisted. Mutation: drop the
+// `httpUrlOrNull` in `appendExternal` and the refusal case fails.
+describe("external embed link scheme", () => {
+  function withExternal(uri: string) {
+    return normaliseAtprotoPost({
+      did: DID,
+      uri: `at://${DID}/${COLLECTION}/${RKEY}`,
+      cid: "bafytest",
+      record: makeRecord({
+        embed: {
+          $type: "app.bsky.embed.external",
+          external: { uri, title: "T", description: "D" },
+        },
+      }),
+      fallbackDate: FALLBACK_DATE,
+    });
+  }
+
+  it("keeps an http(s) preview target", () => {
+    const media = withExternal("https://example.com/story").media;
+    expect(media).toContainEqual(
+      expect.objectContaining({ type: "link", url: "https://example.com/story" }),
+    );
+  });
+
+  it.each(["javascript:alert(1)", "data:text/html,<script>", "not a url"])(
+    "drops the whole media item for %s rather than storing it",
+    (uri) => {
+      // Dropped, not stored with a blanked url: a link tile whose href goes
+      // nowhere is worse than no tile.
+      expect(withExternal(uri).media.some((m) => m.type === "link")).toBe(false);
+    },
+  );
+});

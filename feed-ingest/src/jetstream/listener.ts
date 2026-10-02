@@ -11,11 +11,16 @@ import {
   type JetstreamCommit,
 } from "../adapters/atproto.js";
 import { insertAtprotoItem } from "../lib/atproto-ingest.js";
+import { sourceBlockedSql } from "@platform-pub/shared/lib/platform-blocks.js";
 import { ATPROTO_ENRICH_FAILED_ERROR } from "../tasks/feed-ingest-atproto-backfill.js";
 import { recordRepostEdge } from "../lib/repost-edge.js";
 import { getPlatformConfig } from "../lib/platform-config.js";
 import { SilenceWatchdog, attachLiveness } from "./silence-watchdog.js";
-import { resumeCursor, type ResumePoint } from "./resume-cursor.js";
+import {
+  resumeFrom,
+  watermarkAfterFlush,
+  type ResumePoint,
+} from "./resume-cursor.js";
 
 // =============================================================================
 // Jetstream listener
@@ -160,6 +165,13 @@ export class JetstreamListener {
   private cursorFlushTimer: NodeJS.Timeout | null = null;
   private eventsSinceFlush = 0;
   private watchdog: SilenceWatchdog | null = null;
+  // The one global stream position (CA-C7; resume-cursor.ts says why). Loaded
+  // at start, advanced in memory as each flush lands, null until the first
+  // flush ever written — when the per-source cursors are the fallback.
+  private watermark: bigint | null = null;
+  // The oldest time_us whose ingest FAILED since the last resume: the
+  // watermark is held below it, and a resume at or below it clears it.
+  private failedFloor: bigint | null = null;
 
   constructor(url?: string) {
     this.url = url ?? process.env.JETSTREAM_URL ?? DEFAULT_JETSTREAM_URL;
@@ -168,6 +180,7 @@ export class JetstreamListener {
   async start(): Promise<void> {
     logger.info({ url: this.url }, "Jetstream listener starting");
     await this.loadMaxBackoff();
+    await this.loadWatermark();
     // Try to claim leadership immediately; if another replica holds the lock,
     // poll periodically until it's released.
     await this.tryBecomeLeader();
@@ -259,15 +272,20 @@ export class JetstreamListener {
 
   private async releaseLeadership(): Promise<void> {
     if (!this.leaderClient) return;
+    // A failed unlock on a SURVIVING session must not return the lock-holding
+    // connection to the pool (no later election could ever win it back), so
+    // the client is released WITH the error and pg-pool destroys it — closing
+    // the session is what frees the lock.
+    let unlockErr: Error | undefined;
     try {
       await this.leaderClient.query("SELECT pg_advisory_unlock($1)", [
         JETSTREAM_LOCK_KEY,
       ]);
-    } catch {
-      /* ignore — the session is going away anyway */
+    } catch (err) {
+      unlockErr = err instanceof Error ? err : new Error(String(err));
     }
     try {
-      this.leaderClient.release();
+      this.leaderClient.release(unlockErr);
     } catch {
       /* ignore */
     }
@@ -286,6 +304,25 @@ export class JetstreamListener {
         .catch((err) => logger.warn({ err: err.message }, "DID refresh failed"))
         .finally(() => this.scheduleDidRefresh());
     }, DID_REFRESH_INTERVAL_MS);
+  }
+
+  private async loadWatermark(): Promise<void> {
+    try {
+      const { rows } = await pool.query<{ value: string }>(
+        `SELECT value FROM platform_config WHERE key = 'jetstream_cursor'`,
+      );
+      const raw = rows[0]?.value;
+      if (!raw) return;
+      const v = BigInt(raw);
+      if (v > 0n) this.watermark = v;
+    } catch (err) {
+      // Malformed or unreadable: the per-source cursors are the fallback, as
+      // before this key existed. Never a reason not to start.
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        "Jetstream watermark could not be read — resuming from per-source cursors",
+      );
+    }
   }
 
   private async loadMaxBackoff(): Promise<void> {
@@ -308,8 +345,16 @@ export class JetstreamListener {
 
     const { rows } = await pool.query<SourceRow>(`
       SELECT id, source_uri, cursor, handle, display_name, avatar_url
-      FROM external_sources
+      FROM external_sources es
       WHERE protocol = 'atproto' AND is_active = TRUE
+        -- The operator's refusal (L6.5, D7 §7). Jetstream is a PUSH path with
+        -- no per-source job to guard, so the block is applied to the DID set
+        -- itself: a blocked source drops out of the subscription on the next
+        -- refresh and the listener stops being told about it at all. That
+        -- refresh interval is the lag, and it is the reason this is a
+        -- predicate here rather than a check per event — per event it would be
+        -- a query on the firehose's hot path.
+        AND NOT ${sourceBlockedSql("es")}
     `);
 
     const nextDids = new Set<string>();
@@ -439,21 +484,36 @@ export class JetstreamListener {
   // --- Cursor handling --------------------------------------------------------
 
   // Jetstream's ?cursor= param is time_us (microseconds since epoch). On
-  // reconnect we resume from the oldest cursor across active sources so no
-  // source loses events — CAPPED at feed_ingest_atproto_max_replay_hours.
+  // reconnect we resume from the ONE stream watermark (held below any failed
+  // ingest), or — until the first flush has written one — from the oldest
+  // cursor across active sources; either way CAPPED at
+  // feed_ingest_atproto_max_replay_hours.
   //
-  // The cap is not a refinement, it is the fix: the minimum across N sources is
+  // The cap is not a refinement, it is a fix: the minimum across N sources is
   // the least active account's last post, so it ages without bound, and past
   // the wildcard threshold an old cursor asks Bluesky to replay a month of the
   // entire network. resume-cursor.ts has the measurements and the failure it
-  // presents as. Uncapped, this listener can never reach live.
+  // presents as. Uncapped, this listener can never reach live. And the
+  // watermark is the other half (CA-C7): with the cap alone every reconnect —
+  // every new follow — still replayed the whole cap.
   private async resumePoint(): Promise<ResumePoint> {
     const hours = await loadMaxReplayHours();
-    return resumeCursor(
-      [...this.sourceByDid.values()].map((r) => r.cursor),
+    return resumeFrom(
+      {
+        watermark: this.watermark === null ? null : this.watermark.toString(),
+        failedFloor: this.failedFloor,
+        perSourceCursors: [...this.sourceByDid.values()].map((r) => r.cursor),
+      },
       BigInt(Date.now()) * 1000n,
       BigInt(Math.round(hours * 3600)) * 1_000_000n,
     );
+  }
+
+  // An ingest that FAILED is a position the stream must re-deliver: the
+  // watermark is held below the oldest such event until a resume passes it.
+  private recordFailure(timeUs: number): void {
+    const t = BigInt(timeUs);
+    if (this.failedFloor === null || t < this.failedFloor) this.failedFloor = t;
   }
 
   // --- Batched cursor flush (#5 / B2) -----------------------------------------
@@ -507,18 +567,50 @@ export class JetstreamListener {
       return b === 0 ? `($1::uuid, $2::bigint)` : `($${b + 1}, $${b + 2})`;
     });
 
+    // A live event proves the source alive, which is how a poll-fallback
+    // error heals — but the ENRICHMENT marker is not a liveness question, it
+    // is "getProfile failed and the handle may be stale", and the
+    // enrichMissingHandles filter above backs off on error_count. Clearing it
+    // on every event reset that backoff for any posting source and dropped
+    // the rename-retry class out of the filter (CA-C9), so the marker and its
+    // count are kept; everything else clears as before.
+    const marker = params.length + 1;
+    params.push(ATPROTO_ENRICH_FAILED_ERROR);
     try {
       await pool.query(
         `UPDATE external_sources AS s
          SET cursor = GREATEST(COALESCE(s.cursor::BIGINT, 0), v.cursor)::TEXT,
              last_fetched_at = now(),
-             error_count = 0,
-             last_error = NULL,
+             error_count = CASE WHEN s.last_error = $${marker} THEN s.error_count ELSE 0 END,
+             last_error = CASE WHEN s.last_error = $${marker} THEN s.last_error ELSE NULL END,
              updated_at = now()
          FROM (VALUES ${values.join(", ")}) AS v(id, cursor)
          WHERE s.id = v.id`,
         params,
       );
+      // The stream watermark, from this batch of SUCCESSES, held below any
+      // failure (CA-C7). UPSERT and GREATEST: runtime state that is never
+      // seeded (like the heartbeat), and never moved back by a batch that
+      // flushed out of order. Its own statement, after the per-source write:
+      // a watermark past a per-source cursor that never landed would skip
+      // what the per-source fallback still knew about.
+      const next = watermarkAfterFlush(
+        batch.map(([, c]) => c),
+        this.failedFloor,
+      );
+      if (next !== null) {
+        await pool.query(
+          `INSERT INTO platform_config (key, value, description, updated_at)
+           VALUES ('jetstream_cursor', $1,
+                   'Runtime state: the Jetstream stream position (time_us) the listener resumes from — the newest ingest that succeeded, held below any that failed. Written by the listener''s cursor flush. Not a dial.',
+                   now())
+           ON CONFLICT (key) DO UPDATE
+             SET value = GREATEST(platform_config.value::bigint, EXCLUDED.value::bigint)::text,
+                 updated_at = now()`,
+          [next.toString()],
+        );
+        if (this.watermark === null || next > this.watermark) this.watermark = next;
+      }
     } catch (err) {
       logger.warn(
         { err: err instanceof Error ? err.message : String(err) },
@@ -556,6 +648,22 @@ export class JetstreamListener {
 
     const resume = await this.resumePoint();
     if (resume.cursor) params.set("cursor", resume.cursor);
+    // Resuming at or below the failed floor means the stream will re-deliver
+    // the event that failed; it either lands or records itself again. A
+    // resume past it — clamped by the replay cap, or from live — has lost
+    // it and SAYS so (the per-source poll fallback is what reaches one
+    // account's history directly). Either way the floor is released here:
+    // a floor kept past its resume would hold the watermark for ever.
+    if (this.failedFloor !== null) {
+      const at = resume.cursor === null ? null : BigInt(resume.cursor);
+      if (at === null || at > this.failedFloor) {
+        logger.warn(
+          { failedFloor: this.failedFloor.toString(), resumeAt: resume.cursor },
+          "Jetstream resume is past an ingest that failed — that event is not replayed",
+        );
+      }
+      this.failedFloor = null;
+    }
 
     const fullUrl = `${this.url}?${params.toString()}`;
     // INFO, not debug, and it names the replay depth: an over-deep resume is
@@ -782,13 +890,17 @@ export class JetstreamListener {
     timeUs: number,
   ): Promise<void> {
     try {
-      await withTransaction(async (client) => {
-        await insertAtprotoItem(client, source, item);
-      });
+      const didInsert = await withTransaction(async (client) =>
+        insertAtprotoItem(client, source, item),
+      );
 
       // Eagerly prefetch the parent post (if a reply) and/or the quoted post
-      // (if a quote post) so the /parent and /quote tiles render warm.
-      if (item.sourceReplyUri || item.sourceQuoteUri) {
+      // (if a quote post) so the /parent and /quote tiles render warm. Only
+      // for a row this write CREATED: a replayed commit (a reconnect resumed
+      // from an older cursor) is `ON CONFLICT DO NOTHING` here, and its
+      // neighbourhood was enqueued the first time — re-enqueuing per replay
+      // is one job row and one SELECT each for nothing (CA-C10).
+      if (didInsert && (item.sourceReplyUri || item.sourceQuoteUri)) {
         pool
           .query(
             `SELECT graphile_worker.add_job('external_parent_prefetch', $1)`,
@@ -801,7 +913,16 @@ export class JetstreamListener {
               }),
             ],
           )
-          .catch(() => {});
+          .catch((err: unknown) => {
+            logger.warn(
+              {
+                sourceId: source.id,
+                uri: item.sourceItemUri,
+                err: err instanceof Error ? err.message : String(err),
+              },
+              "Failed to enqueue parent prefetch for atproto item",
+            );
+          });
       }
 
       // Advance this source's cursor. The durable write is debounced into a
@@ -816,6 +937,7 @@ export class JetstreamListener {
       const existing = source.cursor ? BigInt(source.cursor) : 0n;
       if (BigInt(timeUs) > existing) source.cursor = String(timeUs);
     } catch (err) {
+      this.recordFailure(timeUs);
       logger.warn(
         {
           sourceId: source.id,
@@ -880,23 +1002,30 @@ export class JetstreamListener {
   ): Promise<void> {
     const uri = buildAtUri(did, "app.bsky.feed.post", rkey);
     try {
+      // Matched on (protocol, source_item_uri), never on source_id (CA-C11):
+      // a context row inherits the HYDRATING focal's source_id until real
+      // ingest promotes it, and the 24h backfill never re-offers an older
+      // post, so a subscribed author's older post held only as a thread
+      // parent survived its deletion. The uri is built from the event's own
+      // DID, so it cannot name another account's post.
       await withTransaction(async (client) => {
         await client.query(
           `UPDATE external_items SET deleted_at = now()
-           WHERE source_id = $1 AND protocol = 'atproto' AND source_item_uri = $2
+           WHERE protocol = 'atproto' AND source_item_uri = $1
              AND deleted_at IS NULL`,
-          [sourceId, uri],
+          [uri],
         );
         await client.query(
           `UPDATE feed_items SET deleted_at = now()
-           WHERE source_id = $1 AND source_protocol = 'atproto' AND source_item_uri = $2
+           WHERE source_protocol = 'atproto' AND source_item_uri = $1
              AND deleted_at IS NULL`,
-          [sourceId, uri],
+          [uri],
         );
       });
       // Debounced batched cursor advance (#5 / B2).
       this.recordCursor(sourceId, timeUs);
     } catch (err) {
+      this.recordFailure(timeUs);
       logger.warn(
         {
           sourceId,

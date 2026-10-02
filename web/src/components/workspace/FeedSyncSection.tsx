@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   followImports,
   type FeedImportBinding,
@@ -81,7 +81,7 @@ export function FeedSyncSection({
       if (p.upToDate) setSyncedAt(new Date().toISOString());
       setPreview(p);
     } catch (err) {
-      setError(apiErrorMessage(err) ?? "Could not read the origin network — try again.");
+      setError(apiErrorMessage(err) ?? "Couldn’t reach the network this channel was imported from. Please try again.");
     } finally {
       setPreviewing(false);
     }
@@ -99,7 +99,7 @@ export function FeedSyncSection({
       setRun(started);
       setPreview(null);
     } catch (err) {
-      setError(apiErrorMessage(err) ?? "Could not start the sync — try again.");
+      setError(apiErrorMessage(err) ?? "Couldn’t start the sync. Please try again.");
     } finally {
       setConfirming(false);
     }
@@ -114,6 +114,15 @@ export function FeedSyncSection({
     followImports.cancelSync(id).catch(() => {});
   }, [preview]);
 
+  // `onApplied` is read through a ref so the poll below does not depend on
+  // it: FeedComposer passes a fresh inline arrow every render, and with the
+  // callback in the effect's deps the 2s interval was torn down and re-armed
+  // on every parent render — starving under typing (CONSOLIDATED-TODO §0c.5).
+  const onAppliedRef = useRef(onApplied);
+  useEffect(() => {
+    onAppliedRef.current = onApplied;
+  }, [onApplied]);
+
   // Poll the applied run until terminal, then reload the composer's world.
   const runId = run?.id ?? null;
   useEffect(() => {
@@ -125,7 +134,7 @@ export function FeedSyncSection({
           setRun((prev) => (prev && prev.id === runId ? { ...prev, ...next } : prev));
           if (next.status === "done") {
             setSyncedAt(new Date().toISOString());
-            onApplied();
+            onAppliedRef.current();
           }
         })
         .catch(() => {
@@ -133,7 +142,7 @@ export function FeedSyncSection({
         });
     }, POLL_MS);
     return () => clearInterval(t);
-  }, [runId, applying, onApplied]);
+  }, [runId, applying]);
 
   const originLine = [
     PROTOCOL_LABELS[binding.protocol] ?? binding.protocol,
@@ -193,7 +202,7 @@ export function FeedSyncSection({
 
       {preview?.upToDate && (
         <p className="font-mono text-mono-xs" style={{ color: T.hintFg, marginTop: 6 }}>
-          UP TO DATE — nothing changed at the origin.
+          UP TO DATE: you haven’t followed or unfollowed anyone there since the last sync.
           {preview.removalsSkipped &&
             " (Follow list exceeds the import cap, so unfollows weren’t checked.)"}
         </p>
@@ -215,8 +224,8 @@ export function FeedSyncSection({
           {preview.removeSample.length > 0 && (
             <p className="text-ui-xs" style={{ color: T.hintFg, marginTop: 4 }}>
               Removing {preview.removeSample.slice(0, 6).join(", ")}
-              {preview.removes > 6 && ` and ${preview.removes - 6} more`} (unfollowed at the
-              origin — nothing is unfollowed there by us).
+              {preview.removes > 6 && ` and ${preview.removes - 6} more`} (you unfollowed them on
+              the other network; we never unfollow anyone there for you).
             </p>
           )}
           {(preview.truncated || preview.removalsSkipped) && (

@@ -130,7 +130,7 @@ export function PollDisplay({
             disabled={selected.size === 0 || voting}
             onClick={() => onVote(Array.from(selected))}
           >
-            {voting ? "VOTING..." : "VOTE"}
+            {voting ? "VOTING…" : "VOTE"}
           </button>
         )}
         <span className="label-ui" style={{ color: palette.cardMeta }}>
@@ -143,7 +143,12 @@ export function PollDisplay({
         )}
         {!poll.closed && poll.expiresAt && (
           <span className="label-ui" style={{ color: palette.cardMeta }}>
-            ENDS {new Date(poll.expiresAt).toLocaleDateString()}
+            ENDS{" "}
+            {new Date(poll.expiresAt).toLocaleDateString("en-GB", {
+              day: "numeric",
+              month: "short",
+              year: "numeric",
+            })}
           </span>
         )}
       </div>

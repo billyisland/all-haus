@@ -9,7 +9,7 @@ import { useDashboardOverlay } from "../../stores/dashboardOverlay";
 import { useLedgerOverlay } from "../../stores/ledgerOverlay";
 import { useSettingsOverlay } from "../../stores/settingsOverlay";
 import { useLibraryOverlay } from "../../stores/libraryOverlay";
-import { useNetworkOverlay } from "../../stores/networkOverlay";
+import { useProfile } from "../../stores/profileOverlay";
 import { useGlasshousePresence } from "../../stores/glasshouse";
 import { useIsMobile } from "../../hooks/useIsMobile";
 import { useColorScheme } from "../../stores/colorScheme";
@@ -19,6 +19,7 @@ import { useOpenExplain, useExplainable } from "./ExplainProvider";
 import { SearchPanel } from "./SearchPanel";
 import { LIGHT_ISLAND_STYLE } from "../../lib/palette/island";
 import { NAV_BAR_INSET } from "./NavBar";
+import { WRITER_MENU_APPLY, WRITER_MENU_APPLIED } from "../../content/writer-access";
 
 const TOKENS = {
   buttonBg: "var(--ah-ink-925)",
@@ -33,6 +34,16 @@ const TOKENS = {
 
 export type ForallAction = "new-feed" | "new-note";
 
+// The menu's one row height: `text-ui-sm` (14/1.5 = 21px) between two 10px
+// bands. Every row sits on it — see `MenuRow`'s `minHeight`.
+const ROW_H = 41;
+
+// THE LOCKUP IS ONE MARK WITH TWO CONTROLS (2026-09-14). The ∀ disc opens the
+// command menu; the `all.haus` wordmark to its right REFRESHES THE WORKSPACE —
+// every vessel's first page again, the desktop twin of mobile's per-feed
+// pull-to-refresh. They read as one mark and do two things, which is why the
+// wordmark no longer borrows the disc's hover spin: see its render block.
+//
 // NOTHING ON THE BAR IS TURNED. The two labels that live in the lockup — the
 // wordmark and the About pill that stands in for it under Explain — are plain
 // horizontal type. They were set bottom-to-top (`writing-mode: vertical-rl`
@@ -59,6 +70,20 @@ interface ForallMenuProps {
   currentFeed?: { id: string; name: string } | null;
   /** Open the FeedComposer for the feed-scoped row's target. */
   onFeedSettings?: (feedId: string) => void;
+  /** THE WORDMARK'S OWN ACTION: refresh every vessel (2026-09-14). The lockup
+   *  is one mark with TWO controls — the disc opens the menu, the wordmark
+   *  reloads the workspace — which is the only split in the lockup's life and
+   *  is deliberate: "all.haus" is the name of the place, so pressing it means
+   *  *this place, again*, the desktop twin of mobile's pull-to-refresh (which
+   *  reaches one feed at a time and is the only refresh gesture the canvas had).
+   *  Row anchor only; the mobile bar carries its own inert wordmark span.
+   *
+   *  ABSENT IN THE QUEUE (2026-09-26). There the refresh only REVEALS what the
+   *  timer already buffered (WORKSPACE-QUEUE-ADR §VI.5), so with nothing
+   *  buffered a press did nothing at all — and the edge pull already does the
+   *  reveal. Without it the wordmark goes back to being a second trigger for
+   *  the disc's menu: same click, same spin, no name of its own. */
+  onRefreshAll?: () => void;
   /** Placement of the ∀ trigger. "row" docks the whole lockup (disc + wordmark,
    *  adjacent) into the LEFT end of the desktop nav bar, menu opening DOWNWARD
    *  (WORKSPACE-COLUMN-LAYOUT-ADR §VI, as re-oriented 2026-08-25 — NavBar.tsx).
@@ -101,6 +126,7 @@ export function ForallMenu({
   onRestore,
   currentFeed = null,
   onFeedSettings,
+  onRefreshAll,
   anchor = "row",
 }: ForallMenuProps) {
   const inBar = anchor === "bar";
@@ -130,6 +156,11 @@ export function ForallMenu({
   const chromeFg = discBg;
   const router = useRouter();
   const logout = useAuth((s) => s.logout);
+  // The Profile row's gate — a primitive selector, so the menu re-renders only
+  // when the identity itself changes. No username, no row (never a dead one).
+  const username = useAuth((s) => s.user?.username);
+  const canWrite = useAuth((s) => s.user?.canWrite === true);
+  const writerApplied = useAuth((s) => s.user?.writerApplication != null);
   const dmCount = useUnreadCounts((s) => s.dmCount);
   const notificationCount = useUnreadCounts((s) => s.notificationCount);
   const totalUnread = dmCount + notificationCount;
@@ -146,6 +177,18 @@ export function ForallMenu({
   const isMobile = useIsMobile();
   const glasshouseOpen = useGlasshousePresence((s) => s.isOpen);
   const mobileSheetOpen = isMobile && glasshouseOpen;
+
+  // Declare the disc as the sheet's dismiss affordance, so no pane draws a
+  // second ✕ under it (stores/glasshouse.ts::useDiscCloseActive — which carries
+  // why the gate cannot be `isMobile` alone). Mobile only: on desktop the disc
+  // never flips to an X, and every pane keeps its own close. Declared for the
+  // whole mobile session rather than only while a sheet is up — the pane asks
+  // at RENDER time, and a flag that arrived with the sheet would let one frame
+  // of the redundant ✕ through on every open.
+  useEffect(() => {
+    useGlasshousePresence.getState()._setDiscClose(isMobile);
+    return () => useGlasshousePresence.getState()._setDiscClose(false);
+  }, [isMobile]);
 
   // Explain chrome swap (EXPLAIN-ADR D3, 2026-07-15 form). While an Explain
   // program is active only the WORDMARK gives way to an "About all.haus"
@@ -199,6 +242,9 @@ export function ForallMenu({
   // 360°→0° reset so it doesn't visibly unwind.
   const [glyphRot, setGlyphRot] = useState(0);
   const [spinTransition, setSpinTransition] = useState(true);
+  // The wordmark's own hover, kept apart from the disc's spin above: the two
+  // are separate controls now (see the wordmark's render block).
+  const [wordmarkHover, setWordmarkHover] = useState(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
@@ -211,8 +257,8 @@ export function ForallMenu({
   // Rows are grouped find → make → go: search first (the way in), then the
   // create actions, then the destinations, then (mobile only) any hidden-feed
   // restores — see `restoreRows` for why desktop has none. The
-  // groups render with a tight gap between them and flatten into `rows` for
-  // arrow-key navigation.
+  // groups fix that order and flatten into `rows` for arrow-key navigation;
+  // they carry no spacing of their own (see the render site).
   const findRows: FocusRow[] = [
     { kind: "open", target: "search", label: "Search", count: 0 },
   ];
@@ -227,7 +273,7 @@ export function ForallMenu({
           {
             kind: "overlay",
             onOpen: () => onFeedSettings(currentFeed.id),
-            label: "Feed settings",
+            label: "Channel settings",
             count: 0,
           },
         ]
@@ -237,7 +283,7 @@ export function ForallMenu({
     // through its "Make this an article →" escalation (which carries the typed
     // body along), never a second menu row.
     { kind: "action", key: "new-note", label: "Write something" },
-    { kind: "action", key: "new-feed", label: "New feed" },
+    { kind: "action", key: "new-feed", label: "New channel" },
   ];
   // The "what is this place" group (EXPLAIN-ADR §8, keep the menu slim).
   // Desktop: Explain alone (2026-07-16, amendment 11) — About left the menu;
@@ -265,9 +311,9 @@ export function ForallMenu({
   // Library / Network / Ledger / Settings used to render grey against the black
   // of Messages / Dashboard, demoting them to an account cluster under a
   // high-traffic pair. Grey in this menu reads as unavailable rather than
-  // secondary — every row here is a live destination, and the group gap already
-  // says which belong together. The two groups survive; only the colour split
-  // is gone.
+  // secondary — every row here is a live destination. The two groups survive as
+  // ORDER (the pair the reader wants most sits first); the colour split is gone
+  // and so, since 2026-09-14, is the gap that drew them apart.
   const goPrimaryRows: FocusRow[] = [
     {
       // Notifications folded into Messages — one merged inbox surface. The count
@@ -278,9 +324,17 @@ export function ForallMenu({
       count: dmCount + notificationCount,
     },
     {
+      // A READER has no dashboard, and in its place is the one row that
+      // explains why and asks (READER-WRITER-SPLIT-ADR §6.2). Same overlay:
+      // `DashboardOverlay` renders the explanation for a reader, so the row
+      // and a `?overlay=dashboard` deep link cannot land in different places.
       kind: "overlay",
       onOpen: () => useDashboardOverlay.getState().open(),
-      label: "Dashboard",
+      label: canWrite
+        ? "Dashboard"
+        : writerApplied
+          ? WRITER_MENU_APPLIED
+          : WRITER_MENU_APPLY,
       count: 0,
     },
   ];
@@ -291,12 +345,30 @@ export function ForallMenu({
       label: "Library",
       count: 0,
     },
-    {
-      kind: "overlay",
-      onOpen: () => useNetworkOverlay.getState().open(),
-      label: "Network",
-      count: 0,
-    },
+    // YOUR OWN PROFILE — and the only row here that is also a public page,
+    // which is why it alone pushes a real URL (/<username>) and closes on
+    // Back. Until this landed there was no way to reach your own profile from
+    // the chrome at all: you got there by clicking your own byline.
+    //
+    // It replaced NETWORK (2026-09-15), which dissolved rather than moved. Two
+    // of that panel's four live lists were this profile's Following and
+    // Followers views drawn as row strips — the form `PersonCard` replaced on
+    // the profile itself — and the other two (blocked, muted) were already
+    // written in the settings register and are now sections of Settings.
+    //
+    // `openSelf` rather than a username threaded through this menu's props, so
+    // there is one place that can get it wrong; the row is gated on the
+    // username so it never renders as a control that does nothing.
+    ...(username
+      ? [
+          {
+            kind: "overlay" as const,
+            onOpen: () => useProfile.getState().openSelf(),
+            label: "Profile",
+            count: 0,
+          },
+        ]
+      : []),
     {
       kind: "overlay",
       onOpen: () => useLedgerOverlay.getState().open(),
@@ -328,8 +400,8 @@ export function ForallMenu({
   // Sign-out is the terminal action, in its own group at the very bottom. It
   // lives here because the retired black topbar's avatar dropdown used to carry
   // it and there is no topbar anywhere any more — the ∀ is the member's sole
-  // nav. logout() clears the session; WorkspaceView's `!user` guard then
-  // bounces to /auth.
+  // nav. logout() ends the session and loads the public home as a full
+  // document (CA-E11: the navigation is what drops every viewer cache).
   const accountRows: FocusRow[] = [
     {
       kind: "overlay",
@@ -357,10 +429,11 @@ export function ForallMenu({
     buttonRef.current?.focus();
   }
 
-  // The disc / wordmark trigger. On mobile, with a sheet open, it is the
-  // back-to-workspace button (close the sheet); otherwise — including on
-  // desktop with any pane open — it toggles the command menu, which renders at
-  // z-60 above every Glasshouse.
+  // THE DISC's trigger, and the disc's alone since 2026-09-14 — the wordmark
+  // beside it now refreshes the workspace instead (`onRefreshAll`). On mobile,
+  // with a sheet open, it is the back-to-workspace button (close the sheet);
+  // otherwise — including on desktop with any pane open — it toggles the
+  // command menu, which renders at z-60 above every Glasshouse.
   function onTriggerClick() {
     // While Explain is active the disc is the way back out (EXPLAIN-ADR D3,
     // 2026-07-15 form): close the About pane if it is open (back to Explain),
@@ -615,27 +688,55 @@ export function ForallMenu({
         </button>
       )}
       {/* Wordmark — "all.haus" set to the RIGHT of the ∀ disc so the two read as
-          one mark (glyph · text). It is part of the trigger's click target (same
-          toggle + glyph-spin as the disc) and, like the disc, stays CRISP above
-          the frost: the container sits at z-60, above the Glasshouse scrim
-          (z-[55]), so an open overlay never blurs or dims it. Row anchor only —
-          the mobile bar carries its own wordmark. Gives way to the About button
-          while a FLOOR-mode Explain program is active; stays put through a
-          pane-mode one. */}
+          one mark (glyph · text), and, like the disc, CRISP above the frost: the
+          container sits at z-60, above the Glasshouse scrim (z-[55]), so an open
+          overlay never blurs or dims it. Row anchor only — the mobile bar
+          carries its own wordmark. Gives way to the About button while a
+          FLOOR-mode Explain program is active; stays put through a pane-mode
+          one.
+
+          IT IS ITS OWN CONTROL (2026-09-14). Until now it was a second trigger
+          for the disc's menu — same onClick, same glyph-spin — an accessibility
+          no-op (`aria-hidden`, `tabIndex={-1}`) that existed only so the whole
+          lockup was clickable. It now REFRESHES THE WORKSPACE (`onRefreshAll`),
+          so it is a real, focusable button with its own name, and the lockup is
+          one mark carrying two controls: the disc for the menu, the name of the
+          place for *this place, again*.
+
+          THE SPIN DOES NOT FOLLOW IT. Hovering here no longer turns the ∀ —
+          that turn is the DISC's own tell that it is the menu, and firing it
+          from a control that does something else says the two are one button
+          while the click says they are not. The wordmark gets its own signal
+          instead: a dip in weight of colour on hover, type-only, no rule and no
+          box (the ban on thin rules forbids one anyway). */}
       {!inBar && (!explainActive || paneExplain) && (
         <button
           type="button"
-          aria-hidden="true"
-          tabIndex={-1}
-          onClick={onTriggerClick}
-          onMouseEnter={() => {
-            setSpinTransition(true);
-            setGlyphRot(180);
-          }}
-          onMouseLeave={() => {
-            setSpinTransition(true);
-            setGlyphRot(360);
-          }}
+          {...(onRefreshAll
+            ? {
+                "aria-label": "Refresh every channel",
+                title: "Refresh every channel",
+                onClick: onRefreshAll,
+                onMouseEnter: () => setWordmarkHover(true),
+                onMouseLeave: () => setWordmarkHover(false),
+              }
+            : {
+                // The menu's second trigger (queue mode, see `onRefreshAll`):
+                // the disc is the accessible control, so this one is hidden
+                // from assistive tech and the tab order, and it borrows the
+                // disc's spin because here the two ARE one button.
+                "aria-hidden": true,
+                tabIndex: -1,
+                onClick: onTriggerClick,
+                onMouseEnter: () => {
+                  setSpinTransition(true);
+                  setGlyphRot(180);
+                },
+                onMouseLeave: () => {
+                  setSpinTransition(true);
+                  setGlyphRot(360);
+                },
+              })}
           style={{
             // No fixed width: the wordmark is horizontal type again, so it sizes
             // to its own text and the flex container shrinks to the pair. (The
@@ -660,6 +761,13 @@ export function ForallMenu({
               // against the inverted nav row.
               color: chromeFg,
               letterSpacing: "-0.01em",
+              // The wordmark's whole hover signal (see above). Opacity rather
+              // than a second colour token: it holds in both modes without
+              // naming a slug, which is the bug class the lockup has already
+              // been bitten by once (`.claude/rules/web-theme.md` ›
+              // *A component that names a DARK_SLUG*).
+              opacity: wordmarkHover ? 0.6 : 1,
+              transition: "opacity 120ms ease",
             }}
           >
             all.haus
@@ -690,7 +798,16 @@ export function ForallMenu({
           {(() => {
             let flat = 0;
             return groups.map((group, gi) => (
-              <div key={gi} style={gi > 0 ? { marginTop: 6 } : undefined}>
+              // THE GROUPS ORDER THE ROWS; THEY DO NOT SPACE THEM (2026-09-14).
+              // Each group used to open with a 6px margin, which against a 41px
+              // row was too small to read as grouping and too big to read as
+              // even — the menu looked mis-set rather than organised. The list
+              // is now one uniform rhythm and `groups` is an ordering construct
+              // only: it fixes the find → make → explain → go → account
+              // sequence and flattens into `rows` for arrow-key navigation.
+              // Restore the gap only by making it large enough to be legible as
+              // a group break (≥12px), never by putting 6 back.
+              <div key={gi}>
                 {group.map((row) => {
                   const idx = flat++;
                   return (
@@ -963,7 +1080,16 @@ const MenuRow = forwardRef<HTMLButtonElement, MenuRowProps>(function MenuRow(
         gap: 12,
         color: muted ? TOKENS.itemMuted : TOKENS.itemFg,
         opacity: disabled ? 0.55 : 1,
-        padding: isRestore ? "8px 14px 8px 24px" : "10px 14px",
+        padding: isRestore ? "10px 14px 10px 24px" : "10px 14px",
+        // EVERY ROW IS THE SAME HEIGHT, whatever voice it is set in. A
+        // destination row is 21px of `text-ui-sm` between 10px bands = 41; a
+        // restore row is `.label-ui`, whose 11px mono lays out at 17.6 and left
+        // the row 7px short — one list, two rhythms, on the one surface where
+        // the two kinds appear together (mobile, with a feed hidden). The floor
+        // holds the box at the destination row's height and the flex centring
+        // does the rest, so a future row in a third voice inherits the rhythm
+        // rather than breaking it.
+        minHeight: ROW_H,
         background: active ? TOKENS.itemFocusBg : "transparent",
         transition: "background 80ms linear",
         outline: "none",

@@ -14,6 +14,11 @@ import type { VesselPalette } from "./tokens";
 //
 // `replyingTo` renders the non-adjacent-parent "→ NAME" affordance ahead of the
 // speaker, in the same byline idiom (no bold-sans, no colon convention).
+//
+// THE NAME IS THE ONE THING THAT GIVES. A name wider than its card (a long
+// handle in a queue preview row) is cut with an ellipsis at the card's edge;
+// everything else in the row keeps its size, so the time and any trailing mark
+// are never the ones pushed out.
 export function Byline({
   pipNode,
   name,
@@ -28,6 +33,7 @@ export function Byline({
   onNameMouseLeave,
   dataExplain,
   dragHandle,
+  showTime = true,
 }: {
   pipNode?: React.ReactNode;
   name: string;
@@ -50,6 +56,8 @@ export function Byline({
   // `cursor: grab` is the only thing on the card that says so, which is why the
   // affordance lives here rather than on bare chrome the user has to discover.
   dragHandle?: boolean;
+  // The resolved spec's `showTime` — off on a queue preview row (§VI.3).
+  showTime?: boolean;
 }) {
   const nameHover = {
     onMouseEnter: onNameMouseEnter,
@@ -57,7 +65,7 @@ export function Byline({
   };
   return (
     <div
-      className={`flex items-center gap-2 label-ui ${className}`}
+      className={`flex items-center gap-2 label-ui min-w-0 [&>*]:shrink-0 ${className}`}
       style={{ color: palette.cardMeta, cursor: dragHandle ? "grab" : undefined }}
       data-explain={dataExplain}
       data-card-drag-handle={dragHandle ? "" : undefined}
@@ -86,7 +94,7 @@ export function Byline({
             }
           }}
           style={{ color: palette.cardTitle }}
-          className="font-medium hover:underline"
+          className="font-medium hover:underline min-w-0 !shrink truncate"
           {...nameHover}
         >
           {name}
@@ -95,16 +103,20 @@ export function Byline({
         <span
           ref={nameRef as React.Ref<HTMLSpanElement>}
           style={{ color: palette.cardTitle }}
-          className="font-medium"
+          className="font-medium min-w-0 !shrink truncate"
           {...nameHover}
         >
           {name}
         </span>
       )}
-      <span>·</span>
-      <time dateTime={new Date(publishedAt * 1000).toISOString()}>
-        {formatDateRelative(publishedAt)}
-      </time>
+      {showTime && (
+        <>
+          <span>·</span>
+          <time dateTime={new Date(publishedAt * 1000).toISOString()}>
+            {formatDateRelative(publishedAt)}
+          </time>
+        </>
+      )}
       {trailing}
     </div>
   );

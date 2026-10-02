@@ -29,6 +29,42 @@ const SITE_HOSTS = new Set([
   "127.0.0.1",
 ]);
 
+/**
+ * The one gate between ingested data and an `href`. Returns the href only for
+ * `http:`/`https:`, and `undefined` for everything else — `javascript:`,
+ * `data:`, `vbscript:`, a malformed value, an empty one.
+ *
+ * `undefined` rather than `"#"` is deliberate: React omits the attribute
+ * entirely, so a hostile value renders as text that is not a link, instead of a
+ * link that silently does nothing. React 18 does NOT block a `javascript:`
+ * href — it logs "A future version of React will block javascript: URLs" and
+ * renders it — so nothing downstream of this is holding the line.
+ *
+ * Apply it at every `href` built from post or profile data. Internal paths
+ * (`/source/:id`, `/article/:dTag`) are ours by construction and do not go
+ * through it; `web/tests/href-guard.test.ts` is the standing check that a new
+ * external sink cannot skip it.
+ */
+export function safeHttpUrl(
+  url: string | null | undefined,
+): string | undefined {
+  if (!url) return undefined;
+  const trimmed = url.trim();
+  if (!trimmed) return undefined;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    // Relative and hash-only values are internal by construction and have no
+    // business reaching this helper; a malformed absolute one is refused.
+    return undefined;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return undefined;
+  }
+  return trimmed;
+}
+
 export function isExternalHref(href: string): boolean {
   const trimmed = href.trim();
   if (!trimmed) return false;

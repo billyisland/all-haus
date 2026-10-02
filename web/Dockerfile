@@ -8,8 +8,6 @@ ENV npm_config_fetch_retries=5 \
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ .
-ARG NEXT_PUBLIC_RELAY_URL
-ARG NEXT_PUBLIC_GATEWAY_URL
 ARG NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY
 # Pledge drives + commissioning (parked 2026-07-13). Inlined into the client
 # bundle here; default 0 (off). Revive with a rebuild, not just a restart.
@@ -22,18 +20,26 @@ ARG NEXT_PUBLIC_UPSTREAM_EDGES_ENABLED
 # Publications — suspended by operator directive 2026-08-31 (reason and restore
 # conditions: docs/adr/LEGAL-BRAKES.md; see shared/src/lib/env.ts).
 ARG NEXT_PUBLIC_PUBLICATIONS_ENABLED
+# Trust graph (parked) and traffology. `web/src/lib/featureFlags.ts` has read
+# both since they were written, and NEITHER had an ARG here or a build arg in
+# compose — so they were inlined as `undefined` on every build and the two
+# features were off with no way for an operator to turn them on. A flag the
+# code reads and nothing can set is a dead dial; default 0 (off), which is
+# what they have effectively been.
+ARG NEXT_PUBLIC_TRUST_ENABLED
+ARG NEXT_PUBLIC_TRAFFOLOGY_ENABLED
 # next.config.js rewrites() is evaluated at BUILD time and baked into
 # .next/routes-manifest.json — so GATEWAY_URL must be present here, not just at
 # runtime, or the /api proxy destination falls back to localhost:3000 (which,
 # inside the container, is the web service itself → ECONNRESET on every API call).
 ARG GATEWAY_URL
-ENV NEXT_PUBLIC_RELAY_URL=$NEXT_PUBLIC_RELAY_URL
-ENV NEXT_PUBLIC_GATEWAY_URL=$NEXT_PUBLIC_GATEWAY_URL
 ENV NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=$NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY
 ENV NEXT_PUBLIC_PLEDGES_ENABLED=$NEXT_PUBLIC_PLEDGES_ENABLED
 ENV NEXT_PUBLIC_TRIBUTES_ENABLED=$NEXT_PUBLIC_TRIBUTES_ENABLED
 ENV NEXT_PUBLIC_UPSTREAM_EDGES_ENABLED=$NEXT_PUBLIC_UPSTREAM_EDGES_ENABLED
 ENV NEXT_PUBLIC_PUBLICATIONS_ENABLED=$NEXT_PUBLIC_PUBLICATIONS_ENABLED
+ENV NEXT_PUBLIC_TRUST_ENABLED=$NEXT_PUBLIC_TRUST_ENABLED
+ENV NEXT_PUBLIC_TRAFFOLOGY_ENABLED=$NEXT_PUBLIC_TRAFFOLOGY_ENABLED
 ENV GATEWAY_URL=$GATEWAY_URL
 RUN npm run build
 

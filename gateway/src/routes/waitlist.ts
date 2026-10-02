@@ -82,7 +82,7 @@ export async function waitlistRoutes(app: FastifyInstance) {
           { err, email: email.slice(0, 3) + "***" },
           "Waitlist join failed",
         );
-        return reply.status(500).send({ error: "Failed to join the list" });
+        return reply.status(500).send({ error: "Couldn't add you to the list. Please try again." });
       }
 
       // Always the same acknowledgement — new or already present.

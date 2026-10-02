@@ -2,6 +2,8 @@ import { UUID_RE } from "../lib/uuid.js";
 import type { FastifyInstance } from "fastify";
 import { pool } from "@platform-pub/shared/db/client.js";
 import { requireAuth, optionalAuth } from "../middleware/auth.js";
+import { isUuid } from "../lib/request-inputs.js";
+import { trustSystemEnabled } from "@platform-pub/shared/lib/env.js";
 
 // =============================================================================
 // Trust Routes (Phases 1 + 2)
@@ -23,6 +25,21 @@ type Visibility = (typeof VISIBILITIES)[number];
 
 
 export async function trustRoutes(app: FastifyInstance) {
+  // PARKED: every route here 404s unless TRUST_SYSTEM_ENABLED is on — the same
+  // flag that stops feed-ingest scheduling the three trust crons. The web hides
+  // the trust surfaces behind NEXT_PUBLIC_TRUST_ENABLED, but hiding a control
+  // is not closing a door: a vouch written against the open route was a row its
+  // author could neither see nor withdraw, and nothing consumed (walkthrough
+  // A18). One hook, the publications shape: it covers every route this plugin
+  // registers, because `app.register(trustRoutes)` gives it its own context.
+  // It also keeps GDPR export honest — `export.ts` withholds the trust tables
+  // BECAUSE nothing can write them while parked.
+  app.addHook("preHandler", async (_req, reply) => {
+    if (!trustSystemEnabled()) {
+      return reply.status(404).send({ error: "Not found" });
+    }
+  });
+
   // ---------------------------------------------------------------------------
   // GET /trust/:userId — full trust profile
   // ---------------------------------------------------------------------------
@@ -32,6 +49,9 @@ export async function trustRoutes(app: FastifyInstance) {
     { preHandler: optionalAuth },
     async (req, reply) => {
       const { userId } = req.params;
+      if (!isUuid(userId)) {
+        return reply.status(404).send({ error: "not_found" });
+      }
       const viewerId = req.session?.sub;
 
       // Layer 1
@@ -310,10 +330,10 @@ export async function trustRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const attestorId = req.session!.sub;
       const { id } = req.params;
-
-      if (!UUID_RE.test(id)) {
-        return reply.status(400).send({ error: "Invalid vouch ID" });
+      if (!isUuid(id)) {
+        return reply.status(404).send({ error: "not_found" });
       }
+
 
       const { rowCount } = await pool.query(
         `UPDATE vouches SET withdrawn_at = now()
@@ -389,8 +409,8 @@ export async function trustRoutes(app: FastifyInstance) {
     { preHandler: optionalAuth },
     async (req, reply) => {
       const { userId } = req.params;
-      if (!UUID_RE.test(userId)) {
-        return reply.status(400).send({ error: "Invalid user id" });
+      if (!isUuid(userId)) {
+        return reply.status(404).send({ error: "not_found" });
       }
       const viewerId = req.session?.sub ?? null;
 
@@ -451,8 +471,8 @@ export async function trustRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const respondentId = req.session!.sub;
       const { userId } = req.params;
-      if (!UUID_RE.test(userId)) {
-        return reply.status(400).send({ error: "Invalid user id" });
+      if (!isUuid(userId)) {
+        return reply.status(404).send({ error: "not_found" });
       }
       if (userId === respondentId) {
         return reply.status(400).send({ error: "Cannot poll yourself" });
@@ -493,8 +513,8 @@ export async function trustRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const respondentId = req.session!.sub;
       const { userId } = req.params;
-      if (!UUID_RE.test(userId)) {
-        return reply.status(400).send({ error: "Invalid user id" });
+      if (!isUuid(userId)) {
+        return reply.status(404).send({ error: "not_found" });
       }
       const body = (req.body ?? {}) as { question?: string };
       if (

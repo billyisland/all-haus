@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 import { pool } from '@platform-pub/shared/db/client.js'
 import { optionalAuth } from '../../middleware/auth.js'
+import { parseLimit, parseOffset } from '../../lib/request-inputs.js'
 
 // =============================================================================
 // Reader-facing publication routes
@@ -71,8 +72,8 @@ export async function publicationPublicRoutes(app: FastifyInstance) {
     '/publications/by-slug/:slug/articles',
     async (req, reply) => {
       const { slug } = req.params
-      const limit = Math.min(parseInt((req.query as any).limit ?? '20', 10), 50)
-      const offset = parseInt((req.query as any).offset ?? '0', 10)
+      const limit = parseLimit((req.query as any).limit, 20, 50)
+      const offset = parseOffset((req.query as any).offset)
 
       const { rows: pubs } = await pool.query<{ id: string }>(
         `SELECT id FROM publications WHERE slug = $1 AND status = 'active'`,

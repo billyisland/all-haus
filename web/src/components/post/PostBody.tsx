@@ -106,19 +106,27 @@ export function PostBody({
   mode,
   palette,
   pollVote,
+  warningReveal = true,
 }: {
   post: Post;
   bodyPx: number;
   mode: BodyMode;
   palette: VesselPalette;
   pollVote?: PollVote;
+  // The resolved spec's `warningReveal`: false, a warned post shows its label
+  // in place of its text and offers no SHOW CONTENT.
+  warningReveal?: boolean;
 }) {
   const body = (
     <BodyInner post={post} bodyPx={bodyPx} mode={mode} palette={palette} pollVote={pollVote} />
   );
   if (post.body.contentWarning) {
     return (
-      <ContentWarning warningText={post.body.contentWarning} palette={palette}>
+      <ContentWarning
+        warningText={post.body.contentWarning}
+        palette={palette}
+        revealable={warningReveal}
+      >
         {body}
       </ContentWarning>
     );

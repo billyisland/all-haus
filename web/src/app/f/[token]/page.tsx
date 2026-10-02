@@ -4,6 +4,37 @@ import { useCallback, useEffect, useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { useAuth } from '../../../stores/auth'
 import {
+  FEED_LINK_ADD,
+  FEED_LINK_ADDED,
+  FEED_LINK_ADDING,
+  FEED_LINK_BY_BEFORE,
+  FEED_LINK_CLOSED_BETA,
+  FEED_LINK_CONTENTS_LABEL,
+  FEED_LINK_JOIN_WAITLIST,
+  FEED_LINK_LOGIN_AFTER,
+  FEED_LINK_LOGIN_BEFORE,
+  FEED_LINK_LOGIN_LINK,
+  FEED_LINK_MISSING_BODY,
+  FEED_LINK_MISSING_TITLE,
+  FEED_LINK_OUTAGE_BODY,
+  FEED_LINK_OUTAGE_TITLE,
+  FEED_LINK_RETRY,
+  FEED_LINK_OPEN_WORKSPACE,
+  FEED_LINK_REDEEM_ERROR,
+  FEED_LINK_REDEEM_REFUSED_FALLBACK,
+  FEED_LINK_GONE_TITLE,
+  FEED_LINK_REDEEM_REFUSALS,
+  FEED_LINK_WITHDRAWN_TITLE,
+  feedLinkAuthorName,
+  feedLinkExcludedSentence,
+  feedLinkFailedLead,
+  feedLinkGoneSentence,
+  feedLinkRefusalSentence,
+  feedLinkSourceCount,
+  feedLinkTitle,
+  feedLinkWithdrawnSentence,
+} from '../../../content/feed-link'
+import {
   formulas as formulasApi,
   formulaSourceKind,
   type FeedLink,
@@ -79,15 +110,6 @@ import { usePublicPalette } from '../../../components/public/palette'
 // author's composition.
 // =============================================================================
 
-// Keyed on the server's own `error` code, not on the message: the copy here is
-// the recipient's voice and the message is the operator's.
-const REDEEM_REFUSALS: Record<string, string> = {
-  formula_revoked: 'The author has withdrawn this link.',
-  source_feed_gone: 'The feed this link pointed at no longer exists.',
-  formula_empty: 'There is nothing in this feed to add yet.',
-  formula_too_large: 'This feed is too large to share right now.',
-}
-
 function Frame({
   title,
   children,
@@ -116,18 +138,31 @@ export default function FormulaPage() {
   const [formula, setFormula] = useState<FeedLink | null>(null)
   const [loading, setLoading] = useState(true)
   const [missing, setMissing] = useState(false)
+  // The lookup got no ANSWER — not a missing link. Rendered as an outage with
+  // a retry, never as `FEED_LINK_MISSING_BODY` (CA-E1): the header above argues
+  // only that a 404 is deliberately ambiguous, and a 502 is not a 404.
+  const [outage, setOutage] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [redeeming, setRedeeming] = useState(false)
   const [result, setResult] = useState<RedeemResult | null>(null)
 
-  useEffect(() => {
+  const load = useCallback(() => {
     if (!token) return
+    setLoading(true)
+    setOutage(false)
     formulasApi
       .get(token)
       .then(setFormula)
-      .catch(() => setMissing(true))
+      .catch((err: unknown) => {
+        if (err instanceof ApiError && err.status === 404) setMissing(true)
+        else setOutage(true)
+      })
       .finally(() => setLoading(false))
   }, [token])
+
+  useEffect(() => {
+    load()
+  }, [load])
 
   const handleRedeem = useCallback(async () => {
     if (redeeming) return
@@ -145,9 +180,9 @@ export default function FormulaPage() {
       // re-checks rather than trusting what this page was handed.
       setError(
         err instanceof ApiError && err.status === 410
-          ? (REDEEM_REFUSALS[String(err.body?.error ?? '')] ??
-            'This link no longer leads to a feed you can add.')
-          : 'Something went wrong adding this feed. Try again in a moment.',
+          ? (FEED_LINK_REDEEM_REFUSALS[String(err.body?.error ?? '')] ??
+            FEED_LINK_REDEEM_REFUSED_FALLBACK)
+          : FEED_LINK_REDEEM_ERROR,
       )
     } finally {
       setRedeeming(false)
@@ -159,34 +194,38 @@ export default function FormulaPage() {
       <PublicShell>
         <PublicVessel>
           <PublicCard style={{ padding: 0 }}>
-            <IndeterminateSlab label="Loading this feed" />
+            <IndeterminateSlab />
           </PublicCard>
         </PublicVessel>
       </PublicShell>
     )
   }
 
-  if (missing || !formula) {
+  if (outage) {
     return (
-      <Frame title="This link doesn’t lead anywhere">
+      <Frame title={FEED_LINK_OUTAGE_TITLE}>
         <PublicBody>
-          Feed links are long and unguessable, so a missing one is usually a
-          copy that lost its tail. Ask whoever sent it for the whole thing.
+          {FEED_LINK_OUTAGE_BODY}
+          <PublicLink onClick={load}>{FEED_LINK_RETRY}</PublicLink>
         </PublicBody>
       </Frame>
     )
   }
 
-  const authorName = formula.author.displayName ?? formula.author.username
+  if (missing || !formula) {
+    return (
+      <Frame title={FEED_LINK_MISSING_TITLE}>
+        <PublicBody>{FEED_LINK_MISSING_BODY}</PublicBody>
+      </Frame>
+    )
+  }
+
+  const authorName = feedLinkAuthorName(formula)
 
   if (formula.revoked) {
     return (
-      <Frame title="This feed has been withdrawn">
-        <PublicBody>
-          {authorName ? `${authorName} has` : 'The author has'} taken this link
-          down. Anyone who already added the feed keeps it — withdrawing a link
-          stops new copies and reaches into nobody’s workspace.
-        </PublicBody>
+      <Frame title={FEED_LINK_WITHDRAWN_TITLE}>
+        <PublicBody>{feedLinkWithdrawnSentence(authorName)}</PublicBody>
       </Frame>
     )
   }
@@ -196,12 +235,8 @@ export default function FormulaPage() {
   // provenance; what it points at does not.
   if (formula.gone) {
     return (
-      <Frame title="This feed no longer exists">
-        <PublicBody>
-          {authorName ? `${authorName} has` : 'The author has'} deleted the feed
-          this link pointed at. Anyone who already added it keeps their copy —
-          it was theirs from the moment they added it.
-        </PublicBody>
+      <Frame title={FEED_LINK_GONE_TITLE}>
+        <PublicBody>{feedLinkGoneSentence(authorName)}</PublicBody>
       </Frame>
     )
   }
@@ -218,16 +253,15 @@ export default function FormulaPage() {
               a public page. `.trim()` because a whitespace-only name is the same
               untitled case. Same rule the workspace already follows everywhere
               ("Unnamed feed", "No name", `Feed N`); this page was the outlier. */}
-          <PublicTitle>{formula.name?.trim() || 'A feed'}</PublicTitle>
+          <PublicTitle>{feedLinkTitle(formula)}</PublicTitle>
           <div style={{ marginTop: 10 }}>
             <PublicBody>
               {/* D7 — attribution travels, adoption counts do not. There is no
                   "added 41 times" here and there is not meant to be. */}
-              A feed of {formula.sourceCount}{' '}
-              {formula.sourceCount === 1 ? 'source' : 'sources'}
+              {feedLinkSourceCount(formula.sourceCount)}
               {authorName ? (
                 <>
-                  , put together by{' '}
+                  {FEED_LINK_BY_BEFORE}
                   <span style={{ color: palette.cardTitle }}>{authorName}</span>
                 </>
               ) : null}
@@ -236,14 +270,15 @@ export default function FormulaPage() {
           </div>
         </PublicCard>
 
-        {/* The composition itself, in the author's own composer order (§11) —
-            the sequence they arranged, not one this page re-sorts. */}
+        {/* The composition itself, in the author's own composer order (§11,
+            as amended §17: alphabetical by rendered label) — the server's
+            order, frozen at the cut, not one this page re-sorts. */}
         <PublicCard>
           <div
             className="label-ui"
             style={{ color: palette.cardMeta, marginBottom: 12 }}
           >
-            What’s in it
+            {FEED_LINK_CONTENTS_LABEL}
           </div>
           <div
             style={{ display: 'flex', flexDirection: 'column', gap: 10 }}
@@ -287,12 +322,7 @@ export default function FormulaPage() {
         {formula.excludedCount > 0 && (
           <PublicCard>
             <PublicBody>
-              {formula.excludedCount === 1
-                ? 'One source in the original feed couldn’t be shared'
-                : `${formula.excludedCount} sources in the original feed couldn’t be shared`}{' '}
-              — some sources can’t travel: newsletters arrive at a private
-              address that belongs to one subscriber, and a source may no
-              longer exist.
+              {feedLinkExcludedSentence(formula.excludedCount)}
             </PublicBody>
           </PublicCard>
         )}
@@ -302,20 +332,14 @@ export default function FormulaPage() {
         {result ? (
           <PublicCard>
             <div style={{ marginBottom: 16 }}>
-              <PublicBody>
-                Added to your workspace as a feed of your own — retune it,
-                rename it, take things out. It’s yours now, and nothing the
-                author does next will reach it.
-              </PublicBody>
+              <PublicBody>{FEED_LINK_ADDED}</PublicBody>
             </div>
             {/* Reported, never swallowed (§6): a redeem that quietly dropped
                 four sources would read as the author's composition. */}
             {result.failed.length > 0 && (
               <div style={{ marginBottom: 16 }}>
                 <PublicBody>
-                  {result.failed.length === 1
-                    ? 'One source couldn’t be reached and isn’t in your copy: '
-                    : `${result.failed.length} sources couldn’t be reached and aren’t in your copy: `}
+                  {feedLinkFailedLead(result.failed.length)}
                   <span style={{ color: palette.cardTitle }}>
                     {result.failed.map((f) => f.label).join(', ')}
                   </span>
@@ -324,7 +348,7 @@ export default function FormulaPage() {
               </div>
             )}
             <PublicButton full onClick={() => router.push('/reader')}>
-              Open your workspace
+              {FEED_LINK_OPEN_WORKSPACE}
             </PublicButton>
           </PublicCard>
         ) : formula.refusal ? (
@@ -334,37 +358,34 @@ export default function FormulaPage() {
           // keeping rather than discarding as broken.
           <PublicCard>
             <PublicBody>
-              {formula.refusal === 'empty'
-                ? 'There is nothing in this feed to add yet. Keep the link — it will work as soon as its author adds a source.'
-                : 'This feed carries more sources than a link may. Keep the link — it will work once its author trims it.'}
+              {feedLinkRefusalSentence(formula.refusal)}
             </PublicBody>
           </PublicCard>
         ) : user ? (
           <PublicCard>
             <PublicButton full disabled={redeeming} onClick={handleRedeem}>
-              {redeeming ? 'Adding…' : 'Add to my workspace'}
+              {redeeming ? FEED_LINK_ADDING : FEED_LINK_ADD}
             </PublicButton>
           </PublicCard>
         ) : (
           <>
             <PublicCard>
               <div style={{ marginBottom: 16 }}>
-                <PublicBody>
-                  all.haus is in closed beta. Join the waiting list and this
-                  feed will be one click away when you’re in.
-                </PublicBody>
+                <PublicBody>{FEED_LINK_CLOSED_BETA}</PublicBody>
               </div>
               <PublicButton full onClick={() => router.push('/waitlist')}>
-                Join the waiting list
+                {FEED_LINK_JOIN_WAITLIST}
               </PublicButton>
             </PublicCard>
             <PublicCard>
               <PublicBody>
-                Already on all.haus?{' '}
-                <PublicLink href={`/auth?mode=login&redirect=/f/${token}`}>
-                  Log in
+                {FEED_LINK_LOGIN_BEFORE}{' '}
+                {/* No `redirect=`: dead (nothing reads it) and the forbidden
+                    `returnTo` shape — see lib/auth-return.ts. */}
+                <PublicLink href="/auth?mode=login">
+                  {FEED_LINK_LOGIN_LINK}
                 </PublicLink>{' '}
-                to add it.
+                {FEED_LINK_LOGIN_AFTER}
               </PublicBody>
             </PublicCard>
           </>

@@ -63,6 +63,24 @@ const AUTH_CACHE_SWEEP_AT = 10_000;
 interface AccountAuthState {
   status: string;
   sessionsInvalidatedAt: Date | null;
+  /** Terms 1.1: has this member declared their age? Read here so the refusal
+   *  is SERVER-side (§0z item 11) — the web's gate is the surface, not the rule. */
+  ageDeclared: boolean;
+}
+
+/**
+ * Per-route opt-out of the age refusal, for the handful of routes an
+ * undeclared member must still be able to reach: the one that reads their
+ * state (`/auth/me`, which is how the web knows to show the gate) and the one
+ * that records the declaration. Everything else — every money, publish, DM
+ * and read door — answers 403 `age_required` until the column is set. A
+ * route opts out with `config: { allowUndeclaredAge: true }`; the flag is
+ * typed here so a misspelling is a compile error, not a silent open door.
+ */
+declare module "fastify" {
+  interface FastifyContextConfig {
+    allowUndeclaredAge?: boolean;
+  }
 }
 
 // value.state === null encodes "account not found" (also cached, briefly).
@@ -85,15 +103,20 @@ async function loadAccountAuthState(
   const row = await pool.query<{
     status: string;
     sessions_invalidated_at: Date | null;
-  }>("SELECT status, sessions_invalidated_at FROM accounts WHERE id = $1", [
-    accountId,
-  ]);
+    age_declared: boolean;
+  }>(
+    `SELECT status, sessions_invalidated_at,
+            (age_declared_at IS NOT NULL) AS age_declared
+       FROM accounts WHERE id = $1`,
+    [accountId],
+  );
   const state: AccountAuthState | null =
     row.rowCount === 0
       ? null
       : {
           status: row.rows[0].status,
           sessionsInvalidatedAt: row.rows[0].sessions_invalidated_at,
+          ageDeclared: row.rows[0].age_declared === true,
         };
 
   authStateCache.set(accountId, { state, expiresAt: now + AUTH_CACHE_TTL_MS });
@@ -127,6 +150,27 @@ export async function requireAuth(
   const account = await loadAccountAuthState(session.sub);
   if (!account || account.status !== "active") {
     reply.status(403).send({ error: "Account suspended or not found" });
+    return;
+  }
+
+  // Terms 1.1 — "we refuse an account to anyone who tells us they are
+  // younger" — was CLIENT-side until §0z item 11: the web mounted the gate and
+  // nothing on the server read the column, so any client with the cookie
+  // could gate-pass, accrue, DM and publish with no declaration at all. The
+  // refusal lives here, in the one middleware every member door passes, and
+  // a route opts OUT by config rather than in — the two that must (`/auth/me`,
+  // `/auth/declare-age`) name themselves. An under-18 declaration is refused
+  // and not recorded (see that route), which with this check in force means
+  // the account can reach nothing: refused in fact, without a status written
+  // on an unverified assertion.
+  if (
+    !account.ageDeclared &&
+    !req.routeOptions?.config?.allowUndeclaredAge
+  ) {
+    reply.status(403).send({
+      error: "age_required",
+      message: "Please tell us your date of birth before continuing.",
+    });
     return;
   }
 
@@ -191,4 +235,66 @@ export async function optionalAuth(
   } else {
     req.session = null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// requireSelfServiceAuth — requireAuth, widened to a member's OWN deactivation
+//
+// `requireAuth` refuses every status but `active`, which is right for the ~200
+// routes that DO something. It is wrong for the one route whose whole job is
+// handing a member their own data back (L7.1, D8 §7): a member who deactivates
+// on their phone still has a live cookie on their laptop, and an export refused
+// there is a data-subject right refused over a state the member chose and can
+// reverse at any time by signing in.
+//
+// The split is deliberate and is the same one the reinstate route draws:
+// `deactivated` is the MEMBER'S act and is theirs to undo, so it must not cost
+// them their data; `suspended` and `moderated` are the OPERATOR'S and stay
+// refused here — a moderated member's route out is the appeal (D7 §5), not a
+// self-serve bundle carrying their root key.
+//
+// Everything else is requireAuth's, unchanged and deliberately not duplicated:
+// the session check, the invalidation check, the injected identity headers and
+// the silent refresh. This wrapper only widens which statuses may pass, and it
+// re-reads the status from the same cached loader rather than from the session,
+// which carries no status at all.
+// ---------------------------------------------------------------------------
+
+const SELF_SERVICE_STATUSES = new Set(["active", "deactivated"]);
+
+export async function requireSelfServiceAuth(
+  req: FastifyRequest,
+  reply: FastifyReply,
+): Promise<void> {
+  const session = await verifySession(req);
+
+  if (!session || !session.sub) {
+    reply.status(401).send({ error: "Authentication required" });
+    return;
+  }
+
+  const account = await loadAccountAuthState(session.sub);
+  if (!account || !SELF_SERVICE_STATUSES.has(account.status)) {
+    reply.status(403).send({ error: "Account suspended or not found" });
+    return;
+  }
+
+  const invalidatedAt = account.sessionsInvalidatedAt;
+  if (
+    invalidatedAt &&
+    session.iat &&
+    session.iat < Math.floor(invalidatedAt.getTime() / 1000)
+  ) {
+    destroySession(reply);
+    reply.status(401).send({ error: "Session expired" });
+    return;
+  }
+
+  req.headers["x-reader-id"] = session.sub;
+  req.headers["x-reader-pubkey"] = session.pubkey;
+  req.headers["x-writer-id"] = session.sub;
+
+  req.session = session;
+
+  await refreshIfNeeded(req, reply, session);
 }

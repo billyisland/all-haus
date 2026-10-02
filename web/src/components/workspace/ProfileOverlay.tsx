@@ -23,8 +23,17 @@ import { useResolvedDark } from "../../stores/colorScheme";
 import { AuthorProfileView } from "../../app/author/[authorId]/AuthorProfileView";
 
 export function ProfileOverlay() {
-  const { isOpen, target, close, dismiss, _handlePop, frameScheme } =
-    useProfile();
+  const {
+    isOpen,
+    target,
+    close,
+    dismiss,
+    _handlePop,
+    frameScheme,
+    enterFrom,
+    focus,
+    tab,
+  } = useProfile();
   // The pane's own palette, so the ⊓ takes the SAME walls the tier-1 bar is
   // painted in and the two read as one vessel. Off a feed that is the feed's
   // colourway; elsewhere the global content palette, whose walls are ink — so
@@ -72,6 +81,12 @@ export function ProfileOverlay() {
     <Glasshouse
       onClose={close}
       onSupersede={dismiss}
+      // The profile is the second Glasshouse handoff on the platform (the
+      // note→article escalation is the first): a byline inside the reader, and
+      // a notification row inside the Messages inbox, both open this pane IN
+      // THE PLACE OF the one the click was made in. Null off a pane, and the
+      // arrival is unchanged there.
+      enterFrom={enterFrom}
       selfHistory
       // One home with the standalone pages' column, so the two registers of one
       // surface cannot drift in width (`PROFILE_PANE_WIDTH`).
@@ -121,6 +136,8 @@ export function ProfileOverlay() {
             username={target.username}
             onClose={close}
             scheme={frameScheme}
+            focus={focus}
+            tab={tab}
           />
         ) : (
           <AuthorProfileView

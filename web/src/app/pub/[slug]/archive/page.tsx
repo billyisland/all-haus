@@ -4,9 +4,9 @@ import { PublicationMasthead } from '../../../../components/publication/Publicat
 import { PublicPage } from '../../../../components/public/PublicPage'
 import {
   EmptyState,
-  LoadFailed,
   type PubArticle,
 } from '../../../../components/publication/article-shared'
+import { LoadFailed } from '../../../../components/ui/LoadFailed'
 import { PubArchive } from '../../../../components/publication/pub-sections'
 
 // =============================================================================
@@ -19,7 +19,7 @@ import { PubArchive } from '../../../../components/publication/pub-sections'
 const GATEWAY = process.env.GATEWAY_INTERNAL_URL ?? process.env.GATEWAY_URL ?? 'http://localhost:3000'
 
 async function getPublication(slug: string) {
-  const res = await fetch(`${GATEWAY}/api/v1/publications/${slug}/public`, {
+  const res = await fetch(`${GATEWAY}/api/v1/publications/${encodeURIComponent(slug)}/public`, {
     next: { revalidate: 60 },
   })
   if (!res.ok) return null
@@ -28,7 +28,7 @@ async function getPublication(slug: string) {
 
 /** null means the fetch FAILED — distinct from a publication with no articles. */
 async function getArticles(slug: string) {
-  const res = await fetch(`${GATEWAY}/api/v1/publications/by-slug/${slug}/articles?limit=100`, {
+  const res = await fetch(`${GATEWAY}/api/v1/publications/by-slug/${encodeURIComponent(slug)}/articles?limit=100`, {
     next: { revalidate: 60 },
   })
   if (!res.ok) return null

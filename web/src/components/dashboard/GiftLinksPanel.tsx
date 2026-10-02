@@ -1,8 +1,10 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import React, { useState, useEffect } from 'react'
 import { giftLinks, type GiftLink } from '../../lib/api'
 import { useCopyLink } from '../../hooks/useCopyLink'
+import { useConfirm } from '../ui/ConfirmDialog'
+import * as C from '../../content/dashboard'
 
 interface GiftLinksPanelProps {
   articleId: string
@@ -12,11 +14,15 @@ interface GiftLinksPanelProps {
 export function GiftLinksPanel({ articleId, dTag }: GiftLinksPanelProps) {
   const [links, setLinks] = useState<GiftLink[]>([])
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  // A failed load has no list to show and takes the panel; a failed create or
+  // revoke is about one act and is said beside the list, which stays.
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
   const [limit, setLimit] = useState(5)
   const [revokingId, setRevokingId] = useState<string | null>(null)
   const { copiedId, failedId, failedUrl, copy } = useCopyLink()
+  const { ask, dialog } = useConfirm()
 
   useEffect(() => {
     void (async () => {
@@ -25,7 +31,7 @@ export function GiftLinksPanel({ articleId, dTag }: GiftLinksPanelProps) {
         const res = await giftLinks.list(articleId)
         setLinks(res.giftLinks)
       } catch {
-        setError('Failed to load gift links.')
+        setLoadError(C.GIFT_LINKS_LOAD_FAILED)
       } finally {
         setLoading(false)
       }
@@ -34,6 +40,7 @@ export function GiftLinksPanel({ articleId, dTag }: GiftLinksPanelProps) {
 
   async function handleCreate() {
     setCreating(true)
+    setActionError(null)
     try {
       const result = await giftLinks.create(articleId, limit)
       setLinks(prev => [{
@@ -46,19 +53,28 @@ export function GiftLinksPanel({ articleId, dTag }: GiftLinksPanelProps) {
       }, ...prev])
       setLimit(5)
     } catch {
-      setError('Failed to create gift link.')
+      setActionError(C.GIFT_LINK_CREATE_FAILED)
     } finally {
       setCreating(false)
     }
   }
 
-  async function handleRevoke(linkId: string) {
+  // Confirmed: a revoked link cannot be un-revoked, and the reader holding
+  // it has no way of knowing until they try. Mint a new one instead.
+  async function handleRevoke(e: React.MouseEvent<HTMLElement>, linkId: string) {
+    const ok = await ask(e.currentTarget, {
+      title: C.GIFT_LINK_REVOKE_CONFIRM_TITLE,
+      body: C.GIFT_LINK_REVOKE_CONFIRM_BODY,
+      confirmLabel: C.GIFT_LINK_REVOKE_CONFIRM_LABEL,
+    })
+    if (!ok) return
     setRevokingId(linkId)
+    setActionError(null)
     try {
       await giftLinks.revoke(articleId, linkId)
       setLinks(prev => prev.map(l => l.id === linkId ? { ...l, revoked: true } : l))
     } catch {
-      setError('Failed to revoke link.')
+      setActionError(C.GIFT_LINK_REVOKE_FAILED)
     } finally {
       setRevokingId(null)
     }
@@ -69,16 +85,17 @@ export function GiftLinksPanel({ articleId, dTag }: GiftLinksPanelProps) {
   }
 
   if (loading) return <div className="px-4 py-3"><div className="h-4 w-48 animate-pulse bg-grey-100" /></div>
-  if (error) return <div className="px-4 py-3 text-ui-xs text-grey-600">{error}</div>
+  if (loadError) return <div className="px-4 py-3 text-ui-xs text-grey-600">{loadError}</div>
 
   const active = links.filter(l => !l.revoked)
   const revoked = links.filter(l => l.revoked)
 
   return (
     <div className="px-4 py-4 space-y-4">
+      {dialog}
       {/* Create new */}
       <div className="flex items-center gap-3">
-        <label className="text-[12px] font-mono text-grey-400">Limit</label>
+        <label className="label-ui text-grey-400">{C.GIFT_LINK_LIMIT}</label>
         <input
           type="number"
           min={1}
@@ -88,22 +105,23 @@ export function GiftLinksPanel({ articleId, dTag }: GiftLinksPanelProps) {
           className="w-16 bg-grey-100 px-2 py-1 text-ui-xs font-sans text-black"
         />
         <button
-          onClick={handleCreate}
+          onClick={() => void handleCreate()}
           disabled={creating}
           className="btn-text underline underline-offset-4"
         >
-          {creating ? 'Creating…' : 'New gift link'}
+          {creating ? C.GIFT_LINK_CREATING : C.GIFT_LINK_NEW}
         </button>
       </div>
+      {actionError && <p role="alert" className="text-ui-xs text-crimson">{actionError}</p>}
 
       {/* Active links */}
       {active.length > 0 && (
         <table className="w-full text-ui-xs">
           <thead>
             <tr className="border-b-2 border-grey-200">
-              <th className="py-1 text-left label-ui text-grey-400">Link</th>
-              <th className="py-1 text-right label-ui text-grey-400">Redeemed</th>
-              <th className="py-1 text-right label-ui text-grey-400">Created</th>
+              <th className="py-1 text-left label-ui text-grey-400">{C.GIFT_LINK_COL_LINK}</th>
+              <th className="py-1 text-right label-ui text-grey-400">{C.GIFT_LINK_COL_REDEEMED}</th>
+              <th className="py-1 text-right label-ui text-grey-400">{C.GIFT_LINK_COL_CREATED}</th>
               <th className="py-1 text-right label-ui text-grey-400" />
             </tr>
           </thead>
@@ -119,7 +137,7 @@ export function GiftLinksPanel({ articleId, dTag }: GiftLinksPanelProps) {
                       readOnly
                       value={failedUrl}
                       onFocus={e => e.currentTarget.select()}
-                      aria-label="Gift link — copy it by hand"
+                      aria-label={C.GIFT_LINK_COPY_BY_HAND}
                       className="w-full bg-glasshouse-well px-2 py-1 font-mono text-[12px] text-black"
                     />
                   ) : (
@@ -127,7 +145,7 @@ export function GiftLinksPanel({ articleId, dTag }: GiftLinksPanelProps) {
                       onClick={() => copyUrl(link.token, link.id)}
                       className="font-mono text-[12px] text-grey-600 hover:text-black transition-colors"
                     >
-                      {copiedId === link.id ? 'Copied!' : `…${link.token.slice(-8)}`}
+                      {copiedId === link.id ? C.GIFT_LINK_COPIED : `…${link.token.slice(-8)}`}
                     </button>
                   )}
                 </td>
@@ -139,11 +157,11 @@ export function GiftLinksPanel({ articleId, dTag }: GiftLinksPanelProps) {
                 </td>
                 <td className="py-1.5 text-right">
                   <button
-                    onClick={() => handleRevoke(link.id)}
+                    onClick={(e) => handleRevoke(e, link.id)}
                     disabled={revokingId === link.id}
                     className="text-grey-300 hover:text-black disabled:opacity-50"
                   >
-                    {revokingId === link.id ? '…' : 'Revoke'}
+                    {revokingId === link.id ? '…' : C.GIFT_LINK_REVOKE}
                   </button>
                 </td>
               </tr>
@@ -156,7 +174,7 @@ export function GiftLinksPanel({ articleId, dTag }: GiftLinksPanelProps) {
       {revoked.length > 0 && (
         <details className="text-ui-xs">
           <summary className="text-grey-300 cursor-pointer hover:text-grey-600">
-            {revoked.length} revoked
+            {C.revokedCount(revoked.length)}
           </summary>
           <div className="mt-2 space-y-1">
             {revoked.map(link => (
@@ -170,7 +188,7 @@ export function GiftLinksPanel({ articleId, dTag }: GiftLinksPanelProps) {
       )}
 
       {links.length === 0 && (
-        <p className="text-ui-xs text-grey-300">No gift links yet.</p>
+        <p className="text-ui-xs text-grey-300">{C.GIFT_LINKS_EMPTY}</p>
       )}
     </div>
   )

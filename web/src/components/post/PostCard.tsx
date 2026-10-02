@@ -4,7 +4,7 @@ import React from "react";
 import { resolveSpec } from "../../lib/post/level-spec";
 import { explainCardFlavour } from "../../lib/explain/registry";
 import type { Level, Post } from "../../lib/post/types";
-import { PostCardShell, type CardContext, type PipOpen } from "./chassis";
+import { PostCardShell, type CardContext } from "./chassis";
 import { PostByline } from "./PostByline";
 import { PostBody } from "./PostBody";
 import { PostMedia } from "./PostMedia";
@@ -35,32 +35,34 @@ export function PostCard({
   post,
   level,
   ctx,
-  onPipOpen,
   onReply,
   onQuote,
-  onReport,
+  onDelete,
   onExpand,
   onCollapse,
   onReroot,
   onQuoteOpen,
   onOpenReader,
+  onFocus,
   isOwnContent,
   interactions,
   footer,
+  replyingTo,
 }: {
   post: Post;
   level: Level;
   ctx: CardContext;
-  onPipOpen?: PipOpen;
   onReply?: () => void;
   onQuote?: () => void;
-  onReport?: () => void;
+  onDelete?: (anchor: HTMLElement) => void;
   onExpand?: (post: Post) => void;
   onCollapse?: (post: Post) => void;
   onReroot?: (post: Post) => void;
   // Re-root onto this post's quoted post (external quote tile click).
   onQuoteOpen?: (quotedPostId: string) => void;
   onOpenReader?: (post: Post) => void;
+  // Walk the queue to this row's feed (a preview row, `click: "focus"`).
+  onFocus?: (post: Post) => void;
   isOwnContent?: boolean;
   // External interact-back (usePostInteractions), supplied by PostCardInteractive
   // when the card is interactive. Absent ⇒ read-only counters + read-only poll.
@@ -68,6 +70,9 @@ export function PostCard({
   // Slot rendered inside the shell, below the actions (inline reply box).
   // Owned by the container.
   footer?: React.ReactNode;
+  // "→ NAME" ahead of the byline: whom this reply answers, where that is not
+  // the card directly above it. Set by the host that knows the order.
+  replyingTo?: { name: string } | null;
 }) {
   const spec = resolveSpec(level, post.biddabilityTier, post);
   const bodyPx = Math.max(
@@ -110,6 +115,8 @@ export function PostCard({
         return onReroot ? () => onReroot(post) : undefined;
       case "reader-pane":
         return onOpenReader ? () => onOpenReader(post) : undefined;
+      case "focus":
+        return onFocus ? () => onFocus(post) : undefined;
       case "none":
       default:
         return undefined;
@@ -122,25 +129,42 @@ export function PostCard({
   // only row left that names it. Scoped to level="feed" (chassis.tsx).
   const dragHandle = !!ctx.dragData && level === "feed";
 
+  // The reading counts track FEED cards only (WORKSPACE-QUEUE-ADR §IV.7); a
+  // `seen` that leaked into a thread node's ctx must not count it.
+  const counted = ctx.seen !== undefined && level === "feed";
+  // The READ fade is wider than the count: a queue preview row wears it too
+  // (§VII.5), but carries no `data-seen-at`, so nothing can pass it.
+  const receded = (counted || level === "preview") && ctx.seen === "read";
+
   // Quoted is laid out inside its host's container — no shell, no own indent/gap.
   if (spec.insideHost) {
     return (
       <div style={{ cursor: onClick ? "pointer" : undefined }} onClick={onClick}>
         {spec.showByline && (
-          <PostByline post={post} palette={ctx.palette} bylineProfile={spec.bylineProfile} showResonance={spec.showResonance} onPipOpen={onPipOpen} feedId={ctx.feedId} />
+          <PostByline post={post} palette={ctx.palette} bylineProfile={spec.bylineProfile} showResonance={spec.showResonance} feedId={ctx.feedId} showTime={spec.showTime} />
         )}
-        <PostBody post={post} bodyPx={bodyPx} mode={bodyMode} palette={ctx.palette} />
+        <PostBody post={post} bodyPx={bodyPx} mode={bodyMode} palette={ctx.palette} warningReveal={spec.warningReveal} />
         <PostMedia post={post} mode={spec.media} video={spec.video} palette={ctx.palette} density={ctx.density} />
       </div>
     );
   }
 
   return (
-    <PostCardShell ctx={ctx} indentPx={spec.indentPx} gapBelowPx={spec.gapBelowPx} onClick={onClick} explainParam={explainCardFlavour(post)}>
+    <PostCardShell ctx={ctx} postId={post.id} indentPx={spec.indentPx} gapBelowPx={spec.gapBelowPx} onClick={onClick} explainParam={explainCardFlavour(post)} seenAt={counted ? post.publishedAt : undefined} receded={receded}>
       {spec.showByline && (
-        <PostByline post={post} palette={ctx.palette} bylineProfile={spec.bylineProfile} showResonance={spec.showResonance} onPipOpen={onPipOpen} feedId={ctx.feedId} dragHandle={dragHandle} />
+        <PostByline
+          post={post}
+          palette={ctx.palette}
+          bylineProfile={spec.bylineProfile}
+          showResonance={spec.showResonance}
+          feedId={ctx.feedId}
+          dragHandle={dragHandle}
+          showTime={spec.showTime}
+          replyingTo={replyingTo}
+          trailing={counted && ctx.seen === "new" ? <NewMark /> : undefined}
+        />
       )}
-      <PostBody post={post} bodyPx={bodyPx} mode={bodyMode} palette={ctx.palette} pollVote={pollVote} />
+      <PostBody post={post} bodyPx={bodyPx} mode={bodyMode} palette={ctx.palette} pollVote={pollVote} warningReveal={spec.warningReveal} />
       <PostMedia post={post} mode={spec.media} video={spec.video} palette={ctx.palette} density={ctx.density} />
       <QuotedEmbed post={post} mode={spec.quoteEmbed} expanded={quoteExpanded} palette={ctx.palette} onQuoteOpen={onQuoteOpen} />
       <PostCounters post={post} mode={spec.originCounters} palette={ctx.palette} interactions={interactions} />
@@ -153,7 +177,7 @@ export function PostCard({
         isOwnContent={isOwnContent}
         onReply={onReply}
         onQuote={onQuote}
-        onReport={onReport}
+        onDelete={onDelete}
       />
       {spec.showOriginTag && (
         <PostOriginTag
@@ -167,5 +191,17 @@ export function PostCard({
       )}
       {footer}
     </PostCardShell>
+  );
+}
+
+// A new card's label, in the byline row (WORKSPACE-QUEUE-ADR §IV.8). The row is
+// already `.label-ui` in `palette.cardMeta`, so it takes both from there; it
+// sits at the row's far end, clear of the timestamp and the resonance mark it
+// must not be read as part of.
+function NewMark() {
+  return (
+    <span style={{ marginLeft: "auto" }}>
+      NEW
+    </span>
   );
 }

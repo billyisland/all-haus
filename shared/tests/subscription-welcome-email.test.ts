@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+// Every link in these emails is built from APP_URL at SEND time, with no
+// fallback (§0ab residual) — a suite that leaves it unset throws, by design.
+process.env.APP_URL = 'https://test.all.haus'
 
 // =============================================================================
 // The subscription welcome email (§4.2, migration 180).
@@ -26,11 +29,14 @@ const query = vi.fn()
 vi.mock('../src/lib/email.js', () => ({ sendEmail: (...a: unknown[]) => sendEmail(...(a as [])) }))
 vi.mock('../src/db/client.js', () => ({ pool: { query: (...a: unknown[]) => query(...(a as [])) } }))
 
-const {
-  welcomeParagraphs,
-  defaultWelcomeText,
-  sendSubscriptionWelcomeEmail,
-} = await import('../src/lib/subscription-emails.js')
+const { sendSubscriptionWelcomeEmail } = await import('../src/lib/subscription-emails.js')
+const { welcomeParagraphs: welcomeBlocks, defaultWelcomeText } = await import(
+  '../src/lib/email/templates/subscriptions.js'
+)
+const { renderBlocksHtml } = await import('../src/lib/email/layout.js')
+
+/** The writer's message as the email's HTML renders it. */
+const welcomeParagraphs = (message: string) => renderBlocksHtml(welcomeBlocks(message))
 
 type WriterRow = {
   email: string | null
@@ -178,8 +184,8 @@ describe('sendSubscriptionWelcomeEmail', () => {
     await sendSubscriptionWelcomeEmail(READER_ID, WRITER_ID)
 
     const sent = sendEmail.mock.calls[0][0] as { htmlBody: string; textBody: string }
-    expect(sent.htmlBody).toContain('/awriter"')
-    expect(sent.textBody).toContain('/awriter')
+    expect(sent.htmlBody).toContain('https://test.all.haus/awriter"')
+    expect(sent.textBody).toContain('https://test.all.haus/awriter')
   })
 
   it('sends nothing when the reader has no email on file', async () => {

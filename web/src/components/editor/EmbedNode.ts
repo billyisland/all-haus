@@ -5,13 +5,27 @@ import { isEmbeddableUrl } from "../../lib/media";
 // =============================================================================
 // EmbedNode TipTap Extension
 //
-// Custom node that renders oEmbed previews for supported URLs (YouTube,
-// Vimeo, Twitter/X, Spotify). When the user pastes a supported URL on
-// its own line, the editor detects it and replaces it with an embed node.
+// Custom node for the URLs the body renderer turns into a player — YouTube,
+// Vimeo, Spotify; `isEmbeddableUrl` is DEFINED by that renderer
+// (`articleEmbed`), so this can never claim a provider that publishes as a
+// bare link. When the user pastes one on its own line, the editor replaces it
+// with an embed node.
 //
 // In Markdown serialisation, embeds are stored as plain URLs on their own
 // line (Nostr convention). The rendering layer enhances them.
 // =============================================================================
+
+/**
+ * The URL has already passed `isEmbeddableUrl`, but it is being concatenated
+ * into markup — escape it anyway.
+ */
+function escapeAttr(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
 
 export interface EmbedNodeOptions {
   onEmbedInserted?: (url: string) => void;
@@ -53,7 +67,7 @@ export const EmbedNode = Node.create<EmbedNodeOptions>({
       "div",
       mergeAttributes(HTMLAttributes, {
         "data-embed": "",
-        class: "border border-grey-200 p-4 my-4 bg-grey-100",
+        class: "p-4 my-4 bg-grey-100",
       }),
       [
         "a",
@@ -90,10 +104,24 @@ export const EmbedNode = Node.create<EmbedNodeOptions>({
                 if (!isEmbeddableUrl(text)) continue;
 
                 const newToken = new state.Token("embed", "", 0);
-                newToken.attrs = { src: text };
+                newToken.block = true;
+                // PAIRS, not an object: markdown-it's `renderAttrs`/`attrGet`
+                // iterate `attrs` as `[name, value]` tuples, so an object drops
+                // the URL on the floor.
+                newToken.attrs = [["src", text]];
                 tokens.splice(i, 3, newToken);
               }
             });
+            // Without this the token has no renderer rule, `renderToken` builds
+            // its tag from the empty `token.tag`, and the whole paragraph —
+            // URL included — comes out as `<>`. That is a DELETION: every path
+            // that hands stored markdown back to the editor (reopening a draft,
+            // editing a published article, the note→article seed) lost every
+            // bare embed URL, and the next autosave wrote the loss back.
+            markdownit.renderer.rules.embed = (tokens: any, idx: number) =>
+              `<div data-embed="" src="${escapeAttr(
+                tokens[idx].attrGet("src") ?? "",
+              )}"></div>\n`;
           },
         },
       },

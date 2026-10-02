@@ -32,8 +32,9 @@ shared/src/**/*.d.ts.map
 
 # Segregation probe output — a run artifact, overwritten on every run.
 # The findings that matter live in FUNDS-SEGREGATION-INTEGRATION.md §5.
-segregation-probe-results.json
-segregation-sequence-results.json
+# Every default name (`--brands-live` writes segregation-brands-live.json, which
+# carries sandbox customer/account/charge ids — CA-F8).
+segregation-*.json
 # --out <file> renames the run's output, so the default name alone is not enough.
 # Both spellings, because both have been used: `seq-` for the sequence steps and
 # `seg-` for the 2026-08-01 batch and the --brands matrix. These carry sandbox
@@ -67,3 +68,7 @@ certs/
 # Editor swap files
 *.swp
 *.swo
+
+# Local browser drive rigs (playwright, dev accounts, throwaway). Kept in the
+# tree so they sit inside the working directory; never committed.
+scripts/drive/

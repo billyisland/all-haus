@@ -1,6 +1,8 @@
 import type { PoolClient } from "pg";
 import type { NormalisedAtprotoItem } from "../adapters/atproto.js";
 import { truncatePreview } from "@platform-pub/shared/lib/text.js";
+import { CONTEXT_INTERACTION_MERGE_SQL } from "@platform-pub/shared/lib/context-persist.js";
+import { recordServed } from "./item-membership.js";
 
 // =============================================================================
 // Shared atproto ingest write path — used by both the Jetstream listener and
@@ -10,8 +12,9 @@ import { truncatePreview } from "@platform-pub/shared/lib/text.js";
 // The ON CONFLICT is promotion-GATED (EXTERNAL-AUTHOR-HISTORY-ADR §4.2): a row
 // first persisted context-only by thread/profile hydration is promoted to
 // first-class on real ingest — flags cleared, source_id re-homed from the
-// hydrating focal's source to the author's own (deletion matching and feed
-// membership both key on source_id), deleted_at cleared. A REAL existing row
+// hydrating focal's source to the author's own (deletion matching keys on
+// source_id; feed membership is external_item_sources, CA-C4), deleted_at
+// cleared. A REAL existing row
 // makes the WHERE false, no row returns, and the caller sees the exact old
 // DO NOTHING semantics. The feed_items conflict can only fire in the promotion
 // case (a fresh external_items insert mints a fresh id), so its DO UPDATE is
@@ -82,6 +85,26 @@ export async function insertAtprotoItem(
       is_context_only = FALSE,
       is_profile_hydrated = FALSE,
       source_id = EXCLUDED.source_id,
+      -- A PROMOTION TAKES THE REAL PAYLOAD (CA-C8). A context row is the
+      -- THIN write — the parent prefetch stores media = '[]' and the
+      -- client-API hydrators carry no poll or content warning — and
+      -- FEED_SELECT renders COALESCE(ei.media, fi.media), so a promoted post
+      -- kept the empty media it was hydrated with while its feed_items twin
+      -- was refreshed underneath it: images gone, a CW post uncovered.
+      content_text = EXCLUDED.content_text,
+      content_html = EXCLUDED.content_html,
+      language = EXCLUDED.language,
+      media = EXCLUDED.media,
+      source_reply_uri = COALESCE(EXCLUDED.source_reply_uri, external_items.source_reply_uri),
+      source_quote_uri = COALESCE(EXCLUDED.source_quote_uri, external_items.source_quote_uri),
+      -- Counts are monotonic here as in the engagement refresh: a live
+      -- commit carries none, and a context fetch may have read fresher ones.
+      like_count = GREATEST(external_items.like_count, EXCLUDED.like_count),
+      reply_count = GREATEST(external_items.reply_count, EXCLUDED.reply_count),
+      repost_count = GREATEST(external_items.repost_count, EXCLUDED.repost_count),
+      -- MERGED, newcomer last: real ingest's strong refs win, and the keys
+      -- only a context fetch knows (grandparent, thread root) survive.
+      ${CONTEXT_INTERACTION_MERGE_SQL},
       deleted_at = NULL
     WHERE external_items.is_context_only IS TRUE
     RETURNING id
@@ -106,6 +129,10 @@ export async function insertAtprotoItem(
       item.publishedAt,
     ],
   );
+
+  // This source served it, whether the row is new, promoted or already real
+  // under another source (CA-C4) — and it is seen now (CA-G10b).
+  await recordServed(client, source.id, "atproto", [item.sourceItemUri]);
 
   if (!rowCount || rowCount === 0) return false;
 

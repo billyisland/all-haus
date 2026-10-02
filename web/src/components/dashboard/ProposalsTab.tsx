@@ -1,12 +1,16 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, type MouseEvent } from 'react'
 import { drives as drivesApi, subscriptionOffers, type Commission, type PledgeDrive, type SubscriptionOffer } from '../../lib/api'
 import { CommissionCard } from './CommissionsTab'
 import { DriveCard } from './DriveCard'
 import { DriveCreateForm } from './DriveCreateForm'
 import { pledgesEnabled } from '../../lib/featureFlags'
 import { useCopyLink } from '../../hooks/useCopyLink'
+import { formatDateInputEcho } from '../../lib/format'
+import { apiErrorMessage, failureSentence } from '../../lib/api/client'
+import { useConfirm } from '../ui/ConfirmDialog'
+import * as C from '../../content/dashboard'
 
 type ProposalFilter = 'all' | 'commissions' | 'drives' | 'offers'
 
@@ -39,7 +43,7 @@ export function ProposalsTab({ userId }: { userId: string }) {
       setDrives(driveRes.drives)
       setOffers(offerRes.offers)
     } catch {
-      setError('Failed to load proposals.')
+      setError(C.PROPOSALS_LOAD_FAILED)
     } finally {
       setLoading(false)
     }
@@ -65,14 +69,14 @@ export function ProposalsTab({ userId }: { userId: string }) {
   const isEmpty = totalCount === 0 && !showDriveForm && !offerFormMode
 
   const filters: { key: ProposalFilter; label: string }[] = [
-    { key: 'all', label: 'All' },
+    { key: 'all', label: C.PROPOSALS_FILTER_ALL },
     ...(showPledges
       ? ([
           { key: 'commissions', label: `Commissions (${commissions.length})` },
           { key: 'drives', label: `Pledge drives (${drives.length})` },
         ] as { key: ProposalFilter; label: string }[])
       : []),
-    { key: 'offers', label: `Offers (${offers.length})` },
+    { key: 'offers', label: C.proposalsFilterOffers(offers.length) },
   ]
 
   return (
@@ -99,10 +103,10 @@ export function ProposalsTab({ userId }: { userId: string }) {
           {!offerFormMode && (
             <>
               <button onClick={() => { setOfferFormMode('code'); setFilter('offers') }} className="btn-text underline underline-offset-4">
-                New offer code
+                {C.OFFER_NEW_CODE}
               </button>
               <button onClick={() => { setOfferFormMode('grant'); setFilter('offers') }} className="btn-text underline underline-offset-4">
-                Gift subscription
+                {C.OFFER_GIFT_SUBSCRIPTION}
               </button>
             </>
           )}
@@ -125,11 +129,11 @@ export function ProposalsTab({ userId }: { userId: string }) {
 
       {isEmpty && (
         <div className="py-20 text-center">
-          <p className="text-ui-sm text-grey-600 mb-4">No proposals yet.</p>
+          <p className="text-ui-sm text-grey-600 mb-4">{C.PROPOSALS_EMPTY}</p>
           <p className="text-ui-xs text-grey-600">
             {showPledges
-              ? 'Commission requests from readers, your pledge drives, and subscription offers will appear here.'
-              : 'Your subscription offers will appear here.'}
+              ? C.PROPOSALS_EMPTY_WITH_PLEDGES
+              : C.PROPOSALS_EMPTY_OFFERS_ONLY}
           </p>
         </div>
       )}
@@ -168,14 +172,32 @@ export function ProposalsTab({ userId }: { userId: string }) {
 
 function OffersSection({ offers, onUpdate }: { offers: SubscriptionOffer[]; onUpdate: () => void }) {
   const [revokingId, setRevokingId] = useState<string | null>(null)
+  const [revokeError, setRevokeError] = useState<{ id: string; message: string } | null>(null)
   const { copiedId, failedId, failedUrl, copy } = useCopyLink()
+  const { ask, dialog } = useConfirm()
 
-  async function handleRevoke(offerId: string) {
+  // Confirmed, because it cannot be undone — and the consequence stated is
+  // the one the route actually has (walkthrough A16): revoking stops NEW
+  // redemptions; a reader already subscribed under the offer keeps their
+  // terms. The failure is said on the row; it was `catch {}`.
+  async function handleRevoke(e: MouseEvent<HTMLElement>, offerId: string) {
+    const ok = await ask(e.currentTarget, {
+      title: C.OFFER_REVOKE_CONFIRM_TITLE,
+      body: C.OFFER_REVOKE_CONFIRM_BODY,
+      confirmLabel: C.OFFER_REVOKE_CONFIRM_LABEL,
+    })
+    if (!ok) return
     setRevokingId(offerId)
+    setRevokeError(null)
     try {
       await subscriptionOffers.revoke(offerId)
       onUpdate()
-    } catch {}
+    } catch (err) {
+      setRevokeError({
+        id: offerId,
+        message: apiErrorMessage(err) ?? C.OFFER_REVOKE_FAILED,
+      })
+    }
     finally { setRevokingId(null) }
   }
 
@@ -188,19 +210,19 @@ function OffersSection({ offers, onUpdate }: { offers: SubscriptionOffer[]; onUp
 
   return (
     <div className="mb-8">
-      <p className="label-ui text-grey-600 mb-4">Offers</p>
+      <p className="label-ui text-grey-600 mb-4">{C.OFFERS_TITLE}</p>
 
       {active.length > 0 && (
         <div className="overflow-x-auto ah-scrollbar bg-glasshouse-well">
           <table className="w-full text-ui-xs">
             <thead>
               <tr className="border-b-2 border-grey-200">
-                <th className="px-4 py-3 text-left label-ui text-grey-400">Label</th>
-                <th className="px-4 py-3 text-left label-ui text-grey-400">Type</th>
-                <th className="px-4 py-3 text-right label-ui text-grey-400">Discount</th>
-                <th className="px-4 py-3 text-right label-ui text-grey-400">Duration</th>
-                <th className="px-4 py-3 text-right label-ui text-grey-400">Redeemed</th>
-                <th className="px-4 py-3 text-right label-ui text-grey-400">Actions</th>
+                <th className="px-4 py-3 text-left label-ui text-grey-400">{C.OFFER_COL_LABEL}</th>
+                <th className="px-4 py-3 text-left label-ui text-grey-400">{C.OFFER_COL_TYPE}</th>
+                <th className="px-4 py-3 text-right label-ui text-grey-400">{C.OFFER_COL_DISCOUNT}</th>
+                <th className="px-4 py-3 text-right label-ui text-grey-400">{C.OFFER_COL_DURATION}</th>
+                <th className="px-4 py-3 text-right label-ui text-grey-400">{C.OFFER_COL_REDEEMED}</th>
+                <th className="px-4 py-3 text-right label-ui text-grey-400">{C.OFFER_COL_ACTIONS}</th>
               </tr>
             </thead>
             <tbody>
@@ -209,14 +231,14 @@ function OffersSection({ offers, onUpdate }: { offers: SubscriptionOffer[]; onUp
                   <td className="px-4 py-3">{offer.label}</td>
                   <td className="px-4 py-3">
                     <span className={`inline-block px-2 py-0.5 text-[11px] font-mono ${offer.mode === 'code' ? 'bg-grey-100 text-grey-600' : 'bg-grey-100 text-crimson'}`}>
-                      {offer.mode === 'code' ? 'code' : `grant → ${offer.recipientUsername ?? '?'}`}
+                      {C.offerTypeLabel(offer.mode, offer.recipientUsername)}
                     </span>
                   </td>
                   <td className="px-4 py-3 text-right tabular-nums">
-                    {offer.discountPct}%{offer.discountPct === 100 ? ' (free)' : ''}
+                    {C.offerDiscount(offer.discountPct)}
                   </td>
                   <td className="px-4 py-3 text-right tabular-nums text-grey-400">
-                    {offer.durationMonths ? `${offer.durationMonths}mo` : 'permanent'}
+                    {C.offerDuration(offer.durationMonths)}
                   </td>
                   <td className="px-4 py-3 text-right tabular-nums">
                     {offer.redemptionCount}{offer.maxRedemptions ? `/${offer.maxRedemptions}` : ''}
@@ -230,17 +252,20 @@ function OffersSection({ offers, onUpdate }: { offers: SubscriptionOffer[]; onUp
                         readOnly
                         value={failedUrl}
                         onFocus={e => e.currentTarget.select()}
-                        aria-label="Subscription offer link — copy it by hand"
+                        aria-label={C.OFFER_COPY_BY_HAND}
                         className="w-full bg-glasshouse-well px-2 py-1 font-mono text-[12px] text-black"
                       />
                     ) : offer.code ? (
                       <button onClick={() => copyUrl(offer.code!, offer.id)} className="text-grey-400 hover:text-black">
-                        {copiedId === offer.id ? 'Copied!' : 'Copy link'}
+                        {copiedId === offer.id ? C.OFFER_COPIED : C.OFFER_COPY_LINK}
                       </button>
                     ) : null}
-                    <button onClick={() => handleRevoke(offer.id)} disabled={revokingId === offer.id} className="text-grey-300 hover:text-black disabled:opacity-50">
-                      {revokingId === offer.id ? '...' : 'Revoke'}
+                    <button onClick={(e) => handleRevoke(e, offer.id)} disabled={revokingId === offer.id} className="text-grey-300 hover:text-black disabled:opacity-50">
+                      {revokingId === offer.id ? '…' : C.OFFER_REVOKE}
                     </button>
+                    {revokeError?.id === offer.id && (
+                      <p className="text-ui-xs text-crimson mt-1">{revokeError.message}</p>
+                    )}
                   </td>
                 </tr>
               ))}
@@ -249,10 +274,12 @@ function OffersSection({ offers, onUpdate }: { offers: SubscriptionOffer[]; onUp
         </div>
       )}
 
+      {dialog}
+
       {revoked.length > 0 && (
         <details className="text-ui-xs mt-3">
           <summary className="text-grey-300 cursor-pointer hover:text-grey-600">
-            {revoked.length} revoked
+            {C.revokedCount(revoked.length)}
           </summary>
           <div className="mt-2 space-y-1">
             {revoked.map(offer => (
@@ -260,7 +287,7 @@ function OffersSection({ offers, onUpdate }: { offers: SubscriptionOffer[]; onUp
                 <span className="line-through">{offer.label}</span>
                 <span className="font-mono text-mono-xs">{offer.mode}</span>
                 <span>{offer.discountPct}%</span>
-                <span className="tabular-nums">{offer.redemptionCount} redeemed</span>
+                <span className="tabular-nums">{C.offerRedeemedCount(offer.redemptionCount)}</span>
               </div>
             ))}
           </div>
@@ -300,7 +327,7 @@ function OfferCreateForm({ mode, onCreated, onCancel }: { mode: 'code' | 'grant'
       })
       onCreated()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create offer.')
+      setError(failureSentence(err, C.OFFER_CREATE_FAILED))
     } finally {
       setCreating(false)
     }
@@ -310,28 +337,28 @@ function OfferCreateForm({ mode, onCreated, onCancel }: { mode: 'code' | 'grant'
     <div className="bg-glasshouse-well px-5 py-5 space-y-4">
       <div className="flex items-center justify-between">
         <h3 className="label-ui text-black">
-          {mode === 'code' ? 'New offer code' : 'Gift subscription'}
+          {mode === 'code' ? C.OFFER_NEW_CODE : C.OFFER_GIFT_SUBSCRIPTION}
         </h3>
-        <button onClick={onCancel} className="text-ui-xs text-grey-300 hover:text-black">Cancel</button>
+        <button onClick={onCancel} className="text-ui-xs text-grey-300 hover:text-black">{C.OFFER_FORM_CANCEL}</button>
       </div>
 
       {error && <p className="text-ui-xs text-red-600">{error}</p>}
 
       <div className="space-y-3">
         <div>
-          <label className="label-ui text-grey-400 mb-1 block">Label</label>
+          <label className="label-ui text-grey-400 mb-1 block">{C.OFFER_FORM_LABEL}</label>
           <input
             type="text"
             value={label}
             onChange={e => setLabel(e.target.value)}
-            placeholder={mode === 'code' ? 'e.g. Launch discount' : 'e.g. Comp for Jane'}
+            placeholder={mode === 'code' ? C.OFFER_FORM_LABEL_PLACEHOLDER_CODE : C.OFFER_FORM_LABEL_PLACEHOLDER_GRANT}
             className="w-full bg-grey-100 px-3 py-1.5 text-sm focus:outline-none"
           />
         </div>
 
         <div className="flex items-center gap-4">
           <div>
-            <label className="label-ui text-grey-400 mb-1 block">Discount %</label>
+            <label className="label-ui text-grey-400 mb-1 block">{C.OFFER_FORM_DISCOUNT}</label>
             <input
               type="number"
               min={0}
@@ -342,7 +369,7 @@ function OfferCreateForm({ mode, onCreated, onCancel }: { mode: 'code' | 'grant'
             />
           </div>
           <div>
-            <label className="label-ui text-grey-400 mb-1 block">Duration</label>
+            <label className="label-ui text-grey-400 mb-1 block">{C.OFFER_FORM_DURATION}</label>
             <div className="flex items-center gap-2">
               <input
                 type="number"
@@ -350,10 +377,10 @@ function OfferCreateForm({ mode, onCreated, onCancel }: { mode: 'code' | 'grant'
                 max={120}
                 value={durationMonths ?? ''}
                 onChange={e => setDurationMonths(e.target.value ? parseInt(e.target.value, 10) : null)}
-                placeholder="—"
+                placeholder={C.OFFER_FORM_EMPTY_PLACEHOLDER}
                 className="w-16 bg-grey-100 px-3 py-1.5 text-sm focus:outline-none"
               />
-              <span className="text-ui-xs text-grey-400">months (blank = permanent)</span>
+              <span className="text-ui-xs text-grey-400">{C.OFFER_FORM_DURATION_HELP}</span>
             </div>
           </div>
         </div>
@@ -361,7 +388,7 @@ function OfferCreateForm({ mode, onCreated, onCancel }: { mode: 'code' | 'grant'
         {mode === 'code' && (
           <div className="flex items-center gap-4">
             <div>
-              <label className="label-ui text-grey-400 mb-1 block">Max redemptions</label>
+              <label className="label-ui text-grey-400 mb-1 block">{C.OFFER_FORM_MAX_REDEMPTIONS}</label>
               <div className="flex items-center gap-2">
                 <input
                   type="number"
@@ -369,32 +396,41 @@ function OfferCreateForm({ mode, onCreated, onCancel }: { mode: 'code' | 'grant'
                   max={100000}
                   value={maxRedemptions ?? ''}
                   onChange={e => setMaxRedemptions(e.target.value ? parseInt(e.target.value, 10) : null)}
-                  placeholder="—"
+                  placeholder={C.OFFER_FORM_EMPTY_PLACEHOLDER}
                   className="w-20 bg-grey-100 px-3 py-1.5 text-sm focus:outline-none"
                 />
-                <span className="text-ui-xs text-grey-400">blank = unlimited</span>
+                <span className="text-ui-xs text-grey-400">{C.OFFER_FORM_MAX_REDEMPTIONS_HELP}</span>
               </div>
             </div>
             <div>
-              <label className="label-ui text-grey-400 mb-1 block">Expires</label>
-              <input
-                type="date"
-                value={expiresAt}
-                onChange={e => setExpiresAt(e.target.value)}
-                className="bg-grey-100 px-3 py-1.5 text-sm focus:outline-none"
-              />
+              <label className="label-ui text-grey-400 mb-1 block">{C.OFFER_FORM_EXPIRES}</label>
+              <div className="flex items-center gap-3">
+                <input
+                  type="date"
+                  value={expiresAt}
+                  onChange={e => setExpiresAt(e.target.value)}
+                  className="bg-grey-100 px-3 py-1.5 text-sm focus:outline-none"
+                />
+                {/* The widget draws the date in the BROWSER's order; the echo
+                    states it in this site's. */}
+                {formatDateInputEcho(expiresAt) && (
+                  <span className="text-mono-xs text-grey-600">
+                    {formatDateInputEcho(expiresAt)}
+                  </span>
+                )}
+              </div>
             </div>
           </div>
         )}
 
         {mode === 'grant' && (
           <div>
-            <label className="label-ui text-grey-400 mb-1 block">Recipient username</label>
+            <label className="label-ui text-grey-400 mb-1 block">{C.OFFER_FORM_RECIPIENT}</label>
             <input
               type="text"
               value={recipientUsername}
               onChange={e => setRecipientUsername(e.target.value)}
-              placeholder="username"
+              placeholder={C.OFFER_FORM_RECIPIENT_PLACEHOLDER}
               className="w-48 bg-grey-100 px-3 py-1.5 text-sm focus:outline-none"
             />
           </div>
@@ -406,7 +442,7 @@ function OfferCreateForm({ mode, onCreated, onCancel }: { mode: 'code' | 'grant'
         disabled={creating || !label.trim() || (mode === 'grant' && !recipientUsername.trim())}
         className="btn disabled:opacity-50"
       >
-        {creating ? 'Creating...' : mode === 'code' ? 'Create offer code' : 'Grant subscription'}
+        {creating ? C.OFFER_FORM_CREATING : mode === 'code' ? C.OFFER_FORM_CREATE_CODE : C.OFFER_FORM_CREATE_GRANT}
       </button>
     </div>
   )

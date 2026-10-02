@@ -2,11 +2,10 @@
 
 import { useState, useRef, useEffect } from 'react'
 import { useAuth } from '../../stores/auth'
-import { publishReply } from '../../lib/replies'
+import { publishReply, REPLY_CHAR_LIMIT } from '../../lib/replies'
+import { failureSentence } from '../../lib/api/client'
 import { useMediaAttachments } from '../../hooks/useMediaAttachments'
 import { MediaPreview } from '../ui/MediaPreview'
-
-const REPLY_CHAR_LIMIT = 2000
 
 interface ReplyComposerProps {
   targetEventId: string
@@ -90,7 +89,7 @@ export function ReplyComposer({
         replies: [],
       })
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to post reply.')
+      setError(failureSentence(err, 'Couldn’t send your reply. It’s still in the box, so please try again.'))
     } finally {
       setPublishing(false)
     }
@@ -125,7 +124,7 @@ export function ReplyComposer({
             onFocus={() => setFocused(true)}
             onBlur={() => setFocused(false)}
             onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void handlePost() } }}
-            placeholder="Reply..."
+            placeholder="Reply…"
             rows={1}
             className={`w-full resize-none text-ui-sm text-black placeholder:text-grey-300 focus:outline-none leading-relaxed transition-all ${
               isExpanded
@@ -155,7 +154,7 @@ export function ReplyComposer({
             disabled={!canPost}
             className="btn disabled:opacity-30 px-3.5 py-1.5 text-ui-xs font-medium"
           >
-            {publishing ? '...' : 'Post'}
+            {publishing ? '…' : 'Post'}
           </button>
         </div>
       </div>

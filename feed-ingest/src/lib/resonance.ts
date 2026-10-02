@@ -64,12 +64,15 @@ export async function loadResonanceParams(): Promise<ResonanceParams> {
     nativeGate: num("resonance_weight_native_gate", 5),
     // k=3: ambient is ~13% of the baseline at n=20 (migration 158 header).
     k: num("resonance_shrink_k", 3),
-    // Band gates, re-measured at step 3 — the ADR draft's 1/2/3 ran 2-3x hot
-    // against its own targets. Config, not constants: tuning a band must never
-    // need a deploy (migration 160 header carries the measured distributions).
-    band1: num("resonance_band1_min", 2.5),
-    band2: num("resonance_band2_min", 4),
-    band3: num("resonance_band3_min", 6),
+    // Band gates, re-measured at step 3 and again on 2026-09-14 when the marks
+    // read too sparse on a mixed feed (2.5/4/6 -> 1.8/3/5; band>=1 goes 16.7%
+    // -> 24.8% of scored rows, band 3 2.2% -> 4.1%). Config, not constants:
+    // tuning a band must never need a deploy. The measured distributions live
+    // in the config-defaults.sql block these fallbacks are parity-tested
+    // against, and migration 160's header carries the step-3 pass.
+    band1: num("resonance_band1_min", 1.8),
+    band2: num("resonance_band2_min", 3),
+    band3: num("resonance_band3_min", 5),
   };
 }
 

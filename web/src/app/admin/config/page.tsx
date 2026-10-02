@@ -6,6 +6,7 @@ import { apiErrorMessage } from '../../../lib/api/client'
 import { timeAgo } from '../../../lib/format'
 import { AdminShell } from '../../../components/admin/AdminShell'
 import { SeedFormulaPanel } from '../../../components/admin/SeedFormulaPanel'
+import { useConfirm } from '../../../components/ui/ConfirmDialog'
 
 // Ordered grouping — first matching rule wins.
 //
@@ -22,6 +23,7 @@ const GROUPS: Array<{ label: string; match: (key: string) => boolean }> = [
         'free_allowance_pence',
         'arrival_gift_cap_pence',
         'tab_settlement_threshold_pence',
+        'tab_ceiling_pence',
         'monthly_fallback_minimum_pence',
         'monthly_fallback_days',
         'writer_payout_threshold_pence',
@@ -30,7 +32,7 @@ const GROUPS: Array<{ label: string; match: (key: string) => boolean }> = [
       ].includes(k),
   },
   { label: 'Regulatory thresholds', match: (k) => k.startsWith('tax_') || k.startsWith('regulatory_') },
-  { label: 'Feed ranking', match: (k) => k.startsWith('feed_') && !k.startsWith('feed_ingest_') },
+  { label: 'Channels and ranking', match: (k) => k.startsWith('feed_') && !k.startsWith('feed_ingest_') },
   { label: 'Resonance', match: (k) => k.startsWith('resonance_') },
   { label: 'Ingest', match: (k) => k.startsWith('feed_ingest_') || k.startsWith('external_') },
   { label: 'Outbound', match: (k) => k.startsWith('outbound_') },
@@ -44,7 +46,9 @@ export default function AdminConfigPage() {
   const [error, setError] = useState<string | null>(null)
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
+  const [reason, setReason] = useState('')
   const [notice, setNotice] = useState<string | null>(null)
+  const { ask, dialog } = useConfirm()
 
   async function load() {
     try {
@@ -53,7 +57,7 @@ export default function AdminConfigPage() {
       setDrafts({})
       setError(null)
     } catch {
-      setError('Failed to load config.')
+      setError('Couldn’t load config. Please reload the page to try again.')
     }
   }
 
@@ -82,18 +86,36 @@ export default function AdminConfigPage() {
       .map(([key, value]) => ({ key, value }))
   }, [drafts, rows])
 
-  async function save() {
+  async function save(anchor: HTMLElement) {
     if (dirty.length === 0) return
-    const summary = dirty.map((d) => d.key).join(', ')
-    if (!window.confirm(`Update ${dirty.length} config value(s)?\n\n${summary}`)) return
+    const trimmed = reason.trim()
+    // The button is disabled without one; this is the second door, for a save
+    // reached any other way.
+    if (trimmed === '') return
+    const ok = await ask(anchor, {
+      title: `Update ${dirty.length} config value${dirty.length === 1 ? '' : 's'}?`,
+      body: (
+        <ul className="font-mono text-mono-xs text-black space-y-1">
+          {dirty.map((d) => (
+            <li key={d.key} className="break-all">
+              {d.key} → {d.value}
+            </li>
+          ))}
+        </ul>
+      ),
+      confirmLabel: 'Save',
+      width: 360,
+    })
+    if (!ok) return
     setSaving(true)
     setNotice(null)
     try {
-      await adminDashboard.updateConfig(dirty)
-      setNotice(`Saved ${dirty.length} value(s).`)
+      await adminDashboard.updateConfig(dirty, trimmed)
+      setNotice(`Saved ${dirty.length} value${dirty.length === 1 ? '' : 's'}.`)
+      setReason('')
       await load()
     } catch (err) {
-      setNotice(apiErrorMessage(err) ?? 'Save failed.')
+      setNotice(apiErrorMessage(err) ?? 'Couldn’t save. Please reload to see which values are in force.')
     } finally {
       setSaving(false)
     }
@@ -101,6 +123,7 @@ export default function AdminConfigPage() {
 
   return (
     <AdminShell title="Site owner">
+      {dialog}
       {/* Not a platform_config dial — it is the other thing this tab is for,
           an operator setting that used to be a hand-run UPDATE. It loads and
           saves on its own, so a config save never touches it and a failure in
@@ -164,9 +187,39 @@ export default function AdminConfigPage() {
             </section>
           ))}
 
+          {/* THE REASON (L5.2). One line, one save — the batch is the
+              operator's act, so it takes one reason and not one per dial. It
+              appears only once there is something to explain, because before
+              the first edit there is nothing that has happened yet. It is
+              REQUIRED: the gateway refuses a blank one and so does the
+              column's own CHECK, and the button is disabled rather than
+              letting anyone meet a 400 by accident. */}
+          {dirty.length > 0 && (
+            <div className="mb-5 max-w-article">
+              <label htmlFor="config-reason" className="label-ui text-grey-600 block mb-2">
+                Why
+              </label>
+              <input
+                id="config-reason"
+                type="text"
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+                placeholder="What this change is for…"
+                className="w-full bg-glasshouse-well px-3 py-2 text-ui-sm text-black focus-ring"
+              />
+              <p className="text-ui-xs text-grey-600 mt-2">
+                Recorded against every value in this save, with your account and the old figure.
+              </p>
+            </div>
+          )}
+
           <div className="flex items-center gap-4">
-            <button className="btn" disabled={saving || dirty.length === 0} onClick={() => void save()}>
-              {saving ? 'Saving…' : dirty.length > 0 ? `Save ${dirty.length} change(s)` : 'No changes'}
+            <button
+              className="btn"
+              disabled={saving || dirty.length === 0 || reason.trim() === ''}
+              onClick={(e) => void save(e.currentTarget)}
+            >
+              {saving ? 'Saving…' : dirty.length > 0 ? `Save ${dirty.length} change${dirty.length === 1 ? '' : 's'}` : 'No changes'}
             </button>
             {notice && <p className="text-ui-xs text-grey-600">{notice}</p>}
           </div>

@@ -1,9 +1,11 @@
 import type { Task } from "graphile-worker";
 import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
 import logger from "@platform-pub/shared/lib/logger.js";
+import { isSourceBlocked } from "@platform-pub/shared/lib/platform-blocks.js";
 import { fetchRssFeed } from "../adapters/rss.js";
 import { truncatePreview } from "@platform-pub/shared/lib/text.js";
 import { getPlatformConfig } from "../lib/platform-config.js";
+import { recordServed } from "../lib/item-membership.js";
 
 // =============================================================================
 // feed_ingest_rss — per-source RSS fetch job
@@ -53,10 +55,15 @@ export interface ConditionalHeaders {
  * **Hold no items, send no validators.** A validator is a claim about the
  * ORIGIN's state ("has this changed since you last fetched it?"), and it is
  * only safe to act on while our half of that sentence still holds: that we
- * still HAVE what we fetched. `external_items_prune` deletes on
+ * still HAVE what we fetched. `external_items_prune` deleted on
  * `external_items.created_at` — our insert date, not the item's publish date —
- * so a live but infrequently updated feed, whose whole current window predates
- * the retention period, loses its rows. The stored validator then makes every
+ * so a live but infrequently updated feed, whose whole current window predated
+ * the retention period, lost its rows. (It now keeps anything a source served
+ * within retention, which a 304 re-stamps — CA-G10b — but a source can still
+ * come to hold nothing, and this guard is what stops that being silent.) And a
+ * source whose every item was first written by ANOTHER source held nothing
+ * under the old `source_id` probe (CA-C4) — it asks its memberships now. The
+ * stored validator then makes every
  * later fetch a *correct* 304, and the source stays empty forever while
  * reporting perfect health: subscribed, active, `error_count` 0, `last_error`
  * NULL. Every component behaves properly and the member's feed is silent.
@@ -102,14 +109,40 @@ export function conditionalHeadersFor(
 export const RSS_SOURCE_LOAD_SQL = `
   SELECT es.id, es.source_uri, es.cursor, es.error_count, es.display_name,
          es.fetch_interval_seconds,
-         EXISTS (SELECT 1 FROM external_items ei WHERE ei.source_id = es.id)
+         EXISTS (SELECT 1 FROM external_item_sources m WHERE m.source_id = es.id)
            AS holds_items
     FROM external_sources es
    WHERE es.id = $1
 `;
 
+/**
+ * A 304's re-stamp (CA-G10b): the window the origin is still serving is the
+ * one we last fetched, and every membership of it carries the one `now()` of
+ * the transaction that fetched it (step 1c below) — so the newest stamp among
+ * the source's own memberships IS that window. Per source, so a window shared
+ * with another feed is found exactly (CA-C4: the stamp on the item could be
+ * the other source's). Exported so the integration test runs this statement,
+ * not a copy.
+ */
+export const RSS_WINDOW_RESEEN_SQL = `
+  UPDATE external_item_sources SET last_seen_at = now()
+   WHERE source_id = $1
+     AND last_seen_at = (
+       SELECT max(last_seen_at) FROM external_item_sources WHERE source_id = $1
+     )
+`;
+
 export const feedIngestRss: Task = async (payload, _helpers) => {
   const { sourceId } = payload as { sourceId: string };
+  // THE OPERATOR'S REFUSAL (L6.5, D7 §7). Checked per fetch rather than only at
+  // the poll selector, because a job can be enqueued from several places (the
+  // poll, a re-add, a backfill) and the guard has to sit where the work
+  // actually happens. One indexed lookup against an HTTP fetch we are about to
+  // spend.
+  if (await isSourceBlocked(sourceId)) {
+    logger.info({ sourceId }, "Source is blocked platform-wide — skipping fetch");
+    return;
+  }
 
   // Load source
   const {
@@ -123,7 +156,7 @@ export const feedIngestRss: Task = async (payload, _helpers) => {
     fetch_interval_seconds: number;
     holds_items: boolean;
   }>(
-    // `holds_items` is an index probe on idx_ext_items_source_id, not a count —
+    // `holds_items` is an index probe on the membership's primary key, not a count —
     // it exists only to answer "do we still have what our cursor claims we
     // fetched?" (see conditionalHeadersFor).
     RSS_SOURCE_LOAD_SQL,
@@ -188,6 +221,10 @@ export const feedIngestRss: Task = async (payload, _helpers) => {
 
     if (result.notModified) {
       // Feed hasn't changed (304) — the definitive "quiet" signal; back off.
+      // The origin is still serving the window we last fetched, so it is
+      // still SEEN (CA-G10b) — or a quiet feed's items are pruned at
+      // retention and re-inserted as new rows by the next full fetch.
+      await pool.query(RSS_WINDOW_RESEEN_SQL, [sourceId]);
       await pool.query(
         `UPDATE external_sources SET last_fetched_at = now(), error_count = 0, last_error = NULL, fetch_interval_seconds = $2, updated_at = now() WHERE id = $1`,
         [sourceId, nextRssInterval(source.fetch_interval_seconds, false, intervalBounds)],
@@ -213,17 +250,22 @@ export const feedIngestRss: Task = async (payload, _helpers) => {
     }
 
     let inserted = 0;
+    let newlyServed = 0;
     if (items.length > 0) {
-      inserted = await withTransaction(async (client) => {
+      ({ inserted, newlyServed } = await withTransaction(async (client) => {
         // 1. Multi-row external_items insert. sourceId is reused as $1; each
-        //    item contributes 12 params. Conflicting rows return no id and are
+        //    item contributes 13 params. Conflicting rows return no id and are
         //    naturally absent from RETURNING.
         const eiParams: unknown[] = [sourceId];
         const eiRows = items.map((item) => {
           const b = eiParams.length;
           eiParams.push(
             item.sourceItemUri,
-            item.authorName,
+            item.canonicalUrl,
+            // Byte for byte the feed_items expression below (S17) — the two
+            // columns must agree or feed_items_author_refresh repairs a row
+            // every night that re-ingest puts back.
+            item.authorName || null,
             item.authorHandle,
             item.authorUri,
             item.contentText,
@@ -235,7 +277,7 @@ export const feedIngestRss: Task = async (payload, _helpers) => {
             JSON.stringify(item.interactionData ?? {}),
             item.publishedAt,
           );
-          return `($1, 'rss', 'tier4', $${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6}, $${b + 7}, $${b + 8}, $${b + 9}, $${b + 10}, $${b + 11}, $${b + 12})`;
+          return `($1, 'rss', 'tier4', $${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6}, $${b + 7}, $${b + 8}, $${b + 9}, $${b + 10}, $${b + 11}, $${b + 12}, $${b + 13})`;
         });
 
         const { rows: insertedEi } = await client.query<{
@@ -245,7 +287,8 @@ export const feedIngestRss: Task = async (payload, _helpers) => {
           `
           INSERT INTO external_items (
             source_id, protocol, tier,
-            source_item_uri, author_name, author_handle, author_uri,
+            source_item_uri, canonical_url,
+            author_name, author_handle, author_uri,
             content_text, content_html, summary, title, language,
             media, interaction_data, published_at
           ) VALUES ${eiRows.join(", ")}
@@ -255,7 +298,57 @@ export const feedIngestRss: Task = async (payload, _helpers) => {
           eiParams,
         );
 
-        if (insertedEi.length === 0) return 0;
+        // 1b. Gap-fill `canonical_url` on rows that already existed.
+        //
+        // The INSERT above is DO NOTHING, and it has to stay that way: the
+        // dual-write below keys off RETURNING, so a DO UPDATE would hand it
+        // every unchanged row in the feed window as if it were new. But a poll
+        // re-offers the whole window every tick, permalink and all, so a
+        // separate statement heals every row ingested before this column was
+        // carried — which is the entire historical corpus of any feed whose
+        // guid is not a URL, i.e. exactly the rows the reader cannot open.
+        //
+        // FILL ONLY, NEVER OVERWRITE (`canonical_url IS NULL`): the same
+        // COALESCE gap-fill discipline the shared-source upsert keeps, so a
+        // feed that later drops or mangles a link cannot take away a permalink
+        // we already hold.
+        const fillable = items.filter((it) => it.canonicalUrl !== null);
+        if (fillable.length > 0) {
+          const fillParams: unknown[] = [];
+          const fillRows = fillable.map((it) => {
+            const b = fillParams.length;
+            fillParams.push(it.sourceItemUri, it.canonicalUrl);
+            return `($${b + 1}, $${b + 2})`;
+          });
+          await client.query(
+            `
+            UPDATE external_items ei
+               SET canonical_url = v.url
+              FROM (VALUES ${fillRows.join(", ")}) AS v(uri, url)
+             WHERE ei.protocol = 'rss'
+               AND ei.source_item_uri = v.uri
+               AND ei.canonical_url IS NULL
+          `,
+            fillParams,
+          );
+        }
+
+        // 1c. THIS SOURCE SERVED THE WINDOW (CA-C4), and every item of it is
+        //     SEEN now (CA-G10b). The membership is what puts an item in a feed
+        //     built on this source — including one another source wrote first,
+        //     which the insert above refused — and the prune keeps anything a
+        //     source served within retention. Each source's last window carries
+        //     ONE stamp, the fact RSS_WINDOW_RESEEN_SQL finds it by on a 304.
+        //     `fresh` counts the items NEW TO THIS SOURCE, shared ones included:
+        //     that, not the insert count, is whether anything arrived.
+        const fresh = await recordServed(
+          client,
+          sourceId,
+          "rss",
+          items.map((it) => it.sourceItemUri),
+        );
+
+        if (insertedEi.length === 0) return { inserted: 0, newlyServed: fresh };
 
         // 2. Dual-write: one batched feed_items insert keyed off the returned
         //    ids. Rows that conflicted in step 1 are absent here, so they are
@@ -300,8 +393,8 @@ export const feedIngestRss: Task = async (payload, _helpers) => {
           );
         }
 
-        return insertedEi.length;
-      });
+        return { inserted: insertedEi.length, newlyServed: fresh };
+      }));
     }
 
     // Update source: cursor, metadata, reset errors
@@ -317,6 +410,7 @@ export const feedIngestRss: Task = async (payload, _helpers) => {
         cursor = $2,
         display_name = COALESCE($3, display_name),
         description = COALESCE($4, description),
+        avatar_url = COALESCE($6, avatar_url),
         error_count = 0,
         last_error = NULL,
         fetch_interval_seconds = $5,
@@ -328,13 +422,14 @@ export const feedIngestRss: Task = async (payload, _helpers) => {
         newCursor,
         result.feedTitle ?? null,
         result.feedDescription ?? null,
-        nextRssInterval(source.fetch_interval_seconds, inserted > 0, intervalBounds),
+        nextRssInterval(source.fetch_interval_seconds, newlyServed > 0, intervalBounds),
+        result.feedImageUrl ?? null,
       ],
     );
 
-    if (inserted > 0) {
+    if (newlyServed > 0) {
       logger.info(
-        { sourceId, inserted, total: result.items.length },
+        { sourceId, inserted, newlyServed, total: result.items.length },
         "RSS items ingested",
       );
     }

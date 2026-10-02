@@ -17,9 +17,17 @@ import { fetchNostrEvents } from "./nostr-relay.js";
 import { relayCandidates } from "@platform-pub/shared/lib/nostr-relay-req.js";
 import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
 import { safeFetch } from "@platform-pub/shared/lib/http-client.js";
-import { sanitizeContent } from "@platform-pub/shared/lib/sanitize.js";
+import { blueskyInteractionData } from "@platform-pub/shared/lib/atproto-reply-refs.js";
+import {
+  httpUrlOrNull,
+  sanitizeContent,
+} from "@platform-pub/shared/lib/sanitize.js";
 import { truncatePreview } from "@platform-pub/shared/lib/text.js";
 import logger from "@platform-pub/shared/lib/logger.js";
+import {
+  persistHydratedThreadNodes,
+  type HydratedNode,
+} from "@platform-pub/shared/lib/context-persist.js";
 import {
   APPVIEW,
   CACHE_MAX_ENTRIES,
@@ -33,6 +41,10 @@ import {
   stripHtmlTags,
   extractMastodonStatusId,
 } from "./external-items-shared.js";
+import {
+  readMastodonStatusContext,
+  mastodonStatusIdentity,
+} from "@platform-pub/shared/lib/mastodon-api.js";
 
 // ===========================================================================
 // Live thread hydration → DB (UNIVERSAL-POST-ADR §8, /thread parity fix)
@@ -56,23 +68,10 @@ import {
 // whatever was already ingested.
 // ===========================================================================
 
-interface HydratedNode {
-  sourceItemUri: string;
-  sourceReplyUri: string | null;
-  sourceQuoteUri: string | null;
-  authorName: string;
-  authorHandle: string | null;
-  authorAvatarUrl: string | null;
-  authorUri: string | null;
-  contentText: string | null;
-  contentHtml: string | null;
-  media: unknown[];
-  interactionData: Record<string, unknown>;
-  likeCount: number;
-  replyCount: number;
-  repostCount: number;
-  publishedAt: Date;
-}
+// HydratedNode and persistHydratedThreadNodes live in shared (context-persist.ts),
+// held by the gateway and feed-ingest's linked-notification poller alike.
+// Re-exported so every importer of this module is unchanged.
+export { persistHydratedThreadNodes, type HydratedNode };
 
 // Two registries, answering two different questions (THREAD-HYDRATION-LATENCY-ADR
 // D1). Keep them distinct — conflating them is the deadlock this ADR fixes:
@@ -162,143 +161,6 @@ export function resetThreadHydrationGuards(): void {
   hydrationInFlight.clear();
 }
 
-// Dual-write a batch of hydrated nodes (external_items + feed_items) in one
-// transaction. Context-only; deduped by (protocol, source_item_uri) so a node
-// already ingested for real is left as a counts refresh, never duplicated.
-//
-// opts.profileHydrated (EXTERNAL-AUTHOR-HISTORY-ADR §3.3/§3.4): profile-view
-// timeline hydration writes is_profile_hydrated = TRUE so the rows show in
-// GET /author/:id/posts while inheriting everything is_context_only already
-// buys (feed exclusion, context GC, thread-projector expansion). On conflict
-// the flag OR-folds: thread hydration (EXCLUDED = FALSE) never changes
-// anything; profile hydration GRADUATES a pre-existing thread-context row of
-// this author into the profile view; setting it on an already-real row is
-// harmless (real rows pass the /posts filter via is_context_only regardless,
-// and GC only looks at is_context_only). is_context_only itself is never
-// touched on conflict — hydration can never demote a real row (§4.2 is the
-// promotion mirror, in the ingest writers).
-//
-// opts.client: run on the caller's open transaction instead of opening one
-// (used by tests to roll fixtures back).
-export async function persistHydratedThreadNodes(
-  sourceId: string,
-  protocol: "atproto" | "activitypub" | "nostr_external",
-  nodes: HydratedNode[],
-  opts: { profileHydrated?: boolean; client?: { query: any } } = {},
-): Promise<void> {
-  if (nodes.length === 0) return;
-  // atproto + activitypub both map to content_tier 'tier3' (migration 099 §7);
-  // nostr_external is 'tier2', matching the native nostr ingest path
-  // (feed-ingest-nostr.ts) so a hydrated node and a later real ingest agree.
-  const tier = protocol === "nostr_external" ? "tier2" : "tier3";
-  const profileHydrated = opts.profileHydrated === true;
-  const run = async (client: { query: any }) => {
-    for (const n of nodes) {
-      const ins = await client.query(
-        `INSERT INTO external_items (
-           source_id, protocol, tier, source_item_uri,
-           author_name, author_handle, author_avatar_url, author_uri,
-           content_text, content_html, media,
-           source_reply_uri, interaction_data,
-           like_count, reply_count, repost_count,
-           published_at, source_quote_uri, is_context_only,
-           is_profile_hydrated
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, TRUE, $19)
-         ON CONFLICT (protocol, source_item_uri) DO UPDATE SET
-           is_profile_hydrated = external_items.is_profile_hydrated OR EXCLUDED.is_profile_hydrated,
-           like_count = EXCLUDED.like_count,
-           reply_count = EXCLUDED.reply_count,
-           repost_count = EXCLUDED.repost_count,
-           interaction_data = EXCLUDED.interaction_data,
-           -- Fill the parent linkage when we didn't already have it. The ancestor
-           -- walk (assembleExternalThread → loadExternalByUri) climbs via
-           -- source_reply_uri; a row first seen as a standalone feed item has a
-           -- NULL link, so hydration is the only place it can be learned. COALESCE
-           -- so a context-only hydrate only *fills* a gap, never clobbers an
-           -- authoritative ingested linkage.
-           source_reply_uri = COALESCE(external_items.source_reply_uri, EXCLUDED.source_reply_uri),
-           -- Same gap-fill for the quote linkage: a row first seen as a standalone
-           -- feed item (or via reply-only hydration) has a NULL quote uri, so a
-           -- later thread hydration is where the quoted post is learned. COALESCE
-           -- only fills, never clobbers an authoritative ingested value.
-           source_quote_uri = COALESCE(external_items.source_quote_uri, EXCLUDED.source_quote_uri),
-           -- Backfill body/media only when the existing copy is empty, so the
-           -- thin row a standalone ingest left behind gains the richer hydrated
-           -- content (parents were rendering blank), without overwriting a row
-           -- that was already ingested in full.
-           content_text = COALESCE(external_items.content_text, EXCLUDED.content_text),
-           content_html = COALESCE(external_items.content_html, EXCLUDED.content_html),
-           media = CASE
-             WHEN external_items.media IS NULL
-               OR jsonb_array_length(COALESCE(external_items.media, '[]'::jsonb)) = 0
-             THEN EXCLUDED.media
-             ELSE external_items.media
-           END
-         RETURNING id`,
-        [
-          sourceId,
-          protocol,
-          tier,
-          n.sourceItemUri,
-          n.authorName,
-          n.authorHandle,
-          n.authorAvatarUrl,
-          n.authorUri,
-          n.contentText,
-          n.contentHtml,
-          JSON.stringify(n.media),
-          n.sourceReplyUri,
-          JSON.stringify(n.interactionData),
-          n.likeCount,
-          n.replyCount,
-          n.repostCount,
-          n.publishedAt,
-          n.sourceQuoteUri,
-          profileHydrated,
-        ],
-      );
-      const extId = ins.rows[0]?.id;
-      if (!extId) continue;
-      // feed_items dual-write; the BEFORE INSERT identity trigger mints
-      // post_id/version/biddability_tier/external_author_id from these columns.
-      await client.query(
-        `INSERT INTO feed_items (
-           item_type, external_item_id,
-           author_name, author_avatar,
-           title, content_preview,
-           published_at,
-           source_protocol, source_item_uri, source_id, media,
-           is_reply
-         ) VALUES (
-           'external', $1,
-           $2, $3,
-           NULL, $4,
-           $5,
-           $6, $7, $8, $9,
-           $10
-         )
-         ON CONFLICT (external_item_id) WHERE external_item_id IS NOT NULL DO NOTHING`,
-        [
-          extId,
-          n.authorName,
-          n.authorAvatarUrl,
-          truncatePreview(n.contentText ?? ""),
-          n.publishedAt,
-          protocol,
-          n.sourceItemUri,
-          sourceId,
-          JSON.stringify(n.media),
-          n.sourceReplyUri != null,
-        ],
-      );
-    }
-  };
-  if (opts.client) {
-    await run(opts.client);
-  } else {
-    await withTransaction(run);
-  }
-}
 
 // Walk a Bluesky getPostThread response into hydrated nodes (parent chain +
 // focal + flattened replies). Keyed by at:// URIs, which are exactly the
@@ -324,7 +186,7 @@ function collectBlueskyThreadNodes(
       contentText: post.record.text ?? null,
       contentHtml: null,
       media: extractBlueskyViewMedia(post.embed),
-      interactionData: { uri: post.uri, cid: post.cid },
+      interactionData: blueskyInteractionData(post),
       likeCount: post.likeCount ?? 0,
       replyCount: post.replyCount ?? 0,
       repostCount: post.repostCount ?? 0,
@@ -385,10 +247,7 @@ async function hydrateMastodonThread(item: ExternalItemRow): Promise<void> {
   const statusId = extractMastodonStatusId(item.source_item_uri);
   if (!statusId) return;
   const host = new URL(item.source_item_uri).hostname;
-  const res = await safeFetch(
-    `https://${host}/api/v1/statuses/${statusId}/context`,
-    { headers: { Accept: "application/json" }, timeout: NEIGHBOURHOOD_FETCH_TIMEOUT_MS },
-  );
+  const res = await readMastodonStatusContext(`https://${host}`, statusId, { timeout: NEIGHBOURHOOD_FETCH_TIMEOUT_MS });
   // Same split as the Bluesky fetch above: transient (429/5xx) throws so the
   // failure clears the guard and the client keeps polling; a definitive 4xx
   // (status deleted, instance refuses) is a clean settle.
@@ -405,7 +264,7 @@ async function hydrateMastodonThread(item: ExternalItemRow): Promise<void> {
       description?: string;
     }>;
   }
-  const data = JSON.parse(res.text) as {
+  const data = res.body as {
     ancestors: RichStatus[];
     descendants: RichStatus[];
   };
@@ -420,15 +279,26 @@ async function hydrateMastodonThread(item: ExternalItemRow): Promise<void> {
   // `url` would mint a parallel id-space, so the focal's source_reply_uri never
   // matches a hydrated parent's source_item_uri and the ancestor walk finds
   // nothing (parents go missing). `uri` is always present on a Mastodon status.
-  const canonicalUri = (s: RichStatus) => s.uri || s.url;
+  //
+  // AND IT MAY CLAIM THAT ID ONLY ON THE ORIGIN THAT ANSWERED (CA-A10,
+  // 2026-09-29): every node goes through `mastodonStatusIdentity` against the
+  // api origin asked, and a node naming another host's status or actor is
+  // dropped (logged in the one home) — never keyed on its web url instead.
+  // A reply whose parent was dropped threads to nothing rather than to a
+  // forged id.
+  const apiOrigin = `https://${host}`;
+  const admitted: Array<{ s: RichStatus; uri: string; authorUri: string }> = [];
   const idToUri = new Map<string, string>();
   idToUri.set(statusId, item.source_item_uri);
   for (const s of [...data.ancestors, ...data.descendants]) {
-    idToUri.set(s.id, canonicalUri(s));
+    const identity = mastodonStatusIdentity(s, apiOrigin);
+    if (!identity) continue;
+    admitted.push({ s, ...identity });
+    idToUri.set(s.id, identity.uri);
   }
 
-  const toNode = (s: RichStatus): HydratedNode => ({
-    sourceItemUri: canonicalUri(s),
+  const toNode = ({ s, uri, authorUri }: (typeof admitted)[number]): HydratedNode => ({
+    sourceItemUri: uri,
     sourceReplyUri: s.in_reply_to_id
       ? (idToUri.get(s.in_reply_to_id) ?? null)
       : null,
@@ -438,7 +308,7 @@ async function hydrateMastodonThread(item: ExternalItemRow): Promise<void> {
     authorName: s.account.display_name || s.account.acct,
     authorHandle: s.account.acct,
     authorAvatarUrl: s.account.avatar ?? null,
-    authorUri: s.account.uri ?? s.account.url,
+    authorUri,
     contentText: stripHtmlTags(s.content ?? ""),
     contentHtml: sanitizeContent(s.content ?? ""),
     media: (s.media_attachments ?? []).map((m) => ({
@@ -447,17 +317,14 @@ async function hydrateMastodonThread(item: ExternalItemRow): Promise<void> {
       thumbnail: m.preview_url,
       alt: m.description,
     })),
-    interactionData: { id: s.uri, webUrl: s.url },
+    interactionData: { id: uri, webUrl: s.url },
     likeCount: s.favourites_count ?? 0,
     replyCount: s.replies_count ?? 0,
     repostCount: s.reblogs_count ?? 0,
     publishedAt: new Date(s.created_at),
   });
 
-  await persistHydratedThreadNodes(item.source_id, "activitypub", [
-    ...data.ancestors.map(toNode),
-    ...data.descendants.map(toNode),
-  ]);
+  await persistHydratedThreadNodes(item.source_id, "activitypub", admitted.map(toNode));
 }
 
 // ── Nostr thread hydration ─────────────────────────────────────────────────

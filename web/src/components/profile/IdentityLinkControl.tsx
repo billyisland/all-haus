@@ -107,7 +107,7 @@ export function IdentityLinkControl({
         ri.reset();
         invalidateAuthorCardCache();
       } catch {
-        setError("Couldn’t link that. Try a different identifier.");
+        setError("Couldn’t link that. Please try a different handle, URL or address.");
       } finally {
         setBusyKey(null);
       }
@@ -125,7 +125,7 @@ export function IdentityLinkControl({
         setLinks((prev) => prev.filter((l) => l.linkId !== linkId));
         invalidateAuthorCardCache();
       } catch {
-        setError("Couldn’t unlink. Try again.");
+        setError("Couldn’t unlink that. Please try again.");
       } finally {
         setRemoving((prev) => {
           const next = new Set(prev);
@@ -238,7 +238,7 @@ export function IdentityLinkControl({
                       // A global automated link (P3 detection), not the viewer's
                       // own assertion — so unlink hides it for them (a tombstone),
                       // it isn't theirs to delete.
-                      <span className="label-ui text-grey-600" title="Automatically detected">
+                      <span className="label-ui text-grey-600" title="We spotted this link ourselves. You didn’t add it.">
                         {" · DETECTED"}
                       </span>
                     )}
@@ -274,7 +274,7 @@ export function IdentityLinkControl({
 
           <div className="mt-1.5 min-h-[24px]">
             {ri.resolving && (
-              <p className="label-ui text-grey-600 px-1 py-1">RESOLVING…</p>
+              <p className="label-ui text-grey-600 px-1 py-1">Looking it up…</p>
             )}
             {!ri.resolving && (ri.doneEmpty || ri.resolveError) && (
               <p className="text-ui-xs text-grey-600 px-1 py-1">

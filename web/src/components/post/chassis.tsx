@@ -2,7 +2,6 @@
 
 import React from "react";
 import type { Density, VesselPalette } from "../workspace/tokens";
-import type { PipStatus } from "../../lib/ndk";
 import { isDragSurface } from "../../lib/dragSurface";
 import {
   CARD_DRAG_MIME,
@@ -35,14 +34,14 @@ export interface CardContext {
   // (absent on feedless surfaces like profile overlays / the reader). Drives
   // the feed-derived external Follow affordance (add-to-this-feed).
   feedId?: string;
+  // The reading counts' mark for a FEED card (WORKSPACE-QUEUE-ADR §IV.8), off
+  // the feed's window — never the loaded list, so the card and the bar's count
+  // cannot disagree. PRESENT (even as null) means this card is counted: its
+  // shell carries `data-seen-at` for the pass tracker. Absent on every surface
+  // that does not count, and on the cards inside an expanded conversation,
+  // which never mark anything passed. `read` = passed inside the window.
+  seen?: "new" | "unread" | "read" | null;
 }
-
-// Pip-panel handoff callback (matches the workspace PipOpen contract).
-export type PipOpen = (
-  pubkey: string,
-  rect: DOMRect,
-  status: PipStatus | undefined,
-) => void;
 
 /** The card's own padding, both densities. Exported because a card that is not
  *  a post — the profile's `PersonCard` — must take the same shell numbers
@@ -52,13 +51,25 @@ export const CARD_PADDING = { standard: "16px", tight: "8px 12px" } as const;
 
 export function PostCardShell({
   ctx,
+  postId,
   indentPx,
   gapBelowPx,
   onClick,
   explainParam,
+  seenAt,
+  receded = false,
   children,
 }: {
   ctx: CardContext;
+  // The post this card renders, as a DOM attribute. A host that needs to know
+  // which cards a reader actually saw (PostThread's seen-marking, which feeds
+  // the workspace's weed-on-collapse) observes `[data-post-id]` inside its own
+  // root. It is on the SHELL rather than on a wrapper div deliberately: the
+  // gutter-pointer clash test walks `spineRef`'s direct children one rect each,
+  // and a wrapper's rect spans the container's full width whatever its child's
+  // margin is — interposing one would put back the exact bug the 2026-09-12
+  // narrowing fixed.
+  postId?: string;
   indentPx: number;
   gapBelowPx: number;
   onClick?: () => void;
@@ -66,6 +77,14 @@ export function PostCardShell({
   // data-explain-param so the Explain hover caption can say WHAT KIND of card
   // this is (a Bluesky post, an RSS item, …). Absent → the generic card copy.
   explainParam?: string | null;
+  // A COUNTED feed card's publishedAt (unix seconds): rides the shell as
+  // `data-seen-at`, which is what `usePassTracker` observes. Absent on every
+  // card the reading counts do not track.
+  seenAt?: number;
+  // A READ card's ground darkens, in both modes (§IV.8, inverted 2026-09-24). Its own prop, not
+  // read off `seenAt`: a queue preview row recedes and must not be tracked
+  // (§VII.5).
+  receded?: boolean;
   children: React.ReactNode;
 }) {
   const padding =
@@ -114,6 +133,9 @@ export function PostCardShell({
   return (
     <div
       ref={rootRef}
+      data-post-id={postId}
+      data-seen-at={seenAt}
+      data-receded={receded || undefined}
       data-explain="card"
       data-explain-param={explainParam ?? undefined}
       role={onClick ? "button" : undefined}
@@ -148,7 +170,17 @@ export function PostCardShell({
       }
       onDragEnd={canDrag ? () => endCardDrag() : undefined}
       style={{
-        background: ctx.palette.cardBg,
+        // Unread cards are the plain card; a READ one is DARKER, in both
+        // modes (§IV.8; fading the ink instead read as tired eyes, 2026-09-24).
+        // Anchored on `true-black`, which never inverts, so the branch on
+        // isDark picks only an AMOUNT and cannot count the inversion twice
+        // (web-theme.md). A dark card sits ~10-15 levels above its interior,
+        // so 6% would not show there; 15% lands about halfway down to the
+        // ground and the card still stands off it. Nothing on the edge: the
+        // 4px left bar is the provenance slab and crimson means paid.
+        background: receded
+          ? `color-mix(in srgb, ${ctx.palette.cardBg}, var(--ah-true-black) ${ctx.palette.isDark ? 15 : 6}%)`
+          : ctx.palette.cardBg,
         padding,
         marginLeft: indentPx || undefined,
         marginBottom: gapBelowPx || undefined,

@@ -1,74 +1,7 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { drives as drivesApi, type Commission } from '../../lib/api'
-
-export function CommissionsTab() {
-  const [commissions, setCommissions] = useState<Commission[]>([])
-  const [loading, setLoading] = useState(true)
-
-  async function fetchCommissions() {
-    setLoading(true)
-    try {
-      const data = await drivesApi.myCommissions()
-      setCommissions(data.commissions)
-    } catch {}
-    finally { setLoading(false) }
-  }
-
-  useEffect(() => { void fetchCommissions() }, [])
-
-  if (loading) {
-    return (
-      <div className="space-y-3">
-        {[1, 2].map(i => <div key={i} className="h-24 animate-pulse bg-glasshouse-well" />)}
-      </div>
-    )
-  }
-
-  if (commissions.length === 0) {
-    return (
-      <div className="py-20 text-center">
-        <p className="text-ui-sm text-grey-600">No commission requests yet.</p>
-      </div>
-    )
-  }
-
-  const pending = commissions.filter(c => !c.acceptedAt && c.status === 'open')
-  const accepted = commissions.filter(c => c.acceptedAt && ['open', 'funded'].includes(c.status))
-  const other = commissions.filter(c => !pending.includes(c) && !accepted.includes(c))
-
-  return (
-    <div>
-      {pending.length > 0 && (
-        <div className="mb-8">
-          <p className="label-ui text-grey-600 mb-4">Pending</p>
-          <div className="space-y-2">
-            {pending.map(c => <CommissionCard key={c.id} commission={c} onUpdate={fetchCommissions} />)}
-          </div>
-        </div>
-      )}
-
-      {accepted.length > 0 && (
-        <div className="mb-8">
-          <p className="label-ui text-grey-600 mb-4">Accepted</p>
-          <div className="space-y-2">
-            {accepted.map(c => <CommissionCard key={c.id} commission={c} onUpdate={fetchCommissions} />)}
-          </div>
-        </div>
-      )}
-
-      {other.length > 0 && (
-        <div className="mb-8">
-          <p className="label-ui text-grey-600 mb-4">Completed &amp; declined</p>
-          <div className="space-y-2">
-            {other.map(c => <CommissionCard key={c.id} commission={c} onUpdate={fetchCommissions} />)}
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
 
 export function CommissionCard({ commission: c, onUpdate }: { commission: Commission; onUpdate: () => void }) {
   const [acting, setActing] = useState(false)
@@ -158,14 +91,14 @@ export function CommissionCard({ commission: c, onUpdate }: { commission: Commis
       {isPending && (
         <div className="mt-4 flex items-center gap-3">
           <button onClick={handleAccept} disabled={acting} className="btn text-sm disabled:opacity-50">
-            {acting ? '...' : 'Accept'}
+            {acting ? '…' : 'Accept'}
           </button>
           <button
             onClick={handleDecline}
             disabled={acting}
             className={`text-ui-xs font-sans transition-colors disabled:opacity-50 ${confirmDecline ? 'text-crimson font-medium' : 'text-grey-300 hover:text-black'}`}
           >
-            {acting ? '...' : confirmDecline ? 'Confirm decline?' : 'Decline'}
+            {acting ? '…' : confirmDecline ? 'Confirm decline?' : 'Decline'}
           </button>
         </div>
       )}

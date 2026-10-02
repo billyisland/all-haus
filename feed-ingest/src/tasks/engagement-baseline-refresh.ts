@@ -2,6 +2,7 @@ import type { Task } from "graphile-worker";
 import type { ClientBase } from "pg";
 import { pool } from "@platform-pub/shared/db/client.js";
 import logger from "@platform-pub/shared/lib/logger.js";
+import { nostrEngagementCountsEnabled } from "@platform-pub/shared/lib/env.js";
 import {
   loadResonanceParams,
   externalEExpr,
@@ -50,11 +51,6 @@ const BASELINE_MIN_AGE_HOURS = 48; // posts younger than this have partial E
 const BASELINE_LAST_N = 20;
 const STALE_BASELINE_DAYS = 30; // authors gone from the window age out
 
-function nostrEngagementEnabled(): boolean {
-  const v = process.env.NOSTR_ENGAGEMENT_COUNTS_ENABLED;
-  return v === "1" || v === "true";
-}
-
 // The five E weights this task needs are a strict subset of ResonanceParams,
 // so it reads the scorer's OWN loader rather than re-declaring them. They used
 // to be declared twice, with independently written fallbacks — the baseline is
@@ -94,7 +90,7 @@ export async function refresh(
   client: ClientBase,
   w: ResonanceWeights,
 ): Promise<void> {
-  const externalProtocols = nostrEngagementEnabled()
+  const externalProtocols = nostrEngagementCountsEnabled()
     ? ["atproto", "activitypub", "nostr_external"]
     : ["atproto", "activitypub"];
 
@@ -259,7 +255,7 @@ export async function refresh(
       ambientPruned: ambientPruned.rowCount,
       authorBaselines: baselines.rowCount,
       prunedBaselines: pruned.rowCount,
-      nostrIncluded: nostrEngagementEnabled(),
+      nostrIncluded: nostrEngagementCountsEnabled(),
     },
     "engagement baseline refresh complete",
   );

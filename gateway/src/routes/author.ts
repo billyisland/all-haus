@@ -1,4 +1,3 @@
-import { UUID_RE } from "../lib/uuid.js";
 import type { FastifyInstance } from "fastify";
 import { pool } from "@platform-pub/shared/db/client.js";
 import { optionalAuth } from "../middleware/auth.js";
@@ -25,6 +24,11 @@ import {
 } from "../lib/author-timeline-hydration.js";
 import { encodeTsIdCursor } from "../lib/cursor.js";
 import { resolveLockedRoots } from "../lib/root-locked.js";
+import { dedupMinConfidence } from "../lib/dedup-sql.js";
+import { parseLimit, isUuid } from "../lib/request-inputs.js";
+import { accountArrivedSql } from "../lib/account-arrived.js";
+import { npubBlockedSql } from "@platform-pub/shared/lib/platform-blocks.js";
+import { disclosedClaimantSql } from "@platform-pub/shared/lib/presence-claim.js";
 
 // =============================================================================
 // Constructed author profile — UNIVERSAL-POST-ADR Phase 4 (§4.4, §9, §VI.3)
@@ -67,6 +71,35 @@ const MAX_LIMIT = 50;
 export const AUTHOR_POSTS_CONTEXT_FILTER =
   "(ei.is_context_only IS NOT TRUE OR ei.is_profile_hydrated IS TRUE)";
 
+// A member's OWN posts on their linked Bluesky/Mastodon accounts, in their
+// native log (CROSS-NETWORK-ROUNDTRIP-ADR D2, D-Q2: "byline + profile log",
+// operator 2026-09-27). The rows are the external author rows the member
+// CLAIMS (external_authors.account_id, migration 237), shown:
+//   · to everybody where the claim is DISCLOSED — show_on_profile, the consent
+//     the profile's identity row already answers to (D-Q1) — and
+//   · to the member alone where it is not. The one viewer term in this route,
+//     stamped here because this is where the viewer is known; a stranger's
+//     page is exactly what it was before rung D.
+// Not their REPLIES (the native log keeps those to the Replies tab, and an
+// external reply here would read as a remark with its conversation cut off),
+// and not their ECHOES — a cross-post's copy is already this log's own note
+// (rung B). `acct` and `viewer` are parameter placeholders.
+export function ownPostsElsewhereSql(acct: string, viewer: string): string {
+  return `(fi.item_type = 'external'
+      AND fi.is_reply IS NOT TRUE
+      AND fi.external_author_id IN (
+        SELECT xo.id FROM external_authors xo
+         WHERE xo.account_id = ${acct}
+           AND (${viewer}::uuid IS NOT DISTINCT FROM ${acct}::uuid
+                OR ${disclosedClaimantSql("xo")} IS NOT NULL))
+      AND NOT EXISTS (
+        SELECT 1 FROM outbound_posts op
+         WHERE op.external_post_uri = ei.source_item_uri
+           AND op.status = 'sent'
+           AND op.account_id = ${acct}::uuid
+           AND op.protocol::text = fi.source_protocol::text))`;
+}
+
 
 interface ExternalAuthorRow {
   id: string;
@@ -98,7 +131,12 @@ export async function loadExternalAuthor(
     `SELECT id, protocol, stable_handle, tier, account_id, source_id,
             display_name, handle, handle_uri, avatar,
             bio, website, lightning_address, profile_fetched_at
-     FROM external_authors WHERE id = $1`,
+     FROM external_authors
+     WHERE id = $1
+       -- A platform-blocked npub has no profile and no timeline here (§0z
+       -- item 15): every author route loads through this one function, and
+       -- a blocked identity answers "not found" from all of them.
+       AND NOT (protocol = 'nostr_external' AND ${npubBlockedSql("stable_handle")})`,
     [id],
   );
   return rows[0] ?? null;
@@ -106,7 +144,10 @@ export async function loadExternalAuthor(
 
 async function isNativeAccount(id: string): Promise<boolean> {
   const { rows } = await pool.query<{ exists: boolean }>(
-    `SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1 AND status = 'active') AS exists`,
+    // An account admit created has no profile until its owner arrives
+    // (lib/account-arrived.ts).
+    `SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1 AND status = 'active'
+                   AND ${accountArrivedSql("accounts")}) AS exists`,
     [id],
   );
   return rows[0]?.exists ?? false;
@@ -272,10 +313,8 @@ async function resolveExternalAuthorById(
 
   const { rows: repRows } = await pool.query<{
     source_id: string | null;
-    source_item_uri: string | null;
-    author_uri: string | null;
   }>(
-    `SELECT ei.source_id, ei.source_item_uri, ei.author_uri
+    `SELECT ei.source_id
      FROM feed_items fi
      JOIN external_items ei ON ei.id = fi.external_item_id
      WHERE fi.external_author_id = $1 AND fi.deleted_at IS NULL
@@ -283,8 +322,8 @@ async function resolveExternalAuthorById(
      LIMIT 1`,
     [xa.id],
   );
-  // `rep` is kept ONLY for the activitypub host fallback below (Mastodon REST
-  // counts). It must NOT drive follow state: thread-context hydration files
+  // `rep` is kept ONLY for the nostr relay-hint lookup below. It must NOT
+  // drive follow state: thread-context hydration files
   // every participant's post under the FOCAL author's source_id (see
   // routes/external-items.ts), so the representative item's source is the focal
   // author's source for anyone who appears only inside an expanded conversation.
@@ -359,6 +398,19 @@ async function resolveExternalAuthorById(
   // computable once source_a exists; empty otherwise.
   let linkedSources: AuthorCardResponse["linkedSources"];
   if (linkSourceId && viewerId) {
+    // THE SAME FLOOR THE DEDUP ENGINE USES (MIRROR-AUDIT §3 *Security*, S16).
+    // `confidence` was recorded and read by nothing here, so a 0.6
+    // `domain_match` — a cron's guess off a website field the source ASSERTS
+    // about itself, and `identity-link-detect` is steerable by exactly that
+    // field — rendered as an "also them" chip on a profile with the same weight
+    // as a link the viewer had drawn by hand.
+    //
+    // It is `dedupMinConfidence()` rather than a second constant because a chip
+    // claiming two accounts are one person while the feed declines to merge
+    // them is the surface disagreeing with the engine, and an operator retuning
+    // the dial to switch domain-matching on must move both together or find out
+    // which one they forgot from a bug report. One dial, one meaning.
+    const minConfidence = await dedupMinConfidence();
     const { rows: linkRows } = await pool.query<{
       link_id: string;
       source_id: string;
@@ -377,6 +429,7 @@ async function resolveExternalAuthorById(
                            ELSE l.source_a_id END
         WHERE (l.source_a_id = $2 OR l.source_b_id = $2)
           AND l.link_type <> 'user_unlinked'
+          AND l.confidence >= $3
           AND (l.owner_id = $1 OR l.owner_id IS NULL)
           -- Subtract pairs the viewer has tombstoned (the negative override).
           AND NOT EXISTS (
@@ -387,7 +440,7 @@ async function resolveExternalAuthorById(
                AND t.source_b_id = l.source_b_id
           )
         ORDER BY (l.owner_id IS NULL), l.created_at`,
-      [viewerId, linkSourceId],
+      [viewerId, linkSourceId, minConfidence],
     );
     if (linkRows.length > 0) {
       // A pair can carry both the viewer's own assertion and a global detected
@@ -458,7 +511,7 @@ async function resolveExternalAuthorById(
 
   if (xa.protocol === "activitypub") {
     const actor = xa.handle_uri ?? xa.stable_handle; // actor URI
-    const profile = await fetchAPProfile(actor, rep?.source_item_uri ?? actor);
+    const profile = await fetchAPProfile(actor);
     if (profile) {
       return {
         ...base,
@@ -577,8 +630,8 @@ export async function authorRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const { authorId } = req.params;
       const viewerId = req.session?.sub ?? null;
-      if (!UUID_RE.test(authorId)) {
-        return reply.status(400).send({ error: "Invalid author id" });
+      if (!isUuid(authorId)) {
+        return reply.status(404).send({ error: "We couldn't find that author." });
       }
 
       try {
@@ -589,10 +642,10 @@ export async function authorRoutes(app: FastifyInstance) {
         if (await isNativeAccount(authorId)) {
           return reply.send(await resolveNativeAuthor(authorId, viewerId));
         }
-        return reply.status(404).send({ error: "Author not found" });
+        return reply.status(404).send({ error: "We couldn't find that author." });
       } catch (err) {
         logger.error({ err, authorId }, "Author profile fetch failed");
-        return reply.status(500).send({ error: "Author profile fetch failed" });
+        return reply.status(500).send({ error: "Couldn't load this profile. Please try again." });
       }
     },
   );
@@ -620,20 +673,20 @@ export async function authorRoutes(app: FastifyInstance) {
       // /profile route was left gated here BECAUSE it reads req.session.sub —
       // widened 2026-09-02 by making the viewer nullable and omitting the two
       // fields derived from it, rather than by ignoring that it reads one.
+      // Rung D added ONE viewer term (ownPostsElsewhereSql: the member sees
+      // their own undisclosed posts elsewhere); an anonymous read still gets
+      // exactly what a logged-in stranger's does.
       preHandler: optionalAuth,
       config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
     },
     async (req, reply) => {
       const { authorId } = req.params;
-      if (!UUID_RE.test(authorId)) {
-        return reply.status(400).send({ error: "Invalid author id" });
+      if (!isUuid(authorId)) {
+        return reply.status(404).send({ error: "We couldn't find that author." });
       }
 
       const cursor = parseCursor(req.query.cursor);
-      const limit = Math.min(
-        parseInt(req.query.limit ?? String(DEFAULT_LIMIT), 10) || DEFAULT_LIMIT,
-        MAX_LIMIT,
-      );
+      const limit = parseLimit(req.query.limit, DEFAULT_LIMIT, MAX_LIMIT);
       const kind =
         req.query.kind === "article" || req.query.kind === "note"
           ? req.query.kind
@@ -645,6 +698,9 @@ export async function authorRoutes(app: FastifyInstance) {
         const xa = await loadExternalAuthor(authorId);
         let authorFilter: string;
         let hydrating = false;
+        // The viewer rides as the LAST parameter, only on the native arm.
+        const viewerParam = cursor ? 5 : 3;
+        let withViewer = false;
         if (xa) {
           authorFilter = "fi.external_author_id = $1";
           // §3.1 — profile-view timeline hydration: first page only, whenever
@@ -664,11 +720,17 @@ export async function authorRoutes(app: FastifyInstance) {
             }
           }
         } else if (await isNativeAccount(authorId)) {
-          authorFilter = kind
+          const native = kind
             ? `fi.author_id = $1 AND fi.item_type = '${kind}'`
             : "fi.author_id = $1 AND fi.item_type IN ('article', 'note')";
+          // Short posts elsewhere are the Social tab's (kind=note) and the
+          // unfiltered log's; never the Work tab's.
+          withViewer = kind !== "article";
+          authorFilter = withViewer
+            ? `((${native}) OR ${ownPostsElsewhereSql("$1", `$${viewerParam}`)})`
+            : native;
         } else {
-          return reply.status(404).send({ error: "Author not found" });
+          return reply.status(404).send({ error: "We couldn't find that author." });
         }
 
         const cursorClause = cursor
@@ -677,6 +739,7 @@ export async function authorRoutes(app: FastifyInstance) {
         const params: any[] = cursor
           ? [authorId, limit, cursor.ts, cursor.id]
           : [authorId, limit];
+        if (withViewer) params.push(req.session?.sub ?? null);
 
         const result = await pool.query<any>(
           `
@@ -718,7 +781,7 @@ export async function authorRoutes(app: FastifyInstance) {
         });
       } catch (err) {
         logger.error({ err, authorId }, "Author posts fetch failed");
-        return reply.status(500).send({ error: "Author posts fetch failed" });
+        return reply.status(500).send({ error: "Couldn't load their posts. Please try again." });
       }
     },
   );
@@ -743,8 +806,8 @@ export async function authorRoutes(app: FastifyInstance) {
     },
     async (req, reply) => {
       const { authorId } = req.params;
-      if (!UUID_RE.test(authorId)) {
-        return reply.status(400).send({ error: "Invalid author id" });
+      if (!isUuid(authorId)) {
+        return reply.status(404).send({ error: "We couldn't find that author." });
       }
       if (!(await isNativeAccount(authorId))) {
         // External authors have no native comments; empty log (not a 404 — the
@@ -753,10 +816,7 @@ export async function authorRoutes(app: FastifyInstance) {
       }
 
       const cursor = parseCursor(req.query.cursor);
-      const limit = Math.min(
-        parseInt(req.query.limit ?? String(DEFAULT_LIMIT), 10) || DEFAULT_LIMIT,
-        MAX_LIMIT,
-      );
+      const limit = parseLimit(req.query.limit, DEFAULT_LIMIT, MAX_LIMIT);
 
       try {
         const cursorClause = cursor
@@ -793,6 +853,11 @@ export async function authorRoutes(app: FastifyInstance) {
                  -- which piece they name, but only the event id joins to
                  -- the articles table, which is what resolveLockedRoots needs.
                  c.target_event_id,
+                 -- The kind that insert RESOLVED, carried with the event id
+                 -- onto every comment Post as the "conversation" block: what
+                 -- a reply to this comment is addressed to (post-mapper.ts).
+                 -- This log mounts interactive cards, so its Reply needs it.
+                 c.target_kind,
                  c.content,
                  EXTRACT(EPOCH FROM c.published_at)::bigint AS published_at_epoch,
                  -- Fractional epoch for the cursor only (M13); published_at_epoch
@@ -860,7 +925,7 @@ export async function authorRoutes(app: FastifyInstance) {
         return reply.send({ items, nextCursor });
       } catch (err) {
         logger.error({ err, authorId }, "Author replies fetch failed");
-        return reply.status(500).send({ error: "Author replies fetch failed" });
+        return reply.status(500).send({ error: "Couldn't load their replies. Please try again." });
       }
     },
   );

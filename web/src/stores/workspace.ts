@@ -109,6 +109,10 @@ interface WorkspaceState {
 
 const STORAGE_PREFIX = "workspace:layout:v2:";
 const REGIMENTED_PREFIX = "workspace:regimented:";
+/** The retired desktop-mode key (WORKSPACE-QUEUE-ADR §XI, C2): the desktop
+ *  workspace is the queue and nothing else, so there is no mode to store. Read
+ *  by nothing; removed at every hydrate, beside the regimented key. */
+const MODE_PREFIX = "workspace:mode:";
 /** The free-coordinate floor's key. Read once at hydrate for its appearance
  *  fields, then deleted (§VIII). */
 const V1_PREFIX = "workspace:layout:";
@@ -118,6 +122,7 @@ let writeTimer: ReturnType<typeof setTimeout> | null = null;
 
 const storageKey = (userId: string) => `${STORAGE_PREFIX}${userId}`;
 const regimentedKey = (userId: string) => `${REGIMENTED_PREFIX}${userId}`;
+const modeKey = (userId: string) => `${MODE_PREFIX}${userId}`;
 const v1Key = (userId: string) => `${V1_PREFIX}${userId}`;
 
 const EMPTY_LAYOUT: WorkspaceLayout = { columns: [] };
@@ -247,17 +252,48 @@ function writeNow(userId: string, layout: WorkspaceLayout, appearance: Record<st
   }
 }
 
+// The write the debounce is holding, so it can be forced out. A 200ms window
+// is short and the last edit in a session is the one most likely to fall in it:
+// drop a vessel and close the tab, or drag one and follow a link straight out,
+// and the arrangement the member just made was never written — they come back
+// to the one before it, which reads as the floor forgetting at random.
+let pendingWrite: {
+  userId: string;
+  layout: WorkspaceLayout;
+  appearance: Record<string, VesselAppearance>;
+} | null = null;
+
+function flushWrite() {
+  if (writeTimer) {
+    clearTimeout(writeTimer);
+    writeTimer = null;
+  }
+  if (!pendingWrite) return;
+  const { userId, layout, appearance } = pendingWrite;
+  pendingWrite = null;
+  writeNow(userId, layout, appearance);
+}
+
 function scheduleWrite(
   userId: string,
   layout: WorkspaceLayout,
   appearance: Record<string, VesselAppearance>,
 ) {
   if (typeof window === "undefined") return;
+  pendingWrite = { userId, layout, appearance };
   if (writeTimer) clearTimeout(writeTimer);
-  writeTimer = setTimeout(() => {
-    writeNow(userId, layout, appearance);
-    writeTimer = null;
-  }, WRITE_DEBOUNCE_MS);
+  writeTimer = setTimeout(flushWrite, WRITE_DEBOUNCE_MS);
+}
+
+// `pagehide` and not `beforeunload`: the latter is unreliable on mobile, where
+// a tab is frozen rather than unloaded, and `visibilitychange → hidden` covers
+// the app-switch that never unloads at all. Registered once at module scope,
+// because the store outlives every component that reads it.
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", flushWrite);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushWrite();
+  });
 }
 
 export const useWorkspace = create<WorkspaceState>((set, get) => {
@@ -289,10 +325,14 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
 
     hydrate: (userId) => {
       if (get().userId === userId && get().hydrated) return;
+      // Drop any pending write for the PREVIOUS identity rather than flushing
+      // it: hydrating a different user means the debounced layout belongs to
+      // an account that is no longer signed in here.
       if (writeTimer) {
         clearTimeout(writeTimer);
         writeTimer = null;
       }
+      pendingWrite = null;
       const stored = readFromStorage(userId);
       const layout = stored?.layout ?? EMPTY_LAYOUT;
       let appearance = stored?.appearance ?? {};
@@ -314,20 +354,25 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         }
       }
 
-      let regimented = false;
+      // The desktop workspace is the queue (WORKSPACE-QUEUE-ADR §XI, C2): the
+      // mode switch and the parade ground are gone, so their two per-device
+      // keys are cleared here, every hydrate — `removeItem` on an absent key
+      // is a no-op, and a one-shot marker would be a third key to clear. The
+      // layout key STAYS: its `appearance` half carries the local-only text
+      // size, which the queue reads (C3 slims the record, §XI.5 as built).
       if (typeof window !== "undefined") {
         try {
-          regimented =
-            window.localStorage.getItem(regimentedKey(userId)) === "true";
+          window.localStorage.removeItem(modeKey(userId));
+          window.localStorage.removeItem(regimentedKey(userId));
         } catch {
-          regimented = false;
+          // Harmless if left: nothing reads either key.
         }
       }
 
       // No placement here: at hydrate the store cannot tell a hidden feed from
       // a deleted one. reconcileFeeds (bootstrap, once the server list is in)
       // owns pruning and placement.
-      set({ userId, layout, appearance, regimented, hydrated: true });
+      set({ userId, layout, appearance, regimented: false, hydrated: true });
     },
 
     applyDrop: (feedId, drop) =>

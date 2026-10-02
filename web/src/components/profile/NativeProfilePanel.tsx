@@ -18,6 +18,7 @@ import { NativeProfileBody } from "./NativeProfileBody";
 import { profileIslandStyle, profilePalette } from "./ProfileChrome";
 import { useResolvedDark } from "../../stores/colorScheme";
 import type { FeedScheme } from "../workspace/tokens";
+import type { ProfileFocus } from "../../stores/profileOverlay";
 import { getWriter, type WriterProfile } from "../../lib/api/writers";
 import { ApiError } from "../../lib/api/client";
 
@@ -25,11 +26,21 @@ export function NativeProfilePanel({
   username,
   onClose,
   scheme,
+  focus,
+  tab = null,
 }: {
   username: string;
   onClose?: () => void;
   /** The launching feed's colourway — the pane wears it entire. */
   scheme?: FeedScheme | null;
+  /** The conversation this pane was opened ON (a notification row). Overlay
+   *  register only: the standalone page is a front door and has no such
+   *  errand. */
+  focus?: ProfileFocus | null;
+  /** The view to open on, when the caller named one (a retired address that
+   *  was itself a view: /following, /social). Overlay register only — the
+   *  standalone page reads its own `?tab=`. */
+  tab?: string | null;
 }) {
   const dark = useResolvedDark();
   const palette = profilePalette(scheme, dark);
@@ -78,7 +89,7 @@ export function NativeProfilePanel({
         className="font-sans text-ui-sm py-16 text-center"
         style={{ color: palette.cardStandfirst }}
       >
-        @{username} isn&apos;t here.
+        @{username} isn&rsquo;t here.
       </p>,
     );
   }
@@ -89,7 +100,7 @@ export function NativeProfilePanel({
         className="font-sans text-ui-sm py-16 text-center"
         style={{ color: palette.cardStandfirst }}
       >
-        Couldn&apos;t load this profile.
+        Couldn&rsquo;t load this profile. Please try again.
       </p>,
     );
   }
@@ -115,6 +126,8 @@ export function NativeProfilePanel({
       writer={writer}
       onClose={onClose}
       scheme={scheme}
+      focus={focus}
+      tab={tab}
       minHeight="100%"
     />
   );

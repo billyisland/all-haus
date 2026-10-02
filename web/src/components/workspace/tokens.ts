@@ -55,6 +55,21 @@ export const VESSEL_PAD = 16
 /** Flex gap on the card column; ADDS to each card's own `GAP_PX.feed` margin. */
 export const VESSEL_GAP = 12
 
+/** The queue's focal width as a share of the viewport, before the clamp to the
+ *  floor's own readable band (WORKSPACE-QUEUE-ADR §VII.1). */
+export const QUEUE_FOCAL_VW = 0.46
+/** A feed ahead in the queue, as a share of the focal width (§VII.1). Was
+ *  0.4 — widened a fifth (operator, 2026-09-26) because a preview row's
+ *  byline had too little room for an ordinary name. */
+export const QUEUE_COMPACT_RATIO = 0.48
+/** One queue step's travel, as a share of the focal width: a sideways drag of
+ *  `QUEUE_STEP_RATIO × FW` px is a whole step (§VII.6). The draft's 0.9 asked
+ *  a normal two-finger swipe for more than it travels. */
+export const QUEUE_STEP_RATIO = 0.6
+/** Widths, commits, walks and springs back (§VII.8). */
+export const QUEUE_MOTION_MS = 450
+export const QUEUE_EASE: [number, number, number, number] = [0.2, 0.7, 0.2, 1]
+
 /** The height of a Glasshouse pane's thickened top (`.ah-pane-bar`) — the ⊓'s
  *  bar. Sized off the type it carries (`label-ui` at 11px, ~17px line box) plus
  *  a 6px breath either side, NOT off the 8px stroke it replaces, which held no
@@ -75,7 +90,6 @@ export type Brightness = FeedScheme
 export type Density = 'compact' | 'standard' | 'headline'
 export type Orientation = 'vertical' | 'horizontal'
 
-export const DEFAULT_BRIGHTNESS: FeedScheme = 'basic'
 export const DEFAULT_DENSITY: Density = 'standard'
 export const DEFAULT_ORIENTATION: Orientation = 'vertical'
 
@@ -103,6 +117,12 @@ export interface VesselPalette {
   quoteText: string
   quoteMeta: string
   crimson: string
+  // The resonance mark (PostResonance.tsx) — the feed's OWN wall colour, which
+  // is what makes the ⊔ frame read as this feed, brought onto the card. Two
+  // steps: `resonanceMark` (bands 1-2, ▴) and `resonanceMarkLoud` (band 3, ▲).
+  // Derived, never hand-set, and never `crimson` — crimson means PAID.
+  resonanceMark: string
+  resonanceMarkLoud: string
   resizeHandle: string
   pipOpacity: number
   barBg: string
@@ -178,6 +198,17 @@ function deriveVesselPalette(
     `color-mix(in srgb, ${v(s.walls)}, rgb(var(--ah-${
       darkBar ? 'white' : 'ink'
     }-rgb)) ${pct}%)`
+  // The resonance mark wears the WALLS — the feed's identity colour — but the
+  // walls are tuned to sit against the floor, not against a card, so on a dark
+  // card the raw wall lands at 2.4-3.0:1 and would be QUIETER than the muted
+  // meta it replaced. Lift it toward the card's own text direction first: on a
+  // dark card 42% toward white (5.8-6.4:1), on a light card the wall as-is
+  // (4.7-18.9:1). The modest step is then that colour eased 15% back into the
+  // card ground — a weight step inside one hue, so the two marks cannot read as
+  // two different colours the way cardMeta/cardTitle did.
+  const markLoud = darkCard
+    ? `color-mix(in srgb, ${v(s.walls)}, rgb(var(--ah-white-rgb)) 42%)`
+    : v(s.walls)
   return {
     scheme,
     isDark: darkCard,
@@ -193,6 +224,8 @@ function deriveVesselPalette(
     quoteText: darkBar ? 'var(--ah-bone-bright)' : 'var(--ah-ink)',
     quoteMeta: darkBar ? 'var(--ah-stone-350)' : 'var(--ah-stone-600)',
     crimson: darkCard ? 'var(--ah-crimson-soft)' : 'var(--ah-crimson)',
+    resonanceMark: `color-mix(in srgb, ${markLoud}, ${v(s.cardBg)} 15%)`,
+    resonanceMarkLoud: markLoud,
     resizeHandle: 'var(--ah-stone-600)',
     pipOpacity: 1,
     barBg: v(s.walls),
@@ -223,6 +256,11 @@ const BASIC_LIGHT: VesselPalette = {
   quoteText: 'var(--ah-bone-bright)',
   quoteMeta: 'var(--ah-stone-350)',
   crimson: 'var(--ah-crimson)',
+  // Same construction as the seasons, written out (this palette is a literal).
+  // Both slugs are in DARK_SLUGS, so the pair inverts coherently on the one
+  // surface that consumes BASIC_LIGHT un-islanded (globalContentPalette).
+  resonanceMark: 'color-mix(in srgb, var(--ah-ink), var(--ah-white) 15%)',
+  resonanceMarkLoud: 'var(--ah-ink)',
   resizeHandle: 'var(--ah-stone-600)',
   pipOpacity: 1,
   barBg: 'var(--ah-ink)',
@@ -267,6 +305,14 @@ const BASIC_DARK: VesselPalette = {
   // rather than parity. Same divergence, same reason, as `barTextMuted` below.
   quoteMeta: 'var(--ah-stone-300)',
   crimson: 'var(--ah-crimson-soft)',
+  // The seasonal derivation, written out against basic's neutral spine: the
+  // wall lifted 42% toward white reads 6.39:1 on the ink-900 card, the modest
+  // step 5.05:1. Islanded like every other BASIC_DARK literal, so `--ah-white`
+  // here resolves canonical rather than inverting.
+  resonanceMark:
+    'color-mix(in srgb, color-mix(in srgb, var(--ah-basic-walls-dk), var(--ah-white) 42%), var(--ah-ink-900) 15%)',
+  resonanceMarkLoud:
+    'color-mix(in srgb, var(--ah-basic-walls-dk), var(--ah-white) 42%)',
   resizeHandle: 'var(--ah-stone-600)',
   pipOpacity: 1,
   barBg: 'var(--ah-basic-walls-dk)',

@@ -17,8 +17,7 @@ import {
 } from "../../../components/workspace/tokens";
 import { sources, type SourceMeta } from "../../../lib/api/feeds";
 import type { Post } from "../../../lib/post/types";
-import { quotePreviewContent } from "../../../lib/post/quote-preview";
-import { useCompose } from "../../../stores/compose";
+import { openPostInReader } from "../../../lib/workspace/open-post";
 import { useColorScheme } from "../../../stores/colorScheme";
 import { ApiError } from "../../../lib/api/client";
 
@@ -128,27 +127,13 @@ export function SourceSurface({ id }: { id: string }) {
   }, []);
 
   // Article → its addressable reader page (no overlay is mounted off-workspace).
+  // Reader pane inside the workspace, standalone route outside it — one home,
+  // because a bare push from an overlay body is the escape ban (lib/workspace/
+  // open-post.ts, which also gates the external target on a real origin URL).
   const openReader = useCallback(
-    (p: Post) => {
-      if (p.author.pubkey) {
-        if (p.dTag) router.push(`/article/${p.dTag}`);
-      } else {
-        router.push(`/read/${p.id}`);
-      }
-    },
+    (p: Post) => openPostInReader(p, router),
     [router],
   );
-
-  // Native reply via the global compose overlay (mounted in app/layout).
-  const replyFromPost = useCallback((p: Post) => {
-    if (!p.author.pubkey) return;
-    useCompose.getState().open("reply", {
-      eventId: p.version ?? p.id,
-      eventKind: p.type === "article" ? 30023 : 1,
-      authorPubkey: p.author.pubkey,
-      previewContent: quotePreviewContent(p),
-    });
-  }, []);
 
   if (loading) {
     return (
@@ -160,9 +145,9 @@ export function SourceSurface({ id }: { id: string }) {
 
   if (notFound) {
     return (
-      <PageShell width="feed" title="Source not found">
+      <PageShell width="feed" title="We couldn’t find that source.">
         <p className="font-sans text-ui-sm text-grey-600">
-          This source isn&apos;t available.{" "}
+          This source isn&rsquo;t available.{" "}
           <Link href="/reader" className="btn-text">
             Back to workspace
           </Link>
@@ -175,7 +160,7 @@ export function SourceSurface({ id }: { id: string }) {
     return (
       <PageShell width="feed" title="Couldn’t load source">
         <p className="font-sans text-ui-sm text-grey-600">
-          Something went wrong loading this source.
+          Something went wrong while loading this source. Please try again.
         </p>
       </PageShell>
     );
@@ -214,7 +199,7 @@ export function SourceSurface({ id }: { id: string }) {
 
       {items.length === 0 ? (
         <div className="label-ui text-grey-600 py-12 text-center">
-          NO ITEMS YET
+          Nothing yet
         </div>
       ) : (
         // The feed's own rhythm — `FEED_LOG_STYLE`'s column gap PLUS each
@@ -234,9 +219,6 @@ export function SourceSurface({ id }: { id: string }) {
                 onExpand={() => toggleExpand(post.id)}
                 onQuoteOpen={(qid) => expandQuote(post.id, qid)}
                 onOpenReader={openReader}
-                onReply={
-                  post.author.pubkey ? () => replyFromPost(post) : undefined
-                }
               />
             );
             if (root === undefined || post.type === "article")
@@ -255,7 +237,6 @@ export function SourceSurface({ id }: { id: string }) {
                   rootPostId={root}
                   ctx={CTX}
                   onCollapse={() => collapseExpand(post.id)}
-                  onReply={replyFromPost}
                   onOpenReader={openReader}
                 />
               </Fragment>

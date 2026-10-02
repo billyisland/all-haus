@@ -8,7 +8,7 @@ const GATEWAY = process.env.GATEWAY_INTERNAL_URL ?? process.env.GATEWAY_URL ?? '
 const SITE_URL = process.env.APP_URL ?? 'https://all.haus'
 
 async function getPublication(slug: string) {
-  const res = await fetch(`${GATEWAY}/api/v1/publications/${slug}/public`, {
+  const res = await fetch(`${GATEWAY}/api/v1/publications/${encodeURIComponent(slug)}/public`, {
     next: { revalidate: 60 },
   })
   if (!res.ok) return null

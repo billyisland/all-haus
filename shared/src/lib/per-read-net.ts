@@ -43,16 +43,55 @@ export function perReadNetPence(chargeablePence: number, platformFeeBps: number)
 }
 
 /**
- * SQL fragment for the per-read net of `chargeableExpr`, given a bound parameter
- * placeholder (e.g. '$2') carrying the fee bps. Use inside aggregates so the
- * money and display queries share one definition:
- *   `SUM(${readNetSql('r.chargeable_pence', '$2')})`
+ * SQL fragment for the per-read net of `chargeableExpr`, given an expression
+ * carrying the fee bps — normally {@link readFeeBpsSql}, which prefers the
+ * rate STAMPED on the row. Use inside aggregates so the money and display
+ * queries share one definition:
+ *   `SUM(${readNetSql('r.chargeable_pence', readFeeBpsSql('r.', '$2'))})`
  *
  * `chargeableExpr` must be `read_events.chargeable_pence` (however aliased) and
  * NEVER `amount_pence` — the gift rule in the header, enforced by
  * scripts/check-read-chargeable.sh. Both arguments must be trusted (a column
  * ref / a bound placeholder) — never interpolate user input.
  */
-export function readNetSql(chargeableExpr: string, feeBpsParam: string): string {
-  return `(${chargeableExpr} - FLOOR(${chargeableExpr} * ${feeBpsParam} / 10000))`
+export function readNetSql(chargeableExpr: string, feeBpsExpr: string): string {
+  return `(${chargeableExpr} - FLOOR(${chargeableExpr} * ${feeBpsExpr} / 10000))`
+}
+
+// =============================================================================
+// WHICH FEE (migration 208, L5.1). The rate a read earns at is a fact about
+// THAT READ, stamped on it at accrual — `read_events.fee_bps`. Every stage
+// after the accrual reads the row, so retuning `platform_fee_bps` cannot move
+// money that is already earned, and a chargeback reversal computed later backs
+// out exactly the accrual that was posted (a mismatch there is a ledger
+// divergence, which halts every payout on the platform).
+//
+// The parameter is the FALLBACK, and it is the live dial. `fee_bps` is NULL on
+// exactly two populations: rows written before migration 208 backfilled the
+// column (none, after it runs) and rows written by a pre-deploy build during
+// the window between `migrate` and the service rebuild. For those the live dial
+// IS the rate they are being paid at today, so falling back to it changes
+// nothing about them — it is not a second copy of the dial, it is the old
+// behaviour, scoped to the rows that still have the old behaviour.
+// =============================================================================
+
+/**
+ * SQL expression for the fee bps to apply to a read: the rate stamped on the
+ * row, falling back to the live dial for a row written before the stamp.
+ *
+ * `prefix` is the read_events alias including its dot (`'r.'`, `'re.'`, or
+ * `''` for an unaliased/derived query — a derived table must carry `fee_bps`
+ * through its own select list). `feeBpsParam` is the bound placeholder holding
+ * `config.platformFeeBps`. Both must be trusted — never user input.
+ */
+export function readFeeBpsSql(prefix: string, feeBpsParam: string): string {
+  return `COALESCE(${prefix}fee_bps, ${feeBpsParam})`
+}
+
+/**
+ * JS twin of {@link readFeeBpsSql} — the rate stamped on a read row, falling
+ * back to the live dial when the row predates the stamp.
+ */
+export function readFeeBps(stampedFeeBps: number | null | undefined, liveFeeBps: number): number {
+  return stampedFeeBps ?? liveFeeBps
 }

@@ -307,9 +307,22 @@ describe("mutations delegate to the layout module", () => {
     expect(layoutFeedIds(s.layout)).toEqual(["b", "a"]);
   });
 
-  it("restores the regimented flag on hydrate", () => {
+  it("hydrate clears the retired mode and parade keys, and keeps the layout key", () => {
+    // C2 (WORKSPACE-QUEUE-ADR §XI): the desktop workspace is the queue, so the
+    // mode switch and the parade ground are gone. Their per-device keys are
+    // removed; the layout key is NOT, because its appearance half carries the
+    // local-only text size the queue still reads.
+    store.set("workspace:mode:u", "columns");
     store.set("workspace:regimented:u", "true");
+    store.set(
+      V2("u"),
+      JSON.stringify({ columns: [], appearance: { a: { textSize: 4 } } }),
+    );
     useWorkspace.getState().hydrate("u");
-    expect(useWorkspace.getState().regimented).toBe(true);
+    expect(store.has("workspace:mode:u")).toBe(false);
+    expect(store.has("workspace:regimented:u")).toBe(false);
+    expect(useWorkspace.getState().regimented).toBe(false);
+    expect(useWorkspace.getState().appearance.a?.textSize).toBe(4);
+    expect(store.has(V2("u"))).toBe(true);
   });
 });

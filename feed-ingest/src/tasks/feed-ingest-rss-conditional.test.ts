@@ -3,6 +3,7 @@ import pg from "pg";
 import {
   conditionalHeadersFor,
   RSS_SOURCE_LOAD_SQL,
+  RSS_WINDOW_RESEEN_SQL,
 } from "./feed-ingest-rss.js";
 
 // =============================================================================
@@ -177,5 +178,135 @@ describe.skipIf(!DB_URL)("RSS_SOURCE_LOAD_SQL — the holds_items premise", () =
     );
 
     expect(await holdsItems()).toBe(false);
+  });
+
+  // CA-C4. A source whose every item was first written by ANOTHER source held
+  // nothing under the old `source_id` probe, so it sent no validators and
+  // re-fetched in full on every poll. It holds what it SERVES.
+  it("holds an item another source wrote first, once it has served it", async () => {
+    const { rows: [other] } = await client.query<{ id: string }>(
+      `INSERT INTO external_sources (protocol, source_uri)
+       VALUES ('rss', $1) RETURNING id`,
+      [`https://example.test/first-${seq}/feed.xml`],
+    );
+    const { rows: [it] } = await client.query<{ id: string }>(
+      `INSERT INTO external_items (source_id, protocol, tier, source_item_uri, published_at, fetched_at)
+       VALUES ($1,'rss','tier4',$2, now(), now()) RETURNING id`,
+      [other.id, `https://example.test/shared-${seq}`],
+    );
+    expect(await holdsItems()).toBe(false);
+
+    await client.query(
+      `INSERT INTO external_item_sources (external_item_id, source_id) VALUES ($1, $2)`,
+      [it.id, sourceId],
+    );
+    expect(await holdsItems()).toBe(true);
+  });
+});
+
+// CA-G10b. A 304 means the origin still serves the window we last fetched, so
+// that window is re-stamped SEEN — or a quiet feed's items are pruned at
+// retention and re-inserted as new rows by the next full fetch. The window is
+// found as the newest stamp among the source's own rows (the poll stamps a
+// whole window with one transaction's now()). Stamps are literals here: inside
+// the test's transaction now() never moves.
+describe.skipIf(!DB_URL)("RSS_WINDOW_RESEEN_SQL — a 304 re-stamps the last window", () => {
+  let client: pg.Client;
+  let seq = 0;
+
+  beforeAll(async () => {
+    client = new pg.Client({ connectionString: DB_URL });
+    await client.connect();
+  });
+  afterAll(async () => {
+    await client.end();
+  });
+  beforeEach(async () => {
+    await client.query("BEGIN");
+  });
+  afterEach(async () => {
+    await client.query("ROLLBACK");
+  });
+
+  const source = async (): Promise<string> => {
+    const { rows: [s] } = await client.query<{ id: string }>(
+      `INSERT INTO external_sources (protocol, source_uri) VALUES ('rss', $1) RETURNING id`,
+      [`https://example.test/g10b-${Date.now().toString(36)}-${seq++}/feed.xml`],
+    );
+    return s.id;
+  };
+  // The home membership is the trigger's; its stamp is set to the literal.
+  const item = async (sourceId: string, label: string, seenDaysAgo: number): Promise<string> => {
+    const { rows: [r] } = await client.query<{ id: string }>(
+      `INSERT INTO external_items (source_id, protocol, tier, source_item_uri, published_at, fetched_at)
+       VALUES ($1,'rss','tier4',$2, now() - interval '300 days', now()) RETURNING id`,
+      [sourceId, `https://example.test/${sourceId}/${label}`],
+    );
+    await client.query(
+      `UPDATE external_item_sources
+          SET last_seen_at = date_trunc('second', now()) - make_interval(days => $2)
+        WHERE external_item_id = $1`,
+      [r.id, seenDaysAgo],
+    );
+    return r.id;
+  };
+  const reseen = async (sourceId: string): Promise<string[]> => {
+    const { rows } = await client.query<{ source_item_uri: string }>(
+      `SELECT ei.source_item_uri
+         FROM external_item_sources m JOIN external_items ei ON ei.id = m.external_item_id
+        WHERE m.source_id = $1 AND m.last_seen_at = now()`,
+      [sourceId],
+    );
+    return rows.map((r) => r.source_item_uri.split("/").pop()!).sort();
+  };
+
+  it("re-stamps the rows of the newest window and nothing older", async () => {
+    const src = await source();
+    await item(src, "dropped-long-ago", 60);
+    await item(src, "window-a", 30);
+    await item(src, "window-b", 30);
+
+    await client.query(RSS_WINDOW_RESEEN_SQL, [src]);
+
+    expect(await reseen(src)).toEqual(["window-a", "window-b"]);
+  });
+
+  it("never touches another source's rows, however new", async () => {
+    const src = await source();
+    const other = await source();
+    await item(src, "mine", 30);
+    await item(other, "theirs", 1);
+
+    await client.query(RSS_WINDOW_RESEEN_SQL, [src]);
+
+    expect(await reseen(src)).toEqual(["mine"]);
+    expect(await reseen(other)).toEqual([]);
+  });
+
+  // CA-C4. With the stamp on the ITEM, a window shared with another feed
+  // carried whichever source stamped it last, so this source's newest stamp
+  // could be the OTHER's — and its own window was missed. Per membership it is
+  // exact: the shared item is re-stamped for this source alone.
+  it("finds its own window exactly when an item of it is shared with a fresher source", async () => {
+    const src = await source();
+    const other = await source();
+    const shared = await item(other, "shared", 1);
+    await client.query(
+      `INSERT INTO external_item_sources (external_item_id, source_id, last_seen_at)
+       VALUES ($1, $2, date_trunc('second', now()) - interval '30 days')`,
+      [shared, src],
+    );
+    await item(src, "mine", 30);
+
+    await client.query(RSS_WINDOW_RESEEN_SQL, [src]);
+
+    expect(await reseen(src)).toEqual(["mine", "shared"]);
+    expect(await reseen(other)).toEqual([]);
+  });
+
+  it("is a no-op for a source that holds nothing", async () => {
+    const src = await source();
+    const { rowCount } = await client.query(RSS_WINDOW_RESEEN_SQL, [src]);
+    expect(rowCount).toBe(0);
   });
 });

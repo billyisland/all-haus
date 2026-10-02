@@ -4,6 +4,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import pg from "pg";
+import { ADVISORY_LOCKS } from "../lib/advisory-locks.js";
 
 // =============================================================================
 // Migration Runner
@@ -87,7 +88,7 @@ async function applyConfigDefaults(client: pg.PoolClient): Promise<void> {
     await client.query(sql);
     await client.query("COMMIT");
   } catch (err) {
-    await client.query("ROLLBACK");
+    await rollbackQuietly(client, err);
     console.error("  ✗ config-defaults.sql — rolled back");
     throw err;
   }
@@ -97,6 +98,20 @@ async function applyConfigDefaults(client: pg.PoolClient): Promise<void> {
       ? `Config defaults: seeded ${seeded} missing dial(s).`
       : "Config defaults: all dials already present.",
   );
+}
+
+// A ROLLBACK that fails must not replace the migration's own error — the one
+// the operator needs (withTransaction's rule, shared/src/db/client.ts). It is
+// printed with the original as its cause, and the original is what throws.
+async function rollbackQuietly(client: pg.PoolClient, original: unknown) {
+  try {
+    await client.query("ROLLBACK");
+  } catch (rollbackErr) {
+    console.error("  ✗ ROLLBACK failed; the original error follows", {
+      err: rollbackErr,
+      cause: original,
+    });
+  }
 }
 
 async function migrate() {
@@ -127,7 +142,10 @@ async function migrate() {
   // partial double-apply cannot be rolled back. A session-level advisory lock on
   // this connection makes the second runner wait for the first. Released
   // implicitly when the connection closes; explicitly in finally for promptness.
-  const MIGRATE_LOCK_KEY = 481723; // stable, migrate-runner-owned
+  // From the shared registry, so the one place anybody looks before picking an
+  // advisory-lock id actually lists it (it did not; the number was a literal
+  // here and invisible from there).
+  const MIGRATE_LOCK_KEY = ADVISORY_LOCKS.MIGRATE;
   await client.query("SELECT pg_advisory_lock($1)", [MIGRATE_LOCK_KEY]);
 
   try {
@@ -156,6 +174,15 @@ async function migrate() {
 
     if (!fs.existsSync(migrationsDir)) {
       console.log("No migrations/ directory found — nothing to run.");
+      // ...but the config defaults still are. Seeding them does not depend on
+      // there being migrations to apply, and applyConfigDefaults' own contract
+      // above says it runs on EVERY invocation — this early return was the one
+      // path that quietly disagreed. It bites anyone running the runner from a
+      // cwd without migrations/ (the public mirror stages an empty one, so it
+      // is spared by accident rather than by design). The call stays HERE and
+      // not above the loop: "always last" is load-bearing, since a dial
+      // introduced by a pending migration's DDL must exist before it is seeded.
+      await applyConfigDefaults(client);
       return;
     }
 
@@ -293,7 +320,7 @@ async function migrate() {
           await client.query("COMMIT");
           console.log(`  ✓ ${filename}`);
         } catch (err) {
-          await client.query("ROLLBACK");
+          await rollbackQuietly(client, err);
           console.error(`  ✗ ${filename} — rolled back`);
           throw err;
         }

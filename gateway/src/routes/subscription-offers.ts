@@ -3,7 +3,9 @@ import crypto from 'node:crypto'
 import { z } from 'zod'
 import { pool } from '@platform-pub/shared/db/client.js'
 import { requireAuth, optionalAuth } from '../middleware/auth.js'
+import { requireWriter } from '../lib/writer-gate.js'
 import logger from '@platform-pub/shared/lib/logger.js'
+import { zodValidationError } from '@platform-pub/shared/lib/validation.js'
 
 // =============================================================================
 // Subscription Offer Routes
@@ -40,13 +42,13 @@ export async function subscriptionOfferRoutes(app: FastifyInstance) {
 
   app.post(
     '/subscription-offers',
-    { preHandler: requireAuth },
+    { preHandler: [requireAuth, requireWriter] },
     async (req, reply) => {
       const writerId = req.session!.sub
 
       const parsed = CreateOfferSchema.safeParse(req.body)
       if (!parsed.success) {
-        return reply.status(400).send({ error: parsed.error.flatten() })
+        return reply.status(400).send(zodValidationError(parsed.error))
       }
 
       const { label, mode, discountPct, durationMonths, maxRedemptions, expiresAt, recipientUsername } = parsed.data
@@ -154,6 +156,7 @@ export async function subscriptionOfferRoutes(app: FastifyInstance) {
         redemption_count: number
         expires_at: Date | null
         revoked_at: Date | null
+        is_comp: boolean
         created_at: Date
       }>(
         `SELECT so.*,
@@ -179,6 +182,9 @@ export async function subscriptionOfferRoutes(app: FastifyInstance) {
           redemptionCount: r.redemption_count,
           expiresAt: r.expires_at?.toISOString() ?? null,
           revoked: r.revoked_at !== null,
+          // A comp is not a discount (migration 193): free, one calendar year,
+          // and it does not renew. The writer's list has to be able to say so.
+          isComp: r.is_comp,
           createdAt: r.created_at.toISOString(),
         })),
       })
@@ -231,6 +237,7 @@ export async function subscriptionOfferRoutes(app: FastifyInstance) {
         redemption_count: number
         expires_at: Date | null
         recipient_id: string | null
+        is_comp: boolean
         writer_id: string
         writer_username: string
         writer_display_name: string | null
@@ -238,7 +245,7 @@ export async function subscriptionOfferRoutes(app: FastifyInstance) {
       }>(
         `SELECT so.id, so.label, so.mode, so.discount_pct, so.duration_months,
                 so.max_redemptions, so.redemption_count, so.expires_at,
-                so.recipient_id,
+                so.recipient_id, so.is_comp,
                 a.id AS writer_id, a.username AS writer_username,
                 a.display_name AS writer_display_name,
                 a.subscription_price_pence
@@ -298,6 +305,11 @@ export async function subscriptionOfferRoutes(app: FastifyInstance) {
         // The page reads this to say "a gift for you" rather than "an offer".
         // Only ever 'grant' for the recipient — the arm above saw to that.
         mode: offer.mode,
+        // The page must say what is being accepted, and a comp is not a
+        // discounted subscription: it is free for a year and then it ends. The
+        // difference is invisible in `discountPct` alone (a 100%-off offer for
+        // N months looks identical and renews at full price afterwards).
+        isComp: offer.is_comp,
         discountPct: offer.discount_pct,
         durationMonths: offer.duration_months,
         writerId: offer.writer_id,

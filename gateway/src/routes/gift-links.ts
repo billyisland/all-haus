@@ -1,9 +1,12 @@
 import type { FastifyInstance } from 'fastify'
 import crypto from 'node:crypto'
 import { z } from 'zod'
-import { pool } from '@platform-pub/shared/db/client.js'
+import { pool, withTransaction } from '@platform-pub/shared/db/client.js'
 import { requireAuth } from '../middleware/auth.js'
+import { requireWriter } from '../lib/writer-gate.js'
 import logger from '@platform-pub/shared/lib/logger.js'
+import { zodValidationError } from '@platform-pub/shared/lib/validation.js'
+import { isUuid } from '../lib/request-inputs.js'
 
 // =============================================================================
 // Gift Link Routes
@@ -26,14 +29,17 @@ export async function giftLinkRoutes(app: FastifyInstance) {
 
   app.post<{ Params: { articleId: string } }>(
     '/articles/:articleId/gift-link',
-    { preHandler: requireAuth },
+    { preHandler: [requireAuth, requireWriter] },
     async (req, reply) => {
       const creatorId = req.session!.sub
       const { articleId } = req.params
+      if (!isUuid(articleId)) {
+        return reply.status(404).send({ error: 'Article not found' })
+      }
 
       const parsed = CreateGiftLinkSchema.safeParse(req.body)
       if (!parsed.success) {
-        return reply.status(400).send({ error: parsed.error.flatten() })
+        return reply.status(400).send(zodValidationError(parsed.error))
       }
 
       // Verify author owns the article
@@ -58,7 +64,17 @@ export async function giftLinkRoutes(app: FastifyInstance) {
       const dTag = article.rows[0].nostr_d_tag
       const url = `/article/${dTag}?gift=${rows[0].token}`
 
-      logger.info({ creatorId, articleId, token, maxRedemptions }, 'Gift link created')
+      // THE LINK'S ID, NEVER ITS TOKEN. The token is a bearer capability: it
+      // grants free access to a paywalled article to whoever holds it, and
+      // writing it to the log hands that capability to everyone who can read
+      // the log (and to whatever aggregator ships it onward) for as long as the
+      // link is live. The id identifies the row for support and audit and
+      // unlocks nothing — the same split as the S15 finding about the inbound
+      // mail secret in the URL path.
+      logger.info(
+        { creatorId, articleId, giftLinkId: rows[0].id, maxRedemptions },
+        'Gift link created',
+      )
       return reply.status(201).send({
         id: rows[0].id,
         token: rows[0].token,
@@ -78,6 +94,9 @@ export async function giftLinkRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const creatorId = req.session!.sub
       const { articleId } = req.params
+      if (!isUuid(articleId)) {
+        return reply.status(404).send({ error: 'Article not found' })
+      }
 
       // Verify author owns the article
       const article = await pool.query<{ id: string }>(
@@ -126,6 +145,9 @@ export async function giftLinkRoutes(app: FastifyInstance) {
     async (req, reply) => {
       const creatorId = req.session!.sub
       const { articleId, linkId } = req.params
+      if (!isUuid(articleId) || !isUuid(linkId)) {
+        return reply.status(404).send({ error: 'Gift link not found' })
+      }
 
       const result = await pool.query(
         `UPDATE gift_links SET revoked_at = now()
@@ -146,44 +168,83 @@ export async function giftLinkRoutes(app: FastifyInstance) {
   // POST /articles/:articleId/redeem-gift — redeem a gift link token
   // ---------------------------------------------------------------------------
 
-  app.post<{ Params: { articleId: string }; Body: { token: string } }>(
+  // A REDEMPTION IS SPENT ONLY WHERE IT GRANTED SOMETHING (CA-B6, 2026-09-29).
+  // This incremented `redemption_count` in an autocommit UPDATE and then
+  // inserted the unlock `ON CONFLICT DO NOTHING` — so a reader who already
+  // held the piece (a prior redemption, a purchase, a second device) or the
+  // writer themselves burned one of the link's redemptions and got nothing
+  // for it. Now, in ONE transaction: the link is read `FOR UPDATE` and its
+  // three refusals asked; the unlock is `INSERT … RETURNING`; and the count
+  // moves only where a row came back. The body is validated like every
+  // other route's — `req.body.token` on an absent body was a 500.
+  app.post<{ Params: { articleId: string } }>(
     '/articles/:articleId/redeem-gift',
     { preHandler: requireAuth },
     async (req, reply) => {
       const readerId = req.session!.sub
       const { articleId } = req.params
-      const { token } = req.body as { token: string }
-
-      if (!token) {
-        return reply.status(400).send({ error: 'Token is required' })
+      // The answer a well-formed id naming no link already gets.
+      if (!isUuid(articleId)) {
+        return reply.status(410).send({ error: 'Gift link is expired, revoked, or fully redeemed' })
       }
+      const parsed = z.object({ token: z.string().min(1) }).safeParse(req.body)
+      if (!parsed.success) {
+        return reply.status(400).send(zodValidationError(parsed.error))
+      }
+      const { token } = parsed.data
 
-      // Validate and atomically redeem
-      const { rows } = await pool.query<{ id: string }>(
-        `UPDATE gift_links
-         SET redemption_count = redemption_count + 1
-         WHERE token = $1 AND article_id = $2
-           AND revoked_at IS NULL
-           AND (expires_at IS NULL OR expires_at > now())
-           AND redemption_count < max_redemptions
-         RETURNING id`,
-        [token, articleId]
-      )
+      const outcome = await withTransaction(async (client) => {
+        const { rows: links } = await client.query<{
+          id: string
+          revoked_at: Date | null
+          expires_at: Date | null
+          redemption_count: number
+          max_redemptions: number
+        }>(
+          `SELECT id, revoked_at, expires_at, redemption_count, max_redemptions
+             FROM gift_links
+            WHERE token = $1 AND article_id = $2
+            FOR UPDATE`,
+          [token, articleId],
+        )
+        const link = links[0]
+        if (
+          !link ||
+          link.revoked_at !== null ||
+          (link.expires_at !== null && link.expires_at.getTime() <= Date.now()) ||
+          Number(link.redemption_count) >= Number(link.max_redemptions)
+        ) {
+          return { kind: 'refused' as const }
+        }
+        const { rows: granted } = await client.query(
+          `INSERT INTO article_unlocks (reader_id, article_id, unlocked_via)
+           VALUES ($1, $2, 'author_grant')
+           ON CONFLICT (reader_id, article_id) DO NOTHING
+           RETURNING reader_id`,
+          [readerId, articleId],
+        )
+        if (granted.length === 0) {
+          return { kind: 'already_unlocked' as const, linkId: link.id }
+        }
+        await client.query(
+          `UPDATE gift_links SET redemption_count = redemption_count + 1 WHERE id = $1`,
+          [link.id],
+        )
+        return { kind: 'redeemed' as const, linkId: link.id }
+      })
 
-      if (rows.length === 0) {
+      if (outcome.kind === 'refused') {
         return reply.status(410).send({ error: 'Gift link is expired, revoked, or fully redeemed' })
       }
 
-      // Grant access
-      await pool.query(
-        `INSERT INTO article_unlocks (reader_id, article_id, unlocked_via)
-         VALUES ($1, $2, 'author_grant')
-         ON CONFLICT (reader_id, article_id) DO NOTHING`,
-        [readerId, articleId]
+      // Again the row id, not the bearer token — and here it is the id the
+      // locked read returned, so the line still names exactly which link was
+      // spent, and says when it was not.
+      logger.info(
+        { readerId, articleId, giftLinkId: outcome.linkId, redeemed: outcome.kind === 'redeemed' },
+        outcome.kind === 'redeemed' ? 'Gift link redeemed' : 'Gift link presented for a piece the reader already holds — nothing spent',
       )
-
-      logger.info({ readerId, articleId, token }, 'Gift link redeemed')
-      return reply.status(200).send({ ok: true, unlocked: true })
+      return reply.status(200).send({ ok: true, unlocked: true, redeemed: outcome.kind === 'redeemed' })
     }
   )
 }

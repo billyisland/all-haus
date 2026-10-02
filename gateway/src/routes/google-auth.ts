@@ -6,8 +6,9 @@ import { getAccount } from "@platform-pub/shared/auth/accounts.js";
 import { invalidateAuthCache } from "../middleware/auth.js";
 import { CLOSED_BETA, CLOSED_BETA_ERROR } from "../lib/closed-beta.js";
 import logger from "@platform-pub/shared/lib/logger.js";
-import { randomBytes, createHmac, timingSafeEqual } from "crypto";
+import { randomBytes, createHash, createHmac, timingSafeEqual } from "crypto";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import { requireEnv } from "@platform-pub/shared/lib/env.js";
 
 // =============================================================================
 // Google OAuth Routes
@@ -20,16 +21,31 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 //                              403 closed_beta, never provisioned (D1).
 //
 // Flow:
-//   1. Browser clicks "Continue with Google" → GET /api/v1/auth/google
-//   2. Gateway generates an HMAC-signed state (carrying any paywall-arrival
-//      intent), redirects to Google
+//   1. Browser mints 32 random bytes, keeps them in sessionStorage, and clicks
+//      through to GET /api/v1/auth/google?bind=<sha256 of those bytes>
+//   2. Gateway generates an HMAC-signed state (carrying that digest and any
+//      paywall-arrival intent), redirects to Google
 //   3. Google redirects to ${APP_URL}/auth/google/callback (Next.js page)
-//   4. That page POSTs { code, state } to /api/v1/auth/google/exchange
-//   5. Gateway verifies state HMAC, exchanges code, sets pp_session cookie
-//   6. Page calls /auth/me to hydrate the store, then navigates to /feed
+//   4. That page POSTs { code, state, bind } — bind being the RAW value out of
+//      its own sessionStorage — to /api/v1/auth/google/exchange
+//   5. Gateway verifies the state HMAC, checks the raw bind hashes to the digest
+//      it signed, exchanges the code, sets the pp_session cookie
+//   6. Page calls /auth/me to hydrate the store, then navigates on
 //
 // State is verified by HMAC signature (not a cookie) because Next.js rewrite
 // proxies do not reliably forward Set-Cookie headers in redirect responses.
+//
+// AND THE STATE IS BOUND TO THE BROWSER THAT STARTED THE FLOW (§2.5). A signed
+// state proves WE minted it; it proved nothing about WHO it was minted for, so
+// an attacker could start a flow, take the callback URL Google handed them and
+// forward it to a victim, whose browser would complete the exchange and be
+// logged into the attacker's account — with any card the victim then added
+// landing on the attacker's tab. The `bind` segment closes that: only the
+// DIGEST crosses Google, so the forwarded URL carries a binding the victim's
+// browser has no preimage for, and nothing new is cookie-borne (the reason
+// state moved server-side in the first place). The in-process `consumedNonces`
+// map is replay protection and is no help here — it is per-process and
+// per-nonce, never per-browser.
 // =============================================================================
 
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -51,7 +67,7 @@ setInterval(() => {
 function getGoogleConfig() {
   const clientId = process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const appUrl = process.env.APP_URL ?? "https://all.haus";
+  const appUrl = requireEnv("APP_URL");
 
   // The redirect_uri must point to the Next.js callback page (not a proxied
   // gateway route) so Google lands the browser directly on the frontend.
@@ -69,10 +85,26 @@ export async function googleAuthRoutes(app: FastifyInstance) {
   // GET /auth/google — redirect to Google
   // ---------------------------------------------------------------------------
 
-  app.get<{ Querystring: { arrival?: string } }>(
+  app.get<{ Querystring: { arrival?: string; bind?: string } }>(
     "/auth/google",
     async (req, reply) => {
     const { clientId, redirectUri } = getGoogleConfig();
+
+    // THE BINDING IS MANDATORY, not tolerated-empty (§2.5). The caller is a
+    // client component that always runs JS, so it can always produce one — and
+    // an empty-allowed `bind` would be the hole with an extra step, since the
+    // attacker starting the flow is the party who decides whether to send it.
+    // A 400 here is a hand-built or stale URL, which is exactly the traffic
+    // this route should stop carrying.
+    //
+    // Typed AND shape-checked, for the reason the `arrival` note below gives:
+    // `?bind=a&bind=b` arrives as an ARRAY, and `bind` is about to be signed
+    // into a delimiter-separated payload, so it must be 64 hex characters —
+    // the shape a sha256 digest has and the delimiter cannot survive.
+    const bind = req.query.bind;
+    if (typeof bind !== "string" || !/^[0-9a-f]{64}$/.test(bind)) {
+      return reply.status(400).send({ error: "missing_bind" });
+    }
 
     // Use an HMAC-signed state so no cookie is needed.
     // A cookie set in a redirect response is not reliably forwarded by the
@@ -101,6 +133,7 @@ export async function googleAuthRoutes(app: FastifyInstance) {
     // a value of the wrong shape is not a bound (CONSOLIDATED-TODO §0w item 4).
     const arrival = req.query.arrival;
     const state = generateSignedState(
+      bind,
       typeof arrival === "string" && arrival.length > 0 && arrival.length <= 200
         ? arrival
         : null,
@@ -128,17 +161,28 @@ export async function googleAuthRoutes(app: FastifyInstance) {
   // ---------------------------------------------------------------------------
 
   app.post<{
-    Body: { code: string; state: string };
+    Body: { code: string; state: string; bind: string };
   }>("/auth/google/exchange", async (req, reply) => {
-    const { code, state } = req.body ?? {};
+    const { code, state, bind } = req.body ?? {};
 
-    if (!code || !state) {
-      return reply.status(400).send({ error: "Missing code or state" });
+    if (!code || !state || typeof bind !== "string" || bind.length === 0) {
+      return reply.status(400).send({ error: "Missing code, state or bind" });
     }
 
     const stateCheck = verifySignedState(state);
     if (!stateCheck.ok) {
       logger.warn("Google OAuth state verification failed in exchange");
+      return reply.status(400).send({ error: "State mismatch" });
+    }
+
+    // The state is ours; this is what says it is THIS browser's. The raw value
+    // came out of the caller's own sessionStorage, which a forwarded callback
+    // URL cannot carry with it — see the flow note at the top of the file. The
+    // client-facing error is deliberately the same "State mismatch" the check
+    // above returns: the two failures are one fact to the visitor, and telling
+    // the two apart is only useful to whoever forwarded the URL.
+    if (!bindMatches(bind, stateCheck.bindDigest)) {
+      logger.warn("Google OAuth state was not bound to this browser");
       return reply.status(400).send({ error: "State mismatch" });
     }
     const arrivalDTag = stateCheck.arrivalDTag;
@@ -248,7 +292,7 @@ export async function googleAuthRoutes(app: FastifyInstance) {
       const account = await getAccount(accountId);
       if (!account) {
         logger.error({ accountId }, "Account not found after Google login");
-        return reply.status(500).send({ error: "Account not found" });
+        return reply.status(500).send({ error: "We couldn't find that account." });
       }
 
       await createSession(reply, {
@@ -277,8 +321,9 @@ export async function googleAuthRoutes(app: FastifyInstance) {
 // HMAC-signed OAuth state — avoids setting a cookie in a redirect response,
 // which Next.js rewrite proxies don't reliably forward to the browser.
 //
-// Format: <nonce>.<timestamp>.<hmac-sha256-hex>
-// The exchange endpoint verifies the HMAC and that the token is not expired.
+// Format: <nonce>.<bind>.<timestamp>.<arrival>.<hmac-sha256-hex>
+// The exchange endpoint verifies the HMAC, that the token is not expired, and
+// that the caller holds the preimage of <bind>.
 // ---------------------------------------------------------------------------
 
 function getStateSecret(): string {
@@ -288,44 +333,70 @@ function getStateSecret(): string {
   return secret;
 }
 
-// Format: <nonce>.<timestamp>.<arrival-b64url>.<hmac-sha256-hex>
+// Format: <nonce>.<bind-sha256-hex>.<timestamp>.<arrival-b64url>.<hmac-sha256-hex>
 //
-// The third segment is the paywall-arrival intent, base64url-encoded so it can
+// The FOURTH segment is the paywall-arrival intent, base64url-encoded so it can
 // never contain the delimiter, and EMPTY for every ordinary sign-in — which is
-// why it is a fixed four-segment format rather than an optional fifth thing:
-// an optional segment would mean two payload shapes signing to two different
+// why this is a fixed-arity format rather than a bag of optional extras: an
+// optional segment would mean two payload shapes signing to two different
 // strings, and the shorter one would verify against neither.
 //
-// It is inside the SIGNED payload, not beside it. The value decides how much
+// The SECOND is the browser binding (§2.5) and it is mandatory for exactly the
+// same reason inverted — it is never empty, because a value the attacker may
+// omit is a value the attacker will omit. It is a sha256 digest, so it is
+// fixed-width hex and cannot contain the delimiter either.
+//
+// Both are inside the SIGNED payload, not beside it. `arrival` decides how much
 // money a new account is granted (`resolveArrivalGift` looks the price up from
 // it), so a tamperable one would be a free-money endpoint reached through a
-// third party's redirect.
-function generateSignedState(arrivalDTag: string | null): string {
+// third party's redirect; a tamperable `bind` would let the forwarder re-point
+// the binding at a preimage they hold, which is the whole attack.
+function generateSignedState(
+  bindDigest: string,
+  arrivalDTag: string | null,
+): string {
   const nonce = randomBytes(16).toString("hex");
   const timestamp = Math.floor(Date.now() / 1000);
   const arrival = arrivalDTag
     ? Buffer.from(arrivalDTag, "utf8").toString("base64url")
     : "";
-  const payload = `${nonce}.${timestamp}.${arrival}`;
+  const payload = `${nonce}.${bindDigest}.${timestamp}.${arrival}`;
   const sig = createHmac("sha256", getStateSecret())
     .update(payload)
     .digest("hex");
   return `${payload}.${sig}`;
 }
 
+// Does the raw value the caller kept in sessionStorage hash to the digest we
+// signed into the state? Compared timing-safely, and length-checked first
+// because `timingSafeEqual` throws on a length mismatch rather than returning
+// false — a malformed `bind` must be a refusal, never a 500.
+function bindMatches(raw: string, digestHex: string): boolean {
+  const actual = createHash("sha256").update(raw, "utf8").digest();
+  const expected = Buffer.from(digestHex, "hex");
+  if (expected.length !== actual.length) return false;
+  return timingSafeEqual(actual, expected);
+}
+
 function verifySignedState(state: string): {
   ok: boolean;
   arrivalDTag: string | null;
+  bindDigest: string;
 } {
-  const bad = { ok: false, arrivalDTag: null };
+  const bad = { ok: false, arrivalDTag: null, bindDigest: "" };
   const parts = state.split(".");
-  if (parts.length !== 4) return bad;
-  const [nonce, ts, arrival, sig] = parts;
+  if (parts.length !== 5) return bad;
+  const [nonce, bindDigest, ts, arrival, sig] = parts;
+  // Shape-checked even though the signature covers it: `bindDigest` is about to
+  // be `Buffer.from(…, "hex")`d, which answers garbage with a SHORT buffer
+  // rather than an error, and a short buffer compared against a sha256 is a
+  // refusal that looks like a length bug.
+  if (!/^[0-9a-f]{64}$/.test(bindDigest)) return bad;
   const timestamp = parseInt(ts, 10);
   if (isNaN(timestamp)) return bad;
   if (Math.floor(Date.now() / 1000) - timestamp > STATE_MAX_AGE_SECONDS)
     return bad;
-  const payload = `${nonce}.${ts}.${arrival}`;
+  const payload = `${nonce}.${bindDigest}.${ts}.${arrival}`;
   const expectedSig = createHmac("sha256", getStateSecret())
     .update(payload)
     .digest();
@@ -341,6 +412,7 @@ function verifySignedState(state: string): {
     arrivalDTag: arrival
       ? Buffer.from(arrival, "base64url").toString("utf8")
       : null,
+    bindDigest,
   };
 }
 

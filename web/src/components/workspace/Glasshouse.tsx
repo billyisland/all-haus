@@ -48,14 +48,20 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { snap } from "../../lib/workspace/grid";
+import { stretchedMeasure, MEASURE_REST } from "../../lib/workspace/measure";
 import { useIsMobile } from "../../hooks/useIsMobile";
-import { useGlasshousePresence } from "../../stores/glasshouse";
+import {
+  useGlasshousePresence,
+  useDiscCloseActive,
+} from "../../stores/glasshouse";
 import { useExplain } from "../../stores/explain";
 import { useLightbox } from "../../stores/lightbox";
 import { useBackGuard } from "../../lib/backGuard";
 import { isDragSurface } from "../../lib/dragSurface";
+import type { PaneRect } from "./paneRect";
 import { MOBILE_BAR_H } from "./MobileWorkspace";
 import { NAV_BAR_H, NAV_BAR_BAND } from "./NavBar";
+import { reopenAddressedPane } from "../../lib/workspace/overlays";
 
 // Gutter between the pane and the viewport edge. (Not a lattice value — the
 // shared drag/resize lattice is GRID = 8, grid.ts.)
@@ -86,6 +92,21 @@ const SEAM_H = 38;
 // frame colour; the arrow takes the frame's contrast tone.
 const EAR_R = 22; // ear radius (protrusion depth = EAR_R, height = 2·EAR_R)
 const EAR_ARROW = 7; // arrow half-width / height
+
+// Duration of the `enterFrom` morph. Long enough to read as one pane changing
+// shape, short enough that it never stands between the writer and the cursor.
+const ENTER_MS = 260;
+
+// Read once per morph, not subscribed to: a single gesture's animation.
+// Defensive against environments with no matchMedia (jsdom in the test suite).
+function prefersReducedMotion(): boolean {
+  if (typeof window === "undefined" || !window.matchMedia) return false;
+  try {
+    return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  } catch {
+    return false;
+  }
+}
 
 const clampN = (v: number, lo: number, hi: number) =>
   Math.max(lo, Math.min(hi, v));
@@ -152,6 +173,25 @@ function clearSize(key: string) {
   }
 }
 
+// Persisted `\` toggle — whether the pane was last left in its DEFAULT view.
+// Stored only while true, so the ordinary state leaves nothing behind.
+const defaultStoreKey = (key: string) => `ah:overlay-default:${key}`;
+function readShowDefault(key: string): boolean {
+  try {
+    return localStorage.getItem(defaultStoreKey(key)) === "1";
+  } catch {
+    return false;
+  }
+}
+function writeShowDefault(key: string, on: boolean) {
+  try {
+    if (on) localStorage.setItem(defaultStoreKey(key), "1");
+    else localStorage.removeItem(defaultStoreKey(key));
+  } catch {
+    /* ignore */
+  }
+}
+
 // Placement of the pane: a draggable, grid-snapped, viewport-clamped position
 // that persists per overlay.
 //
@@ -188,11 +228,17 @@ function clearSize(key: string) {
 // runs from wherever it sits to the window's bottom edge, which nothing
 // occupies.
 //
-// `coverNavChrome` (the reader) is the exception, unchanged throughout: an
-// immersive reading pane covers the nav chrome entirely — WorkspaceView
-// un-mounts the bar + muster while the reader is open, so nothing paints over
-// the pane except the z-60 ∀ lockup — and its full room is the whole viewport,
-// edge to edge. The flag buys VERTICAL room again, as it did in the row era.
+// `coverNavChrome` (the three immersive panes — the reader, the article editor
+// and the note composer) is the exception, unchanged throughout: immersion
+// belongs to the surfaces where one piece fills the whole of your attention —
+// reading it, and writing it at either length. Such a pane covers the nav
+// chrome entirely — the caller un-mounts the bar + muster while one is open
+// (WorkspaceView for all three, LayoutShell for the global ComposeOverlay), so
+// nothing paints over the pane except the z-60 ∀ lockup — and its full room is
+// the whole viewport, edge to edge. The flag buys VERTICAL room again, as it
+// did in the row era. Everything else — messages, dashboard, settings, the FEED
+// composer — is a panel you dip into while the workspace is still what you are
+// doing, and keeps the bar live.
 const barFor = (coverNavChrome = false) => (coverNavChrome ? 0 : NAV_BAR_H);
 // Width is the plain viewport again: no chrome stands along either side edge.
 const widthFor = (maxWidth: number, vw: number) =>
@@ -290,10 +336,23 @@ function usePanePlacement(
   // WHOLE rather than editing one axis of it (see startDrag / startResize) — a
   // member who has toggled to the default is starting from there, so a drag must
   // not restore the old stretched size and a stretch must not restore the old
-  // spot. Resets to false each time the pane opens (the hook remounts), so a
-  // member always lands on their saved arrangement first.
-  const [showDefault, setShowDefault] = useState(false);
-  const toggleDefault = useCallback(() => setShowDefault((v) => !v), []);
+  // spot. THE TOGGLE IS REMEMBERED PER OVERLAY (with `persistKey`): a pane left
+  // in the default view reopens in it until the member presses `\` again, and a
+  // drag or stretch — which always leaves the default view — clears it too.
+  const [showDefault, setShowDefaultState] = useState(() =>
+    typeof window !== "undefined" && !!persistKey && readShowDefault(persistKey),
+  );
+  const setShowDefault = useCallback(
+    (v: boolean) => {
+      setShowDefaultState(v);
+      if (persistKey) writeShowDefault(persistKey, v);
+    },
+    [persistKey],
+  );
+  const toggleDefault = useCallback(
+    () => setShowDefault(!showDefault),
+    [setShowDefault, showDefault],
+  );
 
   // Re-clamp to the viewport on resize so a remembered spot never strands the
   // pane off-screen on a smaller window.
@@ -375,14 +434,22 @@ function usePanePlacement(
         if (fromDefault) clearSize(persistKey);
       }
     };
+    // The last pointer seen with the button HELD. A release outside the window
+    // never delivers a pointerup, so the gesture only learns it ended from the
+    // first buttonless move on re-entry — which is wherever the cursor came
+    // back in, not where it let go. Committing that point is what collapsed a
+    // stretched Messages pane to its 320×240 floor (re-entry near the top-left)
+    // and SAVED it; the drop is the last held position instead.
+    let lastHeld: PointerEvent | null = null;
     const onMove = (ev: PointerEvent) => {
       // Button released outside the window: no pointerup ever reaches us, so
       // the first buttonless move is the drop (else the pane rides the cursor
       // on re-entry until the next click).
       if ((ev.buttons & 1) === 0) {
-        onUp(ev);
+        onUp(lastHeld ?? ev);
         return;
       }
+      lastHeld = ev;
       moved = true;
       setShowDefault(false);
       // Live, not just on release: the pane keeps the default's width and
@@ -441,11 +508,15 @@ function usePanePlacement(
         writeSize(persistKey, next);
       }
     };
+    // As in the drag: a release outside the window commits the last HELD
+    // position, never the buttonless re-entry point.
+    let lastHeld: PointerEvent | null = null;
     const onMove = (ev: PointerEvent) => {
       if ((ev.buttons & 1) === 0) {
-        onUp(ev);
+        onUp(lastHeld ?? ev);
         return;
       }
+      lastHeld = ev;
       moved = true;
       if (showDefault) setPos({ x: baseX, y: baseY });
       setShowDefault(false);
@@ -512,6 +583,9 @@ function usePanePlacement(
       width: vp.vw,
       height: h,
       ghH: h,
+      // No stretch gesture on the sheet, so no stretched measure: the column
+      // rests, and on a phone it is parent-limited long before 640 anyway.
+      measure: MEASURE_REST,
       startDrag: null,
       startResize: null,
       toggleDefault: null as (() => void) | null,
@@ -525,6 +599,12 @@ function usePanePlacement(
     width: effW,
     height: effH,
     ghH,
+    // The prose measure a stretched pane earns, pivoting on THIS pane's own
+    // default width so nothing moves at rest (lib/workspace/measure.ts). Every
+    // pane publishes it, resizable or not: an unstretched pane's `effW` IS its
+    // rest width, so the curve returns the rest measure and the fallback in
+    // `.ah-measure` never has to be reasoned about twice.
+    measure: stretchedMeasure(effW, widthFor(maxWidth, vp.vw)),
     startDrag: startDrag as ((e: React.PointerEvent) => void) | null,
     startResize: resizable ? startResize : null,
     toggleDefault: toggleDefault as (() => void) | null,
@@ -534,7 +614,59 @@ function usePanePlacement(
 // The currently-open Glasshouse (or null). `token` is a per-instance identity so
 // the unmount cleanup only clears the slot when it still owns it (never clobbers
 // a successor that already claimed it).
-let activeGlasshouse: { token: object; supersede: () => void } | null = null;
+let activeGlasshouse: {
+  token: object;
+  supersede: () => void;
+  rect: () => PaneRect | null;
+} | null = null;
+
+/**
+ * The box the live Glasshouse pane currently occupies, or null when none is
+ * open. Read by a surface that is about to open a DIFFERENT Glasshouse in place
+ * of this one (the note→article handoff) and wants the newcomer to grow out of
+ * it rather than cut to its own geometry — pass the result as `enterFrom`.
+ *
+ * It comes from the registry rather than from a caller-held ref because the
+ * registry is already the primitive's own record of which single pane is live,
+ * and the caller (ComposeOverlay / Composer) never holds the pane element —
+ * Glasshouse does.
+ */
+export function activeGlasshouseRect(): PaneRect | null {
+  return activeGlasshouse?.rect() ?? null;
+}
+
+/**
+ * THE HAND-BACK BELONGS WHERE THE SUPERSEDE HAPPENS.
+ *
+ * A pane that supersedes a URL-synced one has to hand it back, and the
+ * supersede is the PRIMITIVE's doing — every Glasshouse participates in the
+ * one-at-a-time registry automatically, which is the whole reason that rule is
+ * enforced here rather than in callers. The hand-back was wired in exactly one
+ * place instead: `useCompose.close()`. Every other superseder left the address
+ * naming a pane that was no longer on screen, with the pane suspended in its
+ * store and Back visibly doing nothing (it pops the orphaned entry while the
+ * suspended pane's popstate listener is detached). The ∀ menu opens five such
+ * panes over any pane BY DESIGN, and the workspace's own composer never touches
+ * the compose store at all — `setComposerOpen("note")` — so the one wired
+ * superseder was also the one the menu could not reach.
+ *
+ * WHY IT IS DEFERRED. React runs every cleanup in a commit before any create,
+ * so a handoff releases the slot and refills it within one flush: "the slot went
+ * null" is not yet "nothing is open". A microtask asks again once the flush has
+ * settled. The lazy-chunk case needs no extra care — the handoff rule has the
+ * newcomer supersede from its own MOUNT effect, so the outgoing pane holds the
+ * slot for as long as the chunk takes.
+ *
+ * `reopenAddressedPane` is itself guarded (the history marker must say an
+ * overlay put this address there, and it declines if a pane is already up), so
+ * this is safe to fire on any release.
+ */
+function scheduleAddressedPaneHandback(): void {
+  queueMicrotask(() => {
+    if (activeGlasshouse) return;
+    reopenAddressedPane();
+  });
+}
 
 interface GlasshouseProps {
   /** Invoked by the scrim, the close button, and Escape. */
@@ -547,6 +679,15 @@ interface GlasshouseProps {
   maxWidth: number;
   /** Accessible label for the pane dialog. */
   ariaLabel?: string;
+  /** ONE-SHOT ENTRY BOX — the rect of the pane this one is taking the place of
+   *  (`activeGlasshouseRect()`, read at the click). The pane paints its first
+   *  frame at that box and then transitions to its own geometry, so a handoff
+   *  between two different Glasshouse surfaces reads as ONE pane growing rather
+   *  than one pane replaced by another. Affects the first frame only: drag,
+   *  resize, the persisted position and every clamp are untouched, and
+   *  `prefers-reduced-motion` skips straight to the destination. Desktop only —
+   *  the mobile sheet is full-screen and has no box to grow from. */
+  enterFrom?: PaneRect | null;
   /** Stable id for this surface; when set, the pane remembers its dragged spot
    *  (and, when resizable, its size) in localStorage between appearances. Omit to
    *  drag without persisting. */
@@ -559,11 +700,14 @@ interface GlasshouseProps {
    *  sizing to its content — for immersive reading panes. Only a default: a persisted resized height
    *  (the user stretched it smaller) still wins. No effect on the mobile sheet. */
   fillHeight?: boolean;
-  /** The reader's immersive mode: the pane may extend over the desktop nav BAR
-   *  all the way to the window's top edge (its gutter collapses to the edge),
-   *  so it can be stretched to the whole window. Requires the caller to also
-   *  un-mount the bar + muster while open (WorkspaceView does this for the
-   *  reader) — only the z-60 ∀ lockup floats above. With the chrome back along
+  /** Immersive mode — the reader's, the article editor's and the note
+   *  composer's, and no other pane's: the pane may extend over the desktop nav
+   *  BAR all the way to the window's top edge (its gutter collapses to the
+   *  edge), so it can be stretched to the whole window. Requires the caller to
+   *  also un-mount the bar + muster while open (WorkspaceView gates both on
+   *  `readerOpen || editorOpen || composerOpen`; LayoutShell drops
+   *  PublicNavBar for the global ComposeOverlay) — only the z-60 ∀ lockup
+   *  floats above. With the chrome back along
    *  the TOP (NavBar.tsx) the flag buys VERTICAL room again: every pane already
    *  reaches both side edges and the window bottom. No effect on mobile. */
   coverNavChrome?: boolean;
@@ -602,9 +746,12 @@ interface GlasshouseProps {
    *  inside a coloured header band (PROFILE-PANE-REDESIGN-ADR D10: the shared ✕
    *  is `text-grey-600 hover:text-black`, styled for the white pane it has
    *  always floated over, and it is low-contrast at rest and hovers DARKER on a
-   *  dark band). The profile pane is the only caller — DO NOT GENERALISE: a
-   *  pane with a white body has no reason to hide the shared control, and the
-   *  canonical-close rule (web/CLAUDE.md) is otherwise absolute. */
+   *  dark band). Licensed by the COLOURED BAND, not by the pane: the profile,
+   *  reader and About panes are the three callers and there is no fourth
+   *  without one — a pane with a white body has no reason to hide the shared
+   *  control, and the canonical-close rule (web/CLAUDE.md) is otherwise
+   *  absolute. Distinct from the disc suppression below, which takes the ✕ away
+   *  ENTIRELY rather than re-parenting it. */
   hideClose?: boolean;
   /** Nominate a region of the body as a DECLARED drag handle, and suppress the
    *  grip pill in the same breath — a pane has one drag affordance, and two
@@ -653,6 +800,7 @@ export function Glasshouse({
   onSupersede,
   maxWidth,
   ariaLabel,
+  enterFrom,
   persistKey,
   resizable,
   fillHeight,
@@ -674,6 +822,9 @@ export function Glasshouse({
   // spatial affordances) don't render. Presentation only — callers are
   // untouched.
   const isMobile = useIsMobile();
+  // The ∀ disc standing in as this sheet's X (mobile workspace only). It is
+  // declared, not inferred — see the close button below.
+  const discClose = useDiscCloseActive();
   const pane = usePanePlacement(
     maxWidth,
     persistKey,
@@ -682,6 +833,59 @@ export function Glasshouse({
     fillHeight,
     coverNavChrome,
   );
+
+  // THE HANDOFF GROWS; IT DOES NOT CUT. When one Glasshouse surface opens in
+  // the place of another (the note composer → the article editor), the two are
+  // different components and therefore different DOM nodes: nothing about the
+  // swap can be a CSS transition on its own, so a pane that simply mounts at
+  // its own geometry reads as the first pane being destroyed and a second one
+  // built. `enterFrom` paints the first frame at the OUTGOING pane's box and
+  // moves to this pane's real geometry on the next frame, which is the whole
+  // illusion — one window, growing.
+  //
+  // Only `left/top/width/height` transition. `--gh-h` and `--ah-measure` are
+  // published at their FINAL values throughout, so the body inside is laid out
+  // once, at the size it will keep, and the growing pane (overflow-hidden)
+  // reveals it. Animating those too would reflow the prose on every frame — the
+  // measure column would narrow and the text re-wrap, which is the one thing a
+  // reader's eye cannot ignore.
+  //
+  // `prefers-reduced-motion` drops the MOTION, not the arrival: the pane simply
+  // mounts at its destination. Read once, at mount — this is a single gesture's
+  // worth of animation, not a standing behaviour to keep in sync with the query.
+  const enterRect = isMobile ? null : (enterFrom ?? null);
+  const [entering, setEntering] = useState(
+    () => !!enterRect && !prefersReducedMotion(),
+  );
+  const [morphing, setMorphing] = useState(entering);
+  const rafRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!entering) return;
+    // TWO frames. The first commits the entry box; the second commits the
+    // destination with the transition armed. One rAF is not enough — a style
+    // change made in the same frame as the node's insertion is coalesced with
+    // it, and the pane snaps to the destination having never been anywhere
+    // else.
+    const a = requestAnimationFrame(() => {
+      rafRef.current = requestAnimationFrame(() => setEntering(false));
+    });
+    return () => {
+      cancelAnimationFrame(a);
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    };
+    // Mount-only: `entering` goes true→false once and never back.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // The transition comes OFF once the morph has played. Left permanently on,
+  // these four properties would make every drag and every stretch lag the
+  // pointer by the transition's duration.
+  useEffect(() => {
+    if (entering || !morphing) return;
+    const t = setTimeout(() => setMorphing(false), ENTER_MS + 40);
+    return () => clearTimeout(t);
+  }, [entering, morphing]);
 
   // Mobile back-guard: on the full-screen sheet, a browser Back / OS edge-swipe
   // should close this sheet (same as the disc-X), not leave the site. URL-synced
@@ -719,7 +923,32 @@ export function Glasshouse({
   // isDragSurface) so prose stays highlightable and controls stay live. The
   // explicit grip stays as a discoverable affordance. Disabled on the mobile
   // full-screen sheet (startDrag is null there).
+  // CLICK-OUTSIDE-TO-CLOSE MEANS THE PRESS STARTED OUTSIDE, NOT ONLY THAT IT
+  // ENDED THERE. A `click` is dispatched on the nearest common ancestor of the
+  // pointerdown and pointerup targets — so dragging a text selection from
+  // inside the pane and releasing over the backdrop dispatches `click` on the
+  // WRAPPER, whose handler then closed the pane (and, for a URL-synced overlay,
+  // popped history). Selecting a quotation out of an article was enough to lose
+  // the reader; the pane's own `stopPropagation` cannot help, because the event
+  // never passes through the pane at all.
+  //
+  // The flag is set from the backdrop's own pointerdown: a press inside the
+  // pane still BUBBLES to it, with `target !== currentTarget`, so it correctly
+  // records "this gesture did not start on the backdrop".
+  const downOnBackdropRef = useRef(false);
+  const notePointerDown = (e: React.PointerEvent) => {
+    downOnBackdropRef.current = e.target === e.currentTarget;
+  };
+  const closeOnBackdropClick = (e: React.MouseEvent) => {
+    if (e.target !== e.currentTarget) return;
+    if (!downOnBackdropRef.current) return;
+    onClose();
+  };
+
   const onPanePointerDown = (e: React.PointerEvent) => {
+    // A gesture beats the morph: a drag begun mid-transition would otherwise
+    // follow the pointer a beat late for the rest of ENTER_MS.
+    if (morphing) setMorphing(false);
     if (e.button !== 0 || !pane.startDrag) return;
     const paneEl = pane.paneRef.current;
     if (!paneEl) return;
@@ -751,7 +980,16 @@ export function Glasshouse({
   useEffect(() => {
     const token = tokenRef.current;
     const prev = activeGlasshouse;
-    activeGlasshouse = { token, supersede: () => supersedeRef.current() };
+    activeGlasshouse = {
+      token,
+      supersede: () => supersedeRef.current(),
+      rect: () => {
+        const el = pane.paneRef.current;
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { x: r.left, y: r.top, w: r.width, h: r.height };
+      },
+    };
     if (prev && prev.token !== token) prev.supersede();
     // Mirror into the subscribable presence registry so the ∀ disc can act as the
     // minimise-X for this sheet (mobile). Token-guarded like the module var so a
@@ -761,9 +999,14 @@ export function Glasshouse({
       if (activeGlasshouse && activeGlasshouse.token === token) {
         activeGlasshouse = null;
         useGlasshousePresence.getState()._set(null);
+        // The last pane went — if the address still names a suspended one,
+        // put it back (see scheduleAddressedPaneHandback).
+        scheduleAddressedPaneHandback();
       }
     };
-  }, []);
+    // `paneRef` is a `useRef` object — stable for the life of the component —
+    // so this stays a mount-only effect despite the dep.
+  }, [pane.paneRef]);
 
   // Escape closes; lock body scroll while the Glasshouse is mounted.
   useEffect(() => {
@@ -840,21 +1083,32 @@ export function Glasshouse({
           ABOVE the pane, once kept `inset: 0` so a pane dragged flush to the
           bar stayed dimmed to its top; the pane's y floor is now the band
           itself, so that exception is gone too.) Full viewport when
-          there is no bar standing: the mobile sheet, and the reader, which
-          un-mounts the bar (`coverNavChrome`). */}
+          there is no bar standing: the mobile sheet, and the three immersive
+          panes — the reader, the article editor and the note composer — which
+          un-mount the bar (`coverNavChrome`). */}
       <div
         className="fixed inset-x-0 bottom-0 z-[55] gh-scrim"
         style={{ top: isMobile || coverNavChrome ? 0 : NAV_BAR_BAND }}
-        onClick={onClose}
+        onPointerDown={notePointerDown}
+        onClick={closeOnBackdropClick}
       />
 
       {/* Pane wrapper — click outside the pane closes. */}
-      <div className="fixed inset-0 z-[56]" onClick={onClose}>
+      <div
+        className="fixed inset-0 z-[56]"
+        onPointerDown={notePointerDown}
+        onClick={closeOnBackdropClick}
+      >
         <div
           ref={pane.paneRef}
           role="dialog"
           aria-modal="true"
           aria-label={ariaLabel}
+          // The surface that is on top owns a wheel over it, even when it has
+          // nothing of its own to scroll — `useForwardedWheel` would otherwise
+          // read "not inside the fitted column" as "in the page's margins" and
+          // move the page underneath (`hooks/useForwardedWheel.ts`).
+          data-overlay-surface=""
           // The Explain engine's pane-mode root (EXPLAIN-ADR, D10 reversal
           // 2026-07-15): every Glasshouse is explainable as a pane, and this
           // tag answers any interior hover a more specific `data-explain` leaf
@@ -870,12 +1124,30 @@ export function Glasshouse({
           // only when the pane was stretched vertically; otherwise content-driven.
           style={
             {
-              left: pane.x,
-              top: pane.y,
-              width: pane.width,
-              height: pane.height ?? undefined,
+              // The entry box on the first frame only (`enterFrom`); the pane's
+              // real geometry from the second on, with the transition armed for
+              // one beat so the change of shape is seen rather than cut to.
+              // `maxHeight`/`--gh-h`/`--ah-measure` stay at their final values
+              // throughout — the body is laid out once and revealed, never
+              // re-wrapped mid-morph.
+              left: entering && enterRect ? enterRect.x : pane.x,
+              top: entering && enterRect ? enterRect.y : pane.y,
+              width: entering && enterRect ? enterRect.w : pane.width,
+              height:
+                entering && enterRect
+                  ? enterRect.h
+                  : (pane.height ?? undefined),
+              transition: morphing
+                ? `left ${ENTER_MS}ms ease-out, top ${ENTER_MS}ms ease-out, width ${ENTER_MS}ms ease-out, height ${ENTER_MS}ms ease-out`
+                : undefined,
               maxHeight: pane.ghH,
               "--gh-h": `${pane.ghH}px`,
+              // `--ah-measure` is the width a column of prose takes inside this
+              // pane — the rest measure until the member stretches it, then a
+              // decreasing share of each further pixel (lib/workspace/measure.ts).
+              // Consumed by `.ah-measure` (globals.css); surfaces outside a pane
+              // get the class's own fallback and are unaffected.
+              "--ah-measure": `${pane.measure}px`,
             } as React.CSSProperties
           }
           onClick={(e) => e.stopPropagation()}
@@ -960,10 +1232,15 @@ export function Glasshouse({
             />
           )}
 
-          {/* Close — floats top-right over the pane content. Suppressed only for
-              a body that renders its own ✕ against a ground it was coloured for
-              (the profile pane's tier 1 — see `hideClose`). */}
-          {!hideClose && (
+          {/* Close — floats top-right over the pane content. Suppressed for a
+              body that renders its own ✕ against a ground it was coloured for
+              (the profile pane's tier 1 — see `hideClose`), and on the mobile
+              workspace, where the ∀ disc has already flipped to this sheet's X
+              and a second one is furniture arguing with itself. That second
+              gate is a DECLARATION by the disc, never `isMobile` — this pane
+              opens on routes the disc does not reach (see
+              stores/glasshouse.ts::useDiscCloseActive). */}
+          {!hideClose && !discClose && (
             <button
               type="button"
               onClick={onClose}

@@ -1,7 +1,11 @@
 import type { Task } from "graphile-worker";
-import { pool } from "@platform-pub/shared/db/client.js";
+import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
 import { decryptJson } from "@platform-pub/shared/lib/crypto.js";
 import logger from "@platform-pub/shared/lib/logger.js";
+import {
+  invalidatePresence,
+  isCredentialRefusal,
+} from "@platform-pub/shared/lib/presence-health.js";
 import {
   postMastodonStatus,
   favouriteMastodonStatus,
@@ -20,6 +24,9 @@ import {
 } from "../adapters/atproto-outbound.js";
 import { appendWithinBudget } from "../lib/text.js";
 import { runOutboundJob } from "../lib/outbound-retry.js";
+import { isTerminalDeliveryError } from "../lib/outbound-errors.js";
+import { deriveRecordKey } from "../lib/atproto-tid.js";
+import { resolveBlueskyReplyRoot } from "../lib/atproto-reply-root.js";
 
 // =============================================================================
 // outbound_cross_post — per-event job, dispatches a queued outbound_posts row
@@ -34,6 +41,16 @@ import { runOutboundJob } from "../lib/outbound-retry.js";
 //   - On failure: increment retry_count; if below max_retries, mark 'retrying'
 //     and re-enqueue after outbound_retry_delay_seconds * 2^retry_count.
 //     Otherwise mark 'failed' and stop.
+//   - A TERMINAL failure (the far end refused and created nothing) skips the
+//     retry budget entirely and marks 'failed' at once.
+//
+// DELIVERY IDENTITY IS THE ROW'S, NOT THE ATTEMPT'S (audit §2.16). An atproto
+// write is addressed to a record key derived from (id, created_at) and carries
+// the row's `created_at` as the record's own timestamp, so a retry after a lost
+// response overwrites the same record instead of posting a second time; the
+// Mastodon paths carry `Idempotency-Key: row.id` for the same reason. That is
+// what makes it safe to retry an ambiguous failure at all, and it is why the
+// deliver-then-mark ordering below no longer decides anything.
 //
 // The native all.haus event is never touched — outbound failure only affects
 // outbound_posts.
@@ -52,10 +69,14 @@ interface OutboundRow {
   status: string;
   retry_count: number;
   max_retries: number;
+  // Enqueue time. Load-bearing, not diagnostic: it is half the derived atproto
+  // record key and the record's own `createdAt`, so a retry is byte-identical.
+  created_at: Date;
   // Poster username — used to build the all.haus permalink for truncated posts.
   author_username: string | null;
   // Network presence fields (NULL for nostr_external)
   la_external_id: string | null;
+  la_handle: string | null;
   la_instance_url: string | null;
   la_credentials_enc: string | null;
   la_is_valid: boolean | null;
@@ -98,6 +119,7 @@ export const outboundCrossPost: Task = async (payload, helpers) => {
     helpers,
     attemptsOf: (row) => row.retry_count,
     maxOf: (row) => row.max_retries,
+    isTerminal: isTerminalDeliveryError,
     // delay·2^(n-1) seconds, no jitter (config-driven base delay).
     computeBackoff: (nextAttempt) =>
       new Date(Date.now() + cfg.retry_delay * Math.pow(2, nextAttempt - 1) * 1000),
@@ -109,8 +131,10 @@ export const outboundCrossPost: Task = async (payload, helpers) => {
           op.id, op.account_id, op.linked_account_id, op.protocol,
           op.nostr_event_id, op.action_type, op.source_item_id, op.body_text,
           op.signed_event, op.status, op.retry_count, op.max_retries,
+          op.created_at,
           acc.username         AS author_username,
           la.external_id       AS la_external_id,
+          la.handle            AS la_handle,
           la.service_url       AS la_instance_url,
           la.credentials_enc   AS la_credentials_enc,
           la.is_valid          AS la_is_valid,
@@ -148,7 +172,10 @@ export const outboundCrossPost: Task = async (payload, helpers) => {
       return row;
     },
 
-    attempt: async (row) => {
+    // A refused CREDENTIAL invalidates the presence as well as failing the
+    // row (C4), so the next cross-post is refused at the claim with the
+    // reconnect message rather than spending its own retries on the same 401.
+    attempt: (row) => invalidateOnRefusal(row, async () => {
     let externalPostUri: string;
 
     if (row.protocol === "activitypub") {
@@ -223,6 +250,7 @@ export const outboundCrossPost: Task = async (payload, helpers) => {
                 ? (row.ei_source_item_uri ?? undefined)
                 : undefined,
             idempotencyKey: row.id,
+            self: { accountId: row.la_external_id, handle: row.la_handle },
           },
           creds,
         );
@@ -239,10 +267,11 @@ export const outboundCrossPost: Task = async (payload, helpers) => {
             "Source atproto item is missing uri/cid — cannot like",
           );
         }
-        const result = await likeBlueskyRecord(did, {
-          uri: interaction.uri,
-          cid: interaction.cid,
-        });
+        const result = await likeBlueskyRecord(
+          did,
+          { uri: interaction.uri, cid: interaction.cid },
+          writeIdentity(row),
+        );
         externalPostUri = result.externalPostUri;
       } else if (row.action_type === "repost") {
         if (!interaction?.uri || !interaction.cid) {
@@ -250,10 +279,11 @@ export const outboundCrossPost: Task = async (payload, helpers) => {
             "Source atproto item is missing uri/cid — cannot repost",
           );
         }
-        const result = await repostBlueskyRecord(did, {
-          uri: interaction.uri,
-          cid: interaction.cid,
-        });
+        const result = await repostBlueskyRecord(
+          did,
+          { uri: interaction.uri, cid: interaction.cid },
+          writeIdentity(row),
+        );
         externalPostUri = result.externalPostUri;
       } else {
         let reply:
@@ -270,10 +300,14 @@ export const outboundCrossPost: Task = async (payload, helpers) => {
               "Source atproto item is missing uri/cid — cannot reply",
             );
           }
-          const rootUri = interaction.rootUri ?? interaction.uri;
-          const rootCid = interaction.rootCid ?? interaction.cid;
+          const root = await resolveBlueskyReplyRoot({
+            uri: interaction.uri,
+            cid: interaction.cid,
+            rootUri: interaction.rootUri,
+            rootCid: interaction.rootCid,
+          });
           reply = {
-            root: { uri: rootUri, cid: rootCid },
+            root,
             parent: { uri: interaction.uri, cid: interaction.cid },
           };
         } else if (row.action_type === "quote") {
@@ -294,10 +328,13 @@ export const outboundCrossPost: Task = async (payload, helpers) => {
           appUrl && row.author_username
             ? `${appUrl}/${row.author_username}`
             : undefined;
+        const { rkey, createdAt } = writeIdentity(row);
         const result = await postBlueskyRecord({
           did,
           text: row.body_text ?? "",
           maxGraphemes: cfg.bluesky_max,
+          rkey,
+          createdAt,
           allHausUrl,
           reply,
           quote,
@@ -333,7 +370,7 @@ export const outboundCrossPost: Task = async (payload, helpers) => {
         { outboundPostId: row.id, protocol: row.protocol, externalPostUri },
         "outbound cross-post sent",
       );
-    },
+    }),
 
     onRetry: async (row, nextAttempt, _nextAt, msg) => {
       await pool.query(
@@ -361,15 +398,74 @@ export const outboundCrossPost: Task = async (payload, helpers) => {
   });
 };
 
+async function invalidateOnRefusal(
+  row: OutboundRow,
+  deliver: () => Promise<void>,
+): Promise<void> {
+  try {
+    await deliver();
+  } catch (err) {
+    if (row.linked_account_id && isCredentialRefusal(err)) {
+      await invalidatePresence(
+        pool,
+        row.linked_account_id,
+        `outbound ${row.protocol}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    throw err;
+  }
+}
+
+// The atproto write identity for a row: both halves derived from columns the
+// row already carries and never changes, so every attempt sends the same bytes
+// to the same path. `created_at` arrives as a Date from node-postgres; a row
+// whose value is somehow absent would silently get a per-attempt identity, so
+// it throws rather than substituting `new Date()`.
+function writeIdentity(row: OutboundRow): { rkey: string; createdAt: string } {
+  const created = row.created_at ? new Date(row.created_at) : null;
+  if (!created || Number.isNaN(created.getTime())) {
+    throw new Error("outbound_posts.created_at missing — cannot derive rkey");
+  }
+  return {
+    rkey: deriveRecordKey(row.id, created),
+    createdAt: created.toISOString(),
+  };
+}
+
+// A FAILED CROSS-POST IS TOLD TO THE MEMBER (CROSS-NETWORK-ROUNDTRIP-ADR F8/A7).
+// The reply route answered 201 minutes before this runs, and nothing but the
+// data-subject export read outbound_posts, so a reply that never reached
+// Bluesky or Mastodon was known only to the operator's logs — the member
+// believed they had answered somebody who never heard it. The notification is
+// written in the SAME transaction as the status, so there is no `failed` row
+// the member was not told about.
+//
+// Only for the actions that are SPEECH — a reply, a quote, an original — and
+// only where the note exists to point at. `actor_id` is the member: their own
+// act, and a bound actor is what lets `idx_notifications_dedup` collapse the
+// rows for one note (a note sent to two networks that both fail is one unread
+// notification; the read route lists every failed network for it).
+export const CROSS_POST_FAILED_NOTIFICATION_SQL = `
+    INSERT INTO notifications (recipient_id, actor_id, type, note_id)
+    SELECT op.account_id, op.account_id, 'cross_post_failed', n.id
+      FROM outbound_posts op
+      JOIN notes n ON n.nostr_event_id = op.nostr_event_id
+     WHERE op.id = $1
+       AND op.action_type IN ('reply', 'quote', 'original')
+    ON CONFLICT DO NOTHING`;
+
 async function markFailed(id: string, msg: string): Promise<void> {
-  await pool.query(
-    `
-    UPDATE outbound_posts
-    SET status = 'failed', error_message = $2
-    WHERE id = $1
-  `,
-    [id, msg],
-  );
+  await withTransaction(async (client) => {
+    await client.query(
+      `
+      UPDATE outbound_posts
+      SET status = 'failed', error_message = $2
+      WHERE id = $1
+    `,
+      [id, msg],
+    );
+    await client.query(CROSS_POST_FAILED_NOTIFICATION_SQL, [id]);
+  });
 }
 
 async function loadConfig(): Promise<AllHausMeta> {

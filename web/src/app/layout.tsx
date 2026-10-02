@@ -27,7 +27,7 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en">
+    <html lang="en-GB">
       <head>
         {/* No-FOUC: set html.dark before paint so dark-mode users never see a
             white flash. Mirrors useColorScheme (web/src/stores/colorScheme.ts);

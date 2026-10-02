@@ -235,7 +235,7 @@ export function ReaderDemo({ palette, dark }: { palette: VesselPalette; dark: bo
             className="font-serif"
             style={{ fontSize: '0.92em', lineHeight: 1.5, color: PANE_MUTED, maxWidth: '26em', margin: '0 auto 1.3em' }}
           >
-            You&rsquo;ve used your free reading credit. Add a payment card to keep
+            You&rsquo;ve used your free reading allowance. Add a payment card to keep
             reading &mdash; you only pay for what you read.
           </p>
           <div

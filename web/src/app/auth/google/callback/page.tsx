@@ -1,8 +1,10 @@
 'use client'
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, Suspense } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
 import { useAuth } from '../../../../stores/auth'
+import { takeGoogleBind } from '../../../../lib/google-oauth'
+import { request, ApiError } from '../../../../lib/api/client'
 import { PublicShell } from '../../../../components/public/PublicShell'
 import {
   PublicVessel,
@@ -15,8 +17,8 @@ import {
 // Google OAuth callback.
 //
 // Google redirects here after the visitor approves (or denies) consent. We POST
-// the code + state to the gateway exchange endpoint, which validates the state
-// cookie, exchanges the code, and sets the session cookie in its response. We
+// the code + state to the gateway exchange endpoint, which validates the signed
+// state, exchanges the code, and sets the session cookie in its response. We
 // then call /auth/me to hydrate the store and navigate.
 //
 // Doing the exchange via a regular fetch (not a gateway redirect) ensures
@@ -30,7 +32,7 @@ import {
 // so the visitor's screen doesn't change shape underneath them mid-flow.
 // =============================================================================
 
-export default function GoogleCallbackPage() {
+function GoogleCallbackPageBody() {
   const searchParams = useSearchParams()
   const router = useRouter()
   const fetchMe = useAuth((s) => s.fetchMe)
@@ -49,33 +51,26 @@ export default function GoogleCallbackPage() {
       return
     }
 
-    fetch('/api/v1/auth/google/exchange', {
+    // The browser binding this flow started with (MIRROR-AUDIT §2.5). It is in
+    // OUR sessionStorage, so a callback URL forwarded to another browser cannot
+    // carry it — and the absence is a failed sign-in, not an unbound one: there
+    // is no request to make without it, and making one anyway would only teach
+    // the far end to accept a blank binding.
+    const bind = takeGoogleBind()
+    if (!bind) {
+      router.replace('/auth?mode=login&error=google_failed')
+      return
+    }
+
+    request<{ arrivalDTag?: string | null } | null>('/auth/google/exchange', {
       method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, state }),
+      body: JSON.stringify({ code, state, bind }),
     })
-      .then(async (res) => {
-        if (!res.ok) {
-          // Closed beta: this Google email has no account and the gateway
-          // refused to create one (CLOSED-BETA-ADR D1). That is a normal
-          // outcome, not a failure — route straight to the waitlist surface
-          // (D4), which explains and captures the interest, rather than the
-          // generic error, which would read as "something broke".
-          const body = await res.json().catch(() => null)
-          if (body?.error === 'closed_beta') {
-            router.replace('/waitlist?from=beta')
-            return
-          }
-          throw new Error('Exchange failed')
-        }
+      .then(async (body) => {
         // The arrival intent came back inside the HMAC-SIGNED state, so the
         // gateway has already verified it and looked any price up server-side.
         // This page still rebuilds the path from the identifier rather than
         // following one — same rule on all three carriers.
-        const body = (await res.json().catch(() => null)) as {
-          arrivalDTag?: string | null
-        } | null
         await fetchMe()
         router.replace(
           body?.arrivalDTag
@@ -83,7 +78,16 @@ export default function GoogleCallbackPage() {
             : '/reader',
         )
       })
-      .catch(() => {
+      .catch((err: unknown) => {
+        // Closed beta: this Google email has no account and the gateway
+        // refused to create one (CLOSED-BETA-ADR D1). That is a normal
+        // outcome, not a failure — route straight to the waitlist surface
+        // (D4), which explains and captures the interest, rather than the
+        // generic error, which would read as "something broke".
+        if (err instanceof ApiError && err.body?.error === 'closed_beta') {
+          router.replace('/waitlist?from=beta')
+          return
+        }
         router.replace('/auth?mode=login&error=google_failed')
       })
   }, [])
@@ -99,5 +103,15 @@ export default function GoogleCallbackPage() {
         </PublicCard>
       </PublicVessel>
     </PublicShell>
+  )
+}
+
+// useSearchParams() bails this subtree out to client rendering; the boundary
+// keeps that bail-out to the page instead of the whole route (CA-F13).
+export default function GoogleCallbackPage() {
+  return (
+    <Suspense fallback={null}>
+      <GoogleCallbackPageBody />
+    </Suspense>
   )
 }

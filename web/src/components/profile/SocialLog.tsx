@@ -1,10 +1,11 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { PostCardInteractive } from "../post/PostCardInteractive";
 import { PostThread } from "../post/PostThread";
 import { FEED_LOG_STYLE } from "./ProfileChrome";
+import { LoadFailed } from "../ui/LoadFailed";
 import type { CardContext } from "../post/chassis";
 import {
   DEFAULT_DENSITY,
@@ -14,9 +15,8 @@ import {
 } from "../workspace/tokens";
 import { authorPosts, authorReplies } from "../../lib/api/post";
 import type { Post } from "../../lib/post/types";
-import { quotePreviewContent } from "../../lib/post/quote-preview";
+import { openPostInReader } from "../../lib/workspace/open-post";
 import type { WriterProfile } from "../../lib/api";
-import { useCompose } from "../../stores/compose";
 
 // =============================================================================
 // SocialLog — ONE log body for the profile's Posts view and its Replies view,
@@ -43,6 +43,17 @@ interface SocialLogProps {
   isOwnProfile: boolean;
   /** The profile surface's palette — resolved once at the top of the surface. */
   palette: VesselPalette;
+  /** THE CONVERSATION THIS PANE WAS OPENED ON — pinned above the log, already
+   *  expanded, and taken out of the log below so it is not on screen twice.
+   *
+   *  It is pinned rather than scrolled to, and that is the whole reason this is
+   *  not three lines seeding `expanded`: the log is one page of 50, the post a
+   *  notification points at can be older than that, and a feature that works
+   *  only while the thing is recent is the kind that looks fine in dev. Pinning
+   *  addresses the conversation directly (`GET /thread/:postId`), so it does
+   *  not matter whether the post is in the page, and it is what puts the
+   *  message at the TOP rather than wherever its date happens to place it. */
+  focusPostId?: string | null;
 }
 
 export function SocialLog({
@@ -50,16 +61,31 @@ export function SocialLog({
   writer,
   isOwnProfile,
   palette,
+  focusPostId = null,
 }: SocialLogProps) {
   const router = useRouter();
   const [posts, setPosts] = useState<Post[]>([]);
+  const [failed, setFailed] = useState(false);
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const CTX: CardContext = {
-    density: DEFAULT_DENSITY,
-    palette,
-    bodyPx: TEXT_SIZE_PX[DEFAULT_TEXT_SIZE],
-  };
+  // Collapsing the pinned conversation RELEASES it rather than hiding it: the
+  // post rejoins the log in its own place, which is where the reader would
+  // next look for it. A pin that collapses to nothing would make the post
+  // vanish from a profile that has it.
+  const [pinned, setPinned] = useState<string | null>(focusPostId);
+  useEffect(() => setPinned(focusPostId), [focusPostId]);
+  // Memoised on the palette and named in `renderPost`'s deps (CA-E13f): a
+  // context built per render and left out of the deps froze the colours the
+  // pane opened with, so a palette change while it was mounted never reached
+  // the cards.
+  const CTX: CardContext = useMemo(
+    () => ({
+      density: DEFAULT_DENSITY,
+      palette,
+      bodyPx: TEXT_SIZE_PX[DEFAULT_TEXT_SIZE],
+    }),
+    [palette],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -71,10 +97,16 @@ export function SocialLog({
         : authorReplies(writer.id, undefined, 50);
     load
       .then((res) => {
-        if (!cancelled) setPosts(res.items);
+        if (cancelled) return;
+        setPosts(res.items);
+        setFailed(false);
       })
       .catch(() => {
-        /* silently fail */
+        // An outage is not an empty log. Swallowed, this printed "No posts
+        // yet." / "No replies yet." over a member who may have written a great
+        // deal — a confident claim about somebody else's work, made by a
+        // surface that had been told nothing.
+        if (!cancelled) setFailed(true);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -93,26 +125,13 @@ export function SocialLog({
     });
   }, []);
 
+  // Reader pane inside the workspace, standalone route outside it — one home,
+  // because a bare push from an overlay body is the escape ban (lib/workspace/
+  // open-post.ts, which also gates the external target on a real origin URL).
   const openReader = useCallback(
-    (p: Post) => {
-      if (p.author.pubkey) {
-        if (p.dTag) router.push(`/article/${p.dTag}`);
-      } else {
-        router.push(`/read/${p.id}`);
-      }
-    },
+    (p: Post) => openPostInReader(p, router),
     [router],
   );
-
-  const replyFromPost = useCallback((p: Post) => {
-    if (!p.author.pubkey) return;
-    useCompose.getState().open("reply", {
-      eventId: p.version ?? p.id,
-      eventKind: p.type === "article" ? 30023 : 1,
-      authorPubkey: p.author.pubkey,
-      previewContent: quotePreviewContent(p),
-    });
-  }, []);
 
   const renderPost = useCallback(
     (post: Post) =>
@@ -122,7 +141,6 @@ export function SocialLog({
           rootPostId={post.id}
           ctx={CTX}
           onCollapse={() => toggleExpand(post.id)}
-          onReply={replyFromPost}
           onOpenReader={openReader}
         />
       ) : (
@@ -135,10 +153,9 @@ export function SocialLog({
           isOwnContent={isOwnProfile}
           onExpand={() => toggleExpand(post.id)}
           onOpenReader={openReader}
-          onReply={post.author.pubkey ? () => replyFromPost(post) : undefined}
         />
       ),
-    [expanded, isOwnProfile, openReader, replyFromPost, toggleExpand],
+    [expanded, isOwnProfile, openReader, toggleExpand, CTX],
   );
 
   if (loading) {
@@ -147,8 +164,17 @@ export function SocialLog({
         className="py-10 text-center text-ui-sm"
         style={{ color: palette.cardMeta }}
       >
-        Loading...
+        Loading…
       </div>
+    );
+  }
+
+  if (failed) {
+    return (
+      <LoadFailed
+        what={kind === "notes" ? "these posts" : "these replies"}
+        color={palette.cardMeta}
+      />
     );
   }
 
@@ -163,5 +189,20 @@ export function SocialLog({
   // The feed's own rhythm: `FEED_LOG_STYLE`'s column gap PLUS each PostCard's
   // own margin = 20px, which is what a vessel renders (§9.2). The card margin
   // alone is 8px and was never the feed's figure.
-  return <div style={FEED_LOG_STYLE}>{posts.map(renderPost)}</div>;
+  return (
+    <div style={FEED_LOG_STYLE}>
+      {pinned && (
+        <PostThread
+          key={`pinned-${pinned}`}
+          rootPostId={pinned}
+          ctx={CTX}
+          // It is the head of the log already — see `autoScroll`'s own note.
+          autoScroll={false}
+          onCollapse={() => setPinned(null)}
+          onOpenReader={openReader}
+        />
+      )}
+      {posts.filter((p) => p.id !== pinned).map(renderPost)}
+    </div>
+  );
 }

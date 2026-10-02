@@ -21,11 +21,19 @@ import type { WriterProfile } from '../../lib/api'
 const GATEWAY = process.env.GATEWAY_INTERNAL_URL ?? process.env.GATEWAY_URL ?? 'http://localhost:3000'
 const SITE_URL = process.env.APP_URL ?? 'https://all.haus'
 
+// ONLY A 404 IS AN ABSENCE (CA-E1, 2026-09-29). This returned null on any
+// non-2xx, and the page turned null into `notFound()` — so a gateway 5xx or an
+// nginx 502 rendered the 404 page, telling a reader the writer did not exist
+// while the platform was the thing that was down. Anything else THROWS to
+// `app/error.tsx`, which says so and offers a retry; and a throw stores
+// nothing under `revalidate`, where a cached null would have kept the false
+// 404 for a minute after the outage ended.
 async function getWriter(username: string): Promise<WriterProfile | null> {
-  const res = await fetch(`${GATEWAY}/api/v1/writers/${username}`, {
+  const res = await fetch(`${GATEWAY}/api/v1/writers/${encodeURIComponent(username)}`, {
     next: { revalidate: 60 },
   })
-  if (!res.ok) return null
+  if (res.status === 404) return null
+  if (!res.ok) throw new Error(`Writer lookup failed: ${res.status}`)
   return res.json()
 }
 

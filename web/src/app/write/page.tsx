@@ -2,7 +2,7 @@
 
 import { useAuth } from "../../stores/auth";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useEffect } from "react";
+import { useEffect, Suspense } from "react";
 import dynamic from "next/dynamic";
 
 const ArticleEditor = dynamic(
@@ -15,12 +15,13 @@ const ArticleEditor = dynamic(
     loading: () => (
       <div className="mx-auto max-w-article px-4 sm:px-6 pt-16 pb-16 text-center">
         <div className="h-8 w-48 mx-auto animate-pulse rounded bg-grey-100" />
-        <p className="mt-4 text-sm text-grey-300">Loading editor...</p>
+        <p className="mt-4 text-sm text-grey-300">Loading…</p>
       </div>
     ),
   },
 );
 import { useArticleEditorInit } from "../../hooks/useArticleEditorInit";
+import { WriterAccessPage } from "../../components/writer/WriterAccessPanel";
 
 // =============================================================================
 // Write Page — the standalone, addressable full-page article editor (kept for
@@ -35,7 +36,7 @@ import { useArticleEditorInit } from "../../hooks/useArticleEditorInit";
 //   3. Continue draft: /write?draft=<draftId>
 // =============================================================================
 
-export default function WritePage() {
+function WritePageBody() {
   const { user, loading } = useAuth();
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -79,6 +80,10 @@ export default function WritePage() {
     );
   }
 
+  // A reader reaching /write directly meets the explanation, not a 403
+  // (READER-WRITER-SPLIT-ADR §6.2).
+  if (!user.canWrite) return <WriterAccessPage />;
+
   if (loadError) {
     return (
       <div className="mx-auto max-w-article px-4 sm:px-6 pt-16 pb-16 text-center">
@@ -97,7 +102,7 @@ export default function WritePage() {
     return (
       <div className="mx-auto max-w-article px-4 sm:px-6 pt-16 pb-16 text-center">
         <div className="h-8 w-48 mx-auto animate-pulse rounded bg-grey-100" />
-        <p className="mt-4 text-sm text-grey-300">Loading...</p>
+        <p className="mt-4 text-sm text-grey-300">Loading…</p>
       </div>
     );
   }
@@ -120,5 +125,15 @@ export default function WritePage() {
       onPublish={handlePublish}
       onSchedule={!editEventId ? handleSchedule : undefined}
     />
+  );
+}
+
+// useSearchParams() bails this subtree out to client rendering; the boundary
+// keeps that bail-out to the page instead of the whole route (CA-F13).
+export default function WritePage() {
+  return (
+    <Suspense fallback={null}>
+      <WritePageBody />
+    </Suspense>
   );
 }

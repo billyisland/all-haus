@@ -1,4 +1,4 @@
-import { request } from "./client";
+import { request, API_BASE } from "./client";
 import type { Post } from "../post/types";
 import type { AuthorProfile } from "./post";
 
@@ -35,12 +35,29 @@ export interface WorkspaceFeed {
 // the same shape every other feed surface returns — so the workspace renders them
 // through the one Post-model card path with no client-side legacy-item adapter
 // (FEED-RETIREMENT-PLAN Slice 6 item 4). Ranking stays the per-vessel
-// effective_score (weight × sampling_mode), carried only in `nextCursor`.
+// the (published_at, id) keyset, carried only in `nextCursor`.
 export interface WorkspaceFeedItemsResponse {
   feed: WorkspaceFeed;
   items: Post[];
   nextCursor?: string;
   placeholder: boolean;
+  // The server's snapshot token for this page (WORKSPACE-QUEUE-ADR §IV.1):
+  // Postgres-precision text, a minute behind its clock. Sent back verbatim to
+  // `markSeen` — never parsed into a Date, which would truncate it.
+  asOf: string;
+}
+
+// The reading counts' window (WORKSPACE-QUEUE-ADR §IV.1): every post the feed's
+// timeline would show from the last week, newest published first, each flagged
+// `isNew` when it entered the feed after the member last looked. The client
+// adopts it wholesale — it never assembles one from what it has loaded, and
+// never clears a flag itself. `windowStart` is the one home of the floor.
+export interface FeedSeenWindow {
+  asOf: string;
+  seenBaselineAt: string | null;
+  windowStart: string;
+  items: { id: string; publishedAt: number; isNew: boolean }[];
+  truncated: boolean;
 }
 
 export type WorkspaceFeedSourceKind =
@@ -62,8 +79,14 @@ export interface WorkspaceFeedSource {
   sourceType: WorkspaceFeedSourceKind;
   accountId?: string;
   externalSourceId?: string;
-  weight: number;
+  /** Fraction of this source's posts that reach this feed, 0.2 .. 1.0. */
+  throughput: number;
   samplingMode: "random" | "top";
+  /** False where TOP has nothing to rank on — rss/email always, external nostr
+   *  while its counts flag is dark. The throughput is still honoured exactly;
+   *  it is the word "top" that degrades to "most recent", and the control says
+   *  so rather than claiming a ranking it cannot do. */
+  hasEngagementSignal: boolean;
   excludeReplies: boolean;
   mutedAt: string | null;
   createdAt: string;
@@ -107,6 +130,7 @@ export interface WorkspaceBootstrapResponse {
       items: Post[];
       nextCursor?: string;
       placeholder: boolean;
+      asOf: string;
     }
   >;
 }
@@ -173,6 +197,29 @@ export const workspaceFeeds = {
     );
   },
 
+  // Reading counts (WORKSPACE-QUEUE-ADR §IV). `seen` is the poll; `markSeen`
+  // records a look and answers the window computed against the NEW baseline,
+  // which replaces the feed's window in memory.
+  seen: (id: string) => request<FeedSeenWindow>(`/workspace/feeds/${id}/seen`),
+
+  markSeen: (id: string, asOf: string) =>
+    request<FeedSeenWindow>(`/workspace/feeds/${id}/seen`, {
+      method: "POST",
+      body: JSON.stringify({ asOf }),
+    }),
+
+  // The same look from a closing tab (§IV.4): `navigator.sendBeacon` with a
+  // STRING body, which goes as text/plain — the route accepts it for exactly
+  // this. No response to adopt; the next window fetch carries the result.
+  // Returns whether the browser queued it.
+  beaconSeen: (id: string, asOf: string): boolean => {
+    if (typeof navigator === "undefined" || !navigator.sendBeacon) return false;
+    return navigator.sendBeacon(
+      `${API_BASE}/workspace/feeds/${id}/seen`,
+      JSON.stringify({ asOf }),
+    );
+  },
+
   // Slice 4: source authoring
   listSources: (id: string) =>
     request<{
@@ -182,16 +229,23 @@ export const workspaceFeeds = {
       importBinding?: FeedImportBinding | null;
     }>(`/workspace/feeds/${id}/sources`),
 
+  // `following` is present for an ACCOUNT source only, and is the state AFTER
+  // the write. A native follow is derived from a chosen `account` source
+  // (§9.16 as amended 2026-09-18), so the ROUTE decides it — the client reads
+  // the answer rather than assuming the write it asked for is the write that
+  // happened (the follow is skipped for an inactive target, and a removal
+  // only drops it when the LAST feed lets go, which this feed cannot know).
   addSource: (id: string, input: AddWorkspaceFeedSourceInput) =>
-    request<{ source: WorkspaceFeedSource }>(`/workspace/feeds/${id}/sources`, {
-      method: "POST",
-      body: JSON.stringify(input),
-    }),
+    request<{ source: WorkspaceFeedSource; following?: boolean }>(
+      `/workspace/feeds/${id}/sources`,
+      { method: "POST", body: JSON.stringify(input) },
+    ),
 
   removeSource: (id: string, sourceId: string) =>
-    request<void>(`/workspace/feeds/${id}/sources/${sourceId}`, {
-      method: "DELETE",
-    }),
+    request<{ ok: true; following?: boolean }>(
+      `/workspace/feeds/${id}/sources/${sourceId}`,
+      { method: "DELETE" },
+    ),
 
   moveSource: (sourceFeedId: string, sourceId: string, targetFeedId: string) =>
     request<{ ok: true }>(
@@ -222,7 +276,7 @@ export const workspaceFeeds = {
 
   // Slice 14: per-feed-per-author volume + sampling commitment surfaced from
   // the pip panel. step=null means "passive" (no row), step=0 mutes, 1..5 are
-  // the committed levels mapped to feed_sources.weight server-side.
+  // the committed levels mapped to feed_sources.throughput server-side.
   getAuthorVolume: (feedId: string, pubkey: string) =>
     request<AuthorVolume>(`/workspace/feeds/${feedId}/author-volume/${pubkey}`),
 

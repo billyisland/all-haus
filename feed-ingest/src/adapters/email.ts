@@ -2,6 +2,7 @@ import {
   sanitizeContent,
   stripHtml,
 } from "@platform-pub/shared/lib/sanitize.js";
+import { escapeHtml } from "@platform-pub/shared/lib/text.js";
 
 // =============================================================================
 // Email newsletter adapter — normalises Postmark inbound webhook payloads
@@ -158,14 +159,28 @@ export function normaliseEmail(
     contentText = stripHtml(rawHtml);
   } else {
     contentText = payload.TextBody || "";
+    // A text/plain body was never markup, so this branch is BUILDING markup out
+    // of it — the HTML branch above sanitises, and an unescaped wrap here put
+    // whatever the sender wrote straight into `content_html`, which the reader
+    // renders with dangerouslySetInnerHTML. Escape BEFORE the <br> substitution:
+    // the other order escapes the tag this line just inserted.
     contentHtml = contentText
       .split(/\n\n+/)
-      .map((p) => `<p>${p.replace(/\n/g, "<br>")}</p>`)
+      .map((p) => `<p>${escapeHtml(p).replace(/\n/g, "<br>")}</p>`)
       .join("");
   }
 
   let publishedAt = new Date(payload.Date);
   if (isNaN(publishedAt.getTime())) {
+    publishedAt = new Date();
+  }
+  // A Date header more than a day ahead is a sender's clock or a forgery, and
+  // it would pin the issue to the top of every feed until the date came round.
+  // Clamp it the way rss.ts does. The day's allowance is also what the reading
+  // counts' scan argument rests on — every ingest adapter caps a future date,
+  // so a source has at most one future calendar week (WORKSPACE-QUEUE-ADR
+  // §IV.2); this adapter was the one that did not.
+  if (publishedAt.getTime() > Date.now() + 86_400_000) {
     publishedAt = new Date();
   }
 

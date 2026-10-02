@@ -1,7 +1,14 @@
 import type { FastifyInstance } from "fastify";
 import { pool } from "@platform-pub/shared/db/client.js";
 import { safeFetch } from "@platform-pub/shared/lib/http-client.js";
-import { sanitizeContent } from "@platform-pub/shared/lib/sanitize.js";
+import {
+  blueskyInteractionData,
+  type AtprotoReplyRefs,
+} from "@platform-pub/shared/lib/atproto-reply-refs.js";
+import {
+  httpUrlOrNull,
+  sanitizeContent,
+} from "@platform-pub/shared/lib/sanitize.js";
 import { requireAuth } from "../../middleware/auth.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 import {
@@ -13,7 +20,13 @@ import {
   extractMastodonStatusId,
   rowToParentItem,
   ensureContextFeedItem,
+  CONTEXT_INTERACTION_MERGE_SQL,
 } from "../../lib/external-items-shared.js";
+import {
+  readMastodonStatus,
+  mastodonStatusIdentity,
+} from "@platform-pub/shared/lib/mastodon-api.js";
+import { isUuid } from "../../lib/request-inputs.js";
 
 interface ParentContextResponse {
   parent: ParentItem | null;
@@ -48,6 +61,9 @@ export function registerParentRoutes(app: FastifyInstance) {
     },
     async (req, reply) => {
       const { id } = req.params;
+      if (!isUuid(id)) {
+        return reply.status(404).send({ error: "We couldn't find that post." });
+      }
 
       const cached = parentCache.get(id);
       if (cached && cached.expiresAt > Date.now()) {
@@ -62,7 +78,7 @@ export function registerParentRoutes(app: FastifyInstance) {
       );
 
       if (rows.length === 0) {
-        return reply.status(404).send({ error: "Item not found" });
+        return reply.status(404).send({ error: "We couldn't find that post." });
       }
 
       const item = rows[0];
@@ -174,7 +190,7 @@ async function fetchBlueskyParent(
         record: {
           text?: string;
           createdAt?: string;
-          reply?: { parent: { uri: string }; root: { uri: string } };
+          reply?: AtprotoReplyRefs;
         };
         likeCount?: number;
         replyCount?: number;
@@ -201,10 +217,8 @@ async function fetchBlueskyParent(
       if (gpTag) grandparentTag = gpTag;
     }
 
-    const interactionData: Record<string, unknown> = {
-      uri: post.uri,
-      cid: post.cid,
-    };
+    const interactionData: Record<string, unknown> =
+      blueskyInteractionData(post);
     if (grandparentTag) interactionData.grandparent = grandparentTag;
 
     // Store in DB as context-only
@@ -220,7 +234,7 @@ async function fetchBlueskyParent(
         like_count = EXCLUDED.like_count,
         reply_count = EXCLUDED.reply_count,
         repost_count = EXCLUDED.repost_count,
-        interaction_data = EXCLUDED.interaction_data
+        ${CONTEXT_INTERACTION_MERGE_SQL}
       RETURNING id`,
       [
         sourceId,
@@ -309,7 +323,10 @@ async function fetchBlueskyGrandparentTag(
   }
 }
 
-async function fetchMastodonParent(
+// Exported for the routed-mock test: what is under test is whether a hostile
+// answer reaches the INSERT, and only a call through the real function can
+// say (CA-A10).
+export async function fetchMastodonParent(
   parentUri: string,
   sourceId: string,
 ): Promise<{
@@ -321,14 +338,11 @@ async function fetchMastodonParent(
 
   try {
     const host = new URL(parentUri).hostname;
-    const res = await safeFetch(`https://${host}/api/v1/statuses/${statusId}`, {
-      headers: { Accept: "application/json" },
-      timeout: NEIGHBOURHOOD_FETCH_TIMEOUT_MS,
-    });
+    const res = await readMastodonStatus(`https://${host}`, statusId, { timeout: NEIGHBOURHOOD_FETCH_TIMEOUT_MS });
 
     if (!res.ok) return null;
 
-    const status = JSON.parse(res.text) as {
+    const status = res.body as {
       id: string;
       url: string;
       uri: string;
@@ -353,6 +367,12 @@ async function fetchMastodonParent(
         description?: string;
       }>;
     };
+
+    // §2.9 on this door too (CA-A10): the status may claim only ids on the
+    // origin that answered. A refusal writes nothing — no key to squat, no
+    // author to overwrite — and is logged in the one home.
+    const identity = mastodonStatusIdentity(status, `https://${host}`);
+    if (!identity) return null;
 
     const publishedAt = Math.floor(
       new Date(status.created_at).getTime() / 1000,
@@ -387,26 +407,30 @@ async function fetchMastodonParent(
     // Store in DB as context-only
     const insertResult = await pool.query(
       `INSERT INTO external_items (
-        source_id, protocol, tier, source_item_uri,
+        source_id, protocol, tier, source_item_uri, canonical_url,
         author_name, author_handle, author_avatar_url, author_uri,
         content_html, media, source_reply_uri, interaction_data,
         like_count, reply_count, repost_count,
         published_at, is_context_only
-      ) VALUES ($1, $2, 'tier3', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, TRUE)
+        -- canonical_url: the permalink the object declares, distinct from the
+        -- id. The conflict arm STAYS as it is -- the RETURNING clause is what
+        -- tells the caller this row is NEW, and widening it would hand back
+        -- pre-existing rows as fresh and mint duplicate feed_items.
+      ) VALUES ($1, $2, 'tier3', $3, $16, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, TRUE)
       ON CONFLICT (protocol, source_item_uri) DO UPDATE SET
         like_count = EXCLUDED.like_count,
         reply_count = EXCLUDED.reply_count,
         repost_count = EXCLUDED.repost_count,
-        interaction_data = EXCLUDED.interaction_data
+        ${CONTEXT_INTERACTION_MERGE_SQL}
       RETURNING id`,
       [
         sourceId,
         "activitypub",
-        status.uri || status.url || parentUri,
+        identity.uri,
         status.account.display_name || status.account.acct,
         status.account.acct,
         status.account.avatar ?? null,
-        status.account.uri ?? status.account.url,
+        identity.authorUri,
         sanitizeContent(status.content),
         JSON.stringify(media),
         null,
@@ -415,6 +439,8 @@ async function fetchMastodonParent(
         status.replies_count ?? 0,
         status.reblogs_count ?? 0,
         new Date(status.created_at),
+        // The permalink the object declares, distinct from the id.
+        httpUrlOrNull(status.url),
       ],
     );
 
@@ -425,11 +451,11 @@ async function fetchMastodonParent(
     const parent: ParentItem = {
       id: insertResult.rows[0].id,
       sourceProtocol: "activitypub",
-      sourceItemUri: status.uri || status.url || parentUri,
+      sourceItemUri: identity.uri,
       authorName: status.account.display_name || status.account.acct,
       authorHandle: status.account.acct,
       authorAvatarUrl: status.account.avatar ?? null,
-      authorUri: status.account.uri ?? status.account.url,
+      authorUri: identity.authorUri,
       contentText: null,
       contentHtml: sanitizeContent(status.content),
       title: null,
@@ -457,14 +483,11 @@ async function fetchMastodonGrandparentTag(
   statusId: string,
 ): Promise<{ authorName: string; authorHandle: string } | null> {
   try {
-    const res = await safeFetch(`https://${host}/api/v1/statuses/${statusId}`, {
-      headers: { Accept: "application/json" },
-      timeout: GRANDPARENT_FETCH_TIMEOUT_MS,
-    });
+    const res = await readMastodonStatus(`https://${host}`, statusId, { timeout: GRANDPARENT_FETCH_TIMEOUT_MS });
 
     if (!res.ok) return null;
 
-    const status = JSON.parse(res.text) as {
+    const status = res.body as {
       account: { acct: string; display_name: string };
     };
 

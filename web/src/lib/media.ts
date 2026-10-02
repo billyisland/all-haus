@@ -5,7 +5,8 @@
 // All requests go through the gateway to protect reader privacy.
 // =============================================================================
 
-const API_BASE = '/api/v1'
+import { articleEmbed } from './media-embed'
+import { request } from './api/client'
 
 // =============================================================================
 // Image Upload
@@ -19,22 +20,12 @@ export interface UploadResult {
   duplicate?: boolean
 }
 
-export async function uploadImage(file: File): Promise<UploadResult> {
+// A refusal is an `ApiError`; the route's 400s carry a sentence in `error`
+// ("We can't use that kind of file …"), which `failureSentence` shows as written.
+export function uploadImage(file: File): Promise<UploadResult> {
   const formData = new FormData()
   formData.append('file', file)
-
-  const res = await fetch(`${API_BASE}/media/upload`, {
-    method: 'POST',
-    credentials: 'include',
-    body: formData,
-  })
-
-  if (!res.ok) {
-    const body = await res.json().catch(() => null)
-    throw new Error(body?.error ?? `Upload failed: ${res.status}`)
-  }
-
-  return res.json()
+  return request<UploadResult>('/media/upload', { method: 'POST', body: formData })
 }
 
 // =============================================================================
@@ -56,33 +47,20 @@ export interface OEmbedResult {
   height?: number
 }
 
-export async function fetchOEmbed(url: string): Promise<OEmbedResult> {
-  const res = await fetch(
-    `${API_BASE}/media/oembed?url=${encodeURIComponent(url)}`,
-    { credentials: 'include' }
-  )
-
-  if (!res.ok) {
-    throw new Error(`oEmbed lookup failed: ${res.status}`)
-  }
-
-  return res.json()
+export function fetchOEmbed(url: string): Promise<OEmbedResult> {
+  return request<OEmbedResult>(`/media/oembed?url=${encodeURIComponent(url)}`)
 }
 
 // =============================================================================
 // URL Detection
 // =============================================================================
 
-const EMBEDDABLE_PATTERNS = [
-  /^https?:\/\/(www\.)?youtube\.com\/watch/,
-  /^https?:\/\/youtu\.be\//,
-  /^https?:\/\/(www\.)?vimeo\.com\/\d+/,
-  /^https?:\/\/(www\.)?(twitter|x)\.com\/\w+\/status\//,
-  /^https?:\/\/open\.spotify\.com\//,
-]
-
+/** True exactly when the body renderers turn `url` into a player — see
+ *  `articleEmbed` (lib/media-embed.ts), which is the definition. YouTube, Vimeo
+ *  and Spotify; Twitter/X is deliberately absent (no embed without a
+ *  third-party script, which the CSP does not admit). */
 export function isEmbeddableUrl(url: string): boolean {
-  return EMBEDDABLE_PATTERNS.some(pattern => pattern.test(url))
+  return articleEmbed(url) !== null
 }
 
 const IMAGE_URL_PATTERN = /^https?:\/\/.+\.(jpg|jpeg|png|gif|webp)(\?.*)?$/i

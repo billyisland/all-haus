@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import type { AuthorProfile } from "../lib/api/post";
+import { request } from "../lib/api/client";
 
 // One author DTO across the codebase — the gateway AuthorCardResponse, defined
 // canonically in lib/api/post.ts. Re-exported here so AuthorModal's existing
@@ -38,13 +39,11 @@ async function fetchAuthorCard(
   id: string,
 ): Promise<AuthorCardData | null> {
   try {
-    const url =
+    const path =
       type === "author"
-        ? `/api/v1/author/${encodeURIComponent(id)}/profile`
-        : `/api/v1/author-card?type=${type}&id=${encodeURIComponent(id)}`;
-    const res = await fetch(url, { credentials: "include" });
-    if (!res.ok) return null;
-    return (await res.json()) as AuthorCardData;
+        ? `/author/${encodeURIComponent(id)}/profile`
+        : `/author-card?type=${type}&id=${encodeURIComponent(id)}`;
+    return await request<AuthorCardData>(path);
   } catch {
     return null;
   }

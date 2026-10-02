@@ -105,7 +105,7 @@ export function VoteControls({
     }
   }
 
-  const disabled = !user || isOwnContent || submitting
+  const disabled = !user || submitting
 
   // Muted/active colours: on a themed vessel they track the palette (so they read
   // on a dark card); on a fixed-light surface (no palette) they fall back to
@@ -115,16 +115,18 @@ export function VoteControls({
 
   return (
     <div className="flex items-center gap-0.5">
-      <button
-        onClick={() => handleVoteClick('up')}
-        disabled={disabled}
-        title={!user ? 'Log in to vote' : isOwnContent ? 'Cannot vote on own content' : 'Upvote'}
-        aria-label={!user ? 'Log in to vote' : isOwnContent ? 'Cannot vote on own content' : 'Upvote'}
-        className="px-1.5 py-0.5 text-ui-xs transition-opacity hover:opacity-70 disabled:opacity-40 disabled:cursor-not-allowed"
-        style={{ color: myVotes.upCount > 0 ? accentColor : mutedColor, fontWeight: myVotes.upCount > 0 ? 500 : undefined }}
-      >
-        ▲
-      </button>
+      {!isOwnContent && (
+        <button
+          onClick={() => handleVoteClick('up')}
+          disabled={disabled}
+          title={!user ? 'Log in to vote' : 'Upvote'}
+          aria-label={!user ? 'Log in to vote' : 'Upvote'}
+          className="px-1.5 py-0.5 text-ui-xs transition-opacity hover:opacity-70 disabled:opacity-40 disabled:cursor-not-allowed"
+          style={{ color: myVotes.upCount > 0 ? accentColor : mutedColor, fontWeight: myVotes.upCount > 0 ? 500 : undefined }}
+        >
+          ▲
+        </button>
+      )}
 
       <div className="relative">
         <button
@@ -144,16 +146,18 @@ export function VoteControls({
         )}
       </div>
 
-      <button
-        onClick={() => handleVoteClick('down')}
-        disabled={disabled}
-        title={!user ? 'Log in to vote' : isOwnContent ? 'Cannot vote on own content' : 'Downvote'}
-        aria-label={!user ? 'Log in to vote' : isOwnContent ? 'Cannot vote on own content' : 'Downvote'}
-        className="px-1.5 py-0.5 text-ui-xs transition-opacity hover:opacity-70 disabled:opacity-40 disabled:cursor-not-allowed"
-        style={{ color: myVotes.downCount > 0 ? accentColor : mutedColor, fontWeight: myVotes.downCount > 0 ? 500 : undefined }}
-      >
-        ▼
-      </button>
+      {!isOwnContent && (
+        <button
+          onClick={() => handleVoteClick('down')}
+          disabled={disabled}
+          title={!user ? 'Log in to vote' : 'Downvote'}
+          aria-label={!user ? 'Log in to vote' : 'Downvote'}
+          className="px-1.5 py-0.5 text-ui-xs transition-opacity hover:opacity-70 disabled:opacity-40 disabled:cursor-not-allowed"
+          style={{ color: myVotes.downCount > 0 ? accentColor : mutedColor, fontWeight: myVotes.downCount > 0 ? 500 : undefined }}
+        >
+          ▼
+        </button>
+      )}
     </div>
   )
 }

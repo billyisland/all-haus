@@ -90,6 +90,9 @@ export type LedgerTriggerType =
   | 'writer_accrual_reversal' // Reverses a charged-back read's writer_accrual (−read_net, account = writer, cp = reader). Fires for EVERY charged-back settled read (platform_settled and writer_paid), unlike writer_payout_reversal (paid reads only) — the accrual was posted at settlement regardless.
   | 'tribute_carve'         // The author's redirect executing: a ROOT tribute accrual reaching the inspirer's real account (released→paid) debits the author's earned by the carve. −accrual.amount, account = root author, cp = root inspirer. Posted in completeTributePayout for root accruals only (parent_tribute_id IS NULL) — the held share stays OUT of the ledger until this moment (build-plan guard #7). Counted by ledger_writer_earned.
   | 'tribute_carve_reversal' // Reverses a charged-back read's already-paid root carve, restoring the author's earned (+accrual.amount, account = root author, cp = root inspirer). Pairs with tribute_payout_reversal (which backs out the inspirer's receipt) on the earned side.
+  | 'credit_quarantine'      // L3.2: the tab is never somewhere a credit can live. A movement that would leave balance_pence below zero is followed, in the same transaction, by this leg taking the tab back to zero and opening a `reader_credits` payable. NOT a clamp — the causing movement posts in full and this is its own exactly-mirrored movement. Counted by ledger_reader_balance (it moves the column; omitting it from the view breaks B1 parity and halts every payout).
+  | 'credit_release'         // L3.2: the exact inverse, when the movement that over-collected is itself reversed. A double settlement's clean resolution is a full Stripe refund → reverseSettlement, which RESTORES the debt; without this the reader would owe the restored debt AND be owed the quarantine. Posted AFTER the restore, never before — see reverseSettlement. Counted by ledger_reader_balance.
+  | 'credit_refund'          // L3.1: the payable PAID — an outward Stripe refund closes a `reader_credits` row (Reader Terms 4.3). +amount, account = reader, cp = NULL (the platform), ref = the reader_credits row. It MOVES NO COLUMN, which is why it is posted with a plain recordLedger and is deliberately NOT counted by ledger_reader_balance: 206 already took the money out of the tab, so counting a refund there would make `balance == −SUM` false and halt every payout on the platform. Counted by its own view, `ledger_reader_refunds` (migration 207) — the reader-side twin of the writer's earned/paid pair, and never netted against the balance.
   | 'vat'                    // §1.5 pre-positioned (empty). Reserved for a Part-2 Merchant-of-Record pivot (§2.1 Branch B): the VAT leg of a settlement's consolidated supply. NO caller today; posted only if/when MoR ships. Mirrors tab_settlements.vat_pence (migration 155).
 
 export interface LedgerEntryInput {
@@ -205,11 +208,17 @@ export interface ApplyLedgerDeltaResult {
   /** id of the mirror ledger_entries row (call sites that persist it, e.g. the
    * dispute stake's stake_ledger_entry_id). */
   ledgerId: string
-  /** The tab's balance_pence AFTER the delta (call sites that branch on it, e.g.
-   * logSubscriptionCharge's pre-paid-credit collection gate). */
+  /** The tab's balance_pence AFTER the delta AND after any quarantine leg — so
+   * it is never negative, and a caller can no longer read a credit off it. That
+   * is the point rather than a side effect: `logSubscriptionCharge` used to
+   * branch on `balancePence <= 0` and call the charge already collected, which
+   * is how a reader's credit came to settle a writer's earning. */
   balancePence: number
   /** id of the affected reading_tabs row. */
   tabId: string
+  /** The payable opened because this movement would have taken the tab below
+   * zero, or null on every ordinary movement. Its `amountPence` is positive. */
+  quarantined: { creditId: string; ledgerId: string; amountPence: number } | null
 }
 
 const ALLOWED_TAB_TIMESTAMPS: readonly TabTimestamp[] = ['last_read_at', 'last_settled_at']
@@ -250,5 +259,188 @@ export async function applyLedgerDelta(
     refId: input.refId,
   })
 
-  return { ledgerId: ledger.id, balancePence: tab.balance_pence, tabId: tab.id }
+  // ---------------------------------------------------------------------------
+  // THE TAB IS NEVER SOMEWHERE A CREDIT CAN LIVE (L3.2; Reader Terms 4.2/4.3).
+  //
+  // Clause 4.2 says the reading tab is "a record of what you owe, not an account
+  // holding your money … not a payment account, a wallet, a stored-value
+  // facility or a balance", and 4.3 says a credit is refunded to the card and
+  // never shown as a balance or spent. A negative column is all three of the
+  // things 4.2 denies: a reader sitting at −500 who read a 200p piece went to
+  // −300, nothing was charged, and the writer was never paid. The credit paid
+  // for the reading. No wording on any surface fixes that; the arithmetic has to.
+  //
+  // So the over-collection is moved OUT, here, in the same transaction, the
+  // moment it would exist. What is left in `reading_tabs` is always a debt or
+  // nothing, and `reader_credits` holds a payable awaiting an outward refund.
+  //
+  // THIS IS NOT THE BANNED CLAMP, and the difference is the whole of why it is
+  // allowed to sit in this function. A clamp moves the column by less than its
+  // ledger entry says, and that divergence is the bug class this primitive
+  // exists to abolish. The causing movement above posted IN FULL and is
+  // untouched. The quarantine is a SECOND movement with its OWN exact mirror, so
+  // `balance == −SUM(ledger)` holds after each of them independently. Both legs
+  // are counted by `ledger_reader_balance` (migration 206) — a leg that moves
+  // the column and is not in that view breaks B1 parity, which halts every
+  // payout on the platform on every run until someone notices.
+  //
+  // WHY IT IS SAFE HERE, IN THE ONE FUNCTION EVERY MONEY PATH GOES THROUGH: the
+  // condition is false on every ordinary movement. Nothing in normal operation
+  // takes a tab below zero — the only live producer is a settlement fault (the
+  // dispute stake is behind UPSTREAM_EDGES_ENABLED; the spend→subscription
+  // conversion route, the other by-design producer, was deleted 2026-09-29).
+  // Putting it in the primitive rather than at the known producers is
+  // deliberate for exactly that reason: it costs the happy path nothing, and
+  // it covers a producer nobody has written yet.
+  //
+  // Written inline rather than as a recursive `applyLedgerDelta` call: the
+  // recursion would be bounded (the second call lands on zero and cannot
+  // re-fire) but it would also re-run the upsert and the timestamp allowlist for
+  // a movement that is not the caller's, and a reader of this function should be
+  // able to see that the leg is exactly one UPDATE and one entry.
+  // ---------------------------------------------------------------------------
+  if (tab.balance_pence >= 0) {
+    return {
+      ledgerId: ledger.id,
+      balancePence: tab.balance_pence,
+      tabId: tab.id,
+      quarantined: null,
+    }
+  }
+
+  // Positive magnitude of what the platform now owes. `balance_pence` is
+  // negative here, so this is the amount that must leave the tab.
+  const creditPence = -tab.balance_pence
+
+  const { rows: quarantinedRows } = await client.query<{ balance_pence: number }>(
+    `UPDATE reading_tabs
+        SET balance_pence = balance_pence + $2, updated_at = now()
+      WHERE id = $1
+      RETURNING balance_pence`,
+    [tab.id, creditPence],
+  )
+
+  const quarantineLedger = await recordLedger(client, {
+    accountId: input.accountId,
+    // The platform, not the original counterparty: this leg is not about the
+    // writer or reader the causing movement was between. It is us, holding
+    // money we should not have.
+    counterpartyId: null,
+    amountPence: -creditPence, // mirror of a +creditPence column move
+    currency: input.currency,
+    triggerType: 'credit_quarantine',
+    refTable: input.refTable,
+    refId: input.refId,
+  })
+
+  const { rows: creditRows } = await client.query<{ id: string }>(
+    `INSERT INTO reader_credits
+       (reader_id, amount_pence, quarantine_ledger_entry_id,
+        source_ref_table, source_ref_id)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id`,
+    [input.accountId, creditPence, quarantineLedger.id, input.refTable, input.refId],
+  )
+
+  return {
+    ledgerId: ledger.id,
+    // Zero, by construction: the RETURNING above is read rather than assumed,
+    // so a quarantine that somehow failed to land reports the truth instead of
+    // the intention.
+    balancePence: quarantinedRows[0].balance_pence,
+    tabId: tab.id,
+    quarantined: {
+      creditId: creditRows[0].id,
+      ledgerId: quarantineLedger.id,
+      amountPence: creditPence,
+    },
+  }
+}
+
+// =============================================================================
+// releaseReaderCredit — the quarantine's inverse, for when the movement that
+// over-collected is itself reversed.
+//
+// The commonest cause of a credit is a double settlement, and its clean
+// resolution is a FULL Stripe refund of the duplicate charge, which arrives as
+// `charge.refunded` and routes to `reverseSettlement` — restoring the debt to
+// the tab. Without this the reader would owe the restored debt AND be owed the
+// quarantined money: two wrong numbers that only come right if you net them,
+// which is the thing this whole change exists to stop doing.
+//
+// ORDER IS LOAD-BEARING, AND IT IS RESTORE FIRST. Called before the restore, the
+// release would itself drive the tab negative and the quarantine would re-fire
+// on it — a payable closed and an identical one opened, for ever. The caller
+// restores the debt, then calls this.
+//
+// Only OPEN rows are released. A payable already `refunded` means the money has
+// gone back to the reader by L3.1's action; the reversal restoring the debt is
+// then correct on its own, and releasing as well would take it off the tab a
+// second time.
+// =============================================================================
+
+export async function releaseReaderCredit(
+  client: PoolClient,
+  input: { accountId: string; refTable: string; refId: string; currency?: string },
+): Promise<{ creditId: string; amountPence: number } | null> {
+  // `amount_pence` is bigint, and node-postgres hands a bigint back as a STRING
+  // — so it is typed as one here and coerced once, at the edge. Typing it
+  // `number` and trusting the annotation is how `total += amount` became string
+  // concatenation and reported a 600p release as "0600" (caught by the DB-backed
+  // test, which is the only kind that can catch it: a mock hands back whatever
+  // the fixture says, and a fixture written by the same hand says `600`).
+  const { rows } = await client.query<{ id: string; amount_pence: string }>(
+    // A CREDIT WITH A REFUND AT STRIPE IS NOT RELEASED (§0z item 19a).
+    // `refund_reserved_at` is the refund path's claim: the money may be
+    // leaving Stripe as this runs, and closing the row `released` under it
+    // gave the reader the refund AND the restored debt (the
+    // `refund_raced_release` incident). Skipped here, the reversal restores
+    // the whole charge to the tab and the refund's own confirm closes the row
+    // `refunded`: the reader holds the refund and owes the full charge, which
+    // is the same net position as owing the charge less the credit and
+    // holding nothing — and it needs no hand.
+    `SELECT id, amount_pence
+       FROM reader_credits
+      WHERE reader_id = $1
+        AND source_ref_table = $2
+        AND source_ref_id = $3
+        AND status = 'pending_refund'
+        AND refund_reserved_at IS NULL
+      FOR UPDATE`,
+    [input.accountId, input.refTable, input.refId],
+  )
+  if (rows.length === 0) return null
+
+  // Every open payable this movement produced. One is the shape today; the loop
+  // is not defensive padding — nothing stops a source row over-collecting twice,
+  // and releasing one of two would leave a payable nothing will ever release.
+  let total = 0
+  for (const credit of rows) {
+    const amountPence = Number(credit.amount_pence)
+    const releaseLedger = await recordLedger(client, {
+      accountId: input.accountId,
+      counterpartyId: null,
+      amountPence, // mirror of a −amount column move
+      currency: input.currency,
+      triggerType: 'credit_release',
+      refTable: input.refTable,
+      refId: input.refId,
+    })
+    await client.query(
+      `UPDATE reading_tabs
+          SET balance_pence = balance_pence - $2, updated_at = now()
+        WHERE reader_id = $1`,
+      [input.accountId, amountPence],
+    )
+    await client.query(
+      `UPDATE reader_credits
+          SET status = 'released', resolved_at = now(),
+              release_ledger_entry_id = $2
+        WHERE id = $1 AND status = 'pending_refund'`,
+      [credit.id, releaseLedger.id],
+    )
+    total += amountPence
+  }
+
+  return { creditId: rows[0].id, amountPence: total }
 }

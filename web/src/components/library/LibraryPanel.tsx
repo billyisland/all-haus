@@ -34,10 +34,22 @@ import { library as libraryApi, type LibraryItem } from '../../lib/api'
 import { RecentReading } from '../account/RecentReading'
 import { formatDateRelative } from '../../lib/format'
 import { PageShell, PageHeader } from '../ui/PageShell'
+import { LoadFailed } from '../ui/LoadFailed'
+import {
+  LIBRARY_TITLE,
+  LIBRARY_TAB_RECENT,
+  LIBRARY_TAB_LIBRARY,
+  LIBRARY_LOAD_FAILED_WHAT,
+  LIBRARY_EMPTY,
+  LIBRARY_EMPTY_HINT,
+  LIBRARY_GO_TO_WORKSPACE,
+  LIBRARY_LOAD_MORE,
+  LIBRARY_UNKNOWN_WRITER,
+} from '../../content/library'
 
 const TAB_LABEL: Record<LibraryTab, string> = {
-  recent: 'Recent reading',
-  library: 'all.haus library',
+  recent: LIBRARY_TAB_RECENT,
+  library: LIBRARY_TAB_LIBRARY,
 }
 
 export function LibraryPanel({
@@ -77,7 +89,7 @@ export function LibraryPanel({
 
   const body = (
     <>
-      {inOverlay && <PageHeader title="Library" />}
+      {inOverlay && <PageHeader title={LIBRARY_TITLE} />}
       <div className="flex gap-2 mb-8">
         {(['recent', 'library'] as LibraryTab[]).map(t => (
           <button
@@ -104,7 +116,7 @@ export function LibraryPanel({
   )
 
   if (inOverlay) return body
-  return <PageShell width="feed" title="Library">{body}</PageShell>
+  return <PageShell width="feed" title={LIBRARY_TITLE}>{body}</PageShell>
 }
 
 /** Open an article: reader-in-place inside the workspace, route otherwise. */
@@ -129,6 +141,7 @@ function LibraryTabBody({ inOverlay }: { inOverlay: boolean }) {
   const router = useRouter()
   const [items, setItems] = useState<LibraryItem[]>([])
   const [loading, setLoading] = useState(true)
+  const [failed, setFailed] = useState(false)
   const [hasMore, setHasMore] = useState(false)
   const [offset, setOffset] = useState(0)
 
@@ -141,10 +154,17 @@ function LibraryTabBody({ inOverlay }: { inOverlay: boolean }) {
       setItems(prev => (newOffset === 0 ? fetched : [...prev, ...fetched]))
       setHasMore(more)
       setOffset(newOffset + fetched.length)
+      setFailed(false)
     } catch {
-      // Empty rather than broken — and, as in RecentReading, this is the
-      // swallow that hid this route's predecessor for its whole life. Prove
-      // the tab by driving it and asserting a row, never by its silence.
+      // An outage is not an empty library. This used to swallow the failure
+      // into a silent [], which is the swallow that hid this route's
+      // predecessor for its whole life — and the claim it then printed
+      // ("Nothing in your library yet") is about the reader's own possessions,
+      // stated with total confidence by a surface that had not been told
+      // anything. A FIRST page that fails says so; a later page that fails
+      // leaves what is already on screen alone and just stops offering more.
+      if (newOffset === 0) setFailed(true)
+      setHasMore(false)
     }
     finally { setLoading(false) }
   }, [])
@@ -159,12 +179,14 @@ function LibraryTabBody({ inOverlay }: { inOverlay: boolean }) {
     )
   }
 
+  if (failed) return <LoadFailed what={LIBRARY_LOAD_FAILED_WHAT} />
+
   if (items.length === 0) {
     return (
       <div className="py-20 text-center">
-        <p className="text-ui-sm text-grey-400">Nothing in your library yet.</p>
+        <p className="text-ui-sm text-grey-400">{LIBRARY_EMPTY}</p>
         <p className="label-ui text-grey-300 mt-2">
-          Every all.haus piece you unlock is kept here.
+          {LIBRARY_EMPTY_HINT}
         </p>
         {/* In the overlay the ∀ disc (an X) is the way back — no in-panel
             "back to workspace" prompt. Only the standalone page links out. */}
@@ -173,7 +195,7 @@ function LibraryTabBody({ inOverlay }: { inOverlay: boolean }) {
             href="/reader"
             className="btn-text underline underline-offset-4 mt-4 inline-block"
           >
-            Go to workspace
+            {LIBRARY_GO_TO_WORKSPACE}
           </Link>
         )}
       </div>
@@ -195,7 +217,7 @@ function LibraryTabBody({ inOverlay }: { inOverlay: boolean }) {
             onClick={() => load(offset)}
             className="btn-text underline underline-offset-4"
           >
-            Load more
+            {LIBRARY_LOAD_MORE}
           </button>
         </div>
       )}
@@ -214,7 +236,7 @@ function LibraryCard({
   const inner = (
     <>
       <p className="label-ui text-grey-300 mb-1">
-        {item.writer.displayName ?? item.writer.username ?? 'Unknown writer'}
+        {item.writer.displayName ?? item.writer.username ?? LIBRARY_UNKNOWN_WRITER}
         {' · '}
         {formatDateRelative(acquired)}
       </p>

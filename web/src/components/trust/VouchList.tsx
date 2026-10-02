@@ -8,8 +8,12 @@ import { Avatar } from '../ui/Avatar'
 // =============================================================================
 // VouchList — list of vouches by the authenticated user with withdraw buttons
 //
-// Renders on the Network page (/network?tab=vouches). Shows all active vouches
-// grouped by subject, with dimension labels and withdraw action.
+// A Settings section since the Network page dissolved (2026-09-15) — a list of
+// your own statements about other people is something you manage, not a fact
+// about you that belongs on a public profile. Still behind `trustEnabled()`, so
+// it renders nowhere today; /network?tab=vouches redirects into Settings.
+// Shows all active vouches grouped by subject, with dimension labels and a
+// withdraw action.
 // =============================================================================
 
 const DIMENSION_LABELS: Record<string, string> = {
@@ -99,7 +103,7 @@ export function VouchList() {
             disabled={withdrawing.has(v.id)}
             className="btn-text-danger text-ui-xs flex-shrink-0 disabled:opacity-40"
           >
-            {withdrawing.has(v.id) ? '...' : 'Withdraw'}
+            {withdrawing.has(v.id) ? '…' : 'Withdraw'}
           </button>
         </div>
       ))}

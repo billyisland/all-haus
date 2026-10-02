@@ -3,6 +3,7 @@ import { pool } from '@platform-pub/shared/db/client.js'
 import logger from '@platform-pub/shared/lib/logger.js'
 import { publishNostrToRelaysDetailed, type NostrSignedEvent } from '../adapters/nostr-outbound.js'
 import { runOutboundJob } from '../lib/outbound-retry.js'
+import { isTerminalDeliveryError } from '../lib/outbound-errors.js'
 
 // Discovery events (kind 0/3/10002) must reach the public mesh, not just the
 // in-house relay. For these entity types a row is only 'sent' if at least one
@@ -26,6 +27,22 @@ const DISCOVERY_ENTITY_TYPES = new Set(['profile', 'follow_list', 'relay_list'])
 // so Graphile's own retry loop doesn't race ours. On failure we schedule a
 // fresh job with a versioned job_key.
 //
+// THE CLAIM HONOURS next_attempt_at. Each enqueue path respects the backoff on
+// its own — the retry job carries `runAt`, the redrive sweep selects on
+// `next_attempt_at <= now()` — so this is the guard for the case where BOTH
+// have been enqueued for the same window: the second job then runs straight
+// after the first fails and burns an attempt with no wait at all. Due-ness is
+// computed by POSTGRES (`next_attempt_at <= now() AS due`) rather than by
+// comparing a JS Date here, because a Date holds milliseconds where the column
+// holds microseconds and truncation would call a row due a moment early.
+// A not-due row is left alone; the redrive cron picks it up within the minute.
+//
+// TERMINAL VS AMBIGUOUS. A relay's `OK: false` carries a NIP-01 prefix that
+// says which it is (see nostr-outbound.ts): a refusal the same bytes will get
+// again is abandoned at once instead of spending all ten attempts, while a
+// timeout or a rate limit is retried. `duplicate:` is success — the relay
+// already holds the event.
+//
 // Partial success (some relays accept, some reject) is treated as sent per
 // the §71 one-accepts rule; publishNostrToRelaysDetailed logs per-relay
 // rejections. Exception: discovery rows (kind 0/3/10002) require at least one
@@ -41,6 +58,8 @@ interface RelayOutboxRow {
   status: string
   attempts: number
   max_attempts: number
+  /** Postgres's own answer to `next_attempt_at <= now()`. */
+  due: boolean
 }
 
 export const relayPublish: Task = async (payload, helpers) => {
@@ -61,6 +80,7 @@ export const relayPublish: Task = async (payload, helpers) => {
     attemptsOf: (row) => row.attempts,
     maxOf: (row) => row.max_attempts,
     computeBackoff,
+    isTerminal: isTerminalDeliveryError,
 
     claim: async () => {
       await client.query('BEGIN')
@@ -68,7 +88,8 @@ export const relayPublish: Task = async (payload, helpers) => {
 
       const { rows } = await client.query<RelayOutboxRow>(
         `SELECT id, entity_type, entity_id, signed_event, target_relay_urls,
-                status, attempts, max_attempts
+                status, attempts, max_attempts,
+                next_attempt_at <= now() AS due
            FROM relay_outbox
            WHERE id = $1
            FOR UPDATE SKIP LOCKED`,
@@ -83,6 +104,15 @@ export const relayPublish: Task = async (payload, helpers) => {
       if (row.status !== 'pending' && row.status !== 'failed') {
         await client.query('ROLLBACK')
         txnOpen = false
+        return null
+      }
+      // Not yet due: a duplicate job for a window the backoff has not reached.
+      // Bail without touching the row — attempting now would consume an
+      // attempt the backoff was there to save.
+      if (!row.due) {
+        await client.query('ROLLBACK')
+        txnOpen = false
+        logger.debug({ outboxId }, 'relay_publish: not yet due — backoff not elapsed')
         return null
       }
 

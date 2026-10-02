@@ -27,6 +27,11 @@ export type ExplainKind =
   // singletons
   | "floor"
   | "disc"
+  // Queue mode (WORKSPACE-QUEUE-ADR B9): hover-only leaves standing in for
+  // `floor` and `vessel`, which describe the columns. `queue` rides QueueView's
+  // root, `queue.focal` the feed being read.
+  | "queue"
+  | "queue.focal"
   // the nav-row muster — the run of numbered feed roundels (NAV-ROW-MUSTER-ADR
   // §VII). Hover-only, floor mode: the muster sits above the floor-mode scrim
   // (z-58 > 50), so — like the ∀ disc — it reports its own hover to the engine
@@ -70,6 +75,7 @@ export type ExplainKind =
   | "composer"
   | "composer.crosspost"
   | "composer.article"
+  | "composer.image"
   | "editor"
   | "editor.dek"
   | "editor.paywall"
@@ -85,11 +91,12 @@ export type ExplainKind =
   | "feedComposer.volume"
   | "feedComposer.colour"
   | "feedComposer.view"
-  | "feedComposer.orientation"
   | "feedComposer.textSize"
   | "feedComposer.order"
   | "feedComposer.hide"
   | "feedComposer.delete"
+  | "feedComposer.move"
+  | "feedComposer.merge"
   // C3 (2026-07-16) — destination surfaces, all hover-only (pane mode). Each
   // overlay's base kind rides its scroll body (the `reader` pattern); the
   // generic `pane` copy keeps answering pane chrome. Messages (the merged
@@ -107,11 +114,6 @@ export type ExplainKind =
   | "library"
   | "library.recent"
   | "library.holdings"
-  | "network"
-  | "network.dmFee"
-  | "network.following"
-  | "network.blocked"
-  | "network.muted"
   | "ledger"
   | "ledger.balance"
   | "ledger.allowance"
@@ -119,8 +121,17 @@ export type ExplainKind =
   | "ledger.subscriptions"
   | "settings"
   | "settings.payment"
+  // A reader's Payment section has no Connect half (READER-WRITER-SPLIT-ADR
+  // §6.2), so its hint does not promise one.
+  | "settings.paymentReader"
   | "settings.discovery"
   | "settings.reach"
+  // The three that came off the dissolved Network page (2026-09-15) with the
+  // components they annotate. `settings.dmFee` is UNREACHABLE while priced DMs
+  // are suspended, and kept deliberately — see its copy.
+  | "settings.blocked"
+  | "settings.muted"
+  | "settings.dmFee"
   | "settings.theme"
   | "settings.typeSize"
   | "settings.export"
@@ -134,6 +145,10 @@ export type ExplainKind =
   // card.* kinds from the already-tagged chassis.
   | "profile"
   | "profile.follow"
+  // Tier 4's FOLLOWING view. It carries the sentence the retired Network panel
+  // used to make — the feed-derived external-follow invariant, told from the
+  // reader's side — which is said nowhere else on the site.
+  | "profile.following"
   | "profile.followFeeds"
   | "profile.handle"
   | "profile.name"
@@ -198,7 +213,7 @@ export function explainCardFlavour(post: {
   author: { pubkey: string | null };
 }): CardFlavour | null {
   const p = post.origin.protocol;
-  // Mirrors level-spec's isNativePost: native iff nostr + a custodial pubkey.
+  // Native iff nostr + a custodial pubkey (external items never carry one).
   if (p === "nostr" && post.author.pubkey) {
     return post.type === "article" ? "native-article" : "native-note";
   }
@@ -240,36 +255,57 @@ export function explainCopy(kind: ExplainKind, fromStarter = false): string {
 }
 
 // ---------------------------------------------------------------------------
-// First-run program — Appendix A.1, six beats (prose in ./copy.ts).
+// First-run program — Appendix A.1, rebuilt for the queue (T1,
+// WORKSPACE-QUEUE-ADR §XI.6; prose in ./copy.ts).
 //
-// Beat 1 forks on provenance (D7); beat 6 carries the "done" affordance and two
-// paragraphs. Beats 1-4 anchor to their kind where it exists, free-float centred
-// where it does not (D8); beats 5-6 are floor beats and always free-float.
+// QUEUE ONLY. The tour starts only in queue mode (WorkspaceView mounts the
+// controller there alone), so the floor's beats are gone rather than kept
+// beside these: C3 has nothing of the tour to remove.
+//
+// Beat 1 forks on provenance (D7) and beat 4 on `canWrite`; the finale carries
+// the "done" affordance and two paragraphs. Beats 1-5 anchor to their kind
+// where it exists — in the queue the `vessel` root is the FOCAL entry
+// (QueueEntry registers it), so beats 1-3 land on the feed being read — and
+// free-float centred where it does not (D8); the queue beat and the finale
+// always free-float.
 // ---------------------------------------------------------------------------
 
 export interface FirstRunBeat {
   kind: ExplainKind;
   copy: string;
-  // D8: beats 5-6 always free-float over the floor; beats 1-4 anchor if their
-  // target exists and free-float centred otherwise (resolved at open()).
+  // D8: the last two beats always free-float over the queue; the rest anchor
+  // if their target exists and free-float centred otherwise (resolved at
+  // open()).
   alwaysFloat?: boolean;
-  // Beat 6 carries the explicit dismiss affordance (§6).
+  // The finale carries the explicit dismiss affordance (§6).
   done?: boolean;
 }
 
-// The sequence, resolving the provenance fork for beat 1 and the arrival fork
-// after the disc.
+export interface FirstRunInputs {
+  /** The anchored feed was seeded for its owner (D7). */
+  fromStarter: boolean;
+  /** Something is in Recent reading (the arrival beat). */
+  hasReading?: boolean;
+  /** `/auth/me`'s `canWrite`. Anything but `true` reads as a reader, whose
+   *  ∀ beat is the one true of everybody. */
+  canWrite?: boolean;
+}
+
+// The sequence, resolving the provenance fork for beat 1, the writer fork on
+// the ∀ beat and the arrival fork after it.
 //
 // `hasReading` ADDS A BEAT rather than changing one, and it is placed straight
 // after the `disc` beat on purpose: it anchors on the disc too, so it lands
 // while the reader is still looking at the menu it names. A step with nothing
 // to offer is ABSENT rather than rendered empty — the same rule the deleted
 // welcome sheet used, and the reason the count reads 6 or 7 rather than 7 with
-// a hollow slot.
-export function firstRunBeats(
-  fromStarter: boolean,
+// a hollow slot. Seven is the ceiling (§XI.6), which is why walking and
+// pulling share the one queue beat.
+export function firstRunBeats({
+  fromStarter,
   hasReading = false,
-): FirstRunBeat[] {
+  canWrite = false,
+}: FirstRunInputs): FirstRunBeat[] {
   return [
     {
       kind: "vessel",
@@ -279,13 +315,16 @@ export function firstRunBeats(
     },
     { kind: "vessel.addSource", copy: FIRST_RUN_COPY.addSource },
     { kind: "card.byline", copy: FIRST_RUN_COPY.byline },
-    { kind: "disc", copy: FIRST_RUN_COPY.disc },
+    {
+      kind: "disc",
+      copy: canWrite ? FIRST_RUN_COPY.disc : FIRST_RUN_COPY.discReader,
+    },
     ...(hasReading
       ? [{ kind: "disc" as const, copy: FIRST_RUN_COPY.library }]
       : []),
-    { kind: "floor", copy: FIRST_RUN_COPY.floor, alwaysFloat: true },
+    { kind: "queue", copy: FIRST_RUN_COPY.queue, alwaysFloat: true },
     {
-      kind: "floor",
+      kind: "queue",
       copy: FIRST_RUN_COPY.finale,
       alwaysFloat: true,
       done: true,

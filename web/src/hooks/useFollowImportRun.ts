@@ -9,6 +9,7 @@ import {
 } from '../lib/api'
 import { apiErrorMessage } from '../lib/api/client'
 import { useFeedArrivals } from '../stores/feedArrivals'
+import { FOLLOW_IMPORT_START_FAILED } from '../content/networks'
 
 // =============================================================================
 // useFollowImportRun — start a follow-graph import and follow its progress
@@ -65,9 +66,7 @@ export function useFollowImportRun(): UseFollowImportRun {
         useFeedArrivals.getState().announce(res.feed)
         return true
       } catch (err) {
-        setError(
-          apiErrorMessage(err) ?? 'Could not read the follow list — try again.',
-        )
+        setError(apiErrorMessage(err) ?? FOLLOW_IMPORT_START_FAILED)
         return false
       } finally {
         setStarting(false)

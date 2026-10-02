@@ -61,15 +61,38 @@ export function parseNostrProfileContent(content: string): NostrProfile | null {
   }
 }
 
+/**
+ * How many relays one kind-0 lookup will open sockets against (MIRROR-AUDIT §3
+ * *Security*, S16).
+ *
+ * The cap is HERE rather than at the call sites because this is the one place
+ * that turns a list into N concurrent sockets, and the hint lists that reach it
+ * are third-party data: an `nprofile`'s relay TLVs are decoded from a string the
+ * member pasted, and `source-liveness.ts::verifyNostr` unions those with the
+ * caller's `relayUrls` and the defaults with no bound of its own — so a single
+ * `POST /workspace/feeds/:id/sources` could ask the gateway to open as many
+ * outbound sockets as the nprofile had TLVs, which is the same fan-out amplifier
+ * the resolver's arms were capped for in S7 (its arms cap at 5 before this).
+ *
+ * 8 rather than 5 because this pool is a UNION of hints and defaults and the
+ * cap must not evict the defaults when a source supplies a few of its own; the
+ * order below is hints-first for the reason `relayCandidates` fixes it there —
+ * a cap must never drop a profile's own relay in favour of an aggregator.
+ */
+export const MAX_PROFILE_RELAYS = 8;
+
 export async function fetchNostrProfile(
   pubkey: string,
   relayHints?: string[],
 ): Promise<NostrProfile | null> {
   if (!HEX_64.test(pubkey)) return null;
-  const relays =
-    relayHints && relayHints.length > 0
-      ? relayHints
-      : getDefaultProfileRelays();
+  const relays = [
+    ...new Set(
+      relayHints && relayHints.length > 0
+        ? relayHints
+        : getDefaultProfileRelays(),
+    ),
+  ].slice(0, MAX_PROFILE_RELAYS);
   // Race relays — first successful kind-0 wins. Newest createdAt as tiebreaker.
   const results = await Promise.allSettled(
     relays.map((relayUrl) => fetchKind0FromRelay(relayUrl, pubkey)),

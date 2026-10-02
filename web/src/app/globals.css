@@ -697,6 +697,17 @@ html.dark {
     outline: 2px solid var(--ah-crimson);
     outline-offset: 2px;
   }
+  /* The same ring drawn INSIDE the element, for a focusable scroller whose
+     outside edge is a wall or a clip (the queue's focal feed, §VI.7). It is
+     focused programmatically after a keyboard move, so the UA ring is
+     suppressed for mouse users as `.forall-trigger` does. */
+  .focus-ring-inset:focus {
+    outline: none;
+  }
+  .focus-ring-inset:focus-visible {
+    outline: 2px solid var(--ah-crimson);
+    outline-offset: -2px;
+  }
 
   /* ----- Glasshouse scrim (GLASSHOUSE-AND-PALETTE-ADR §III.1) -----
      The scrim, not the pane, does the separating: a feed scheme behind the
@@ -810,6 +821,84 @@ html.dark {
     padding-left: 16px;
     color: var(--ah-grey-600);
     font-style: italic;
+  }
+
+  /* ----- The caption voice — ONE home, three surfaces -----
+     A picture caption is apparatus, not literary content, so it takes the
+     PLATFORM voice even inside a serif reading column (the three-voice rule):
+     Jost at text-ui-xs, grey, 8px under its picture and 24px clear of the
+     prose. The typeface says *this is not the piece*; the spacing says *this
+     belongs to that picture*.
+
+     Three surfaces take it and they must not drift — the native reader
+     (`.prose`), the external reader (whose body HTML the gateway normalises
+     into the same <figure>/<figcaption>), and the EDITOR, whose node view
+     renders the real elements so what a writer sees is what publishes. Before
+     this there was no caption on the native side at all, and Tailwind
+     typography — which sets a figcaption's size, leading and colour but never
+     its FAMILY — would have left it in Literata while the external reader used
+     the sans, i.e. two readers quietly disagreeing about one thing.
+
+     It beats the plugin by specificity rather than by order: every `.prose`
+     figcaption rule is `:where()`-wrapped and so weighs (0,1,0), while this
+     weighs (0,1,1). Verified in the BUILT stylesheet, not assumed. */
+  .ah-caption-voice figure,
+  .ah-editor-figure {
+    margin: 1.5rem 0;
+  }
+  .ah-caption-voice figure > img,
+  .ah-caption-voice figure > a > img,
+  .ah-editor-figure > img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    margin: 0;
+  }
+  .ah-caption-voice figcaption,
+  .ah-editor-figure > figcaption {
+    font-family: 'Jost', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    font-size: 0.8125rem;
+    line-height: 1.375;
+    color: var(--ah-grey-600);
+    margin-top: 0.5rem;
+    font-style: normal;
+    text-align: left;
+  }
+  .ah-caption-voice figcaption a {
+    color: var(--ah-grey-600);
+  }
+
+  /* The editor's half. The caption field is only THERE when it has something
+     to say or the writer has selected the picture — an empty box under every
+     image is chrome in the way of the writing, and this pane's whole rule is
+     that the chrome recedes. */
+  .ah-editor-figure > figcaption {
+    min-height: 1.2em;
+  }
+  /* A bare `outline: none` was the whole of it, which suppresses the UA ring
+     for the mouse AND for the keyboard — in a field that is INVISIBLE until it
+     is focused, so somebody tabbing into it had nothing whatever to say they
+     had arrived. The house construction is both halves (web-foundations ›
+     Focus state): kill the bare :focus ring, which retrips on every click into
+     the caption, and keep a genuine keyboard one. 2px, the a11y exemption to
+     the ban on thin rules. */
+  .ah-editor-figure > figcaption:focus {
+    outline: none;
+  }
+  .ah-editor-figure > figcaption:focus-visible {
+    outline: 2px solid var(--ah-crimson);
+    outline-offset: 2px;
+  }
+  .ah-editor-figure[data-has-caption='false'] > figcaption {
+    display: none;
+  }
+  .ah-editor-figure.ProseMirror-selectednode > figcaption,
+  .ah-editor-figure > figcaption:focus {
+    display: block;
+  }
+  .ah-editor-figure > figcaption:empty::before {
+    content: attr(data-placeholder);
+    color: var(--ah-grey-400);
   }
 
   /* ----- Mobile prose scaling ----- */
@@ -1026,6 +1115,84 @@ html.dark {
     }
   }
 
+  /* 1a-ter. A LEGAL DOCUMENT'S BODY, which arrives as rendered HTML.
+         The Reader Terms and the Writer Agreement are written as markdown and
+         converted at generation time (web/scripts/gen-legal-texts.ts), so the
+         register cannot reach them through PublicTitle / PublicBody the way
+         About does — there is one HTML blob, not a list of paragraphs. This is
+         those two components' typography, expressed as element rules over that
+         blob, and nothing else uses it.
+
+         IT IS THE REGISTER'S VOICE, NOT `.prose`. Tailwind's typography plugin
+         is the ARTICLE voice (serif, dropcaps, the reading measure); the public
+         register's prose voice is the mono, at PublicBody's exact size, leading
+         and tracking. Terms set in the article voice would read as a piece of
+         writing on the platform rather than as the house's own document, which
+         is the one thing they must not be mistaken for.
+
+         THE COLOURS COME IN AS CUSTOM PROPERTIES, for the reason §1c gives for
+         the walls: the palette resolves in JS and these pages are SSR'd, so the
+         geometry and the type live here and only the two palette-derived inks
+         cross the boundary. A clause's emphasis is the TITLE ink rather than a
+         weight change — the mono has one weight that reads as body text, and
+         faking a bolder one is the fourth voice the house does not have. */
+  .ah-legal-body {
+    font-size: 1.0625rem;
+    line-height: 1.65;
+    letter-spacing: 0.01em;
+    color: var(--ah-legal-muted);
+  }
+  .ah-legal-body > * {
+    margin: 0;
+  }
+  .ah-legal-body > * + * {
+    margin-top: 12px;
+  }
+  /* PublicTitle's `as="h2"` exactly: the serif, medium, 20/1.2, tight tracking.
+     Serif for anything that makes a claim, mono for prose — a clause HEADING
+     is a claim, and About's section headings are set this way one page over.
+     Written out rather than reached through PublicTitle because the body is an
+     HTML blob, which is the whole reason this block exists. */
+  .ah-legal-body h2 {
+    font-family: 'Literata', Georgia, 'Times New Roman', serif;
+    font-weight: 500;
+    font-size: 20px;
+    line-height: 1.2;
+    letter-spacing: -0.025em;
+    color: var(--ah-legal-ink);
+    margin-top: 32px;
+  }
+  .ah-legal-body h2:first-child {
+    margin-top: 0;
+  }
+  .ah-legal-body strong {
+    font-weight: inherit;
+    color: var(--ah-legal-ink);
+  }
+  /* The texts separate the preamble from clause 1, and the signature block
+     from the body, with a rule. `---` in the markdown would render as the raw
+     element, which is a 1px line by browser default and a weight the house does
+     not have, so the generator emits this instead. It is the wall's colour and
+     not `.slab-rule-4`'s ink: these pages sit inside an islanded vessel, where
+     an un-islanded ink token inverts twice and vanishes. */
+  .ah-legal-rule {
+    height: 4px;
+    background: var(--ah-public-wall);
+    margin-top: 24px;
+  }
+  .ah-legal-body a {
+    color: var(--ah-legal-ink);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .ah-legal-body ul,
+  .ah-legal-body ol {
+    padding-left: 20px;
+  }
+  .ah-legal-body li + li {
+    margin-top: 6px;
+  }
+
   /* 1b. Clear the bar from an ordinary scrolling page. The utility form of the
          same reservation, for surfaces that aren't part of the public register
          but still sit under the fixed bar — the standalone /write editor, and
@@ -1034,6 +1201,112 @@ html.dark {
          five Glasshouse overlay panels, where there is no bar to clear. */
   .ah-clear-bar-band {
     padding-top: var(--ah-bar-band, 0px);
+  }
+
+  /* 1b-bis. THE BAR'S CTA HAS A SHORT SPELLING ON A VERY SMALL PHONE.
+
+            The bar carries four things in a row that cannot wrap — disc,
+            wordmark, "Log in", the accent CTA — and by ~344px they need more
+            room than the viewport has, so the button is clipped at the right
+            edge. At 360 it fits, but the wordmark and "Log in" close to 27px
+            apart and the pair reads as crowded rather than docked. Everything
+            that can yield has: the end insets and the action gap are clamp()ed
+            and have bottomed out by ~360, and the occupants themselves are
+            fixed (disc 40, wordmark and its gap 91, "Log in" 35, CTA 135). So
+            below the break something has to GO rather than shrink, and the
+            label is the cheapest thing to lose — ~77px, the largest saving
+            available short of dropping an occupant, and the only one that
+            costs neither the mark nor a way in.
+
+            HERE AND NOT IN A `useIsMobile` BRANCH, for §1c's reason: this bar
+            is mounted on every SSR'd public route, so a JS form-factor switch
+            would paint the long label first and snap after hydration.
+
+            `display: none`, NEVER A VISUALLY-HIDDEN CLASS. Both spellings are
+            in the DOM at once, so anything that merely moves the inactive one
+            off screen leaves it in the accessibility tree and the button's
+            accessible name becomes "Join the waiting listSign up" at every
+            width. `display: none` takes it out of both. This is one control
+            with two spellings, not a control with a caption.
+
+            359 AND NOT 767. The mobile breakpoint everywhere else in this file
+            answers "is this a phone"; this one answers "has the bar run out of
+            room", which is a different question with a different threshold —
+            360 and 375 are phones and are fine. Measured on the live page, not
+            picked. */
+  .ah-cta-short {
+    display: none;
+  }
+  @media (max-width: 359px) {
+    .ah-cta-long {
+      display: none;
+    }
+    .ah-cta-short {
+      display: inline;
+    }
+  }
+
+  /* 1b'. The stretched measure — the width a column of prose takes inside a
+          resizable Glasshouse. `--ah-measure` is published by the pane
+          (Glasshouse.tsx) from the curve in lib/workspace/measure.ts: the rest
+          measure until the member stretches the pane, then a decreasing share
+          of each further pixel, easing toward `maxWidth.feed` and never past it.
+
+          The FALLBACK is what every surface outside a pane gets — the
+          standalone /write editor, /article/[dTag], the public register — so
+          those are pixel-unchanged and stay at the canonical column. Same shape
+          as `--ah-bar-band` above: a component publishes it where it applies,
+          and the utility names the resting value for everywhere else.
+
+          `theme()` rather than a literal 640px, because this IS
+          `maxWidth.article` and the two must not drift. */
+  .ah-measure {
+    max-width: var(--ah-measure, theme('maxWidth.article'));
+  }
+
+  /* 1b''. The draft watermark — `/preview/:draftId`'s standing statement that
+           what you are reading is not published. FIXED, so it does not scroll
+           away: the fact is true of the whole piece, not of its first screen,
+           and a strap the writer scrolls past is a fact they stop being told.
+           It replaced a crimson strap, which cost a band of the reading
+           surface and made a preview look unlike the article it previews.
+
+           The colour is a WASH of the canonical accent, never a new pink:
+           `crimson` is an identity and never inverts, but the reading ground
+           (`white`) does, so the same alpha that reads as a faint tint on
+           paper all but vanishes on ink. The alpha is therefore the variable
+           and the hue is not — the dark block below re-declares it.
+
+           `pointer-events: none` throughout: this sits OVER the prose (there
+           is no layer under an opaque ground to hide in), so it must not take
+           a click, a selection or a caret from the text it is printed on. */
+  .ah-draft-watermark {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    user-select: none;
+  }
+  /* `overflow: visible` is load-bearing, not tidiness: the viewBox is the word's
+     INK rectangle, so the glyph advances overhang it at both ends and clipping
+     at the default would shave the antialiasing off the D's stem and the T's
+     arm — the two strokes the layout exists to put on the window edges. */
+  .ah-draft-watermark svg {
+    width: 100%;
+    height: auto;
+    display: block;
+    overflow: visible;
+  }
+  .ah-draft-watermark text {
+    font-family: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-weight: 400;
+    fill: rgb(var(--ah-crimson-rgb) / var(--ah-draft-watermark-alpha, 0.11));
+  }
+  html.dark .ah-draft-watermark text {
+    --ah-draft-watermark-alpha: 0.14;
   }
 
   /* 1c. The landing vessel — `/`'s own chassis, and the ONE public surface that
@@ -1521,10 +1794,15 @@ html.dark {
   .ah-pane-bar-close:hover {
     opacity: 1;
   }
-  /* On the full-screen sheet the ✕ is one of the two closes a thumb has (the
-     other is the ∀ disc), and a 15×18 glyph is a mouse target, not a thumb one.
-     The padding takes the tap area to ~43×46; the equal negative margin gives
-     the layout back, so the glyph does not move. Same trade as .ah-profile-close. */
+  /* A 15×18 glyph is a mouse target, not a thumb one. The padding takes the
+     tap area to ~43×46; the equal negative margin gives the layout back, so the
+     glyph does not move. Same trade as .ah-profile-close.
+
+     This rule now fires only OFF the workspace. On the mobile workspace the ∀
+     disc is the sheet's one X and the bar draws none at all
+     (stores/glasshouse.ts::useDiscCloseActive) — but these panes also open on
+     routes with no disc (/article/:dTag, /:username, /read/:postId, the public
+     register), and there the ✕ is still the only close a thumb has. */
   @media (max-width: 767px) {
     .ah-pane-bar-close {
       padding: 14px;
@@ -1597,11 +1875,15 @@ html.dark {
     .ah-profile-bar--drag:active {
       cursor: auto;
     }
-    /* The ✕ glyph is a 15×18 box, which is a mouse target, not a thumb one —
-       and on the full-screen sheet this is the only close a thumb has (Back
-       and the edge-swipe are the OS's, not ours). The padding takes the tap
-       area to ~43×46 and the equal negative margin gives the layout back, so
-       the glyph does not move and the row's measured geometry is unchanged. */
+    /* The ✕ glyph is a 15×18 box, which is a mouse target, not a thumb one.
+       The padding takes the tap area to ~43×46 and the equal negative margin
+       gives the layout back, so the glyph does not move and the row's measured
+       geometry is unchanged.
+
+       On the mobile WORKSPACE this ✕ is not rendered — the ∀ disc is the
+       sheet's one X. Off the workspace (an /article/:dTag or public-register
+       profile pane) there is no disc, the ✕ is the only close a thumb has
+       besides the OS's Back, and this rule is what makes it reachable. */
     .ah-profile-close {
       padding: 14px;
       margin: -14px;
@@ -1788,6 +2070,77 @@ html.dark {
     }
   }
 
+  /* 1g. THE FOCUS FADE — the editor's tools recede while you are writing.
+         Slice 5 of ARTICLE-EDITOR-PLAN, held back from slices 2+3 deliberately
+         so the room those bought could be measured with no fade in the frame.
+
+         THE SIGNAL IS THE BODY HAVING FOCUS, not the pane having it. TipTap's
+         contenteditable carries `.ProseMirror-focused` (prosemirror-view puts it
+         there on focus and takes it off on blur), and the toolbar is an earlier
+         SIBLING of the body inside the document column — so the column's
+         `:has()` is what lets a later element's state reach an earlier one.
+         `:focus-within` on the chrome itself, which the plan named, is the wrong
+         signal twice over: it is TRUE when a toolbar button is focused, so the
+         block would dim exactly while being used, and FALSE while you type,
+         which is the whole case. A browser that cannot parse `:has()` drops the
+         rule and simply never fades — the right way for this to fail.
+
+         IT FADES THE CONTENTS, NEVER THE STICKY BOX. An opacity below 1 on the
+         sticky wrapper would take its BACKGROUND with it, and that background is
+         load-bearing: prose scrolls BEHIND a sticky element, so a translucent
+         toolbar is one with the writer's own paragraphs ghosting through it (the
+         same reason the wrapper's clearance is `pb-5` padding and not a margin).
+         The class therefore sits on the toolbar row and on the cover panel, and
+         the wrapper it is inside stays opaque.
+
+         0.5 IS DERIVED, NOT PICKED. Composited over its own ground it lands the
+         toolbar's `grey-600` on `grey-300` — the register's existing "present
+         but recessed" weight, which `Save draft` two rows down already wears —
+         and it does so in BOTH modes, because the ramp is near-symmetric about
+         it. Read back off the painted pixels: light ink 177 against grey-300's
+         185 on a 255 ground; dark ink 101 against its 108 on a 35 ground.
+
+         POINTER-GATED, BECAUSE THE THING THAT UNDIMS IT IS A POINTER. On touch
+         there is no hover, the soft keyboard is up, and the toolbar is both the
+         only way to format and permanently in the focused state a fade keys on —
+         so dimming it there is a contrast cost with no gesture to pay it back.
+         `prefers-contrast: more` opts out for the same reason. Both do it by
+         moving ONE custom property rather than by fighting specificity with a
+         second selector, so nothing here depends on source order.
+
+         REDUCED MOTION DROPS THE TRANSITION, NOT THE FADE: the recession is a
+         state, and only the crossing of it is motion. */
+  .ah-editor-chrome {
+    --ah-chrome-rest: 1;
+    transition: opacity 220ms ease-out;
+  }
+
+  @media (hover: hover) and (pointer: fine) {
+    .ah-editor-chrome {
+      --ah-chrome-rest: 0.5;
+    }
+  }
+
+  @media (prefers-contrast: more) {
+    .ah-editor-chrome {
+      --ah-chrome-rest: 1;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .ah-editor-chrome {
+      transition: none;
+    }
+  }
+
+  /* Hover and focus-within are the two ways back — reaching for the toolbar,
+     and shift-tabbing into it from the body (the tab order runs title →
+     standfirst → toolbar → body, so backwards is how a keyboard gets there). */
+  .ah-editor-column:has(.ProseMirror-focused)
+    .ah-editor-chrome:not(:hover):not(:focus-within) {
+    opacity: var(--ah-chrome-rest);
+  }
+
 }
 
 /* ── Print ───────────────────────────────────────────────────────────────────── */
@@ -1902,4 +2255,33 @@ html.dark {
 .ah-scrollbar,
 pre {
   scrollbar-width: auto;
+}
+
+/* The roundel name label, driven by the browser's own hover
+   (`RoundelLabel.tsx` says why never by React state). The host lifts one step
+   so its label clears the neighbours to its right. */
+.ah-roundel-label {
+  opacity: 0;
+}
+.ah-roundel-host:hover {
+  z-index: 1;
+}
+.ah-roundel-host:hover > .ah-roundel-label {
+  opacity: 1;
+}
+
+/* A picture in an article BODY that opens the lightbox (`useBodyImageLightbox`
+   marks it after each render of the sanitised HTML). Outside any @layer on
+   purpose: the marker is an attribute set at runtime, and a layered rule is
+   only as safe as Tailwind's reading of the source. The ring is the site's
+   keyboard ring (`.focus-ring`), with the UA's mouse-focus ring suppressed. */
+img[data-enlargeable] {
+  cursor: zoom-in;
+}
+img[data-enlargeable]:focus {
+  outline: none;
+}
+img[data-enlargeable]:focus-visible {
+  outline: 2px solid var(--ah-crimson);
+  outline-offset: 2px;
 }

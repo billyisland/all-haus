@@ -7,6 +7,7 @@ import {
   type WorkspaceFeedSource,
 } from "../../lib/api";
 import type { AuthorCardData } from "../../hooks/useAuthorCard";
+import { throughputToStep, stepPercent } from "../../lib/volume-scale";
 
 // =============================================================================
 // SourceVolume — per-feed volume/sampling control hosted in the byline hover
@@ -23,26 +24,12 @@ import type { AuthorCardData } from "../../hooks/useAuthorCard";
 //     by-feed-source-id path the FeedComposer uses). Absent row ⇒ not followed
 //     here ⇒ no control.
 //
-// The 5-step weight + RANDOM/TOP sampling mirror the FeedComposer SourceRow and
-// the gateway stepToWeight scale. Weight is recorded but the items query is
-// still chronological (mute is honoured); the hint copy stays honest about that.
+// The 5-step throughput + RANDOM/TOP sampling mirror the FeedComposer SourceRow
+// and the gateway stepToThroughput scale. The bar is a real control now: the
+// step is the FRACTION of this source's posts that reach this feed, and the
+// chip decides which fraction (migration 202). It used to write a ranking
+// multiplier that a chronological feed spent on the sort key.
 // =============================================================================
-
-// Mirror of FeedComposer's VOLUME_WEIGHTS / gateway stepToWeight. 0 = mute,
-// 1..5 quieter→louder, step 3 = the default weight (1.0).
-const VOLUME_WEIGHTS = [1.0, 0.25, 0.5, 1.0, 2.0, 4.0];
-function weightToStep(weight: number): number {
-  let best = 3;
-  let bestDelta = Infinity;
-  for (let s = 1; s <= 5; s++) {
-    const d = Math.abs(VOLUME_WEIGHTS[s] - weight);
-    if (d < bestDelta) {
-      bestDelta = d;
-      best = s;
-    }
-  }
-  return best;
-}
 
 export function SourceVolume({
   data,
@@ -139,7 +126,7 @@ function NativeVolume({ feedId, pubkey }: { feedId: string; pubkey: string }) {
     setBusy(true);
     try {
       await workspaceFeedsApi.clearAuthorVolume(feedId, pubkey);
-      setState({ ...state!, step: null, muted: false, sampling: "random" });
+      setState({ ...state!, step: null, muted: false, sampling: "top" });
     } finally {
       setBusy(false);
     }
@@ -149,6 +136,7 @@ function NativeVolume({ feedId, pubkey }: { feedId: string; pubkey: string }) {
     <VolumeStepper
       step={state.step}
       sampling={state.sampling}
+      hasEngagementSignal
       busy={busy}
       onStep={commitStep}
       onSampling={commitSampling}
@@ -204,7 +192,7 @@ function ExternalVolume({
   if (loading || !row) return null;
 
   const isMuted = row.mutedAt !== null;
-  const step = isMuted ? 0 : weightToStep(row.weight);
+  const step = isMuted ? 0 : throughputToStep(row.throughput);
 
   async function commitStep(next: number) {
     if (busy || !row) return;
@@ -237,6 +225,7 @@ function ExternalVolume({
     <VolumeStepper
       step={step}
       sampling={row.samplingMode}
+      hasEngagementSignal={row.hasEngagementSignal}
       busy={busy}
       onStep={commitStep}
       onSampling={commitSampling}
@@ -254,6 +243,7 @@ function ExternalVolume({
 function VolumeStepper({
   step,
   sampling,
+  hasEngagementSignal,
   busy,
   onStep,
   onSampling,
@@ -261,17 +251,23 @@ function VolumeStepper({
 }: {
   step: number | null;
   sampling: "random" | "top";
+  hasEngagementSignal: boolean;
   busy: boolean;
   onStep: (s: number) => void;
   onSampling: (m: "random" | "top") => void;
   onClear?: () => void;
 }) {
   const isMuted = step === 0;
-  // Sampling is moot with no committed level (passive) or while muted.
-  const samplingMoot = step === null || isMuted;
+  // Sampling is moot with no committed level (passive) or while muted, and at
+  // full volume there is nothing to select between.
+  const samplingMoot = step === null || isMuted || step === 5;
+  // At 100% the number would say nothing the full bar has not already said.
+  const pct = step !== null && !isMuted && step < 5 ? stepPercent(step) : null;
   return (
     <div className="mt-3">
-      <p className="label-ui text-grey-400 mb-1.5">VOLUME</p>
+      <p className="label-ui text-grey-400 mb-1.5">
+        VOLUME{pct ? ` · ${pct}` : ""}
+      </p>
       <div className="flex items-center gap-2 flex-wrap">
         <div className="flex items-center" style={{ gap: 3 }}>
           {[0, 1, 2, 3, 4, 5].map((s) => {
@@ -283,7 +279,7 @@ function VolumeStepper({
                 type="button"
                 onClick={() => onStep(s)}
                 disabled={busy}
-                aria-label={s === 0 ? "Mute" : `Volume ${s}`}
+                aria-label={s === 0 ? "Mute" : `Volume ${stepPercent(s)}`}
                 style={{
                   width: s === 0 ? 20 : 16,
                   height: 16,
@@ -306,7 +302,8 @@ function VolumeStepper({
           })}
         </div>
 
-        {/* RANDOM / TOP — fill-only chips, dimmed while muted. */}
+        {/* RANDOM / TOP — fill-only chips, dimmed where there is nothing to
+            select between (full volume, muted, or no committed level). */}
         <div
           className="flex items-center"
           style={{ gap: 3, opacity: samplingMoot ? 0.4 : 1 }}
@@ -356,10 +353,16 @@ function VolumeStepper({
         style={{ fontSize: 12, lineHeight: 1.4 }}
       >
         {step === null
-          ? "No commitment yet — set how much of this source you want here."
+          ? "You haven’t set a volume for this source in this channel yet. You can do that here."
           : isMuted
-            ? "Muted in this feed."
-            : "Weight applied to this feed’s ranking."}
+            ? "Muted in this channel."
+            : step === 5
+              ? "Everything from this source, in time order."
+              : sampling === "top" && !hasEngagementSignal
+                ? `This source doesn’t tell us how popular its posts are, so “top” shows its most recent ${pct} each week.`
+                : sampling === "top"
+                  ? `The ${pct} of this source’s posts each week that drew the most response.`
+                  : `A random ${pct} of this source’s posts. It’s the same ${pct} each time you look.`}
       </p>
     </div>
   );

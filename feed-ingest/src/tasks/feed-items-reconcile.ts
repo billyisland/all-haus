@@ -6,7 +6,7 @@ import logger from "@platform-pub/shared/lib/logger.js";
 // feed_items_reconcile — daily integrity check
 //
 // Detects and repairs drift between source tables and feed_items:
-//   1. Published articles/notes with no feed_items row → INSERT
+//   1. Published articles/notes/comments with no feed_items row → INSERT
 //   2. External items with no feed_items row → INSERT
 //   3. feed_items pointing to deleted/missing sources → clean up
 //
@@ -127,6 +127,36 @@ export const feedItemsReconcile: Task = async (_payload, _helpers) => {
   `);
   const notesInserted = notesResult.rowCount ?? 0;
 
+  // 2b. Comments (native replies) missing from feed_items. A comment has had a
+  // card since migration 232 — `is_reply` TRUE by construction, which is what
+  // makes the reader's per-source "no replies" chip govern it — and this is the
+  // net under `POST /replies`' dual-write. Soft-deleted comments are carried
+  // over WITH their deleted_at rather than skipped, or this pass re-inserts a
+  // live card for a deleted reply every night.
+  const commentsResult = await pool.query(`
+    INSERT INTO feed_items (
+      item_type, comment_id, author_id,
+      author_name, author_avatar, author_username,
+      content_preview, nostr_event_id,
+      published_at, is_reply, deleted_at
+    )
+    SELECT
+      'comment', c.id, c.author_id,
+      COALESCE(acc.display_name, acc.username, 'Unknown'),
+      acc.avatar_blossom_url,
+      acc.username,
+      LEFT(c.content, 200),
+      c.nostr_event_id,
+      c.published_at,
+      TRUE,
+      c.deleted_at
+    FROM comments c
+    JOIN accounts acc ON acc.id = c.author_id
+    WHERE NOT EXISTS (SELECT 1 FROM feed_items fi WHERE fi.comment_id = c.id)
+    ON CONFLICT DO NOTHING
+  `);
+  const commentsInserted = commentsResult.rowCount ?? 0;
+
   // 3. External items missing from feed_items (see RECONCILE_EXTERNAL_INSERT_SQL)
   const externalResult = await pool.query(RECONCILE_EXTERNAL_INSERT_SQL);
   const externalsInserted = externalResult.rowCount ?? 0;
@@ -150,6 +180,19 @@ export const feedItemsReconcile: Task = async (_payload, _helpers) => {
       AND fi.deleted_at IS NULL
   `);
   const staleExternalsFixed = staleExternalResult.rowCount ?? 0;
+
+  // 5b. feed_items for comments that were soft-deleted. `comments` is the only
+  // native content table with its own soft-delete column, so this is the note
+  // case's opposite: a note's card leaves by FK cascade on a hard DELETE, a
+  // comment's has to be stamped.
+  const staleCommentsResult = await pool.query(`
+    UPDATE feed_items fi SET deleted_at = c.deleted_at
+    FROM comments c
+    WHERE fi.comment_id = c.id
+      AND c.deleted_at IS NOT NULL
+      AND fi.deleted_at IS NULL
+  `);
+  const staleCommentsFixed = staleCommentsResult.rowCount ?? 0;
 
   // 6–8. Repair denormalised field drift on rows that already exist. The
   // ON CONFLICT DO NOTHING inserts above close the "missing row" gap, but
@@ -182,6 +225,16 @@ export const feedItemsReconcile: Task = async (_payload, _helpers) => {
   `);
   const noteDriftFixed = noteDriftResult.rowCount ?? 0;
 
+  const commentDriftResult = await pool.query(`
+    UPDATE feed_items fi SET
+      content_preview = LEFT(c.content, 200)
+    FROM comments c
+    WHERE fi.comment_id = c.id
+      AND fi.deleted_at IS NULL
+      AND fi.content_preview IS DISTINCT FROM LEFT(c.content, 200)
+  `);
+  const commentDriftFixed = commentDriftResult.rowCount ?? 0;
+
   // (see RECONCILE_EXTERNAL_DRIFT_SQL)
   const externalDriftResult = await pool.query(RECONCILE_EXTERNAL_DRIFT_SQL);
   const externalDriftFixed = externalDriftResult.rowCount ?? 0;
@@ -189,11 +242,14 @@ export const feedItemsReconcile: Task = async (_payload, _helpers) => {
   const anyDrift =
     articlesInserted +
     notesInserted +
+    commentsInserted +
     externalsInserted +
     staleArticlesFixed +
     staleExternalsFixed +
+    staleCommentsFixed +
     articleDriftFixed +
     noteDriftFixed +
+    commentDriftFixed +
     externalDriftFixed;
 
   // Any non-zero case means a dual-write path leaked. Log at WARN so the
@@ -204,11 +260,14 @@ export const feedItemsReconcile: Task = async (_payload, _helpers) => {
       {
         articlesInserted,
         notesInserted,
+        commentsInserted,
         externalsInserted,
         staleArticlesFixed,
         staleExternalsFixed,
+        staleCommentsFixed,
         articleDriftFixed,
         noteDriftFixed,
+        commentDriftFixed,
         externalDriftFixed,
         totalDrift: anyDrift,
       },

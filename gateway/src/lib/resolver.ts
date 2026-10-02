@@ -27,6 +27,7 @@ import {
   type ResolveContext,
   type ResolverMatch,
 } from "./resolver-merge.js";
+import { isUuid } from "./request-inputs.js";
 
 // Match/context types live in resolver-merge.ts (§8.5 decomposition);
 // re-exported for existing callers (routes/resolve.ts).
@@ -82,8 +83,11 @@ export async function getAsyncResult(
   requestId: string,
   initiatorId: string,
 ): Promise<ResolverResult | null> {
-  // UUID type mismatches throw on older Postgres versions — guard explicitly.
-  if (!/^[0-9a-f-]{36}$/i.test(requestId)) return null;
+  // A malformed id reaches `$1` as a uuid cast and raises, so it is refused
+  // here rather than becoming a 500. The old guard was `[0-9a-f-]{36}`, which
+  // accepts 36 hyphens: the right length, the right character class, and still
+  // `invalid input syntax for type uuid`.
+  if (!isUuid(requestId)) return null;
   const { rows } = await pool.query<{ result: ResolverResult }>(
     `SELECT result FROM resolver_async_results
       WHERE request_id = $1 AND initiator_id = $2 AND expires_at > now()`,
@@ -1114,8 +1118,22 @@ async function resolveNip05(identifier: string): Promise<ResolverMatch[]> {
       const account = await lookupByPubkey(pubkey);
       if (account) matches.push(account);
 
-      // Also offer as external Nostr source
+      // Also offer as external Nostr source. The relay list is a HINT and is
+      // filtered and capped here the way the nprofile arm above is: it comes
+      // off a third party's .well-known/nostr.json, which may list any number
+      // of entries in any shape, and `POST /feeds/:id/sources` caps hints at 5
+      // ws:// or wss:// URLs (MIRROR-AUDIT §2.11) — an unfiltered list would
+      // hand the member a resolver match that then 400s when they add it.
       const relays = data?.relays?.[pubkey];
+      const relayUrls = Array.isArray(relays)
+        ? relays
+            .filter(
+              (r: unknown): r is string =>
+                typeof r === "string" &&
+                (r.startsWith("ws://") || r.startsWith("wss://")),
+            )
+            .slice(0, 5)
+        : undefined;
       matches.push({
         type: "external_source",
         confidence: "exact",
@@ -1123,7 +1141,7 @@ async function resolveNip05(identifier: string): Promise<ResolverMatch[]> {
           protocol: "nostr_external",
           sourceUri: pubkey,
           displayName: `${name}@${domain}`,
-          relayUrls: Array.isArray(relays) ? relays : undefined,
+          relayUrls: relayUrls && relayUrls.length > 0 ? relayUrls : undefined,
         },
       });
     }
@@ -1274,6 +1292,27 @@ async function lookupByPubkey(
   };
 }
 
+/**
+ * Confirm that an email address belongs to a member, and name them — but only
+ * where that member has said it may (MIRROR-AUDIT §3 *Security*, S16).
+ *
+ * Unqualified this was an email→account oracle: 30 tries a minute for any
+ * member, which against a breach list binds real-world identities to the
+ * pseudonyms this platform exists to let writers keep. It also contradicted a
+ * rule the codebase had already written down one route over — `POST /auth/login`
+ * answers identically whether or not the address has an account, saying so in a
+ * comment.
+ *
+ * `discoverable_by_email` (migration 196) is the member's own answer, default
+ * FALSE. Nothing else narrows: every other identifier the resolver accepts —
+ * name, username, npub, handle, NIP-05 — is PUBLISHED, and searching by those is
+ * untouched. This is only about the address somebody handed us to log in with.
+ *
+ * The predicate is in the WHERE clause rather than a check on the returned row,
+ * so an opted-out account is indistinguishable here from an address with no
+ * account at all: the two must produce the same silence, or the column buys
+ * nothing.
+ */
 async function lookupByEmail(email: string): Promise<ResolverMatch | null> {
   const { rows } = await pool.query<{
     id: string;
@@ -1282,7 +1321,8 @@ async function lookupByEmail(email: string): Promise<ResolverMatch | null> {
     avatar_blossom_url: string | null;
   }>(
     `SELECT id, username, display_name, avatar_blossom_url FROM accounts
-     WHERE email = $1 AND status = 'active'`,
+     WHERE email = $1 AND status = 'active'
+       AND discoverable_by_email = TRUE`,
     [email],
   );
   if (rows.length === 0) return null;

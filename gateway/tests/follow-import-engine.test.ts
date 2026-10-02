@@ -281,9 +281,13 @@ describe("runFollowImportSweep", () => {
     expect(addSource).toHaveBeenCalledTimes(60);
     const volume = calls.find((c) => c.sql.includes("UPDATE feed_sources"));
     expect(volume).toBeDefined();
-    // Only rows still at the 4.0 show-everything default are rewritten.
-    expect(volume!.sql).toContain("weight = 4.0");
-    expect(volume!.params).toEqual([FEED_ID, 1.0]);
+    // Only rows still at the show-everything default are rewritten, and the
+    // literal is that default (1.0 since migration 202, 4.0 before it). A
+    // structural pin, not a behavioural one: under a mocked pool nothing here
+    // can observe how many rows the UPDATE actually matched, which is why the
+    // route logs its rowCount. See follow-import.ts at the sentinel.
+    expect(volume!.sql).toContain("throughput = 1.0");
+    expect(volume!.params).toEqual([FEED_ID, 0.6]);
     // Batched at 25: counter updates at cursor 25, 50, 60.
     const cursors = calls
       .filter((c) => c.sql.includes("SET imported ="))

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, Suspense, useRef } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
 import { auth } from '../../../lib/api'
 import { useAuth } from '../../../stores/auth'
@@ -15,9 +15,16 @@ import {
   PublicButton,
   IndeterminateSlab,
 } from '../../../components/public/Field'
+import {
+  VERIFY_FAILED_TITLE,
+  VERIFY_EXPIRED,
+  VERIFY_NO_TOKEN,
+  VERIFY_REQUEST_NEW,
+} from '../../../content/auth'
 
 // =============================================================================
 // Magic Link Verification — /auth/verify?token=<token>
+//                  and email change — /auth/verify?emailChange=<token>
 //
 // On mount: extract the token, POST /auth/verify, hydrate the session and
 // REPLACE straight to the piece they came for — or the workspace when there
@@ -58,23 +65,67 @@ import {
 // it has now gone too. Success here is the redirect and nothing else. See the
 // note in `verify()` for why: the sentence it printed was a promise this page
 // could only sometimes keep.
+//
+// `?emailChange=` IS THE OTHER LINK THIS PAGE RECEIVES. The change-email route
+// (gateway `POST /auth/change-email`) mails `/auth/verify?emailChange=<token>`,
+// and until 2026-09-28 this page read only `?token` — so every confirmation
+// landed on "missing its token" and no email change could ever complete. That
+// arm is not a login: it creates no session (a device already signed in to this
+// account keeps its own; every other one is signed out by the change), so it ends on the word rather than
+// a redirect (there is nowhere it was going), and a refusal points back to
+// Settings, where a new link is asked for, rather than to the login form.
 // =============================================================================
 
-export default function VerifyPage() {
+function VerifyPageBody() {
   const searchParams = useSearchParams()
   const router = useRouter()
   const { fetchMe } = useAuth()
   // No 'success' state: verification either navigates away or reports a
   // failure, so there is no third thing for this page to be.
-  const [status, setStatus] = useState<'verifying' | 'error'>('verifying')
+  // …except for an email change, which has no destination and so ends on the
+  // word ('changed').
+  const [status, setStatus] = useState<'verifying' | 'changed' | 'error'>('verifying')
   const [errorMessage, setErrorMessage] = useState('')
+  const [isEmailChange, setIsEmailChange] = useState(false)
+  // The token this page has already spent (CA-E13c). Both tokens are
+  // single-use, and an effect that runs twice for one link (StrictMode's dev
+  // double-invoke, a searchParams identity change) spends it twice: the loser
+  // 401s and flashes the expired card before the winner's navigation lands.
+  const spent = useRef<string | null>(null)
 
   useEffect(() => {
+    const emailChange = searchParams.get('emailChange')
+    const once = emailChange ?? searchParams.get('token')
+    if (once && spent.current === once) return
+    spent.current = once
+    if (emailChange) {
+      setIsEmailChange(true)
+      void (async () => {
+        try {
+          await auth.verifyEmailChange(emailChange)
+          // Refresh the session's copy of the address, if there is a session.
+          // fetchMe swallows its own 401, so a logged-out click still lands here.
+          await fetchMe()
+          setStatus('changed')
+        } catch (err: any) {
+          setStatus('error')
+          if (err.status === 400) {
+            setErrorMessage('This link has expired or has already been used. You can ask for a new one in Settings, under Email.')
+          } else if (err.status === 409) {
+            setErrorMessage('That address now belongs to another account, so the change was cancelled.')
+          } else {
+            setErrorMessage('Something went wrong. Please try again.')
+          }
+        }
+      })()
+      return
+    }
+
     const token = searchParams.get('token')
     const arrival = searchParams.get('arrival')
     if (!token) {
       setStatus('error')
-      setErrorMessage('No login token found in the URL.')
+      setErrorMessage(VERIFY_NO_TOKEN)
       return
     }
 
@@ -95,7 +146,7 @@ export default function VerifyPage() {
       } catch (err: any) {
         setStatus('error')
         if (err.status === 401) {
-          setErrorMessage('This login link has expired, or has already been used.')
+          setErrorMessage(VERIFY_EXPIRED)
         } else {
           setErrorMessage('Something went wrong. Please try again.')
         }
@@ -111,13 +162,29 @@ export default function VerifyPage() {
         {status === 'verifying' && (
           <>
             <PublicCard>
-              <PublicTitle>Logging you in</PublicTitle>
+              <PublicTitle>{isEmailChange ? 'Changing your email' : 'Logging you in'}</PublicTitle>
               <div style={{ marginTop: 10 }}>
-                <PublicBody>Checking your login link.</PublicBody>
+                <PublicBody>Checking your link.</PublicBody>
               </div>
             </PublicCard>
             <PublicCard style={{ padding: 0 }}>
-              <IndeterminateSlab label="Verifying your login link" />
+              <IndeterminateSlab />
+            </PublicCard>
+          </>
+        )}
+
+        {status === 'changed' && (
+          <>
+            <PublicCard>
+              <PublicTitle>Email changed</PublicTitle>
+              <div style={{ marginTop: 10 }}>
+                <PublicBody>Your account now uses the new address. Every other device has been logged out, and we've written to your old address to tell it.</PublicBody>
+              </div>
+            </PublicCard>
+            <PublicCard>
+              <PublicButton full href="/reader">
+                Continue
+              </PublicButton>
             </PublicCard>
           </>
         )}
@@ -125,19 +192,35 @@ export default function VerifyPage() {
         {status === 'error' && (
           <>
             <PublicCard>
-              <PublicTitle>That link didn’t work</PublicTitle>
+              <PublicTitle>{VERIFY_FAILED_TITLE}</PublicTitle>
               <div style={{ marginTop: 10 }}>
                 <PublicBody>{errorMessage}</PublicBody>
               </div>
             </PublicCard>
             <PublicCard>
-              <PublicButton full href="/auth?mode=login">
-                Request a new link
-              </PublicButton>
+              {isEmailChange ? (
+                <PublicButton full href="/settings">
+                  Go to Settings
+                </PublicButton>
+              ) : (
+                <PublicButton full href="/auth?mode=login">
+                  {VERIFY_REQUEST_NEW}
+                </PublicButton>
+              )}
             </PublicCard>
           </>
         )}
       </PublicVessel>
     </PublicShell>
+  )
+}
+
+// useSearchParams() bails this subtree out to client rendering; the boundary
+// keeps that bail-out to the page instead of the whole route (CA-F13).
+export default function VerifyPage() {
+  return (
+    <Suspense fallback={null}>
+      <VerifyPageBody />
+    </Suspense>
   )
 }

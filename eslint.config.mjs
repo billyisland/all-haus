@@ -83,7 +83,9 @@ const nextStub = externalRuleStubs(['no-img-element']);
 
 export default tseslint.config(
   {
-    ignores: ['**/dist/**', '**/node_modules/**', 'web/.next/**', 'migrations/**'],
+    // scripts/drive/ is the local, gitignored playwright rig folder: never
+    // committed, so never linted.
+    ignores: ['**/dist/**', '**/node_modules/**', 'web/.next/**', 'migrations/**', 'scripts/drive/**'],
   },
   {
     // Backend services + shared.

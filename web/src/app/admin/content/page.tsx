@@ -14,7 +14,7 @@ export default function AdminContentPage() {
     adminDashboard
       .content()
       .then(setData)
-      .catch(() => setError('Failed to load content metrics.'))
+      .catch(() => setError('Couldn’t load content metrics. Please reload the page to try again.'))
   }, [])
 
   const stale =

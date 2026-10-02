@@ -102,7 +102,7 @@ export default function TraffologyFeedPage() {
               disabled={loadingMore}
               className="mt-6 btn-text-muted"
             >
-              {loadingMore ? 'Loading...' : 'Load more'}
+              {loadingMore ? 'Loading…' : 'Load more'}
             </button>
           )}
         </>

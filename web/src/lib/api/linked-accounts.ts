@@ -14,6 +14,10 @@ export interface LinkedAccount {
   showOnProfile?: boolean
   tokenExpiresAt: string | null
   createdAt: string
+  // A Mastodon token granted fewer scopes than all.haus now asks for (replies
+  // to other instances, likes): valid, but it must be reconnected to do
+  // everything. Absent on a stale gateway.
+  needsReconnect?: boolean
 }
 
 export interface NetworkCapabilities {
@@ -36,7 +40,7 @@ export interface NetworkCapabilities {
 // §10): the user is creating a *real* network account mid-redirect, so this must
 // be an explicit acknowledgement, never ambient copy.
 export const ASSISTED_BLUESKY_CONSENT =
-  'You’re about to create a real Bluesky account on bsky.social. Bluesky holds the keys; all.haus just connects it. You can disconnect anytime.'
+  'You’re about to create a real Bluesky account on bsky.social. Bluesky holds the keys; all.haus just connects it. You can disconnect at any time.'
 
 // Mastodon's round-trip has two extra steps Bluesky doesn't (email confirmation
 // + a first login on the instance), and it only resumes in the same browser —
@@ -45,7 +49,7 @@ export const ASSISTED_BLUESKY_CONSENT =
 // small footer link users genuinely fail to find (first live run, 2026-06-11)
 // — so name the link and the direct /auth/sign_up path explicitly.
 export const assistedMastodonConsent = (instance: string) =>
-  `You’re about to create a real Mastodon account on ${instance}. ${instance} holds the keys; all.haus just connects it. You’ll land on ${instance}’s login page — use its “Sign up” link (or go to ${instance}/auth/sign_up) to create the account, confirm your email, then log in. Finish in this browser and you’ll land back here. You can disconnect anytime.`
+  `You’re about to create a real Mastodon account on ${instance}. ${instance} holds the keys; all.haus just connects it. You’ll land on ${instance}’s login page — use its “Sign up” link (or go to ${instance}/auth/sign_up) to create the account, confirm your email, then log in. Finish in this browser and you’ll land back here. You can disconnect at any time.`
 
 export const linkedAccounts = {
   list: () =>

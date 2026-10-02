@@ -9,6 +9,8 @@ import {
   fetchAPProfile,
   buildExternalProfileUrl,
 } from "../lib/author-resolve.js";
+import { isUuid } from "../lib/request-inputs.js";
+import { npubBlockedSql } from "@platform-pub/shared/lib/platform-blocks.js";
 
 const CACHE_TTL_MS = 5 * 60_000;
 const authorCardCache = new Map<
@@ -39,6 +41,15 @@ export async function authorCardRoutes(app: FastifyInstance) {
         return reply
           .status(400)
           .send({ error: 'type must be "native" or "external"' });
+      }
+
+      // Both arms read `id` as a uuid (`accounts.id` / `external_items.id`),
+      // so a malformed one raises the cast rather than missing — and it would
+      // be cached under its own key on the way past. 404 rather than 400: a
+      // well-formed id naming nobody answers the same way, and the split would
+      // make the route an oracle for which ids exist.
+      if (!isUuid(id)) {
+        return reply.status(404).send({ error: "not_found" });
       }
 
       const cacheKey = `${type}:${id}:${viewerId}`;
@@ -84,7 +95,21 @@ async function resolveExternalAuthor(
   }>(
     `SELECT id, source_id, protocol, author_name, author_handle,
             author_avatar_url, author_uri, source_item_uri
-     FROM external_items WHERE id = $1 AND deleted_at IS NULL`,
+     FROM external_items
+     WHERE id = $1 AND deleted_at IS NULL
+       -- A platform-blocked npub gets no card (§0z item 15): the hover card
+       -- is an author surface, and the block holds on every one.
+       --
+       -- KEYED ON THE PUBKEY IN interaction_data, NOT ON author_uri
+       -- (§0ab item 2). author_uri is NULL for every nostr row ever written
+       -- — the ingest and thread mappers put the pubkey in interaction_data
+       -- and leave the uri to the protocols that HAVE a per-author URL — so
+       -- the non-null arm on it made this predicate unreachable and the block
+       -- a no-op on this surface. Same field the identity trigger mints
+       -- external_authors.stable_handle from, which is what makes this agree
+       -- with externalAuthorBlockedSql on the surfaces that join.
+       AND NOT (protocol = 'nostr_external'
+                AND ${npubBlockedSql("interaction_data->>'pubkey'")})`,
     [externalItemId],
   );
 
@@ -212,7 +237,7 @@ async function resolveExternalAuthor(
     item.protocol === "activitypub" &&
     item.author_uri
   ) {
-    const profile = await fetchAPProfile(item.author_uri, item.source_item_uri);
+    const profile = await fetchAPProfile(item.author_uri);
     if (profile) {
       return {
         tier,

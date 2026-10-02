@@ -23,19 +23,27 @@ export function TagInput({ value, onChange, max = 5 }: Props) {
       return
     }
 
+    // The cleanup cancels a search not yet sent; `stale` drops the answer to
+    // one already in flight, so an older query cannot land its suggestions
+    // over a newer one's (CA-E13e).
+    let stale = false
     clearTimeout(debounceRef.current)
     debounceRef.current = setTimeout(async () => {
       try {
         const res = await tagsApi.search(input.trim())
+        if (stale) return
         const filtered = res.tags.filter(t => !value.includes(t.name))
         setSuggestions(filtered)
         setShowDropdown(filtered.length > 0)
       } catch {
-        setSuggestions([])
+        if (!stale) setSuggestions([])
       }
     }, 300)
 
-    return () => clearTimeout(debounceRef.current)
+    return () => {
+      stale = true
+      clearTimeout(debounceRef.current)
+    }
   }, [input, value])
 
   // Close dropdown on outside click
@@ -93,14 +101,14 @@ export function TagInput({ value, onChange, max = 5 }: Props) {
           </span>
         ))}
         {atMax ? (
-          <span className="text-ui-xs text-grey-600">5 tags maximum</span>
+          <span className="text-ui-xs text-grey-600">That&rsquo;s {max} tags, which is the most a piece can have.</span>
         ) : (
           <input
             type="text"
             value={input}
             onChange={e => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Add tag..."
+            placeholder="Add tag…"
             className="flex-1 min-w-[80px] border-none bg-transparent label-ui placeholder:text-grey-300 focus:outline-none"
           />
         )}

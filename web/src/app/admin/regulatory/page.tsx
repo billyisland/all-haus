@@ -49,7 +49,7 @@ export default function AdminRegulatoryPage() {
     adminDashboard
       .regulatory()
       .then(setData)
-      .catch(() => setError('Failed to load regulatory metrics.'))
+      .catch(() => setError('Couldn’t load regulatory metrics. Please reload the page to try again.'))
   }, [])
 
   return (

@@ -1,7 +1,7 @@
 {
   "name": "@platform-pub/key-custody",
   "version": "0.1.0",
-  "description": "Custodial keypair service — generates, stores, and uses Nostr private keys on behalf of users",
+  "description": "Custodial keypair service \u2014 generates, stores, and uses Nostr private keys on behalf of users",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@platform-pub/shared": "*",
+    "@fastify/rate-limit": "^8.1.0",
     "fastify": "^4.26.0",
     "@fastify/sensible": "^5.5.0",
     "nostr-tools": "^2.3.0",

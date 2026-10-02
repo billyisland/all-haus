@@ -6,7 +6,9 @@ import { getPlatformConfig } from "../lib/platform-config.js";
 // Recent-reading retention sweep (READING-LOG-AND-LIBRARY-ADR D5 + D8)
 //
 // Deletes rows past the window from BOTH reading_log and reading_positions,
-// and it is the only reader of `reading_log_retention_days`.
+// and it owns the one reader of `reading_log_retention_days`
+// (`readingLogRetentionDays` below — the list route and the preferences route
+// call it too, to NAME the window in copy).
 //
 // WHY reading_positions IS IN HERE AND NOT SOMEWHERE ELSE. Before migration
 // 189 that table was keyed on articles.id by an FK ON DELETE CASCADE, so a
@@ -17,10 +19,11 @@ import { getPlatformConfig } from "../lib/platform-config.js";
 // same age — and without this the table grows for the life of every account,
 // silently, in the one direction nobody looks.
 //
-// THE WINDOW IS A DIAL, and this is its only consumer. Per the tuning-dials
-// invariant a dial with no reader is not a dial: the operator's UPDATE would
-// succeed, report nothing and change nothing. If a second consumer ever
-// appears, it reads the dial rather than restating the number.
+// THE WINDOW IS A DIAL, and this is the only thing that ENFORCES it. Per the
+// tuning-dials invariant a dial with no reader is not a dial: the operator's
+// UPDATE would succeed, report nothing and change nothing. Everything that
+// merely SAYS the number — Recent reading's empty state, Settings › Reading —
+// asks `readingLogRetentionDays` for it rather than restating it.
 // =============================================================================
 
 // SECOND COPY OF THE NUMBER, and it substitutes silently in exactly the case

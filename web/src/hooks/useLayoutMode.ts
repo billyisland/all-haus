@@ -5,30 +5,30 @@ import { usePathname } from 'next/navigation'
 export type LayoutMode = 'platform' | 'canvas' | 'workspace'
 
 /**
- * Known platform-register route prefixes.
- * Everything else at the root level (/:username) is canvas.
+ * Platform-register route prefixes. Everything else at the root level
+ * (/:username) is canvas.
+ *
+ * ONLY ROUTES THAT PAINT BELONG HERE. A route whose page is nothing but a
+ * server `redirect()` never renders in any register — Next answers the request
+ * with the redirect and no HTML, and a client navigation follows it from the
+ * RSC payload — so listing one says a surface exists where none does. Thirteen
+ * of the twenty entries were that: the whole overlay migration (/feed,
+ * /dashboard, /search, /profile, /settings, /notifications, /history, /ledger,
+ * /library) plus the dissolved Network family (/following, /followers,
+ * /network, /social), each now a shim into `/reader?overlay=…`.
+ *
+ * `/account` stays despite its own index being a shim, because `/account/export`
+ * beneath it is a real page — the check is whether ANYTHING under the prefix
+ * renders, not whether its index does.
  */
 const PLATFORM_PREFIXES = [
-  '/feed',
   '/write',
-  '/dashboard',
   '/about',
   '/auth',
   '/waitlist',
-  '/search',
-  '/profile',
-  '/settings',
-  '/notifications',
-  '/history',
-  '/following',
-  '/followers',
   '/messages',
   '/account',
   '/admin',
-  '/ledger',
-  '/network',
-  '/library',
-  '/social',
 ]
 
 export function useLayoutMode(): LayoutMode {

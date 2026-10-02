@@ -2,6 +2,7 @@ import type { Task } from "graphile-worker";
 import { pool } from "@platform-pub/shared/db/client.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 import { getPlatformConfig } from "../lib/platform-config.js";
+import { sourceBlockedSql } from "@platform-pub/shared/lib/platform-blocks.js";
 
 // =============================================================================
 // feed_ingest_poll — scheduled every 60 seconds
@@ -9,6 +10,30 @@ import { getPlatformConfig } from "../lib/platform-config.js";
 // Finds external_sources that are due for polling and enqueues per-source
 // fetch jobs. Enforces per-host concurrency limits to be a good citizen.
 // =============================================================================
+
+// ONE FETCH IN FLIGHT PER SOURCE (CA-C5). The `jobKey` below does not give it:
+// graphile-worker's add_jobs strips the key from a job that is already LOCKED
+// and inserts a second beside it, and this poll re-selected on
+// `last_fetched_at`, which every fetch task stamps only at completion — so any
+// fetch longer than the 60s tick (an ActivityPub walk, a slow nostr relay set)
+// ran twice, doubling remote load and racing its own cursor writes. So the poll
+// stamps `fetch_enqueued_at` for what it enqueues, and a source whose stamp is
+// newer than its last completion is IN FLIGHT and not re-selected.
+//
+// The staleness bound is what stops a crashed or killed worker stranding a
+// source: past it the claim is presumed dead and the source is due again. It
+// must exceed the longest honest fetch (AP: a 3-arm actor read plus up to 20
+// pages at 10s each). Nothing but this selection reads the column, so admin
+// diagnostics see every source exactly as before.
+export const FETCH_IN_FLIGHT_STALE_SECONDS = 600;
+
+/** True for a source a fetch is already queued or running for. `$n` binds
+ *  FETCH_IN_FLIGHT_STALE_SECONDS. */
+export function fetchInFlightSql(alias: string, staleParam: string): string {
+  return `(${alias}.fetch_enqueued_at IS NOT NULL
+      AND (${alias}.last_fetched_at IS NULL OR ${alias}.fetch_enqueued_at > ${alias}.last_fetched_at)
+      AND ${alias}.fetch_enqueued_at > now() - make_interval(secs => ${staleParam}))`;
+}
 
 export const feedIngestPoll: Task = async (_payload, helpers) => {
   // Load config values (process-cached, 30s TTL — A5)
@@ -18,7 +43,8 @@ export const feedIngestPoll: Task = async (_payload, helpers) => {
   // Per-tick enqueue cap (audit #1 / C2). This bounds how many fetch jobs the
   // poll enqueues per 60s tick — NOT how many run at once. Actual fetch
   // concurrency is the worker runner's `concurrency` (index.ts) plus the
-  // per-source `jobKey` (one in-flight job per source); per-host politeness is
+  // per-source in-flight claim (`fetchInFlightSql` above — the `jobKey` alone
+  // does not hold it); per-host politeness is
   // `maxPerHost` (≤N/host/tick), preserved below. The two were historically
   // conflated at 10, which capped steady-state throughput at ~10/min ≈ 50
   // sources before they fell behind. Decoupled: default 100 (= the SELECT
@@ -70,14 +96,21 @@ export const feedIngestPoll: Task = async (_payload, helpers) => {
           ),
           source_uri
         ) AS host
-      FROM external_sources
+      FROM external_sources es
       WHERE is_active = TRUE
+        -- Blocked sources are not enqueued at all (L6.5). The per-task guard is
+        -- the one that MATTERS — a job can arrive from a re-add or a backfill,
+        -- not only from here — but a blocked source left in this selection
+        -- would go on taking a slot in every tick's window and its host's
+        -- per-host cap, crowding out sources we do carry.
+        AND NOT ${sourceBlockedSql("es")}
         AND protocol != 'email'
         AND (protocol != 'atproto' OR $1::boolean = FALSE)
         AND (
           last_fetched_at IS NULL
           OR last_fetched_at + (fetch_interval_seconds || ' seconds')::interval <= now()
         )
+        AND NOT ${fetchInFlightSql("es", "$3")}
     ),
     ranked AS (
       SELECT id, protocol, source_uri, relay_urls, last_fetched_at,
@@ -93,10 +126,18 @@ export const feedIngestPoll: Task = async (_payload, helpers) => {
     ORDER BY last_fetched_at ASC NULLS FIRST, id ASC
     LIMIT 100
   `,
-    [jetstreamHealthy, maxPerHost],
+    [jetstreamHealthy, maxPerHost, FETCH_IN_FLIGHT_STALE_SECONDS],
   );
 
-  if (sources.length === 0) return;
+  // Nothing due is a poll that ran to completion, so it beats the heart too —
+  // otherwise a quiet ten minutes (no non-atproto source due) reads on
+  // /admin/overview exactly like a dead worker (CA-C6). Written HERE and not
+  // in a `finally`: a poll that throws must stay stale, see the heartbeat's
+  // header below.
+  if (sources.length === 0) {
+    await writeIngestHeartbeat();
+    return;
+  }
 
   // Group by hostname for rate limiting
   // RSS: group by feed URL hostname
@@ -137,6 +178,7 @@ export const feedIngestPoll: Task = async (_payload, helpers) => {
   let skippedByTickCap = 0;
   let skippedNoTask = 0;
   const hostsCapped = new Set<string>();
+  const enqueuedIds: string[] = [];
   for (const [hostname, hostSources] of byHost) {
     const toEnqueue = hostSources.slice(0, maxPerHost);
     if (hostSources.length > toEnqueue.length) {
@@ -173,8 +215,18 @@ export const feedIngestPoll: Task = async (_payload, helpers) => {
         },
       );
       totalEnqueued++;
+      enqueuedIds.push(source.id);
     }
     if (totalEnqueued >= maxEnqueuePerTick) break;
+  }
+
+  // The in-flight claim. After the enqueue, never before: a claim with no job
+  // behind it would hide the source for the whole staleness bound.
+  if (enqueuedIds.length > 0) {
+    await pool.query(
+      `UPDATE external_sources SET fetch_enqueued_at = now() WHERE id = ANY($1::uuid[])`,
+      [enqueuedIds],
+    );
   }
 
   const totalSkipped = skippedByHostCap + skippedByTickCap + skippedNoTask;

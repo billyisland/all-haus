@@ -6,6 +6,7 @@ import { useExplain } from "../../stores/explain";
 import { useAboutOverlay } from "../../stores/aboutOverlay";
 import { prefersReducedMotion } from "../../lib/workspace/motion";
 import { LIGHT_ISLAND_STYLE } from "../../lib/palette/island";
+import { RoundelLabel } from "./RoundelLabel";
 
 // =============================================================================
 // Muster — the run of numbered feed roundels in the desktop nav bar.
@@ -158,27 +159,20 @@ const LEFT_RESERVE = 232;
 const DISC_TRANSITION =
   "width 140ms ease-out, height 140ms ease-out, background-color 140ms ease-out, box-shadow 140ms ease-out, color 140ms ease-out, font-size 140ms ease-out";
 
-// Hover-name label tokens — the SAME treatment as the vessel's corner roundel
-// name label (Vessel.tsx ROUNDEL_TOKENS), so the muster and the vessel speak
+// The hover-name label is the shared `RoundelLabel` — the SAME treatment as
+// the vessel's corner roundel name label, so the muster and the vessel speak
 // one visual language (§V).
 //
 // THE LABEL IS ISLANDED; THE ROUNDELS ARE NOT. That split looks inconsistent
 // and is the fix for a real dark-mode bug. The discs are global chrome and MUST
 // invert with `html.dark` along with the bar they sit on (see the note above).
-// The label is not on the bar — it floats over the FLOOR — and these two
-// tokens invert asymmetrically: `bone` is in `DARK_SLUGS` and `ink-925` is not,
-// so under `html.dark` the ground stayed dark while the text went dark with it,
-// and a hovered feed name was a dark smudge on a dark pill. Islanding it pins
-// both to canonical light, which is a dark pill with light text in EITHER mode
-// — and that is exactly what the vessel's roundel label already does, because
-// the vessel carries the island wholesale. So the "one visual language" claim
-// above is only true with the island; without it, the two drifted apart the
-// moment the mode flipped.
+// The label is not on the bar — it floats over the FLOOR — and its tokens
+// invert asymmetrically (`RoundelLabel.tsx` says how), so it carries the
+// island in its placement, exactly as the vessel's label gets it from the
+// vessel it sits on.
 //
 // It went unseen until 2026-08-24 because the label was clipped by its own
 // scroll container and had never actually rendered (see the state note below).
-const LABEL_BG = "var(--ah-ink-925)";
-const LABEL_FG = "var(--ah-bone)";
 
 const STATE_LABEL: Record<MusterState, string> = {
   in: "in view",
@@ -358,7 +352,7 @@ export function Muster({
     // pointer events, so the empty run beside it never eats a click.
     <div
       role="group"
-      aria-label="Feeds"
+      aria-label="Channels"
       // Global chrome, drawn straight through by every look-through path
       // (scrim hit-test, wheel-forward). Explain reaches the muster by its own
       // hover report, not this tag — see the header HOW-divergence note.
@@ -398,6 +392,11 @@ export function Muster({
         }}
         onMouseLeave={() => {
           if (explainActive) useExplain.getState().setHover(null);
+          // The floating name label belongs to the track, not to a roundel, so
+          // leaving the track must take it with you — a per-roundel mouseleave
+          // fires on the way to the NEXT roundel too, and clearing it there
+          // would flicker the label off between every pair.
+          setLabel(null);
         }}
         style={{
           display: "flex",
@@ -423,14 +422,24 @@ export function Muster({
       >
         {feeds.map((f) => {
           const label = f.name
-            ? `Go to Feed ${f.numeral}: ${f.name} (${STATE_LABEL[f.state]})`
-            : `Go to Feed ${f.numeral} (${STATE_LABEL[f.state]})`;
+            ? `Go to Channel ${f.numeral}: ${f.name} (${STATE_LABEL[f.state]})`
+            : `Go to Channel ${f.numeral} (${STATE_LABEL[f.state]})`;
           return (
             <div
               key={f.id}
               onMouseEnter={(e) => {
                 setHoveredId(f.id);
-                if (!f.name) return;
+                // AN UNNAMED FEED CLEARS THE LABEL, it does not just decline to
+                // set one. Returning early left the PREVIOUS feed's name
+                // floating — over the previous feed's position, since the x
+                // came off that roundel — so hovering an unnamed feed printed
+                // somebody else's name beside a numeral that is not theirs.
+                // A feed's name is optional by design (`feeds_name_length` has
+                // no floor), so this is the ordinary case, not an edge one.
+                if (!f.name) {
+                  setLabel(null);
+                  return;
+                }
                 const r = e.currentTarget.getBoundingClientRect();
                 setLabel({ name: f.name, x: r.left + r.width / 2 });
               }}
@@ -486,27 +495,20 @@ export function Muster({
 
           Kept mounted so the fade-out plays; pointer-inert either way. */}
       {label && (
-        <div
-          className="label-ui"
-          aria-hidden
-          style={{
+        <RoundelLabel
+          visible={hoveredId !== null}
+          ariaHidden
+          fade={!reduced}
+          place={{
             ...LIGHT_ISLAND_STYLE,
             position: "fixed",
             left: label.x,
             top: NAV_BAR_H + 6,
             transform: "translateX(-50%)",
-            background: LABEL_BG,
-            color: LABEL_FG,
-            padding: "3px 8px",
-            whiteSpace: "nowrap",
-            boxShadow: "0 2px 6px rgba(0, 0, 0, 0.15)",
-            opacity: hoveredId ? 1 : 0,
-            pointerEvents: "none",
-            transition: reduced ? undefined : "opacity 120ms ease-out",
           }}
         >
           {label.name}
-        </div>
+        </RoundelLabel>
       )}
     </div>
   );

@@ -1,5 +1,5 @@
-import { safeFetch } from "@platform-pub/shared/lib/http-client.js";
 import logger from "@platform-pub/shared/lib/logger.js";
+import { readMastodonAccountSearch } from "@platform-pub/shared/lib/mastodon-api.js";
 
 // =============================================================================
 // ActivityPub account search — discovery branch 6 (RESOLVER-DISCOVERY-ADR §5).
@@ -107,15 +107,11 @@ async function searchInstance(
   // instance isn't immediately re-hit.
   const result: ApAccountCandidate[] = [];
   try {
-    const res = await safeFetch(
-      `https://${host}/api/v2/search?q=${encodeURIComponent(query)}&type=accounts&limit=${limit}`,
-      {
-        headers: { Accept: "application/json" },
-        timeout: SEARCH_TIMEOUT_MS,
-      },
-    );
+    const res = await readMastodonAccountSearch(`https://${host}`, query, limit, {
+      timeout: SEARCH_TIMEOUT_MS,
+    });
     if (res.ok) {
-      const body = JSON.parse(res.text);
+      const body = res.body as { accounts?: unknown } | null;
       const accounts = Array.isArray(body?.accounts) ? body.accounts : [];
       for (const a of accounts) {
         if (!a || typeof a.acct !== "string" || !a.acct) continue;

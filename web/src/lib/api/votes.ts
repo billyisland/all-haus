@@ -19,7 +19,6 @@ export const votes = {
     request<{
       ok: boolean
       counted: boolean
-      sequenceNumber: number
       tally: VoteTally
     }>('/votes', {
       method: 'POST',

@@ -1,6 +1,7 @@
 import Parser from "rss-parser";
 import { safeFetch } from "@platform-pub/shared/lib/http-client.js";
 import {
+  httpUrlOrNull,
   sanitizeContent,
   stripHtml,
 } from "@platform-pub/shared/lib/sanitize.js";
@@ -60,11 +61,27 @@ interface RssFetchResult {
   lastModified?: string;
   feedTitle?: string;
   feedDescription?: string;
+  // The feed's OWN picture (RSS <image><url>, else the podcast's itunes:image;
+  // JSON Feed `icon`, else `favicon`) — the source's avatar. Refused at the
+  // write if it is not http(s), because it is rendered as an <img> src.
+  feedImageUrl?: string;
   notModified: boolean;
 }
 
 interface NormalisedItem {
   sourceItemUri: string;
+  /**
+   * The item's public web PERMALINK, where one is knowable — a different thing
+   * from `sourceItemUri`, which is its stable IDENTITY.
+   *
+   * For RSS/Atom the identity is `guid ?? link`, and a guid is under no
+   * obligation to be a URL: `urn:uuid:…`, `tag:example.com,2004:1234`, or a
+   * bare integer are all ordinary. The reader used to be handed the identity
+   * and answered "Could not extract"; the card's `→` correctly showed nothing.
+   * Carrying the link separately is what makes such a feed readable at all,
+   * and `httpUrlOrNull` is the refusal at the WRITE site the URL rule asks for.
+   */
+  canonicalUrl: string | null;
   authorName: string | null;
   authorHandle: string | null;
   authorUri: string | null;
@@ -180,6 +197,9 @@ export async function fetchRssFeed(
 
     items.push({
       sourceItemUri: guid,
+      // `entry.link` is the permalink; fall back to the guid only when it is
+      // itself a URL, which is the common case and what already worked.
+      canonicalUrl: httpUrlOrNull(entry.link) ?? httpUrlOrNull(guid),
       authorName:
         entry.creator ??
         entry.author ??
@@ -205,6 +225,7 @@ export async function fetchRssFeed(
     lastModified: response.headers.get("last-modified") ?? undefined,
     feedTitle: feed.title ?? undefined,
     feedDescription: feed.description ?? undefined,
+    feedImageUrl: httpUrlOrNull(feed.image?.url ?? feed.itunes?.image) ?? undefined,
     notModified: false,
   };
 }
@@ -351,6 +372,8 @@ interface JsonFeed {
   version: string;
   title?: string;
   description?: string;
+  icon?: string;
+  favicon?: string;
   language?: string;
   items?: JsonFeedItem[];
 }
@@ -416,6 +439,8 @@ function parseJsonFeed(
 
     items.push({
       sourceItemUri: id,
+      // JSON Feed: `url` is the permalink, `id` need not be one.
+      canonicalUrl: httpUrlOrNull(entry.url) ?? httpUrlOrNull(id),
       authorName: authorObj?.name ?? null,
       authorHandle: null,
       authorUri: authorObj?.url ?? null,
@@ -435,6 +460,7 @@ function parseJsonFeed(
     lastModified: response.headers.get("last-modified") ?? undefined,
     feedTitle: feed.title ?? undefined,
     feedDescription: feed.description ?? undefined,
+    feedImageUrl: httpUrlOrNull(feed.icon ?? feed.favicon) ?? undefined,
     notModified: false,
   };
 }

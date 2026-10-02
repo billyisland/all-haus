@@ -83,3 +83,69 @@ export function resumeCursor(
 
   return { cursor: oldest.toString(), clamped: false, storedAgeHours };
 }
+
+// =============================================================================
+// ONE STREAM, ONE WATERMARK (CA-C7, 2026-09-29).
+//
+// The cap above bounds the damage; it does not remove the cause. The resume
+// point was still the MIN over per-source cursors, and a source's cursor moves
+// only when THAT ACCOUNT posts — so every reconnect (and the listener
+// reconnects on every DID-set change, i.e. every new Bluesky follow) replayed
+// the full cap: in wildcard mode, 24h of the entire network, ~30 minutes at
+// 3.8 MB/s, while `jetstream_healthy` read true.
+//
+// Jetstream is ONE stream, so the position in it is one number: the newest
+// time_us whose ingest SUCCEEDED, persisted by the batched flush as the
+// runtime-state key `jetstream_cursor` (read-only in the admin editor, like
+// the heartbeat). Two guards keep it honest.
+//
+//   • Advanced from SUCCESSES only. `recordCursor` is called after the write
+//     commits, so the batch the flush sees is the set of successes; its max is
+//     the watermark. A failed ingest is not in it.
+//   • Held BELOW a failure. A failed event must not be skipped past, and
+//     with one global position "the per-source cursor holds and replay
+//     recovers it" no longer follows — a later success on another source
+//     would carry the watermark over it. So the listener keeps the oldest
+//     time_us that FAILED since it last resumed (`failedFloor`), the flush
+//     writes min(batch max, floor), and the resume point is min(watermark,
+//     floor). A reconnect that resumes at or below the floor clears it: the
+//     stream re-delivers the event and either it lands or it re-records.
+//
+// The per-source cursors are still written (the atproto poll fallback and
+// the backfill read them) and are still the FALLBACK resume set when no
+// watermark has ever been written — the first boot after this ships resumes
+// exactly as before, and writes the key on its first flush.
+//
+// Pure, for the same reason `resumeCursor` is.
+// =============================================================================
+
+export interface ResumeInputs {
+  /** The persisted global watermark, or null before the first flush. */
+  watermark: string | null;
+  /** The oldest time_us whose ingest failed since the last resume, or null. */
+  failedFloor: bigint | null;
+  /** Per-source cursors — the fallback while no watermark exists. */
+  perSourceCursors: Array<string | null | undefined>;
+}
+
+export function resumeFrom(
+  inputs: ResumeInputs,
+  nowUs: bigint,
+  maxReplayUs: bigint,
+): ResumePoint {
+  const candidates: Array<string | null | undefined> =
+    inputs.watermark !== null ? [inputs.watermark] : [...inputs.perSourceCursors];
+  if (inputs.failedFloor !== null) candidates.push(inputs.failedFloor.toString());
+  return resumeCursor(candidates, nowUs, maxReplayUs);
+}
+
+/** What the flush writes: the batch's newest success, held below any failure. */
+export function watermarkAfterFlush(
+  batchCursors: Iterable<bigint>,
+  failedFloor: bigint | null,
+): bigint | null {
+  let max: bigint | null = null;
+  for (const c of batchCursors) if (max === null || c > max) max = c;
+  if (max === null) return null;
+  return failedFloor !== null && failedFloor < max ? failedFloor : max;
+}

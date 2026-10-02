@@ -1,7 +1,6 @@
 'use client'
 
-import { createContext, useContext } from 'react'
-import { useLayoutMode, type LayoutMode } from '../../hooks/useLayoutMode'
+import { useLayoutMode } from '../../hooks/useLayoutMode'
 import { PublicNavBar } from '../public/PublicNavBar'
 import { NAV_BAR_BAND } from '../workspace/NavBar'
 
@@ -31,18 +30,14 @@ import { PaletteHydrator } from '../devtools/PaletteHydrator'
 import { TypeScaleHydrator } from '../TypeScaleHydrator'
 import { ColorSchemeHydrator } from '../ColorSchemeHydrator'
 import { TributeClaimResumer } from '../tribute/TributeClaimResumer'
+import { AgeGate } from '../legal/AgeGate'
 import { useReader } from '../../stores/reader'
 import { useProfile } from '../../stores/profileOverlay'
 import { useSurfaceOverlay } from '../../stores/surfaceOverlay'
 import { useEditorOverlay } from '../../stores/editorOverlay'
 import { useWorkspaceSurface } from '../../stores/workspaceSurface'
+import { useCompose } from '../../stores/compose'
 import { useAuth } from '../../stores/auth'
-
-const LayoutModeContext = createContext<LayoutMode>('platform')
-
-export function useLayoutModeContext(): LayoutMode {
-  return useContext(LayoutModeContext)
-}
 
 // =============================================================================
 // THE BLACK TOPBAR IS GONE (2026-07-25). `Nav` and `LandingNavRow` are deleted.
@@ -139,12 +134,36 @@ export function LayoutShell({ children }: { children: React.ReactNode }) {
   // plus the band's worth of layout shift. The mount flag is a positive fact
   // about what is on screen (`stores/workspaceSurface.ts`), so whatever the
   // URL says mid-transition, the workspace's own chrome rules while it is up.
+  const composeOpen = useCompose((s) => s.isOpen)
   const workspaceMounted = useWorkspaceSurface((s) => s.mounted)
   const barSurface = mode !== 'workspace' && !overlayOpen && !workspaceMounted
-  const showPublicBar = barSurface && !authLoading
+  // THE COMPOSER MOUNTS WHEREVER THE WORKSPACE'S OWN COMPOSER IS NOT THERE TO
+  // ANSWER, AND THAT IS THE WHOLE OF THE TEST. The gate used to read
+  // `mode === 'platform' && !overlayOpen`, which is neither half of it: every
+  // surface that actually raises a compose request is a CANVAS route (a
+  // profile, an author, a tag, a source, an article) or an overlay body open
+  // over one, so the request arrived at a surface that had just been excluded
+  // by both terms. Nothing rendered, nothing errored — five Reply buttons and
+  // the article page's Quote were simply inert, in every register, since the
+  // day each was written. The condition is the same fact `routeToOverlay` asks
+  // one surface over: an overlay href is claimed only where the overlay is
+  // mounted, and the discriminator is the workspace's own mount flag, never
+  // the URL (a URL-synced pane reads as `canvas` over a live workspace).
+  //   • `!workspaceMounted` is the real exclusion; `mode !== 'workspace'` is
+  //     the same claim from the URL, kept for the first frame of a cold
+  //     `/reader` load before the floor registers itself.
+  //   • It is `composeMounted`, not `useCompose().isOpen`, and the SAME value
+  //     gates the bar below — a bare `isOpen` would hide the bar for a
+  //     composer that never appears (which, on the workspace, it does not).
+  //   • The note composer is the third immersive pane (`coverNavChrome`), so
+  //     the bar un-mounts while it is open — the same contract WorkspaceView
+  //     honours for the reader and the editor. That moves `showPublicBar`
+  //     ALONE, never `barSurface`, so the band stays RESERVED and the page
+  //     underneath does not reflow by the bar's height behind the frost.
+  const composeMounted = composeOpen && mode !== 'workspace' && !workspaceMounted
+  const showPublicBar = barSurface && !authLoading && !composeMounted
 
   return (
-    <LayoutModeContext.Provider value={mode}>
       <div
         data-layout-mode={mode}
         style={
@@ -153,7 +172,7 @@ export function LayoutShell({ children }: { children: React.ReactNode }) {
           } as React.CSSProperties
         }
       >
-        {mode === 'platform' && !overlayOpen && <ComposeOverlay />}
+        {composeMounted && <ComposeOverlay />}
         {/* `min-height: 100dvh` and nothing else. `dvh` not `vh`: on mobile
             Safari `100vh` is the tallest the viewport ever gets, so a fitted
             vessel measured against it hides its bottom wall behind the browser
@@ -183,12 +202,21 @@ export function LayoutShell({ children }: { children: React.ReactNode }) {
         {/* Headless — redeems a stashed external tribute-claim token once auth
             resolves (the claim survives signup). Dark behind TRIBUTES_ENABLED. */}
         <TributeClaimResumer />
+        {/* The age declaration (L6.1). Mounted unconditionally and renders null
+            unless this member has never made one — a Google arrival on their
+            first landing, or anyone who was already here. It is BLOCKING (the
+            topmost layer, above the lightbox) and has no ✕, which is the one
+            deliberate exception to the dismiss rule: it is the only surface on
+            the site the member did not open. Sitewide rather than on the
+            workspace, because an OAuth arrival lands on `/article/<dTag>` as
+            readily as on `/reader`, and a member who was already here lands
+            wherever they were going. */}
+        <AgeGate />
         {/* Operator-only colour-tuning kit (not a Glasshouse — floats above all
             surfaces, page stays sharp). No shipped menu/settings entry; reach it
-            via ?palette or the Ctrl+Alt+P chord (GLASSHOUSE-AND-PALETTE-ADR
+            via ?palette only (GLASSHOUSE-AND-PALETTE-ADR
             §III.5). Renders null until opened. */}
         <PalettePanel />
       </div>
-    </LayoutModeContext.Provider>
   )
 }

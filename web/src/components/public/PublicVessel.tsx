@@ -1,6 +1,7 @@
 'use client'
 
-import type { CSSProperties, ReactNode } from 'react'
+import { useRef, type CSSProperties, type ReactNode } from 'react'
+import { useForwardedWheel } from '../../hooks/useForwardedWheel'
 import { LIGHT_ISLAND_STYLE } from '../../lib/palette/island'
 import { usePublicPalette, PAD, GAP } from './palette'
 
@@ -44,6 +45,14 @@ import { usePublicPalette, PAD, GAP } from './palette'
 // `data-vessel-scroll` is carried for parity with the workspace's scroll bodies
 // — anything that queries for a scrollable vessel region finds this one too.
 //
+// AND A WHEEL FROM ANYWHERE ON THE PAGE DRIVES IT (2026-09-14), by the same
+// `useForwardedWheel` the landing vessel uses. The fitted chassis puts a 480px
+// column in the middle of a monitor three times that wide and centres it on
+// BOTH axes, so most of the screen — and most of where a cursor actually rests
+// — is bone floor over which a wheel did nothing at all. The hook stands down
+// when the DOCUMENT can scroll, which is exactly the short-viewport fallback
+// `.ah-public-fit` drops into below 480px of height; see its header.
+//
 // WHAT HAPPENS AT THE MOUTH. The top is OPEN (⊔), so scrolled content is
 // clipped at a line where there is no wall. Under `basic` the interior and the
 // floor are the same colour, so a card passing the mouth doesn't cut against an
@@ -75,6 +84,9 @@ interface PublicVesselProps {
 export function PublicVessel({ children, style }: PublicVesselProps) {
   const palette = usePublicPalette()
 
+  const scrollRef = useRef<HTMLDivElement>(null)
+  useForwardedWheel(scrollRef)
+
   return (
     <div
       className="ah-public-vessel"
@@ -101,6 +113,7 @@ export function PublicVessel({ children, style }: PublicVesselProps) {
       }
     >
       <div
+        ref={scrollRef}
         data-vessel-scroll=""
         style={{
           // No scroll marker: the register's pages are not reading surfaces,

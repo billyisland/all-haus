@@ -42,7 +42,7 @@
 // under the pinned grip, and nothing scrolls under an in-flow bar.
 // =============================================================================
 
-import React, { useEffect, useRef, useState, type RefObject } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { useReader } from "../../stores/reader";
 import { useIsMobile } from "../../hooks/useIsMobile";
 import { Glasshouse } from "./Glasshouse";
@@ -50,9 +50,11 @@ import { ExternalArticleReader } from "../article/ExternalArticleReader";
 import { ArticleReader } from "../article/ArticleReader";
 import { articles, type ArticleMetadata } from "../../lib/api";
 import { InwardLink } from "../ui/InwardLink";
+import { safeHttpUrl } from "../../lib/external-links";
 import { ProfileLink } from "../ui/ProfileLink";
 import { profilePalette } from "../profile/ProfileChrome";
 import { useResolvedDark } from "../../stores/colorScheme";
+import { useDiscCloseActive } from "../../stores/glasshouse";
 import { PANE_BAR_H, type FeedScheme, type VesselPalette } from "./tokens";
 
 export function ReaderOverlay() {
@@ -139,6 +141,28 @@ export function ReaderOverlay() {
       cancelled = true;
     };
   }, [nativeDTag]);
+
+  // A SKIP IS A NEW PIECE IN THE SAME ELEMENT, so the pane's scroller has to be
+  // told. The ears, ←/→ and the mobile swipe all change `target` in place —
+  // the Glasshouse, the scroll div and the reader body component all survive —
+  // so without this the next article opened at whatever offset the last one was
+  // left at. Its twin is in `useReadingPosition`, which resets its own
+  // per-piece refs on the same change; between them a skip starts at the top
+  // and the restore then moves it, exactly as opening the piece cold does.
+  //
+  // A LAYOUT effect, and the ORDER is the point: React runs child passive
+  // effects before parent ones, so a passive reset here would fire AFTER the
+  // reader body's `useReadingPosition` had already read the stale scrollTop.
+  // Layout effects all run before any passive effect, so this lands first.
+  const targetKey =
+    target === null
+      ? null
+      : target.kind === "native"
+        ? `native:${target.dTag}`
+        : `external:${target.url}`;
+  useLayoutEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
+  }, [targetKey]);
 
   const SWIPE_MIN_X = 56;
   const swipeRef = useRef<{ x: number; y: number } | null>(null);
@@ -245,7 +269,9 @@ export function ReaderOverlay() {
             : null,
           sourceKind: "surface" as const,
           title: target.title,
-          titleHref: target.url,
+          // The origin URL is ingested data; the native branch below builds an
+          // internal path and needs no gate.
+          titleHref: safeHttpUrl(target.url) ?? null,
         }
       : {
           // Publication else writer: the publication is the thing subscribed to
@@ -330,6 +356,7 @@ export function ReaderOverlay() {
             article={article}
             error={articleError}
             preview={target.preview}
+            focusCommentId={target.focusCommentId ?? null}
             scrollRef={scrollRef}
           />
         )}
@@ -369,6 +396,7 @@ function ReaderBar({
    *  reached from the reader wears the same feed's colourway the reader does. */
   frameScheme: FeedScheme | null;
 }) {
+  const discClose = useDiscCloseActive();
   const name = sourceName ? (
     sourceHref ? (
       sourceKind === "surface" ? (
@@ -424,15 +452,22 @@ function ReaderBar({
             {title}
           </a>
         )}
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Close"
-          className="ah-pane-bar-close"
-          style={{ color: "inherit" }}
-        >
-          ✕
-        </button>
+        {/* On the mobile workspace the ∀ disc has already flipped to this
+            sheet's X, so the bar draws none (stores/glasshouse.ts::
+            useDiscCloseActive — the declaration, not `isMobile`). The title
+            keeps its half-bar cap either way: the cap is measured on the bar,
+            not on what happens to sit beside it. */}
+        {!discClose && (
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="ah-pane-bar-close"
+            style={{ color: "inherit" }}
+          >
+            ✕
+          </button>
+        )}
       </span>
     </div>
   );
@@ -451,11 +486,13 @@ function NativeArticleBody({
   article,
   error,
   preview,
+  focusCommentId,
   scrollRef,
 }: {
   article: ArticleMetadata | null;
   error: boolean;
   preview?: { title: string | null; summary: string | null } | null;
+  focusCommentId: string | null;
   // Passed straight through to ArticleReader: the pane's scroller, not the
   // document's. See the external branch above for why that matters.
   scrollRef: RefObject<HTMLDivElement | null>;
@@ -463,7 +500,7 @@ function NativeArticleBody({
   if (error) {
     return (
       <div className="px-8 py-16 text-center">
-        <p className="text-ui-xs text-grey-600">Could not load this article.</p>
+        <p className="text-ui-xs text-grey-600">Couldn’t load this article. Please try again.</p>
       </div>
     );
   }
@@ -513,6 +550,7 @@ function NativeArticleBody({
   return (
     <ArticleReader
       postId={article.postId}
+      focusCommentId={focusCommentId}
       scrollRef={scrollRef}
       article={{
         id: article.nostrEventId,
@@ -540,7 +578,6 @@ function NativeArticleBody({
         article.writer.subscriptionPricePence
       }
       writerSpendThisMonthPence={article.writerSpendThisMonthPence ?? undefined}
-      nudgeShownThisMonth={article.nudgeShownThisMonth ?? false}
       publicationName={article.publication?.name ?? undefined}
       publicationSlug={article.publication?.slug ?? undefined}
     />

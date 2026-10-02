@@ -1,4 +1,4 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import { pool, withTransaction } from "@platform-pub/shared/db/client.js";
 import {
   enqueueRelayPublish,
@@ -16,6 +16,72 @@ import {
 import { signEvent } from "../../lib/key-custody-client.js";
 import logger from "@platform-pub/shared/lib/logger.js";
 import { type ExternalItemRow } from "../../lib/external-items-shared.js";
+import { nostrTargetTag } from "../../lib/nostr-thread.js";
+import { isUuid } from "../../lib/request-inputs.js";
+
+// =============================================================================
+// Per-member budgets for the four routes that WRITE to a third-party network
+// (MIRROR-AUDIT §3 *Security*, S16).
+//
+// Every route here posts in the MEMBER'S OWN NAME on somebody else's platform:
+// a like, a repost, a poll vote, or a reply that mints a note, a relay-outbox
+// row and an outbound job per call. They carried no budget at all, so a runaway
+// client — or a hostile one holding a session — could spend a member's Bluesky
+// or Mastodon account straight into that platform's own abuse limits, and the
+// bill for it lands on the member, not on us.
+//
+// `hook: 'preHandler'` is load-bearing and is the S15 lesson: @fastify/rate-limit
+// defaults to `onRequest`, which runs BEFORE `requireAuth`, so `req.session` is
+// undefined, every request falls through to `req.ip` — one nginx, one bucket,
+// the whole platform in it — and it reads as working. The plugin appends its
+// hook to the route's existing preHandler chain, so at `preHandler` the session
+// is there.
+//
+// WRITE is the tighter budget: a reply is a post, and nobody composes 30 of
+// them a minute. Like/repost/poll-vote sit above it because flicking through a
+// feed genuinely produces bursts.
+const interactionLimit = (max: number) => ({
+  rateLimit: {
+    max,
+    timeWindow: '1 minute',
+    hook: 'preHandler' as const,
+    keyGenerator: (req: FastifyRequest) => req.session?.sub ?? req.ip,
+  },
+});
+
+const REACT_LIMIT = interactionLimit(60);
+const COMPOSE_LIMIT = interactionLimit(20);
+
+// The member's linked account for an interact-back: theirs (403 otherwise),
+// usable (422 while it needs reconnecting) and on the protocol the act needs
+// (422, worded by the caller). `null` means go ahead. One home for the four
+// routes' copies (CA-H3).
+async function linkedAccountRefusal(
+  linkedAccountId: string,
+  accountId: string,
+  protocol: string,
+  mismatch: (actual: string) => string,
+): Promise<{ status: number; error: string } | null> {
+  const { rows } = await pool.query<{
+    protocol: string;
+    is_valid: boolean;
+    lifecycle_state: string;
+  }>(
+    `SELECT protocol, is_valid, lifecycle_state FROM network_presences
+     WHERE id = $1 AND account_id = $2`,
+    [linkedAccountId, accountId],
+  );
+  const la = rows[0];
+  if (!la) return { status: 403, error: "We couldn't find that linked account." };
+  if (la.lifecycle_state !== "active" || !la.is_valid) {
+    return {
+      status: 422,
+      error: "That account needs reconnecting. You can do that in Settings.",
+    };
+  }
+  if (la.protocol !== protocol) return { status: 422, error: mismatch(la.protocol) };
+  return null;
+}
 
 export function registerInteractionRoutes(app: FastifyInstance) {
   // =========================================================================
@@ -23,9 +89,12 @@ export function registerInteractionRoutes(app: FastifyInstance) {
   // =========================================================================
   app.post<{ Params: { id: string }; Body: { linkedAccountId: string } }>(
     "/external-items/:id/like",
-    { preHandler: requireAuth },
+    { preHandler: requireAuth, config: REACT_LIMIT },
     async (req, reply) => {
       const { id } = req.params;
+      if (!isUuid(id)) {
+        return reply.status(404).send({ error: "We couldn't find that post." });
+      }
       const { linkedAccountId } = req.body ?? {};
       const accountId = req.session!.sub;
 
@@ -41,47 +110,42 @@ export function registerInteractionRoutes(app: FastifyInstance) {
         [id],
       );
       if (items.length === 0) {
-        return reply.status(404).send({ error: "Item not found" });
+        return reply.status(404).send({ error: "We couldn't find that post." });
       }
       const item = items[0];
 
       if (item.protocol === "rss") {
         return reply
           .status(422)
-          .send({ error: "Likes are not supported for RSS items" });
+          .send({ error: "You can't like a post from an RSS feed." });
       }
 
-      // Validate linked account ownership + protocol match
-      const { rows: la } = await pool.query<{
-        protocol: string;
-        is_valid: boolean;
-        lifecycle_state: string;
-      }>(
-        `SELECT protocol, is_valid, lifecycle_state FROM network_presences
-         WHERE id = $1 AND account_id = $2`,
-        [linkedAccountId, accountId],
+      const refusal = await linkedAccountRefusal(linkedAccountId, accountId, item.protocol, (p) =>
+        `Linked account protocol (${p}) does not match item protocol (${item.protocol})`,
       );
-      if (la.length === 0) {
-        return reply.status(403).send({ error: "Linked account not found" });
-      }
-      if (la[0].lifecycle_state !== "active" || !la[0].is_valid) {
-        return reply
-          .status(422)
-          .send({ error: "Linked account is invalid — reconnect in settings" });
-      }
-      if (la[0].protocol !== item.protocol) {
-        return reply.status(422).send({
-          error: `Linked account protocol (${la[0].protocol}) does not match item protocol (${item.protocol})`,
-        });
+      if (refusal) return reply.status(refusal.status).send({ error: refusal.error });
+
+      // The reference tag for a nostr target — `e` with the HEX event id, or
+      // `a` for an addressable kind (S17). Resolved before the try so a uri we
+      // cannot reference is a 422 rather than a signed event no client can
+      // follow; non-null here is exactly "this item is nostr_external".
+      let nostrTag: string[] | null = null;
+      if (item.protocol === "nostr_external") {
+        nostrTag = nostrTargetTag(item.source_item_uri);
+        if (!nostrTag) {
+          return reply
+            .status(422)
+            .send({ error: "We can't point to this post on Nostr, so you can't act on it there." });
+        }
       }
 
       try {
-        if (item.protocol === "nostr_external") {
+        if (nostrTag) {
           // Sign a kind 7 reaction event and enqueue via Nostr outbound
           const signed = await signEvent(accountId, {
             kind: 7,
             content: "+",
-            tags: [["e", item.source_item_uri]],
+            tags: [nostrTag],
             created_at: Math.floor(Date.now() / 1000),
           });
           await enqueueNostrOutbound({
@@ -102,7 +166,7 @@ export function registerInteractionRoutes(app: FastifyInstance) {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         logger.warn({ err: msg, itemId: id, accountId }, "Like enqueue failed");
-        return reply.status(500).send({ error: "Failed to enqueue like" });
+        return reply.status(500).send({ error: "Couldn't send your like. Please try again." });
       }
 
       return reply.status(202).send({ status: "accepted" });
@@ -114,9 +178,12 @@ export function registerInteractionRoutes(app: FastifyInstance) {
   // =========================================================================
   app.post<{ Params: { id: string }; Body: { linkedAccountId: string } }>(
     "/external-items/:id/repost",
-    { preHandler: requireAuth },
+    { preHandler: requireAuth, config: REACT_LIMIT },
     async (req, reply) => {
       const { id } = req.params;
+      if (!isUuid(id)) {
+        return reply.status(404).send({ error: "We couldn't find that post." });
+      }
       const { linkedAccountId } = req.body ?? {};
       const accountId = req.session!.sub;
 
@@ -132,39 +199,20 @@ export function registerInteractionRoutes(app: FastifyInstance) {
         [id],
       );
       if (items.length === 0) {
-        return reply.status(404).send({ error: "Item not found" });
+        return reply.status(404).send({ error: "We couldn't find that post." });
       }
       const item = items[0];
 
       if (item.protocol === "rss" || item.protocol === "nostr_external") {
         return reply
           .status(422)
-          .send({ error: "Reposts are not supported for this protocol" });
+          .send({ error: "You can't repost from this network." });
       }
 
-      // Validate linked account ownership + protocol match
-      const { rows: la } = await pool.query<{
-        protocol: string;
-        is_valid: boolean;
-        lifecycle_state: string;
-      }>(
-        `SELECT protocol, is_valid, lifecycle_state FROM network_presences
-         WHERE id = $1 AND account_id = $2`,
-        [linkedAccountId, accountId],
+      const refusal = await linkedAccountRefusal(linkedAccountId, accountId, item.protocol, (p) =>
+        `Linked account protocol (${p}) does not match item protocol (${item.protocol})`,
       );
-      if (la.length === 0) {
-        return reply.status(403).send({ error: "Linked account not found" });
-      }
-      if (la[0].lifecycle_state !== "active" || !la[0].is_valid) {
-        return reply
-          .status(422)
-          .send({ error: "Linked account is invalid — reconnect in settings" });
-      }
-      if (la[0].protocol !== item.protocol) {
-        return reply.status(422).send({
-          error: `Linked account protocol (${la[0].protocol}) does not match item protocol (${item.protocol})`,
-        });
-      }
+      if (refusal) return reply.status(refusal.status).send({ error: refusal.error });
 
       try {
         await enqueueRepost({
@@ -178,7 +226,7 @@ export function registerInteractionRoutes(app: FastifyInstance) {
           { err: msg, itemId: id, accountId },
           "Repost enqueue failed",
         );
-        return reply.status(500).send({ error: "Failed to enqueue repost" });
+        return reply.status(500).send({ error: "Couldn't send your repost. Please try again." });
       }
 
       return reply.status(202).send({ status: "accepted" });
@@ -193,9 +241,12 @@ export function registerInteractionRoutes(app: FastifyInstance) {
     Body: { linkedAccountId: string; choices: number[] };
   }>(
     "/external-items/:id/poll-vote",
-    { preHandler: requireAuth },
+    { preHandler: requireAuth, config: REACT_LIMIT },
     async (req, reply) => {
       const { id } = req.params;
+      if (!isUuid(id)) {
+        return reply.status(404).send({ error: "We couldn't find that post." });
+      }
       const { linkedAccountId, choices } = req.body ?? {};
       const accountId = req.session!.sub;
 
@@ -213,38 +264,20 @@ export function registerInteractionRoutes(app: FastifyInstance) {
         [id],
       );
       if (items.length === 0) {
-        return reply.status(404).send({ error: "Item not found" });
+        return reply.status(404).send({ error: "We couldn't find that post." });
       }
       const item = items[0];
 
       if (item.protocol !== "activitypub") {
         return reply
           .status(422)
-          .send({ error: "Poll voting is only supported for Mastodon items" });
+          .send({ error: "You can only vote in Mastodon polls from here." });
       }
 
-      const { rows: la } = await pool.query<{
-        protocol: string;
-        is_valid: boolean;
-        lifecycle_state: string;
-      }>(
-        `SELECT protocol, is_valid, lifecycle_state FROM network_presences
-         WHERE id = $1 AND account_id = $2`,
-        [linkedAccountId, accountId],
+      const refusal = await linkedAccountRefusal(linkedAccountId, accountId, "activitypub", () =>
+        "Linked account must be a Mastodon account",
       );
-      if (la.length === 0) {
-        return reply.status(403).send({ error: "Linked account not found" });
-      }
-      if (la[0].lifecycle_state !== "active" || !la[0].is_valid) {
-        return reply
-          .status(422)
-          .send({ error: "Linked account is invalid — reconnect in settings" });
-      }
-      if (la[0].protocol !== "activitypub") {
-        return reply.status(422).send({
-          error: "Linked account must be a Mastodon account",
-        });
-      }
+      if (refusal) return reply.status(refusal.status).send({ error: refusal.error });
 
       try {
         await enqueuePollVote({
@@ -259,7 +292,7 @@ export function registerInteractionRoutes(app: FastifyInstance) {
           { err: msg, itemId: id, accountId },
           "Poll vote enqueue failed",
         );
-        return reply.status(500).send({ error: "Failed to enqueue poll vote" });
+        return reply.status(500).send({ error: "Couldn't send your vote. Please try again." });
       }
 
       return reply.status(202).send({ status: "accepted" });
@@ -276,9 +309,12 @@ export function registerInteractionRoutes(app: FastifyInstance) {
     Body: { linkedAccountId: string; content: string };
   }>(
     "/external-items/:id/reply",
-    { preHandler: requireAuth },
+    { preHandler: requireAuth, config: COMPOSE_LIMIT },
     async (req, reply) => {
       const { id } = req.params;
+      if (!isUuid(id)) {
+        return reply.status(404).send({ error: "We couldn't find that post." });
+      }
       const { linkedAccountId, content } = req.body ?? {};
       const accountId = req.session!.sub;
 
@@ -290,21 +326,24 @@ export function registerInteractionRoutes(app: FastifyInstance) {
         typeof content !== "string" ||
         content.trim().length === 0
       ) {
-        return reply.status(400).send({ error: "content is required" });
+        return reply.status(400).send({ error: "Please write something first." });
       }
       if (content.length > NOTE_CHAR_LIMIT) {
         return reply
           .status(400)
-          .send({ error: `content exceeds ${NOTE_CHAR_LIMIT} characters` });
+          .send({ error: `That's longer than ${NOTE_CHAR_LIMIT} characters. Please shorten it.` });
       }
 
       // Load item + source relay URLs (needed for nostr_external outbound)
       const { rows: items } = await pool.query<
-        ExternalItemRow & { relay_urls: string[] | null }
+        ExternalItemRow & {
+          relay_urls: string[] | null;
+          canonical_url: string | null;
+        }
       >(
         `SELECT ei.id, ei.source_id, ei.protocol, ei.source_item_uri,
                 ei.source_reply_uri, ei.like_count, ei.reply_count,
-                ei.repost_count, ei.interaction_data,
+                ei.repost_count, ei.interaction_data, ei.canonical_url,
                 xs.relay_urls
          FROM external_items ei
          JOIN external_sources xs ON xs.id = ei.source_id
@@ -312,50 +351,50 @@ export function registerInteractionRoutes(app: FastifyInstance) {
         [id],
       );
       if (items.length === 0) {
-        return reply.status(404).send({ error: "Item not found" });
+        return reply.status(404).send({ error: "We couldn't find that post." });
       }
       const item = items[0];
 
       if (item.protocol === "rss") {
         return reply
           .status(422)
-          .send({ error: "Replies are not supported for RSS items" });
+          .send({ error: "You can't reply to a post from an RSS feed." });
       }
 
-      // Validate linked account ownership + protocol match
-      const { rows: la } = await pool.query<{
-        protocol: string;
-        is_valid: boolean;
-        lifecycle_state: string;
-      }>(
-        `SELECT protocol, is_valid, lifecycle_state FROM network_presences
-         WHERE id = $1 AND account_id = $2`,
-        [linkedAccountId, accountId],
+      const refusal = await linkedAccountRefusal(linkedAccountId, accountId, item.protocol, (p) =>
+        `Linked account protocol (${p}) does not match item protocol (${item.protocol})`,
       );
-      if (la.length === 0) {
-        return reply.status(403).send({ error: "Linked account not found" });
-      }
-      if (la[0].lifecycle_state !== "active" || !la[0].is_valid) {
-        return reply
-          .status(422)
-          .send({ error: "Linked account is invalid — reconnect in settings" });
-      }
-      if (la[0].protocol !== item.protocol) {
-        return reply.status(422).send({
-          error: `Linked account protocol (${la[0].protocol}) does not match item protocol (${item.protocol})`,
-        });
-      }
+      if (refusal) return reply.status(refusal.status).send({ error: refusal.error });
 
       const trimmed = content.trim();
 
-      // Build Nostr kind 1 event tags
+      // Build Nostr kind 1 event tags. The root reference is `e` with the HEX
+      // event id, or `a` for an addressable kind (S17) — never the stored
+      // bech32 uri, which no client can resolve.
       const tags: string[][] = [];
       if (item.protocol === "nostr_external") {
-        tags.push(["e", item.source_item_uri, "", "root"]);
+        const rootTag = nostrTargetTag(item.source_item_uri, "root");
+        if (!rootTag) {
+          return reply
+            .status(422)
+            .send({ error: "You can't reply to this post on Nostr." });
+        }
+        tags.push(rootTag);
         const authorPubkey = (item.interaction_data as Record<string, unknown>)
           ?.pubkey;
         if (typeof authorPubkey === "string") {
           tags.push(["p", authorPubkey]);
+        }
+      } else {
+        // THE NOSTR COPY SAYS WHAT IT ANSWERS (CROSS-NETWORK-ROUNDTRIP-ADR
+        // F7/A6). A Bluesky/Mastodon parent has no event to e-tag, and this
+        // note went to our relay with no tags at all — a context-free
+        // top-level note, the F5 shape on our own relay. NIP-73 names an
+        // external thing by `i` (+ its `k` kind, `web` for a URL); `r` beside
+        // it for clients that read only the older URL reference.
+        const parentUrl = externalParentWebUrl(item);
+        if (parentUrl) {
+          tags.push(["i", parentUrl], ["k", "web"], ["r", parentUrl]);
         }
       }
 
@@ -370,7 +409,7 @@ export function registerInteractionRoutes(app: FastifyInstance) {
         });
       } catch (err) {
         logger.error({ err, accountId }, "Failed to sign reply event");
-        return reply.status(500).send({ error: "Failed to sign event" });
+        return reply.status(500).send({ error: "Couldn't sign that. Please try again." });
       }
 
       // Create note + feed_items + enqueue relay publish in one transaction
@@ -406,16 +445,24 @@ export function registerInteractionRoutes(app: FastifyInstance) {
           const nId = noteRows[0].id;
 
           await client.query(
+            // `is_reply` TRUE, because this note IS one — it carries
+            // `notes.external_parent_id` and exists only as an answer to
+            // somebody's Bluesky/Mastodon/nostr post. It was written with the
+            // column default (FALSE) until 2026-09-18, which made it the one
+            // native reply that could already reach a feed and the one the
+            // reader's "no replies" chip could not hide: `exclude_replies` is
+            // asked of this column alone. Migration 232 backfills the rows
+            // already written.
             `INSERT INTO feed_items (
                item_type, note_id, author_id,
                author_name, author_avatar, author_username,
                content_preview, nostr_event_id,
-               published_at
+               published_at, is_reply
              ) VALUES (
                'note', $1, $2,
                $3, $4, $5,
                $6, $7,
-               now()
+               now(), TRUE
              )
              ON CONFLICT (note_id) WHERE note_id IS NOT NULL DO UPDATE SET
                content_preview = EXCLUDED.content_preview,
@@ -448,10 +495,16 @@ export function registerInteractionRoutes(app: FastifyInstance) {
         noteId = result.noteId;
       } catch (err) {
         logger.error({ err, accountId }, "Reply note creation failed");
-        return reply.status(500).send({ error: "Failed to create reply note" });
+        return reply.status(500).send({ error: "Couldn't post your reply. Please try again." });
       }
 
-      // Best-effort: enqueue outbound cross-post
+      // Best-effort: enqueue outbound cross-post. The note is indexed and
+      // published either way, so a failure here is still a 201 — but it is
+      // SAID (A7): `crossPost` tells the composer the reply exists here and did
+      // not go to the network it was written for, which it otherwise has no
+      // way to learn. The worker's own later failures reach the member as a
+      // `cross_post_failed` notification.
+      let crossPost: "queued" | "not_sent" = "queued";
       try {
         if (item.protocol === "nostr_external") {
           await enqueueNostrOutbound({
@@ -473,6 +526,7 @@ export function registerInteractionRoutes(app: FastifyInstance) {
           });
         }
       } catch (err) {
+        crossPost = "not_sent";
         logger.warn(
           { err, noteId, itemId: id, accountId },
           "Reply cross-post enqueue failed (note created successfully)",
@@ -484,7 +538,29 @@ export function registerInteractionRoutes(app: FastifyInstance) {
         "External reply note created",
       );
 
-      return reply.status(201).send({ noteId, nostrEventId: signed.id });
+      return reply
+        .status(201)
+        .send({ noteId, nostrEventId: signed.id, crossPost });
     },
   );
+}
+
+// The public web address of an atproto/activitypub parent, for the Nostr
+// copy's tags (A6). The ingester's canonical_url first — activitypub stores
+// the permalink there; atproto declares none, so its at:// identity is
+// rewritten to the bsky.app URL (web/src/lib/post/origin-url.ts, the same
+// rewrite). An http(s) identity passes through. Anything else is no URL.
+export function externalParentWebUrl(item: {
+  protocol: string;
+  source_item_uri: string;
+  canonical_url?: string | null;
+}): string | null {
+  if (item.canonical_url && /^https?:\/\//.test(item.canonical_url))
+    return item.canonical_url;
+  const at = item.source_item_uri.match(
+    /^at:\/\/([^/]+)\/app\.bsky\.feed\.post\/([^/]+)$/,
+  );
+  if (at) return `https://bsky.app/profile/${at[1]}/post/${at[2]}`;
+  if (/^https?:\/\//.test(item.source_item_uri)) return item.source_item_uri;
+  return null;
 }

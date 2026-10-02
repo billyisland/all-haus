@@ -19,7 +19,11 @@ export function PubFollowButton({ publicationId, initialFollowing }: Props) {
 
   async function handleClick() {
     if (!user) {
-      router.push(`/auth?mode=login&redirect=${encodeURIComponent(window.location.pathname)}`)
+      // No `redirect=` — `/auth` has never read one, and it is the exact
+      // `returnTo` shape `lib/auth-return.ts` forbids on purpose. Where a
+      // return really is wanted, the carrier is `?arrival=<dTag>`, which is an
+      // identifier read off our own route rather than a path we navigate to.
+      router.push('/auth?mode=login')
       return
     }
 
@@ -37,7 +41,7 @@ export function PubFollowButton({ publicationId, initialFollowing }: Props) {
   }
 
   const label = loading
-    ? '...'
+    ? '…'
     : following
       ? hovering ? 'Unfollow' : 'Following'
       : 'Follow'

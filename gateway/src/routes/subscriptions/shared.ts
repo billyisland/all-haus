@@ -64,23 +64,47 @@ export async function logSubscriptionCharge(
     [subscriptionId, readerId, writerId, publicationId, pricePence, periodStart, periodEnd,
      `Subscription charge`]
   )
-  const { balancePence } = await applyLedgerDelta(client, {
+  // No `touch: ['last_read_at']` here (CA-F16b, 2026-09-29). That column is
+  // the monthly fallback's "last read anything" (Reader Terms 5.1(b):
+  // `sweepMonthlyFallback` and `shouldTriggerSettlement`), and a renewal is
+  // not a read — bumping it on every charge deferred the ≥£2 fallback by
+  // another window each month for a subscriber who had stopped reading, so
+  // their tab was collected late rather than "no later than about 30 days
+  // after you last read anything". A subscriber who never reads has the
+  // column NULL, which the sweep treats as due — the right answer.
+  await applyLedgerDelta(client, {
     accountId: readerId,
     counterpartyId: writerId,
     deltaPence: pricePence,
     triggerType: 'subscription_charge',
     refTable: 'subscription_events',
     refId: chargeEvent.id,
-    touch: ['last_read_at'],
   })
 
-  // Collection gate (migration 146): a post-charge balance <= 0 means the
-  // charge was fully funded by pre-paid credit (negative balance = platform
-  // owes reader), so it is already collected — no settlement will ever fire
-  // for it (nothing to charge), and the earning is payable immediately.
-  // Otherwise the earning stays settled_at NULL until confirmSettlement stamps
-  // it when the reader's tab settlement lands.
-  const chargeCollected = balancePence <= 0
+  // THE EARNING IS SETTLED WHEN A SETTLEMENT SETTLES IT, AND NEVER BY A SIGN
+  // TEST (L3.2, migration 206). This was `chargeCollected = balancePence <= 0`,
+  // on the reading that a post-charge balance at or below zero meant the charge
+  // had been funded by pre-paid credit and was therefore already collected. It
+  // stamped the writer's earning `settled_at` there and then — so a reader's
+  // CREDIT, which is money the platform over-collected and owes back, was
+  // settling a writer's money. Two of the reader's promises broken by one
+  // comparison: 4.3 ("we will not … let you spend it") and 11.1 (reading and
+  // writing are separate).
+  //
+  // It cannot arise any more: `applyLedgerDelta` quarantines a credit the
+  // moment it would exist, so `balancePence` comes back at zero or above, and a
+  // charge of `pricePence` on a tab that cannot be negative always leaves a
+  // positive balance. (A comp never reaches this function at all — zero is not
+  // a movement; see the writer route.) The sign test is gone rather than left
+  // as an unreachable branch, because an unreachable branch that would be wrong
+  // if reached is how this one survived as long as it did.
+  //
+  // So the earning stays unsettled until `confirmSettlement` stamps it when the
+  // reader's tab settlement lands. Nothing strands waiting for that: the debt is
+  // in a tab that is never in credit, so the threshold is reachable. Hence
+  // `settled_at` NULL below, always — written as a literal, because a constant
+  // feeding a ternary was the unreachable branch this comment says is gone
+  // (CA-H4).
 
   // Credit event for writer/publication (after platform fee)
   const { rows: [earningEvent] } = await client.query(
@@ -90,7 +114,7 @@ export async function logSubscriptionCharge(
      RETURNING id`,
     [subscriptionId, readerId, writerId, publicationId, writerEarningPence, periodStart, periodEnd,
      `Subscriber income (after ${feePct}% fee)`,
-     chargeCollected ? new Date() : null]
+     null]
   )
 
   // Writer leg: only WRITER subscriptions post an earned ledger entry + fold into
